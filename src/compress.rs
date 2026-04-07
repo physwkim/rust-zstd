@@ -68,6 +68,9 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     let n_blocks = block_ranges.len();
 
+    // Cross-block state for Treeless Huffman
+    let mut prev_huf_codes: Option<([(u32, u8); 256], u8)> = None;
+
     for (bi, &(s_start, s_end, d_end)) in block_ranges.iter().enumerate() {
         let is_last = bi == n_blocks - 1;
         let block_seqs = &all_encoded[s_start..s_end];
@@ -77,7 +80,6 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         let d_start = if s_start == 0 {
             0
         } else {
-            // Sum up all ll + ml of sequences before this block
             let mut p = 0usize;
             for s in &all_sequences[..s_start] {
                 p += s.ll as usize + s.ml as usize;
@@ -87,7 +89,6 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         let block_data = &data[d_start..d_end];
 
         if block_seqs.is_empty() {
-            // No sequences in this block - use RLE if possible, else raw
             if is_rle_block(block_data) {
                 write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
             } else {
@@ -103,30 +104,72 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
             literals.extend_from_slice(&block_data[pos..pos + seq.ll as usize]);
             pos += seq.ll as usize + seq.ml as usize;
         }
-        // Trailing literals
         literals.extend_from_slice(&block_data[pos..]);
 
         // Encode block
         let mut block = Vec::with_capacity(block_data.len());
 
-        // Literals section: try Huffman, fall back to raw
+        // === Literals section: try Huffman with Treeless, fall back to new tree ===
         let mut used_huf = false;
         if literals.len() >= 64 {
-            if let Some(huf) = encode_literals_huffman(&literals) {
-                if huf.len() < literals.len() {
-                    block.extend_from_slice(&huf);
-                    used_huf = true;
+            // Build a new Huffman tree for this block's literals
+            let new_result = encode_literals_huffman(&literals);
+
+            // Try Treeless: reuse previous tree (saves tree description bytes)
+            let treeless_result = if let Some((prev, _pm)) = &prev_huf_codes {
+                let mut counts = [0u32; 256];
+                let mut max_sym = 0u8;
+                for &b in literals.iter() {
+                    counts[b as usize] += 1;
+                    if b > max_sym { max_sym = b; }
                 }
+                let all_covered = (0..=max_sym as usize).all(|s| counts[s] == 0 || prev[s].1 > 0);
+                if all_covered {
+                    encode_literals_treeless(&literals, prev)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Pick the smaller of: new tree vs treeless vs raw
+            match (&new_result, &treeless_result) {
+                (Some(new_enc), Some(treeless_enc)) => {
+                    if treeless_enc.len() <= new_enc.len() && treeless_enc.len() < literals.len() {
+                        block.extend_from_slice(treeless_enc);
+                        // ALWAYS update prev with new tree so next block has fresh comparison
+                        update_prev_huf(&literals, &mut prev_huf_codes);
+                        used_huf = true;
+                    } else if new_enc.len() < literals.len() {
+                        block.extend_from_slice(new_enc);
+                        update_prev_huf(&literals, &mut prev_huf_codes);
+                        used_huf = true;
+                    }
+                }
+                (Some(new_enc), None) => {
+                    if new_enc.len() < literals.len() {
+                        block.extend_from_slice(new_enc);
+                        update_prev_huf(&literals, &mut prev_huf_codes);
+                        used_huf = true;
+                    }
+                }
+                (None, Some(treeless_enc)) => {
+                    if treeless_enc.len() < literals.len() {
+                        block.extend_from_slice(treeless_enc);
+                        used_huf = true;
+                    }
+                }
+                (None, None) => {}
             }
         }
         if !used_huf {
             encode_literals_raw(&mut block, &literals);
         }
 
-        // Sequences section
         encode_sequences_section(&mut block, block_seqs);
 
-        // Choose smallest block type: RLE < compressed < raw
+        // Choose smallest block type
         if is_rle_block(block_data) {
             write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
         } else if block.len() < block_data.len() {
@@ -416,7 +459,7 @@ fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     while ip + ZSTD_MINMATCH < data.len() {
         let best = find_best_at_n(data, ip, &hash_table, &chain, hash_mask, params.search_depth, 4);
 
-        if let Some((offset, match_len)) = best.filter(|&(off, ml)| is_match_profitable(ml, off)) {
+        if let Some((offset, match_len)) = best {
             let mut final_off = offset;
             let mut final_len = match_len;
             let mut final_ip = ip;
@@ -639,6 +682,142 @@ fn hash4(data: &[u8], mask: u32) -> usize {
 // =========================================================================
 // Huffman literal compression
 // =========================================================================
+
+/// Update prev_huf_codes from current literals
+fn update_prev_huf(literals: &[u8], prev: &mut Option<([(u32, u8); 256], u8)>) {
+    let mut counts = [0u32; 256];
+    let mut max_sym = 0u8;
+    for &b in literals { counts[b as usize] += 1; if b > max_sym { max_sym = b; } }
+    if let Some((codes, mb)) = build_huffman_codes(&counts, max_sym as usize) {
+        *prev = Some((codes, mb));
+    }
+}
+
+/// Encode literals using a previous Huffman tree (Treeless_Literals_Block, type=3).
+fn encode_literals_treeless(literals: &[u8], prev_codes: &[(u32, u8); 256]) -> Option<Vec<u8>> {
+    let use_4 = literals.len() >= 1024;
+    let streams = if use_4 {
+        encode_huf_4streams(literals, prev_codes)
+    } else {
+        encode_huf_1stream(literals, prev_codes)
+    };
+
+    let regen = literals.len();
+    let comp = streams.len(); // no tree description for treeless!
+    let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
+
+    let mut out = Vec::with_capacity(lh_size + comp);
+    let htype = LIT_TYPE_TREELESS as u32;
+
+    match lh_size {
+        3 => {
+            let sf = if use_4 { 1u32 } else { 0u32 };
+            let lhc = htype | (sf << 2) | ((regen as u32) << 4) | ((comp as u32) << 14);
+            out.extend_from_slice(&lhc.to_le_bytes()[..3]);
+        }
+        4 => {
+            let lhc = htype | (2u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 18);
+            out.extend_from_slice(&lhc.to_le_bytes()[..4]);
+        }
+        _ => {
+            let lhc = htype | (3u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 22);
+            out.extend_from_slice(&lhc.to_le_bytes()[..4]);
+            out.push((comp >> 10) as u8);
+        }
+    }
+    out.extend_from_slice(&streams);
+    Some(out)
+}
+
+/// Encode literals with Huffman, optionally reusing previous tree (Treeless mode).
+/// Returns (encoded_bytes, codes, max_bits) on success.
+fn encode_literals_huffman_with_reuse(
+    literals: &[u8],
+    prev_codes: &Option<([(u32, u8); 256], u8)>,
+) -> Option<(Vec<u8>, [(u32, u8); 256], u8)> {
+    // Count frequencies
+    let mut counts = [0u32; 256];
+    let mut max_sym = 0u8;
+    for &b in literals {
+        counts[b as usize] += 1;
+        if b > max_sym { max_sym = b; }
+    }
+    let n_used = counts.iter().filter(|&&c| c > 0).count();
+    if n_used < 2 { return None; }
+
+    // Build new Huffman codes
+    let (new_codes, new_max_bits) = build_huffman_codes(&counts, max_sym as usize)?;
+    let new_tree_desc = encode_huffman_tree(&new_codes, new_max_bits, max_sym as usize);
+    if new_tree_desc.is_empty() { return None; }
+
+    // Try both: new tree (Compressed) and reused tree (Treeless)
+    let use_4 = literals.len() >= 1024;
+
+    // Option A: new tree (type=2)
+    let streams_new = if use_4 {
+        encode_huf_4streams(literals, &new_codes)
+    } else {
+        encode_huf_1stream(literals, &new_codes)
+    };
+    let comp_new = new_tree_desc.len() + streams_new.len();
+
+    // Option B: treeless reuse (type=3) if previous tree exists and covers all symbols
+    let mut best_type = LIT_TYPE_COMPRESSED;
+    let mut best_codes = new_codes;
+    let mut best_max_bits = new_max_bits;
+    let mut best_streams = streams_new;
+    let best_comp = comp_new;
+    let mut best_tree_desc = new_tree_desc;
+
+    if let Some((prev, prev_mb)) = prev_codes {
+        // Check: does prev tree cover all symbols in current literals?
+        let all_covered = (0..=max_sym as usize).all(|s| counts[s] == 0 || prev[s].1 > 0);
+        if all_covered {
+            let streams_reuse = if use_4 {
+                encode_huf_4streams(literals, prev)
+            } else {
+                encode_huf_1stream(literals, prev)
+            };
+            let comp_reuse = streams_reuse.len(); // no tree desc!
+            if comp_reuse < best_comp {
+                best_type = LIT_TYPE_TREELESS;
+                best_codes = *prev;
+                best_max_bits = *prev_mb;
+                best_streams = streams_reuse;
+                let _ = comp_reuse;
+                best_tree_desc = vec![]; // no tree header for treeless
+            }
+        }
+    }
+
+    let regen = literals.len();
+    let comp = best_tree_desc.len() + best_streams.len();
+    let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
+
+    let mut out = Vec::with_capacity(lh_size + comp);
+    let htype = best_type as u32;
+
+    match lh_size {
+        3 => {
+            let sf = if use_4 { 1u32 } else { 0u32 };
+            let lhc = htype | (sf << 2) | ((regen as u32) << 4) | ((comp as u32) << 14);
+            out.extend_from_slice(&lhc.to_le_bytes()[..3]);
+        }
+        4 => {
+            let lhc = htype | (2u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 18);
+            out.extend_from_slice(&lhc.to_le_bytes()[..4]);
+        }
+        _ => {
+            let lhc = htype | (3u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 22);
+            out.extend_from_slice(&lhc.to_le_bytes()[..4]);
+            out.push((comp >> 10) as u8);
+        }
+    }
+
+    out.extend_from_slice(&best_tree_desc);
+    out.extend_from_slice(&best_streams);
+    Some((out, best_codes, best_max_bits))
+}
 
 /// Build Huffman codes, encode tree + streams. Returns None if Huffman doesn't help.
 fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
@@ -1251,6 +1430,84 @@ fn encode_literals_raw(out: &mut Vec<u8>, literals: &[u8]) {
 // Sequences section encoding using exact C-compatible FSE tables
 // =========================================================================
 
+/// Encode sequences with cross-block Repeat mode support.
+/// If the current block's symbol distribution matches the previous block, use Repeat mode
+/// (no table header needed). Otherwise choose best of Predefined/RLE/Custom FSE.
+fn encode_sequences_section_with_reuse(
+    out: &mut Vec<u8>,
+    sequences: &[EncodedSequence],
+    prev_ll: &mut Option<SeqTableMode>,
+    prev_of: &mut Option<SeqTableMode>,
+    prev_ml: &mut Option<SeqTableMode>,
+) {
+    let nb_seq = sequences.len();
+
+    // Number of sequences header
+    if nb_seq < 128 {
+        out.push(nb_seq as u8);
+    } else if nb_seq < 0x7F00 {
+        out.push(((nb_seq >> 8) as u8) + 128);
+        out.push(nb_seq as u8);
+    } else {
+        out.push(255);
+        out.extend_from_slice(&((nb_seq - 0x7F00) as u16).to_le_bytes());
+    }
+
+    if nb_seq == 0 {
+        return;
+    }
+
+    // Convert sequences to codes
+    let mut ll_codes_v = Vec::with_capacity(nb_seq);
+    let mut ml_codes_v = Vec::with_capacity(nb_seq);
+    let mut off_codes_v = Vec::with_capacity(nb_seq);
+    let mut ll_values = Vec::with_capacity(nb_seq);
+    let mut ml_values = Vec::with_capacity(nb_seq);
+    let mut off_values = Vec::with_capacity(nb_seq);
+
+    for seq in sequences {
+        let llc = ll_code(seq.ll);
+        let ml_base = seq.ml - ZSTD_MINMATCH as u32;
+        let mlc = ml_code(ml_base);
+        let ofc = off_code(seq.of_value);
+
+        ll_codes_v.push(llc);
+        ml_codes_v.push(mlc);
+        off_codes_v.push(ofc);
+        ll_values.push(seq.ll - LL_BASE[llc as usize]);
+        ml_values.push(seq.ml - ML_BASE[mlc as usize]);
+        off_values.push(if ofc > 0 { seq.of_value - (1u32 << ofc) } else { 0 });
+    }
+
+    // Choose mode for each table, considering Repeat from previous block
+    let ll_mode = choose_seq_mode_with_repeat(&ll_codes_v, MAX_LL, LL_DEFAULT_NORM_LOG, &LL_DEFAULT_NORM, LL_FSE_LOG, prev_ll);
+    let of_mode = choose_seq_mode_with_repeat(&off_codes_v, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG, &OF_DEFAULT_NORM, OFF_FSE_LOG, prev_of);
+    let ml_mode = choose_seq_mode_with_repeat(&ml_codes_v, MAX_ML, ML_DEFAULT_NORM_LOG, &ML_DEFAULT_NORM, ML_FSE_LOG, prev_ml);
+
+    // Write compression modes byte
+    let mode_byte = (ll_mode.tag() << 6) | (of_mode.tag() << 4) | (ml_mode.tag() << 2);
+    out.push(mode_byte);
+
+    // Write table descriptions and build tables
+    let ll_table = write_seq_table_and_build(out, &ll_mode, prev_ll, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+    let of_table = write_seq_table_and_build(out, &of_mode, prev_of, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
+    let ml_table = write_seq_table_and_build(out, &ml_mode, prev_ml, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+
+    // Encode with FSE sequence encoder
+    let bitstream = super::fse::encode_sequences(
+        &ll_table, &of_table, &ml_table,
+        &ll_codes_v, &off_codes_v, &ml_codes_v,
+        &ll_values, &ml_values, &off_values,
+    );
+    out.extend_from_slice(&bitstream);
+
+    // Save current modes for next block's Repeat consideration
+    // For Repeat, preserve the previous mode (don't overwrite with Repeat itself)
+    if !matches!(ll_mode, SeqTableMode::Repeat) { *prev_ll = Some(ll_mode); }
+    if !matches!(of_mode, SeqTableMode::Repeat) { *prev_of = Some(of_mode); }
+    if !matches!(ml_mode, SeqTableMode::Repeat) { *prev_ml = Some(ml_mode); }
+}
+
 fn encode_sequences_section(out: &mut Vec<u8>, sequences: &[EncodedSequence]) {
     let nb_seq = sequences.len();
 
@@ -1305,9 +1562,10 @@ fn encode_sequences_section(out: &mut Vec<u8>, sequences: &[EncodedSequence]) {
     out.push(mode_byte);
 
     // Write table descriptions for non-predefined modes, then build tables
-    let ll_table = write_seq_table_and_build(out, &ll_mode, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-    let of_table = write_seq_table_and_build(out, &of_mode, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
-    let ml_table = write_seq_table_and_build(out, &ml_mode, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+    let no_prev = None;
+    let ll_table = write_seq_table_and_build(out, &ll_mode, &no_prev, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+    let of_table = write_seq_table_and_build(out, &of_mode, &no_prev, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
+    let ml_table = write_seq_table_and_build(out, &ml_mode, &no_prev, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
 
     // Encode with FSE sequence encoder
     let bitstream = super::fse::encode_sequences(
@@ -1338,6 +1596,7 @@ enum SeqTableMode {
         table_log: u32,
         header_bytes: Vec<u8>,
     },
+    Repeat, // Reuse previous block's table (no header written)
 }
 
 impl SeqTableMode {
@@ -1346,6 +1605,7 @@ impl SeqTableMode {
             SeqTableMode::Predefined => SEQ_MODE_PREDEFINED,
             SeqTableMode::Rle(_) => SEQ_MODE_RLE,
             SeqTableMode::Fse { .. } => SEQ_MODE_FSE,
+            SeqTableMode::Repeat => SEQ_MODE_REPEAT,
         }
     }
 }
@@ -1502,6 +1762,67 @@ fn encode_fse_header(norm: &[i16], max_symbol: usize, table_log: u32) -> Vec<u8>
 
 /// Estimate the compressed size (in bits) of encoding `codes` with a given normalized distribution.
 
+/// Choose best mode considering Repeat from previous block.
+fn choose_seq_mode_with_repeat(
+    codes: &[u8],
+    max_symbol_default: usize,
+    default_log: u32,
+    default_norm: &[i16],
+    max_log: u32,
+    prev_mode: &Option<SeqTableMode>,
+) -> SeqTableMode {
+    // First get the best non-repeat mode
+    let best = choose_seq_mode(codes, max_symbol_default, default_log, default_norm, max_log);
+
+    // If we have a previous mode, check if Repeat is valid and cheaper
+    if let Some(prev) = prev_mode {
+        if codes.is_empty() {
+            return best;
+        }
+        // Repeat is valid if the previous table can represent all current symbols
+        let repeat_valid = match prev {
+            SeqTableMode::Predefined => {
+                codes.iter().all(|&c| {
+                    let s = c as usize;
+                    s <= max_symbol_default && s < default_norm.len() && default_norm[s] != 0
+                })
+            }
+            SeqTableMode::Rle(sym) => codes.iter().all(|&c| c == *sym),
+            SeqTableMode::Fse { norm, max_symbol, .. } => {
+                codes.iter().all(|&c| {
+                    let s = c as usize;
+                    s <= *max_symbol && norm[s] != 0
+                })
+            }
+            SeqTableMode::Repeat => false, // can't repeat a repeat
+        };
+
+        if repeat_valid {
+            // Repeat saves header bytes but might use a worse distribution.
+            // Only use Repeat if the previous table is FSE or RLE (custom).
+            // Predefined→Repeat is pointless (Predefined also has no header).
+            let worth_repeating = match prev {
+                SeqTableMode::Fse { .. } | SeqTableMode::Rle(_) => true,
+                _ => false,
+            };
+            if worth_repeating {
+                let best_header_cost = match &best {
+                    SeqTableMode::Predefined => 0,
+                    SeqTableMode::Rle(_) => 1,
+                    SeqTableMode::Fse { header_bytes, .. } => header_bytes.len(),
+                    SeqTableMode::Repeat => 0,
+                };
+                // Only use Repeat if the current best mode requires a header
+                if best_header_cost > 0 {
+                    return SeqTableMode::Repeat;
+                }
+            }
+        }
+    }
+
+    best
+}
+
 /// Choose the best compression mode for a sequence symbol type.
 fn choose_seq_mode(
     codes: &[u8],
@@ -1616,6 +1937,7 @@ fn choose_seq_mode(
 fn write_seq_table_and_build(
     out: &mut Vec<u8>,
     mode: &SeqTableMode,
+    prev_mode: &Option<SeqTableMode>,
     default_norm: &[i16],
     default_max_symbol: usize,
     default_log: u32,
@@ -1626,7 +1948,6 @@ fn write_seq_table_and_build(
         }
         SeqTableMode::Rle(sym) => {
             out.push(*sym);
-            // RLE table: single symbol, 0 bits per symbol, accuracy_log=0
             super::fse::FseCTable::build_rle(*sym)
         }
         SeqTableMode::Fse {
@@ -1637,6 +1958,19 @@ fn write_seq_table_and_build(
         } => {
             out.extend_from_slice(header_bytes);
             super::fse::FseCTable::build(norm, *max_symbol, *table_log)
+        }
+        SeqTableMode::Repeat => {
+            // No header written. Rebuild table from previous block's mode.
+            match prev_mode {
+                Some(SeqTableMode::Predefined) => {
+                    super::fse::FseCTable::build(default_norm, default_max_symbol, default_log)
+                }
+                Some(SeqTableMode::Rle(sym)) => super::fse::FseCTable::build_rle(*sym),
+                Some(SeqTableMode::Fse { norm, max_symbol, table_log, .. }) => {
+                    super::fse::FseCTable::build(norm, *max_symbol, *table_log)
+                }
+                _ => super::fse::FseCTable::build(default_norm, default_max_symbol, default_log),
+            }
         }
     }
 }
