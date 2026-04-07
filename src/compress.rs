@@ -1418,12 +1418,54 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         return None;
     }
 
-    // Verify Kraft
-    let kraft: u64 = (0..256)
+    // Fix Kraft inequality: adjust lengths until sum of 2^(max-len) == 2^max
+    let target = 1u64 << max_bits;
+    let mut kraft: u64 = (0..256)
         .filter(|&s| lengths[s] > 0)
         .map(|s| 1u64 << (max_bits - lengths[s]))
         .sum();
-    if !kraft.is_power_of_two() {
+
+    // Under-full (kraft < target): shorten longest-code symbols (decrease length)
+    // Each decrease of 1 bit adds 2^(max-len) to kraft
+    let mut iters = 0;
+    while kraft < target && iters < 256 {
+        // Find symbol with longest code (highest length) to shorten
+        let mut best_s = 0usize;
+        let mut best_len = 0u8;
+        for i in 0..n {
+            let s = syms[i].1 as usize;
+            if lengths[s] > 1 && lengths[s] > best_len {
+                best_len = lengths[s];
+                best_s = s;
+            }
+        }
+        if best_len <= 1 { break; }
+        let added = (1u64 << (max_bits - best_len + 1)) - (1u64 << (max_bits - best_len));
+        if kraft + added > target { break; } // would overshoot
+        lengths[best_s] -= 1;
+        kraft += added;
+        iters += 1;
+    }
+
+    // Over-full (kraft > target): lengthen shortest-code symbols (increase length)
+    while kraft > target && iters < 512 {
+        let mut best_s = 0usize;
+        let mut best_len = MAX_BITS;
+        for i in 0..n {
+            let s = syms[i].1 as usize;
+            if lengths[s] > 0 && lengths[s] < MAX_BITS && lengths[s] < best_len {
+                best_len = lengths[s];
+                best_s = s;
+            }
+        }
+        if best_len >= MAX_BITS { break; }
+        let removed = (1u64 << (max_bits - best_len)) - (1u64 << (max_bits - best_len - 1));
+        lengths[best_s] += 1;
+        kraft -= removed;
+        iters += 1;
+    }
+
+    if kraft != target {
         return None;
     }
 
