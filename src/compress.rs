@@ -1831,22 +1831,29 @@ pub fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     }
 
     // CTable-based 2-stream interleaved encoding.
-    // CTable.encode_symbol guarantees valid state transitions.
+    // init_state from decoder table (correct symbol mapping).
+    // encode_symbol from CTable (valid transitions, but decoder-table init).
     let stream1: Vec<u8> = weights.iter().step_by(2).copied().collect();
     let stream2: Vec<u8> = weights.iter().skip(1).step_by(2).copied().collect();
     let len1 = stream1.len();
     let len2 = stream2.len();
 
-    // Encoder init: set initial state for each stream's first symbol.
-    // Decoder will read init_state as table_log bits → decode[idx].symbol == stream[0].
-    let mut st1 = fse.init_state(stream1[0] as usize);
-    let mut st2 = if len2 > 0 { fse.init_state(stream2[0] as usize) } else { 0 };
+    // Find decoder-table-compatible init states: scan decode table for first
+    // occurrence of each symbol, then convert to CTable state range.
+    let find_init = |sym: u8| -> u32 {
+        for i in 0..ts {
+            if dec_symbol[i] == sym {
+                // Convert decode table index to CTable state: table_size + index
+                return table_size + i as u32;
+            }
+        }
+        fse.init_state(sym as usize)
+    };
+    let mut st1 = find_init(stream1[0]);
+    let mut st2 = if len2 > 0 { find_init(stream2[0]) } else { 0 };
 
     let mut bw = super::bitstream::BackwardBitWriter::new();
 
-    // Backward encoding: process symbols from last to first.
-    // Decoder reads dec1.update, dec2.update alternating.
-    // In backward order: write dec2[last], dec1[last], ..., dec2[1], dec1[1].
     let max_idx = std::cmp::max(len1, len2);
     for i in (1..max_idx).rev() {
         if i < len2 {
@@ -1863,8 +1870,7 @@ pub fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // Write init states: decoder reads st1 first → write st2 first (backward).
-    // Convert CTable state [ts, 2*ts) to decode table index [0, ts).
+    // Write init states — convert CTable state to decoder index
     bw.add_bits((st2 - table_size) as u64, table_log);
     bw.flush_bits();
     bw.add_bits((st1 - table_size) as u64, table_log);
