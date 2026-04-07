@@ -56,9 +56,8 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         if lazy_cost < fast_cost { all_sequences = lazy_seqs; }
     }
 
-    // Split oversized sequences BEFORE resolve_repeat_offsets.
-    // Each sequence's ll+ml must fit in BLOCKSIZE_MAX.
-    let all_sequences = split_long_sequences(all_sequences);
+    // Split oversized sequences first, then resolve repeat offsets.
+    let all_sequences = split_long_raw_sequences(all_sequences);
     let all_encoded = resolve_repeat_offsets(&all_sequences);
 
     // Split sequences into blocks. Each block's decompressed content must not
@@ -505,30 +504,107 @@ fn resolve_repeat_offsets(sequences: &[Sequence]) -> Vec<EncodedSequence> {
     out
 }
 
-/// Split sequences where ll+ml > BLOCKSIZE_MAX into multiple valid sequences.
-/// Must be called BEFORE resolve_repeat_offsets since it creates new raw sequences.
-fn split_long_sequences(sequences: Vec<Sequence>) -> Vec<Sequence> {
-    let mut out = Vec::with_capacity(sequences.len());
+/// Split raw sequences where ll+ml > BLOCKSIZE_MAX. Called BEFORE resolve_repeat_offsets.
+fn split_long_raw_sequences(sequences: Vec<Sequence>) -> Vec<Sequence> {
+    let needs_split = sequences.iter().any(|s| s.ll as usize + s.ml as usize > ZSTD_BLOCKSIZE_MAX);
+    if !needs_split { return sequences; }
+
+    let mut out = Vec::with_capacity(sequences.len() + 16);
     for seq in sequences {
         let total = seq.ll as usize + seq.ml as usize;
         if total <= ZSTD_BLOCKSIZE_MAX {
             out.push(seq);
         } else {
             // First chunk: all literals + partial match
-            let max_ml_first = ZSTD_BLOCKSIZE_MAX.saturating_sub(seq.ll as usize);
-            let ml_first = std::cmp::max(ZSTD_MINMATCH, std::cmp::min(seq.ml as usize, max_ml_first));
+            let max_ml = ZSTD_BLOCKSIZE_MAX.saturating_sub(seq.ll as usize);
+            let ml_first = std::cmp::max(ZSTD_MINMATCH, std::cmp::min(seq.ml as usize, max_ml));
             out.push(Sequence { ll: seq.ll, off: seq.off, ml: ml_first as u32 });
             let mut remaining = seq.ml as usize - ml_first;
-            // Continuation chunks: ll=0, same offset
-            while remaining > 0 {
-                let ml = std::cmp::min(remaining, ZSTD_BLOCKSIZE_MAX);
-                if ml < ZSTD_MINMATCH { break; }
-                out.push(Sequence { ll: 0, off: seq.off, ml: ml as u32 });
-                remaining -= ml;
+            // Continuation: use ll=1 (not ll=0!) to avoid the ll=0 offset shift
+            // in resolve_repeat_offsets. With ll=1, of_value=1 → rep1 = this offset.
+            // We "borrow" 1 byte from the match to use as a literal.
+            while remaining >= ZSTD_MINMATCH + 1 {
+                let ml = std::cmp::min(remaining - 1, ZSTD_BLOCKSIZE_MAX - 1);
+                out.push(Sequence { ll: 1, off: seq.off, ml: ml as u32 });
+                remaining -= ml + 1; // 1 literal + ml match
             }
         }
     }
     out
+}
+
+/// Split oversized sequences (ll+ml > BLOCKSIZE_MAX) after resolve_repeat_offsets.
+/// Continuation sequences get of_value=1 (repeat the same offset that was just used).
+/// For ll=0 continuations, of_value=1 means "rep2" in zstd spec, but since the previous
+/// sequence used the same offset, rep1=offset, so of_value=1 with ll>0 means rep1.
+/// When ll=0, the spec shifts: of_value=1 → rep2. So we need of_value=2 for ll=0
+/// to get rep1 when ll=0... Actually it's simpler: the first continuation has ll=0
+/// and wants the SAME offset. With ll=0, of_value=1 → rep2. But rep2=rep1_before
+/// since the previous seq made rep1=offset. So of_value=1 with ll=0 gives rep2=old_rep1.
+/// That's wrong. We need of_value that gives rep1. With ll=0, of_value for rep1 is...
+/// not directly available. The trick: make ll=1 (one literal byte) for continuation,
+/// then of_value=1 → rep1. But that changes the data.
+///
+/// Simplest correct approach: don't split at the encoded level. Instead, limit match
+/// length during match finding.
+fn split_long_sequences_encoded(
+    sequences: Vec<Sequence>,
+    encoded: Vec<EncodedSequence>,
+) -> (Vec<Sequence>, Vec<EncodedSequence>) {
+    // Check if any splitting is needed
+    let needs_split = sequences.iter().any(|s| s.ll as usize + s.ml as usize > ZSTD_BLOCKSIZE_MAX);
+    if !needs_split {
+        return (sequences, encoded);
+    }
+
+    // For sequences that need splitting, limit match length.
+    // This is safe because the data is still valid — we just encode fewer
+    // matched bytes and more literal bytes in the next sequence.
+    let mut out_seq = Vec::with_capacity(sequences.len() + 16);
+    let mut out_enc = Vec::with_capacity(sequences.len() + 16);
+
+    for (seq, enc) in sequences.into_iter().zip(encoded.into_iter()) {
+        let total = seq.ll as usize + seq.ml as usize;
+        if total <= ZSTD_BLOCKSIZE_MAX {
+            out_seq.push(seq);
+            out_enc.push(enc);
+        } else {
+            // Limit match to fit in one block. Rest becomes literals for next sequence.
+            let max_ml = ZSTD_BLOCKSIZE_MAX.saturating_sub(seq.ll as usize);
+            let new_ml = std::cmp::max(ZSTD_MINMATCH, max_ml);
+            let leftover = seq.ml as usize - new_ml;
+
+            out_seq.push(Sequence { ll: seq.ll, off: seq.off, ml: new_ml as u32 });
+            out_enc.push(EncodedSequence { ll: enc.ll, of_value: enc.of_value, ml: new_ml as u32 });
+
+            // Leftover becomes additional sequences at same offset with ll=0
+            // Use of_value=1 (repeat offset 1) — valid because previous sequence just set rep1
+            let mut rem = leftover;
+            while rem >= ZSTD_MINMATCH {
+                let chunk = std::cmp::min(rem, ZSTD_BLOCKSIZE_MAX);
+                // ll=0, of_value=1: with ll=0, decoder shifts offsets so of_value=1 → rep2.
+                // But rep2 was set to old rep1, not current offset. This is incorrect.
+                // Instead, use a small literal (ll=1) to avoid the ll=0 shift.
+                // But we don't have literal data here...
+                //
+                // Actually: after the first split sequence, rep1 = seq.off.
+                // The continuation has ll=0. With ll=0, of_value mappings:
+                //   1 → rep2 (= old rep1 before this sequence)
+                //   2 → rep3
+                //   3 → rep1-1
+                // None of these give us rep1 directly with ll=0!
+                //
+                // The ONLY way to use rep1 with ll=0 is to not use rep at all:
+                // of_value = offset + 3 (raw offset). This costs more bits but is correct.
+                let of_val = seq.off + 3; // raw offset, not rep code
+                out_seq.push(Sequence { ll: 0, off: seq.off, ml: chunk as u32 });
+                out_enc.push(EncodedSequence { ll: 0, of_value: of_val, ml: chunk as u32 });
+                rem -= chunk;
+            }
+        }
+    }
+
+    (out_seq, out_enc)
 }
 
 /// Match finder: fast (level 1-2) or lazy (level 3+).
@@ -752,8 +828,9 @@ fn read32(data: &[u8], pos: usize) -> u32 {
     u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]])
 }
 
-/// Max match length for ML code 52: baseline 65539 + (1<<16)-1 = 131074
-const MAX_MATCH_LEN: usize = 131074;
+/// Max match length. Capped to ensure ll+ml fits in BLOCKSIZE_MAX for any literal length.
+/// Using BLOCKSIZE_MAX directly since ll is typically small.
+const MAX_MATCH_LEN: usize = ZSTD_BLOCKSIZE_MAX;
 
 #[inline]
 fn count_match(data: &[u8], mut a: usize, mut b: usize) -> usize {
