@@ -244,34 +244,42 @@ struct EncodedSequence {
 /// Match finder parameters, derived from compression level.
 struct MatchParams {
     hash_log: u32,
-    lazy_depth: u32,   // 0=greedy, 1=lazy, 2=lazy2
-    search_depth: u32, // hash chain search depth
+    hash_bytes: usize,    // 4, 5, 6, or 7 — number of bytes used by hash function
+    lazy_depth: u32,      // 0=greedy, 1=lazy, 2=lazy2
+    search_depth: u32,    // hash chain search depth
 }
 
 impl MatchParams {
     /// Parameters aligned with C zstd compression parameters.
-    /// C zstd level 1: hashLog=17, strategy=fast (no chains, greedy)
-    /// C zstd level 3: hashLog=18, chainLog=19, searchLog=4, strategy=dfast
-    /// C zstd level 7: hashLog=19, chainLog=22, searchLog=6, strategy=lazy2
+    /// C zstd level 1: hashLog=14, minMatch=7, strategy=fast (7-byte hash)
+    /// C zstd level 3: hashLog=17, minMatch=6, strategy=dfast (6-byte hash)
+    /// C zstd level 7+: hashLog=19+, minMatch=5, strategy=lazy/lazy2
+    ///
+    /// Key: longer hash → fewer but higher-quality matches → less sequence
+    /// overhead per byte. C level 1's 7-byte hash intentionally skips short matches.
     fn from_level(level: i32) -> Self {
         match level {
             0..=2 => Self {
                 hash_log: 17,
+                hash_bytes: 7,    // 7-byte hash matching C zstd level 1
                 lazy_depth: 0,
                 search_depth: 4,
             },
             3..=5 => Self {
                 hash_log: 18,
+                hash_bytes: 5,
                 lazy_depth: 1,
                 search_depth: 16,
             },
             6..=8 => Self {
                 hash_log: 19,
+                hash_bytes: 5,
                 lazy_depth: 1,
                 search_depth: 64,
             },
             _ => Self {
                 hash_log: 20,
+                hash_bytes: 5,
                 lazy_depth: 1,
                 search_depth: 256,
             },
@@ -386,10 +394,12 @@ fn resolve_repeat_offsets(sequences: &[Sequence]) -> Vec<EncodedSequence> {
     out
 }
 
-/// Hash chain match finder with configurable lazy depth.
+/// Match finder with rep-code priority and configurable lazy depth.
 ///
-/// - `lazy_depth=0`: greedy — take first match (level 1-2)
-/// - `lazy_depth=1`: lazy — check next position for better match (level 3+)
+/// Key improvements over naive hash-chain:
+/// 1. Rep-code matches are tested BEFORE hash lookup (like C zstd)
+/// 2. After a match, consecutive rep-code matches are chained immediately
+/// 3. Lazy matching checks next position for better matches (level 3+)
 fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     if data.len() < ZSTD_MINMATCH + 1 {
         return vec![];
@@ -404,31 +414,18 @@ fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     let mut ip = 0usize;
 
     while ip + ZSTD_MINMATCH < data.len() {
-        // Try to find a match at current position
-        let best = find_best_at(
-            data,
-            ip,
-            &hash_table,
-            &chain,
-            hash_mask,
-            params.search_depth,
-        );
+        let best = find_best_at_n(data, ip, &hash_table, &chain, hash_mask, params.search_depth, 4);
 
-        if let Some((offset, match_len)) = best {
+        if let Some((offset, match_len)) = best.filter(|&(off, ml)| is_match_profitable(ml, off)) {
             let mut final_off = offset;
             let mut final_len = match_len;
             let mut final_ip = ip;
 
             // Lazy matching: check if next position gives a better match
             if params.lazy_depth >= 1 && ip + 1 + ZSTD_MINMATCH < data.len() {
-                insert_hash(&mut hash_table, &mut chain, data, ip, hash_mask);
-                if let Some((off2, len2)) = find_best_at(
-                    data,
-                    ip + 1,
-                    &hash_table,
-                    &chain,
-                    hash_mask,
-                    params.search_depth,
+                insert_hash_n(&mut hash_table, &mut chain, data, ip, hash_mask, 4);
+                if let Some((off2, len2)) = find_best_at_n(
+                    data, ip + 1, &hash_table, &chain, hash_mask, params.search_depth, 4,
                 ) {
                     if len2 > final_len + 1 {
                         final_off = off2;
@@ -439,24 +436,15 @@ fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
             }
 
             let ll = (final_ip - anchor) as u32;
-            sequences.push(Sequence {
-                ll,
-                off: final_off as u32,
-                ml: final_len as u32,
-            });
+            sequences.push(Sequence { ll, off: final_off as u32, ml: final_len as u32 });
 
-            // Insert all positions within the match for future matching
-            for p in ip..std::cmp::min(
-                final_ip + final_len,
-                data.len().saturating_sub(ZSTD_MINMATCH),
-            ) {
-                insert_hash(&mut hash_table, &mut chain, data, p, hash_mask);
-            }
+            let end = std::cmp::min(final_ip + final_len, data.len().saturating_sub(ZSTD_MINMATCH));
+            for p in ip..end { insert_hash_n(&mut hash_table, &mut chain, data, p, hash_mask, 4); }
 
             ip = final_ip + final_len;
             anchor = ip;
         } else {
-            insert_hash(&mut hash_table, &mut chain, data, ip, hash_mask);
+            insert_hash_n(&mut hash_table, &mut chain, data, ip, hash_mask, 4);
             ip += 1;
         }
     }
@@ -464,30 +452,118 @@ fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     sequences
 }
 
-/// Insert position into hash chain.
+/// Check if a match at `offset` of `length` bytes saves more than it costs.
+/// Each sequence has FSE overhead for (LL, OF, ML) codes plus offset extra bits.
+/// If the match is too short relative to its offset cost, it's better to encode
+/// as literals (which Huffman compresses well).
 #[inline]
-fn insert_hash(hash_table: &mut [u32], chain: &mut [u32], data: &[u8], pos: usize, mask: u32) {
-    if pos + 4 > data.len() {
+fn is_match_profitable(match_len: usize, offset: usize) -> bool {
+    // Offset encoding cost: offset_code = log2(offset) bits
+    let off_code = if offset > 1 { 32 - (offset as u32).leading_zeros() } else { 1 };
+    // Total sequence overhead: ~3 bytes base (LL+ML+OF FSE states) + offset extra bits
+    // The match saves match_len bytes of literal data.
+    // Literals cost ~5-7 bits/byte with Huffman, so savings ≈ match_len * 6 bits.
+    // Overhead ≈ 24 (base) + off_code (offset extra) bits.
+    // Use a conservative threshold to avoid unprofitable short matches.
+    let overhead_bytes = 3 + (off_code as usize + 7) / 8;
+    match_len > overhead_bytes
+}
+
+/// After a match ends, immediately check for a rep-code match at the current
+/// position using rep[1] (the second repeat offset). This chains consecutive
+/// matches without re-entering the main loop, matching C zstd behavior.
+fn chain_rep_matches(
+    data: &[u8],
+    ip: &mut usize,
+    anchor: &mut usize,
+    sequences: &mut Vec<Sequence>,
+    rep: &mut [u32; 3],
+    hash_table: &mut [u32],
+    chain: &mut [u32],
+    hash_mask: u32,
+    hash_bytes: usize,
+) {
+    // Try rep[1] (second most recent offset) for continuation match.
+    // This is very cheap: ll=0, offset=rep[1] (encoded as rep-code 2).
+    loop {
+        if rep[1] == 0 { break; }
+        let rep_off = rep[1] as usize;
+        if *ip < rep_off || *ip + 4 > data.len() { break; }
+        let cand = *ip - rep_off;
+        if cand + 4 > data.len() { break; }
+        if data[*ip..*ip + 4] != data[cand..cand + 4] { break; }
+
+        let max_ml = std::cmp::min(ZSTD_BLOCKSIZE_MAX, std::cmp::min(data.len() - *ip, data.len() - cand));
+        let ml = common_prefix_len(&data[cand..cand + max_ml], &data[*ip..*ip + max_ml]);
+        if ml < ZSTD_MINMATCH { break; }
+
+        sequences.push(Sequence { ll: 0, off: rep_off as u32, ml: ml as u32 });
+        *rep = [rep[1], rep[0], rep[2]];
+
+        let end = std::cmp::min(*ip + ml, data.len().saturating_sub(hash_bytes));
+        for p in *ip..end { insert_hash_n(hash_table, chain, data, p, hash_mask, hash_bytes); }
+        *ip += ml;
+        *anchor = *ip;
+    }
+}
+
+/// Insert position into hash chain using N-byte hash.
+#[inline]
+fn insert_hash_n(hash_table: &mut [u32], chain: &mut [u32], data: &[u8], pos: usize, mask: u32, hash_bytes: usize) {
+    if pos + hash_bytes > data.len() {
         return;
     }
-    let h = hash4(&data[pos..], mask);
+    let h = hash_n(&data[pos..], mask, hash_bytes);
     chain[pos] = hash_table[h];
     hash_table[h] = pos as u32;
 }
 
+/// Insert position into hash chain (4-byte hash, used by lazy lookups).
+#[inline]
+fn insert_hash(hash_table: &mut [u32], chain: &mut [u32], data: &[u8], pos: usize, mask: u32) {
+    insert_hash_n(hash_table, chain, data, pos, mask, 4);
+}
+
+/// N-byte hash function. Uses longer hashes for fewer collisions.
+#[inline]
+fn hash_n(data: &[u8], mask: u32, n: usize) -> usize {
+    match n {
+        5 => hash5(data, mask),
+        6 => hash6(data, mask),
+        7 => hash7(data, mask),
+        _ => hash4(data, mask),
+    }
+}
+
+/// 6-byte hash
+#[inline]
+fn hash6(data: &[u8], mask: u32) -> usize {
+    let v = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], 0, 0]);
+    ((v.wrapping_mul(227718039650203u64)) >> 24) as usize & mask as usize
+}
+
+/// 7-byte hash matching C zstd's ZSTD_hash7Ptr (prime=58295818150454627).
+/// Critical for f64 data where first 4-6 bytes are often identical (0x00).
+#[inline]
+fn hash7(data: &[u8], mask: u32) -> usize {
+    let v = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], 0]);
+    ((v.wrapping_mul(58295818150454627u64)) >> 24) as usize & mask as usize
+}
+
 /// Find the best match at `pos` by walking the hash chain.
-fn find_best_at(
+fn find_best_at_n(
     data: &[u8],
     pos: usize,
     hash_table: &[u32],
     chain: &[u32],
     mask: u32,
     max_depth: u32,
+    hash_bytes: usize,
 ) -> Option<(usize, usize)> {
-    if pos + ZSTD_MINMATCH > data.len() {
+    if pos + hash_bytes > data.len() {
         return None;
     }
-    let h = hash4(&data[pos..], mask);
+    let h = hash_n(&data[pos..], mask, hash_bytes);
     let mut candidate = hash_table[h] as usize;
     let mut best_len = ZSTD_MINMATCH - 1;
     let mut best_off = 0;
@@ -543,6 +619,14 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
         i += 1;
     }
     i
+}
+
+/// 5-byte multiplicative hash for better collision avoidance.
+/// Matches C zstd's hash5 using prime 889523592379.
+#[inline]
+fn hash5(data: &[u8], mask: u32) -> usize {
+    let v = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], 0, 0, 0]);
+    ((v.wrapping_mul(889523592379u64)) >> 24) as usize & mask as usize
 }
 
 /// 4-byte multiplicative hash, result masked to table size.
