@@ -40,9 +40,29 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     // Level 1+: run match finder on entire input (cross-block window), then
     // split sequences into blocks for encoding.
+    // Try both fast (fewer sequences, better for high-entropy) and lazy (more
+    // matches, better for structured data) and keep the one producing smaller output.
     let params = MatchParams::from_level(level);
     let all_sequences = find_matches(data, &params);
     let all_encoded = resolve_repeat_offsets(&all_sequences);
+
+    // For level 1-2: also try the other strategy and pick smaller
+    let (all_sequences, all_encoded) = if params.lazy_depth == 0 {
+        let lazy_params = MatchParams { lazy_depth: 1, hash_log: 17, hash_bytes: 5, search_depth: 8 };
+        let lazy_seqs = find_matches_lazy(data, &lazy_params);
+        let lazy_enc = resolve_repeat_offsets(&lazy_seqs);
+        // Quick estimate: fewer sequences → less overhead → usually smaller
+        // Use sequence count as proxy (actual encoding would be too slow to try both)
+        let fast_cost = estimate_seq_cost(&all_sequences, &all_encoded);
+        let lazy_cost = estimate_seq_cost(&lazy_seqs, &lazy_enc);
+        #[cfg(any())]
+        eprintln!("[compress] fast: {} seqs cost={}, lazy: {} seqs cost={} → {}",
+            all_sequences.len(), fast_cost, lazy_seqs.len(), lazy_cost,
+            if lazy_cost < fast_cost { "lazy" } else { "fast" });
+        if lazy_cost < fast_cost { (lazy_seqs, lazy_enc) } else { (all_sequences, all_encoded) }
+    } else {
+        (all_sequences, all_encoded)
+    };
 
     // Split sequences into blocks of up to ZSTD_BLOCKSIZE_MAX output bytes.
     // Each sequence produces ll + ml output bytes. Track cumulative output
@@ -112,9 +132,14 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         // Encode block
         let mut block = Vec::with_capacity(block_data.len());
 
-        // === Literals section: try Huffman with Treeless, fall back to new tree ===
+        // === Literals section: RLE → Huffman/Treeless → Raw ===
         let mut used_huf = false;
-        if literals.len() >= 64 {
+
+        // Try RLE literals first (all same byte)
+        if !literals.is_empty() && literals.iter().all(|&b| b == literals[0]) {
+            encode_literals_rle(&mut block, literals[0], literals.len());
+            used_huf = true;
+        } else if literals.len() >= 64 {
             // Build a new Huffman tree for this block's literals
             let new_result = encode_literals_huffman(&literals);
 
@@ -443,10 +468,23 @@ fn resolve_repeat_offsets(sequences: &[Sequence]) -> Vec<EncodedSequence> {
     out
 }
 
-/// Match finder with rep-code integration and lazy evaluation.
-/// All levels use hash-chain matching with rep-code chaining after matches.
+/// Match finder: fast (level 1-2) or lazy (level 3+).
 fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
-    find_matches_lazy(data, params)
+    if params.lazy_depth == 0 {
+        find_matches_fast(data, params)
+    } else {
+        find_matches_lazy(data, params)
+    }
+}
+
+/// Estimate the encoded cost of a set of sequences (without actually encoding).
+/// Uses: literals_cost (Huffman ~5 bits/byte) + sequence_count * overhead + match_savings.
+fn estimate_seq_cost(raw_seqs: &[Sequence], _enc_seqs: &[EncodedSequence]) -> u64 {
+    let mut literal_bytes = 0u64;
+    for seq in raw_seqs {
+        literal_bytes += seq.ll as u64;
+    }
+    raw_seqs.len() as u64 * 20 + literal_bytes * 5
 }
 
 /// Greedy fast match finder modeled on ZSTD_compressBlock_fast_noDict_generic.
@@ -1763,6 +1801,19 @@ fn encode_huf_4streams(data: &[u8], codes: &[(u32, u8); 256]) -> Vec<u8> {
 // Literals section encoding (Raw mode)
 // =========================================================================
 
+fn encode_literals_rle(out: &mut Vec<u8>, byte: u8, size: usize) {
+    if size <= 31 {
+        out.push(LIT_TYPE_RLE | ((size as u8) << 3));
+    } else if size <= 4095 {
+        let h = (LIT_TYPE_RLE as u16) | (1 << 2) | ((size as u16) << 4);
+        out.extend_from_slice(&h.to_le_bytes());
+    } else {
+        let h = (LIT_TYPE_RLE as u32) | (3 << 2) | ((size as u32) << 4);
+        out.extend_from_slice(&h.to_le_bytes()[..3]);
+    }
+    out.push(byte);
+}
+
 fn encode_literals_raw(out: &mut Vec<u8>, literals: &[u8]) {
     let size = literals.len();
 
@@ -1805,17 +1856,18 @@ fn encode_sequences_section_with_reuse(
         let mut with_reuse = Vec::new();
         encode_sequences_section_repeat(&mut with_reuse, sequences, prev_ll, prev_of, prev_ml);
 
+        #[cfg(any())]
+        eprintln!("[seq_reuse] no_reuse={} with_reuse={} → {}",
+            no_reuse.len(), with_reuse.len(),
+            if with_reuse.len() < no_reuse.len() { "REUSE" } else { "FRESH" });
+
         if with_reuse.len() < no_reuse.len() {
             out.extend_from_slice(&with_reuse);
-            // Keep prev modes for next block (they were reused successfully)
             return;
         }
     }
 
-    // No reuse or reuse was worse: use non-reuse version and update prev modes
     out.extend_from_slice(&no_reuse);
-
-    // Update prev modes from the non-reuse encoding's chosen modes
     update_prev_modes(sequences, prev_ll, prev_of, prev_ml);
 }
 
