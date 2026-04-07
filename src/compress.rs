@@ -1364,33 +1364,27 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
             if node_nbits[i] > MAX_BITS { node_nbits[i] = MAX_BITS; }
         }
 
-        // Repay cost: lengthen some shallow symbols by 1 bit each
-        // Iterate from shallowest (most costly to lose) to deepest
-        while total_cost > 0 {
-            let mut repaid = false;
-            for nb in (1..MAX_BITS).rev() {
+        // Repay cost by lengthening symbols. Process from MAX_BITS-1 downward
+        // (smallest cost unit = 1 at MAX_BITS-1, largest = 2^(MAX_BITS-2) at nb=1).
+        // This ensures we can hit total_cost=0 exactly.
+        let mut nb_to_repay = MAX_BITS - 1;
+        while total_cost > 0 && nb_to_repay >= 1 {
+            let unit_cost = 1i32 << (MAX_BITS - nb_to_repay - 1);
+            while total_cost >= unit_cost {
+                // Find a symbol at depth nb_to_repay to lengthen
+                let mut found = false;
                 for i in 0..n {
-                    if node_nbits[i] == nb {
-                        node_nbits[i] = nb + 1;
-                        total_cost -= 1 << (MAX_BITS - nb - 1);
-                        repaid = true;
-                        if total_cost <= 0 { break; }
+                    if node_nbits[i] == nb_to_repay {
+                        node_nbits[i] += 1;
+                        total_cost -= unit_cost;
+                        found = true;
+                        break;
                     }
                 }
-                if total_cost <= 0 { break; }
+                if !found { break; }
             }
-            if !repaid { break; }
-        }
-
-        // If over-compensated (total_cost < 0), shorten deepest symbols
-        while total_cost < 0 {
-            for i in (0..n).rev() {
-                if node_nbits[i] == MAX_BITS {
-                    node_nbits[i] = MAX_BITS - 1;
-                    total_cost += 1; // each shortening at MAX_BITS saves cost of 1
-                    if total_cost >= 0 { break; }
-                }
-            }
+            if nb_to_repay == 0 { break; }
+            nb_to_repay -= 1;
         }
     }
 
