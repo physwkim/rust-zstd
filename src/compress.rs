@@ -1692,7 +1692,7 @@ fn highest_bit_set_dec(x: u32) -> u32 {
 
 /// FSE-compress weights using 2-stream interleaved encoding.
 /// Uses decoder's FSE table directly for encoding to guarantee compatibility.
-fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
+pub fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     let mut counts = [0u32; 13];
     let mut max_w = 0u8;
     for &w in weights {
@@ -1751,46 +1751,48 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     let prob_sum = table_size;
     let mut counter = 0u32;
 
-    for s in 0..=max_w as usize {
-        if counter >= prob_sum {
-            break;
-        }
+    let mut s = 0usize;
+    while s <= max_w as usize && counter < prob_sum {
         let prob = norm[s] as i32;
-        let value = (prob + 1) as u32; // prob=-1 → value=0, prob=0 → value=1, etc.
+        let value = (prob + 1) as u32;
 
         let max_remaining = prob_sum - counter + 1;
-        let bits_to_read = 32 - max_remaining.leading_zeros(); // = highest_bit_set(max_remaining)
-
+        let bits_to_read = 32 - max_remaining.leading_zeros();
         let low_threshold = ((1u32 << bits_to_read) - 1) - max_remaining;
         let mask = (1u32 << (bits_to_read - 1)) - 1;
 
         if value < low_threshold {
-            // Case 1: decoder reads (btr-1) bits, gets value directly
             bb |= (value as u64) << bp;
             bp += bits_to_read - 1;
         } else if value <= mask {
-            // Case 3: decoder reads btr bits, unchecked = value, value <= mask, value >= low_threshold
             bb |= (value as u64) << bp;
             bp += bits_to_read;
         } else {
-            // Case 2: decoder reads btr bits, unchecked > mask, value = unchecked - low_threshold
-            let encoded = value + low_threshold;
-            bb |= (encoded as u64) << bp;
+            bb |= ((value + low_threshold) as u64) << bp;
             bp += bits_to_read;
         }
+        while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
 
-        while bp >= 8 {
-            hdr.push(bb as u8);
-            bb >>= 8;
-            bp -= 8;
-        }
+        if prob > 0 { counter += prob as u32; }
+        else if prob == -1 { counter += 1; }
 
-        if prob > 0 {
-            counter += prob as u32;
-        } else if prob == -1 {
-            counter += 1;
+        if prob == 0 {
+            let mut repeat = 0u32;
+            while s + 1 + repeat as usize <= max_w as usize
+                && norm[s + 1 + repeat as usize] == 0 && repeat < 3 { repeat += 1; }
+            bb |= (repeat as u64) << bp; bp += 2;
+            while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
+            s += repeat as usize;
+            while repeat == 3 {
+                repeat = 0;
+                while s + 1 + repeat as usize <= max_w as usize
+                    && norm[s + 1 + repeat as usize] == 0 && repeat < 3 { repeat += 1; }
+                bb |= (repeat as u64) << bp; bp += 2;
+                while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
+                s += repeat as usize;
+            }
         }
-        // prob == 0 doesn't contribute to counter
+        s += 1;
     }
     if bp > 0 {
         hdr.push(bb as u8);
