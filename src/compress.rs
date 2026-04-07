@@ -43,48 +43,56 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
     // Try both fast (fewer sequences, better for high-entropy) and lazy (more
     // matches, better for structured data) and keep the one producing smaller output.
     let params = MatchParams::from_level(level);
-    let all_sequences = find_matches(data, &params);
-    let all_encoded = resolve_repeat_offsets(&all_sequences);
+    let mut all_sequences = find_matches(data, &params);
 
     // For level 1-2: also try the other strategy and pick smaller
-    let (all_sequences, all_encoded) = if params.lazy_depth == 0 {
+    if params.lazy_depth == 0 {
         let lazy_params = MatchParams { lazy_depth: 1, hash_log: 17, hash_bytes: 5, search_depth: 8 };
         let lazy_seqs = find_matches_lazy(data, &lazy_params);
+        let fast_enc = resolve_repeat_offsets(&all_sequences);
         let lazy_enc = resolve_repeat_offsets(&lazy_seqs);
-        // Quick estimate: fewer sequences → less overhead → usually smaller
-        // Use sequence count as proxy (actual encoding would be too slow to try both)
-        let fast_cost = estimate_seq_cost(&all_sequences, &all_encoded);
+        let fast_cost = estimate_seq_cost(&all_sequences, &fast_enc);
         let lazy_cost = estimate_seq_cost(&lazy_seqs, &lazy_enc);
-        #[cfg(any())]
-#[cfg(any())] eprintln!("[compress] fast: {} seqs cost={}, lazy: {} seqs cost={} → {}",
-            all_sequences.len(), fast_cost, lazy_seqs.len(), lazy_cost,
-            if lazy_cost < fast_cost { "lazy" } else { "fast" });
-        if lazy_cost < fast_cost { (lazy_seqs, lazy_enc) } else { (all_sequences, all_encoded) }
-    } else {
-        (all_sequences, all_encoded)
-    };
+        if lazy_cost < fast_cost { all_sequences = lazy_seqs; }
+    }
 
-    // Split sequences into blocks of up to ZSTD_BLOCKSIZE_MAX output bytes.
-    // Each sequence produces ll + ml output bytes. Track cumulative output
-    // and cut a new block when we'd exceed the limit.
+    // Split oversized sequences BEFORE resolve_repeat_offsets.
+    // Each sequence's ll+ml must fit in BLOCKSIZE_MAX.
+    let all_sequences = split_long_sequences(all_sequences);
+    let all_encoded = resolve_repeat_offsets(&all_sequences);
+
+    // Split sequences into blocks. Each block's decompressed content must not
+    // exceed ZSTD_BLOCKSIZE_MAX (128 KiB). Decompressed size = sum(ll + ml) for
+    // all sequences in the block + trailing literals (for last block in range).
     let mut block_ranges: Vec<(usize, usize, usize)> = Vec::new(); // (seq_start, seq_end, data_end)
     let mut seq_start = 0usize;
     let mut data_pos = 0usize;
     let mut block_output = 0usize;
 
-    for (i, (raw, _enc)) in all_sequences.iter().zip(all_encoded.iter()).enumerate() {
+    for (i, raw) in all_sequences.iter().enumerate() {
         let seq_output = raw.ll as usize + raw.ml as usize;
-        if block_output + seq_output > ZSTD_BLOCKSIZE_MAX && i > seq_start {
-            // End current block before this sequence
-            block_ranges.push((seq_start, i, data_pos));
-            seq_start = i;
-            block_output = 0;
+        if block_output + seq_output > ZSTD_BLOCKSIZE_MAX {
+            if i > seq_start {
+                block_ranges.push((seq_start, i, data_pos));
+                seq_start = i;
+                block_output = 0;
+            }
         }
         block_output += seq_output;
         data_pos += seq_output;
     }
-    // Final block: includes remaining sequences + trailing literals
-    block_ranges.push((seq_start, all_sequences.len(), data.len()));
+
+    // Final block: includes remaining sequences + trailing literals.
+    // Ensure decompressed size doesn't exceed BLOCKSIZE_MAX.
+    let trailing_lits = data.len() - data_pos;
+    if block_output + trailing_lits > ZSTD_BLOCKSIZE_MAX && block_output > 0 {
+        // Sequences go in one block (without trailing lits as block data)
+        block_ranges.push((seq_start, all_sequences.len(), data_pos));
+        // Trailing literals become a separate empty-sequences block
+        block_ranges.push((all_sequences.len(), all_sequences.len(), data.len()));
+    } else {
+        block_ranges.push((seq_start, all_sequences.len(), data.len()));
+    }
 
     let n_blocks = block_ranges.len();
 
@@ -203,13 +211,39 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
             &mut prev_ll_mode, &mut prev_of_mode, &mut prev_ml_mode,
         );
 
-        // Choose smallest block type
-        if is_rle_block(block_data) {
-            write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
-        } else if block.len() < block_data.len() {
-            write_compressed_block(&mut out, &block, is_last);
+        // Choose smallest block type.
+        // Compressed blocks: Block_Size = compressed size (must be <= BLOCKSIZE_MAX).
+        // Raw/RLE blocks: Block_Size = decompressed size (must be <= BLOCKSIZE_MAX).
+        // For compressed, the decompressed size may exceed BLOCKSIZE_MAX IF the
+        // compressed size fits. But spec says both must fit, so we need to ensure
+        // decompressed size <= BLOCKSIZE_MAX too.
+        if block_data.len() <= ZSTD_BLOCKSIZE_MAX {
+            if is_rle_block(block_data) {
+                write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
+            } else if block.len() < block_data.len() && block.len() <= ZSTD_BLOCKSIZE_MAX {
+                write_compressed_block(&mut out, &block, is_last);
+            } else {
+                write_raw_block(&mut out, block_data, is_last);
+            }
         } else {
-            write_raw_block(&mut out, block_data, is_last);
+            // Decompressed size exceeds limit — use compressed if it fits,
+            // otherwise split into raw/rle sub-blocks
+            if block.len() < block_data.len() && block.len() <= ZSTD_BLOCKSIZE_MAX {
+                write_compressed_block(&mut out, &block, is_last);
+            } else {
+                let mut remaining = block_data;
+                while !remaining.is_empty() {
+                    let chunk_size = std::cmp::min(remaining.len(), ZSTD_BLOCKSIZE_MAX);
+                    let chunk = &remaining[..chunk_size];
+                    let chunk_last = is_last && chunk_size == remaining.len();
+                    if is_rle_block(chunk) {
+                        write_rle_block(&mut out, chunk[0], chunk.len(), chunk_last);
+                    } else {
+                        write_raw_block(&mut out, chunk, chunk_last);
+                    }
+                    remaining = &remaining[chunk_size..];
+                }
+            }
         }
     }
 
@@ -468,6 +502,32 @@ fn resolve_repeat_offsets(sequences: &[Sequence]) -> Vec<EncodedSequence> {
         });
     }
 
+    out
+}
+
+/// Split sequences where ll+ml > BLOCKSIZE_MAX into multiple valid sequences.
+/// Must be called BEFORE resolve_repeat_offsets since it creates new raw sequences.
+fn split_long_sequences(sequences: Vec<Sequence>) -> Vec<Sequence> {
+    let mut out = Vec::with_capacity(sequences.len());
+    for seq in sequences {
+        let total = seq.ll as usize + seq.ml as usize;
+        if total <= ZSTD_BLOCKSIZE_MAX {
+            out.push(seq);
+        } else {
+            // First chunk: all literals + partial match
+            let max_ml_first = ZSTD_BLOCKSIZE_MAX.saturating_sub(seq.ll as usize);
+            let ml_first = std::cmp::max(ZSTD_MINMATCH, std::cmp::min(seq.ml as usize, max_ml_first));
+            out.push(Sequence { ll: seq.ll, off: seq.off, ml: ml_first as u32 });
+            let mut remaining = seq.ml as usize - ml_first;
+            // Continuation chunks: ll=0, same offset
+            while remaining > 0 {
+                let ml = std::cmp::min(remaining, ZSTD_BLOCKSIZE_MAX);
+                if ml < ZSTD_MINMATCH { break; }
+                out.push(Sequence { ll: 0, off: seq.off, ml: ml as u32 });
+                remaining -= ml;
+            }
+        }
+    }
     out
 }
 
