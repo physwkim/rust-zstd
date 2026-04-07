@@ -1,0 +1,15 @@
+[package]
+name = "zstd-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust Zstandard codec — compress + decompress, zero external dependencies"
+license = "BSD-3-Clause"
+
+[dependencies]
+rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+
+[features]
+default = []
+parallel = ["rayon"]
