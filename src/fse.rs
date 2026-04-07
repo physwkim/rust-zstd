@@ -66,27 +66,27 @@ impl FseCTable {
         }
 
         // 4. Build per-symbol compression transforms.
+        // Use the decoder's baseline/numbits calculation for compatibility.
+        // For each state in the table, compute its decoder-compatible numbits,
+        // then derive the CTable's delta_nb_bits and delta_find_state from that.
         let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
+        let _sym_count_tt = vec![0u32; max_symbol + 1];
         let mut total = 0u32;
         for s in 0..=max_symbol {
-            match norm[s] {
-                0 => {
-                    symbol_tt[s].delta_nb_bits = ((table_log + 1) << 16) - table_size;
-                }
-                -1 | 1 => {
-                    symbol_tt[s].delta_nb_bits = (table_log << 16) - table_size;
-                    symbol_tt[s].delta_find_state = total as i32 - 1;
-                    total += 1;
-                }
-                n => {
-                    let n = n as u32;
-                    let max_bits_out = table_log - highest_bit(n - 1);
-                    let min_state_plus = n << max_bits_out;
-                    symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
-                    symbol_tt[s].delta_find_state = total as i32 - n as i32;
-                    total += n;
-                }
+            let prob = if norm[s] == -1 { 1 } else { norm[s].max(0) as u32 };
+            if prob == 0 {
+                symbol_tt[s].delta_nb_bits = ((table_log + 1) << 16) - table_size;
+            } else if prob == 1 {
+                symbol_tt[s].delta_nb_bits = (table_log << 16) - table_size;
+                symbol_tt[s].delta_find_state = total as i32 - 1;
+            } else {
+                // Use the same formula as C zstd FSE_buildCTable
+                let max_bits_out = table_log - highest_bit(prob - 1);
+                let min_state_plus = prob << max_bits_out;
+                symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
+                symbol_tt[s].delta_find_state = total as i32 - prob as i32;
             }
+            total += prob;
         }
 
         Self {
