@@ -577,7 +577,7 @@ fn fse_next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
-fn fse_calc_baseline_and_numbits(
+pub(crate) fn fse_calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,
     state_number: u32,
@@ -605,7 +605,7 @@ fn fse_calc_baseline_and_numbits(
     }
 }
 
-fn highest_bit_set(x: u32) -> u32 {
+pub(crate) fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
 }
