@@ -1485,23 +1485,15 @@ fn encode_huffman_tree(codes: &[(u32, u8); 256], max_bits: u8, max_sym: usize) -
         match fse_result {
             Some(compressed) if compressed.len() < 127 => {
                 let header_byte = compressed.len() as u8;
-                // Verify roundtrip correctness
+                // Verify roundtrip to catch any encode/decode mismatch
                 let verify = crate::decode::decode_huf_weights_from_fse(&compressed, header_byte);
-                if let Ok(ref decoded_weights) = verify {
-                    if *decoded_weights == weights {
+                if let Ok(ref dw) = verify {
+                    if *dw == weights {
                         let mut desc = Vec::with_capacity(1 + compressed.len());
                         desc.push(header_byte);
                         desc.extend_from_slice(&compressed);
                         return desc;
                     }
-                    let diff_idx = weights.iter().zip(decoded_weights.iter()).position(|(a,b)| a!=b).unwrap_or(9999);
-                    eprintln!("[FSE_W] mismatch at {}: expected {} got {} (of {} weights)",
-                        diff_idx,
-                        if diff_idx < weights.len() { weights[diff_idx] } else { 0 },
-                        if diff_idx < decoded_weights.len() { decoded_weights[diff_idx] } else { 0 },
-                        weights.len());
-                } else if let Err(ref e) = verify {
-                    eprintln!("[FSE_W] decode err: {}", e);
                 }
                 // FSE roundtrip failed — fall through to direct mode fallback
                 if num <= 128 {
@@ -1536,13 +1528,39 @@ fn encode_huffman_tree(codes: &[(u32, u8); 256], max_bits: u8, max_sym: usize) -
     }
 }
 
+/// Calculate baseline and num_bits for FSE decode table entry.
+/// EXACT copy of decode.rs fse_calc_baseline_and_numbits.
+fn fse_enc_baseline_numbits(num_states_total: u32, num_states_symbol: u32, state_number: u32) -> (u32, u32) {
+    if num_states_symbol == 0 {
+        return (0, 0);
+    }
+    let num_state_slices = if 1u32 << (highest_bit_set_dec(num_states_symbol) - 1) == num_states_symbol {
+        num_states_symbol
+    } else {
+        1u32 << highest_bit_set_dec(num_states_symbol)
+    };
+
+    let num_double_width = num_state_slices - num_states_symbol;
+    let num_single_width = num_states_symbol - num_double_width;
+    let slice_width = num_states_total / num_state_slices;
+    let num_bits = highest_bit_set_dec(slice_width) - 1;
+
+    if state_number < num_double_width {
+        let baseline = num_single_width * slice_width + state_number * slice_width * 2;
+        (baseline, num_bits + 1)
+    } else {
+        let index_shifted = state_number - num_double_width;
+        (index_shifted * slice_width, num_bits)
+    }
+}
+
+fn highest_bit_set_dec(x: u32) -> u32 {
+    if x == 0 { return 0; }
+    32 - x.leading_zeros()
+}
+
 /// FSE-compress weights using 2-stream interleaved encoding.
-///
-/// Decoder reads: sentinel → init_state(dec1) → init_state(dec2) →
-/// loop { dec1.decode + update, dec2.decode + update } until exhausted.
-///
-/// Encoder writes backward: data pairs → state2 → state1 → sentinel.
-/// After bw.finish() (reverse + sentinel), decoder reads correctly.
+/// Uses decoder's FSE table directly for encoding to guarantee compatibility.
 fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     let mut counts = [0u32; 13];
     let mut max_w = 0u8;
@@ -1588,7 +1606,7 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
         dist += 1;
     }
 
-    let fse = super::fse::FseCTable::build(&norm, max_w as usize, table_log);
+    let _fse = super::fse::FseCTable::build(&norm, max_w as usize, table_log);
 
     // --- FSE table header (must match decode.rs read_probabilities exactly) ---
     // Decoder: accuracy_log = 5 + get_bits(4)
@@ -1647,98 +1665,144 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
         hdr.push(bb as u8);
     }
 
-    // --- 2-stream interleaved backward bitstream ---
-    let _n = weights.len();
-    let mut bw = super::bitstream::BackwardBitWriter::new();
+    // --- Build decoder-compatible FSE table and encode using it ---
+    // This guarantees encode/decode compatibility by using the same table structure.
+    let ts = table_size as usize;
 
-    // Decoder reads:
-    //   1. sentinel (1-bit + padding zeros)
-    //   2. dec1.init_state (table_log bits)
-    //   3. dec2.init_state (table_log bits)
-    //   4. loop: dec1.decode_symbol, dec1.update_state(num_bits),
-    //            dec2.decode_symbol, dec2.update_state(num_bits), ...
-    //
-    // decode_symbol reads nothing (just returns state.symbol).
-    // update_state reads state.num_bits bits → new_state = base_line + bits_read.
-    //
-    // Encoder must write in reverse:
-    //   First: update_state bits for early symbols
-    //   ...
-    //   Last: init states → sentinel
-    //
-    // The FSE CTable.encode_symbol(state, sym) returns:
-    //   (bits_out, num_bits, new_state)
-    // where bits_out are the low bits of the OLD state.
-    // This corresponds to what update_state reads.
+    // Build decode table (same algorithm as decode.rs)
+    let mut dec_symbol = vec![0u8; ts];
+    let mut dec_baseline = vec![0u32; ts];
+    let mut dec_numbits = vec![0u8; ts];
 
-    // Split: stream1 = w[0],w[2],w[4],... stream2 = w[1],w[3],w[5],...
-    let stream1: Vec<u8> = weights.iter().step_by(2).copied().collect();
-    let stream2: Vec<u8> = weights.iter().skip(1).step_by(2).copied().collect();
-
-    // Init states: decoder outputs stream1[0] first, so init with that symbol.
-    // In backward encoding, init is the LAST thing written → FIRST thing read.
-    // encode_symbol processes stream1[len1-2]..stream1[1] (skipping [0] and last).
-    // The last symbol (stream1.last()) gets its state from the final encode_symbol.
-    // The first symbol (stream1[0]) is the init state — decoded first.
-    // BUT: the loop processes down to index 0, so actually we init with stream1.last()
-    // and the loop's final encode_symbol at i=0 produces the state that carries stream1[0].
-    // Wait... let me re-think.
-    //
-    // FSE backward encoding protocol:
-    // 1. init_state(last_symbol) → set initial state for that symbol
-    // 2. for each symbol from second-to-last down to first:
-    //    encode_symbol(state, symbol) → output bits, update state
-    // 3. flush final state
-    //
-    // Decoder:
-    // 1. read init state → state
-    // 2. output state.symbol (= LAST symbol from encoding, = FIRST output from decoder)
-    // 3. read update bits → new state, output new state.symbol
-    //    (= second-to-last symbol from encoding, = second output)
-    //
-    // So init_state(last_symbol) is correct! The decoder's first output IS the last
-    // symbol encoded. But we process stream1 elements as: last → init, then
-    // second-to-last → encode, ..., first → encode.
-    // Decoder outputs: last (from init), second-to-last, ..., first.
-    // That means decoder output = REVERSED stream1.
-    //
-    // But we want decoder to output stream1 in FORWARD order!
-    // So we need to REVERSE the encoding order:
-    // init_state(stream1[0]), encode stream1[1], stream1[2], ..., stream1[last]
-    //
-    // That way decoder outputs: stream1[0] (init), stream1[1], ..., stream1[last]
-    let mut st1 = fse.init_state(stream1[0] as usize);
-    let mut st2 = fse.init_state(stream2[0] as usize);
-
-    // Encode in reverse order, alternating stream2 then stream1
-    // (because decoder reads stream1 first after init)
-    let len1 = stream1.len();
-    let len2 = stream2.len();
-
-    // Backward encoding: init with [0], encode [last] first → [1] last.
-    // Decoder reads: init([0]) → update with [1] bits → update with [2] → ... → [last].
-    let max_idx = std::cmp::max(len1, len2);
-    for i in (1..max_idx).rev() {
-        if i < len2 {
-            let (bits, nb, ns) = fse.encode_symbol(st2, stream2[i] as usize);
-            bw.add_bits(bits as u64, nb);
-            bw.flush_bits();
-            st2 = ns;
-        }
-        if i < len1 {
-            let (bits, nb, ns) = fse.encode_symbol(st1, stream1[i] as usize);
-            bw.add_bits(bits as u64, nb);
-            bw.flush_bits();
-            st1 = ns;
+    // Place -1 symbols at the end
+    let mut neg_idx = ts;
+    for s in 0..=max_w as usize {
+        if norm[s] == -1 {
+            neg_idx -= 1;
+            dec_symbol[neg_idx] = s as u8;
+            dec_baseline[neg_idx] = 0;
+            dec_numbits[neg_idx] = table_log as u8;
         }
     }
 
-    // Write init states as decode table indices (state - table_size).
-    // dec1 is read first → written last (backward bitstream convention).
-    let table_size = 1u32 << table_log;
-    bw.add_bits((st2 - table_size) as u64, table_log);
+    // Spread remaining symbols
+    let mut pos = 0usize;
+    for s in 0..=max_w as usize {
+        if norm[s] <= 0 { continue; }
+        for _ in 0..norm[s] {
+            dec_symbol[pos] = s as u8;
+            pos += (ts >> 1) + (ts >> 3) + 3;
+            pos &= ts - 1;
+            while pos >= neg_idx { pos += (ts >> 1) + (ts >> 3) + 3; pos &= ts - 1; }
+        }
+    }
+
+    // Fill baseline and numbits
+    let mut sym_count = vec![0u32; max_w as usize + 1];
+    for i in 0..neg_idx {
+        let s = dec_symbol[i] as usize;
+        let prob = norm[s] as u32;
+        let sc = sym_count[s];
+        let (bl, nb) = fse_enc_baseline_numbits(ts as u32, prob, sc);
+        dec_baseline[i] = bl;
+        dec_numbits[i] = nb as u8;
+        sym_count[s] += 1;
+    }
+
+    // Build reverse map: for encoding, given (symbol, state), find which decode entry to use.
+    // For each symbol, collect all decode table positions that decode to it.
+    let mut sym_states: Vec<Vec<usize>> = vec![vec![]; max_w as usize + 1];
+    for i in 0..ts {
+        sym_states[dec_symbol[i] as usize].push(i);
+    }
+
+    // Encode: given current state and next symbol, find the bits to output and new state.
+    // Decoder: state → (symbol, baseline, numbits), reads numbits bits → new_state = baseline + bits
+    // Encoder: to transition to a state S that decodes symbol SYM:
+    //   S must be in sym_states[SYM], and new_state = baseline[S] + bits_read
+    //   So bits_read = new_state - baseline[S], and numbits = dec_numbits[S]
+    //   We need new_state such that baseline[S] <= new_state < baseline[S] + (1 << numbits[S])
+
+    // For interleaved 2-stream, the encoding process:
+    // Decoder order: init(st1) → init(st2) → loop { dec1: peek+update, dec2: peek+update }
+    // Weights output: w[0]=dec_symbol[st1], w[1]=dec_symbol[st2],
+    //   w[2]=dec_symbol[new_st1], w[3]=dec_symbol[new_st2], ...
+    // Where new_st1 = dec_baseline[st1] + bits_read_1, etc.
+
+    // Forward simulation: determine all states from weights
+    let stream1: Vec<u8> = weights.iter().step_by(2).copied().collect();
+    let stream2: Vec<u8> = weights.iter().skip(1).step_by(2).copied().collect();
+    let _len1 = stream1.len();
+    let _len2 = stream2.len();
+
+    // Find initial states and all transition bits by forward simulation
+    // state[i] for stream1: must satisfy dec_symbol[state1[i]] == stream1[i]
+    // and state1[i+1] = dec_baseline[state1[i]] + bits_read_from_stream
+
+    // Pick initial states: find any decode table entry with correct symbol
+    let find_state = |sym: u8| -> Option<usize> {
+        sym_states[sym as usize].first().copied()
+    };
+
+    let init_st1 = find_state(stream1[0])?;
+    let init_st2 = find_state(stream2[0])?;
+
+    // Forward pass: for each symbol, find the state chain and bits to encode
+    let _bits_to_write: Vec<(u64, u32)> = Vec::new(); // (value, nbits)
+
+    let encode_stream = |stream: &[u8], init: usize, bits: &mut Vec<(u64, u32)>| {
+        let mut state = init;
+        for i in 1..stream.len() {
+            let nb = dec_numbits[state] as u32;
+            // Decoder reads nb bits from backward stream, computes: next_state = baseline + bits_read
+            // Encoder: we need to write bits such that baseline[state] + bits = target_next_state
+            // target_next_state must decode to stream[i]
+            // Find a target state that decodes to stream[i]
+            let target_sym = stream[i];
+            let baseline = dec_baseline[state];
+            let max_bits_val = 1u32 << nb;
+            // Find target state in range [baseline, baseline + max_bits_val)
+            let mut found = None;
+            for &ts_idx in &sym_states[target_sym as usize] {
+                if ts_idx as u32 >= baseline && (ts_idx as u32) < baseline + max_bits_val {
+                    found = Some(ts_idx);
+                    break;
+                }
+            }
+            let target = found.unwrap_or_else(|| sym_states[target_sym as usize][0]);
+            let bits_val = target as u32 - baseline;
+            bits.push((bits_val as u64, nb));
+            state = target;
+        }
+    };
+
+    let mut bits1 = Vec::new();
+    let mut bits2 = Vec::new();
+    encode_stream(&stream1, init_st1, &mut bits1);
+    encode_stream(&stream2, init_st2, &mut bits2);
+
+    // Write backward bitstream:
+    // Backward order: last bits first, init states last (they're read first by decoder)
+    let mut bw = super::bitstream::BackwardBitWriter::new();
+
+    // Interleave: decoder reads st1_update, st2_update, st1_update, st2_update...
+    // Backward: write in reverse interleaved order
+    let max_len = std::cmp::max(bits1.len(), bits2.len());
+    for i in (0..max_len).rev() {
+        if i < bits2.len() {
+            bw.add_bits(bits2[i].0, bits2[i].1);
+            bw.flush_bits();
+        }
+        if i < bits1.len() {
+            bw.add_bits(bits1[i].0, bits1[i].1);
+            bw.flush_bits();
+        }
+    }
+
+    // Write initial states (decoder reads st1 first, so write st2 first in backward)
+    bw.add_bits(init_st2 as u64, table_log);
     bw.flush_bits();
-    bw.add_bits((st1 - table_size) as u64, table_log);
+    bw.add_bits(init_st1 as u64, table_log);
     bw.flush_bits();
 
     let bitstream = bw.finish();
