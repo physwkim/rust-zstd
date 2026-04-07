@@ -577,6 +577,11 @@ fn fse_next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
+/// Compute baseline and numbits for FSE decode table entry.
+/// Port of C zstd educational decoder / reference FSE_buildDTable:
+///   state_desc = num_states_symbol + state_number
+///   num_bits = accuracy_log - floor(log2(state_desc))
+///   baseline = (state_desc << num_bits) - table_size
 pub(crate) fn fse_calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,
@@ -585,24 +590,12 @@ pub(crate) fn fse_calc_baseline_and_numbits(
     if num_states_symbol == 0 {
         return (0, 0);
     }
-    let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
-        num_states_symbol
-    } else {
-        1 << highest_bit_set(num_states_symbol)
-    };
-
-    let num_double_width_state_slices = num_state_slices - num_states_symbol;
-    let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices;
-    let slice_width = num_states_total / num_state_slices;
-    let num_bits = highest_bit_set(slice_width) - 1;
-
-    if state_number < num_double_width_state_slices {
-        let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
-        (baseline, num_bits as u8 + 1)
-    } else {
-        let index_shifted = state_number - num_double_width_state_slices;
-        (index_shifted * slice_width, num_bits as u8)
-    }
+    let accuracy_log = highest_bit_set(num_states_total) - 1;
+    let state_desc = num_states_symbol + state_number;
+    let hsb = highest_bit_set(state_desc) - 1; // floor(log2(state_desc))
+    let num_bits = accuracy_log - hsb;
+    let baseline = (state_desc << num_bits) - num_states_total;
+    (baseline, num_bits as u8)
 }
 
 pub(crate) fn highest_bit_set(x: u32) -> u32 {
