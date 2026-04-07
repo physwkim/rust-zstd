@@ -309,8 +309,8 @@ impl MatchParams {
     fn from_level(level: i32) -> Self {
         match level {
             0..=2 => Self {
-                hash_log: 17,
-                hash_bytes: 6,
+                hash_log: 14,      // C zstd level 1 uses hashLog=14
+                hash_bytes: 7,     // 7-byte hash like C zstd level 1 (minMatch=7)
                 lazy_depth: 0,
                 search_depth: 4,
             },
@@ -701,17 +701,28 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     let lazy = params.lazy_depth >= 1;
 
     while ip + 8 <= data.len() {
-        // === 1. Rep-code check (free offset — always try first) ===
+        // === 1. Rep-code check (near-free offset, ~12 bits overhead) ===
+        // Rep saves offset bits but still has LL+ML FSE overhead (~12 bits).
+        // A rep match of N bytes saves N*5 bits (literals), costs ~12 bits → profitable if N >= 3.
+        // But at N=4-5 with ll=2, the net savings are thin. Require N >= ZSTD_MINMATCH (always true).
         let rep_match = if rep1 > 0 && ip >= rep1 as usize && ip + 4 <= data.len() {
             let cand = ip - rep1 as usize;
             if cand + 4 <= data.len() && read32(data, ip) == read32(data, cand) {
                 let ml = 4 + count_match(data, ip + 4, cand + 4);
-                Some((rep1 as usize, ml))
+                // Rep overhead: ~12 bits (LL FSE + ML FSE, no offset bits)
+                // Savings: ml * 5 bits. Net positive if ml*5 > 20 → ml > 4
+                // Rep overhead: ~12 bits for LL+ML FSE.
+                // Savings: ml * literal_cost (~5 bits/byte).
+                // Net benefit must exceed per-sequence fixed cost to be worthwhile.
+                // For high-entropy data, a 6-byte rep match at ll=2 is marginal.
+                // Require ml >= 7 to skip borderline short matches that
+                // produce too many sequences (key insight from C zstd analysis).
+                if ml * 5 > 40 { Some((rep1 as usize, ml)) } else { None }
             } else { None }
         } else { None };
 
-        // === 2. Short hash-chain match (4-byte, for nearby) ===
-        let short_match = find_best_at_n(data, ip, &ht_short, &chain, hash_mask, params.search_depth, 4);
+        // === 2. Hash-chain match using configured hash_bytes ===
+        let short_match = find_best_at_n(data, ip, &ht_short, &chain, hash_mask, params.search_depth, std::cmp::min(params.hash_bytes, 4));
 
         // === 3. Long hash match (7-byte, single lookup, for long-range) ===
         let long_match = if ip + 7 <= data.len() {
@@ -727,7 +738,10 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
         } else { None };
 
         // === 4. Pick best overall ===
-        // Rep is free, long match avoids collision issues, short is reliable
+        // Filter hash matches for profitability (rep matches are always free)
+        let short_match = short_match.filter(|&(off, ml)| is_match_profitable(ml, off));
+        let long_match = long_match.filter(|&(off, ml)| is_match_profitable(ml, off));
+
         let best_hash = match (short_match, long_match) {
             (Some((so, sl)), Some((lo, ll))) => {
                 if ll >= sl + 2 { Some((lo, ll)) } else { Some((so, sl)) }
@@ -834,20 +848,24 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
 }
 
 /// Check if a match at `offset` of `length` bytes saves more than it costs.
-/// Each sequence has FSE overhead for (LL, OF, ML) codes plus offset extra bits.
-/// If the match is too short relative to its offset cost, it's better to encode
-/// as literals (which Huffman compresses well).
+///
+/// Key insight from C zstd analysis: each sequence has ~17+ bits of FSE overhead
+/// (LL state + OF state + ML state + offset extra bits). A match only "saves"
+/// bytes that would otherwise be literals. Literals compress well with Huffman
+/// (~5-6 bits/byte for typical data). So a match of N bytes saves ~N*5 bits
+/// but costs ~17+offset_code bits.
+///
+/// For match_len=6, offset=8: saves 30 bits, costs ~20 bits → marginal
+/// For match_len=4, offset=1000: saves 20 bits, costs ~27 bits → unprofitable!
 #[inline]
 fn is_match_profitable(match_len: usize, offset: usize) -> bool {
-    // Offset encoding cost: offset_code = log2(offset) bits
     let off_code = if offset > 1 { 32 - (offset as u32).leading_zeros() } else { 1 };
-    // Total sequence overhead: ~3 bytes base (LL+ML+OF FSE states) + offset extra bits
-    // The match saves match_len bytes of literal data.
-    // Literals cost ~5-7 bits/byte with Huffman, so savings ≈ match_len * 6 bits.
-    // Overhead ≈ 24 (base) + off_code (offset extra) bits.
-    // Use a conservative threshold to avoid unprofitable short matches.
-    let overhead_bytes = 3 + (off_code as usize + 7) / 8;
-    match_len > overhead_bytes
+    // Sequence overhead: ~6 (LL) + 5 (OF_FSE) + off_code (OF extra) + 6 (ML) = 17 + off_code bits
+    // Match saves: match_len * literal_bits_per_byte
+    // Use literal cost of 5 bits/byte (conservative Huffman estimate)
+    let overhead_bits = 17 + off_code;
+    let savings_bits = match_len as u32 * 5;
+    savings_bits > overhead_bits + 8 // require >1 byte net benefit
 }
 
 /// After a match ends, immediately check for a rep-code match at the current
@@ -1991,7 +2009,8 @@ impl SeqTableMode {
     }
 }
 
-/// Normalize counts to fit `table_log` total, producing FSE-compatible normalized frequencies.
+/// Normalize symbol counts to probability distribution for FSE table.
+/// Port of C zstd's FSE_normalizeCount() with 62-bit precision scaling.
 fn normalize_counts(counts: &[u32], max_symbol: usize, table_log: u32) -> Vec<i16> {
     let table_size = 1u32 << table_log;
     let total: u64 = counts[..=max_symbol].iter().map(|&c| c as u64).sum();
@@ -2000,53 +2019,115 @@ fn normalize_counts(counts: &[u32], max_symbol: usize, table_log: u32) -> Vec<i1
     }
 
     let mut norm = vec![0i16; max_symbol + 1];
-    let mut distributed = 0i32;
+
+    // Use C zstd's high-precision scaling: step = (1<<62) / total
+    let scale: u32 = 62 - table_log;
+    let step: u64 = (1u64 << 62) / total;
+    let v_step: u64 = 1u64 << (scale - 20);
+    let low_threshold: u64 = total >> table_log;
+
+    // C zstd's rtbTable for precise rounding of small probabilities
+    static RTB_TABLE: [u32; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
+
+    // Use lowProbCount = -1 for large blocks (>= 2048 sequences), 1 otherwise
+    let use_low_prob_count = total >= 2048;
+    let low_prob_count: i16 = if use_low_prob_count { -1 } else { 1 };
+
+    let mut still_to_distribute = table_size as i32;
     let mut largest_sym = 0usize;
-    let mut largest_count = 0u32;
+    let mut largest_prob = 0i16;
 
     for s in 0..=max_symbol {
+        if counts[s] as u64 == total {
+            // Single-symbol dominance
+            norm[s] = table_size as i16;
+            return norm;
+        }
         if counts[s] == 0 {
             continue;
         }
-        if counts[s] > largest_count {
-            largest_count = counts[s];
-            largest_sym = s;
-        }
-        // Proportional allocation, minimum 1 (or -1 for very rare)
-        let prob = (counts[s] as u64 * table_size as u64 / total) as i16;
-        if prob == 0 {
-            // Very rare symbol: assign probability -1 (special "less than 1")
-            norm[s] = -1;
-            distributed += 1;
+
+        if (counts[s] as u64) <= low_threshold {
+            norm[s] = low_prob_count;
+            still_to_distribute -= 1;
         } else {
-            norm[s] = std::cmp::max(1, prob);
-            distributed += norm[s] as i32;
+            let mut proba = ((counts[s] as u64 * step) >> scale) as i16;
+            if proba < 8 {
+                // Use rtbTable for precise rounding
+                let rest_to_beat = v_step as u128 * RTB_TABLE[proba as usize] as u128;
+                let actual = (counts[s] as u128 * step as u128) - ((proba as u128) << scale);
+                if actual > rest_to_beat {
+                    proba += 1;
+                }
+            }
+            if proba > (table_size >> 1) as i16 {
+                proba = (table_size >> 1) as i16; // cap at half table
+            }
+            norm[s] = std::cmp::max(1, proba);
+            still_to_distribute -= norm[s] as i32;
+        }
+
+        if norm[s] > largest_prob {
+            largest_prob = norm[s];
+            largest_sym = s;
         }
     }
 
-    // Adjust the most frequent symbol to make the total exactly table_size
-    let target = table_size as i32;
-    norm[largest_sym] += (target - distributed) as i16;
-    // Ensure it stays positive
-    if norm[largest_sym] < 1 {
-        // Fallback: redistribute from others
-        let deficit = 1 - norm[largest_sym] as i32;
-        norm[largest_sym] = 1;
-        let mut remaining = deficit;
-        for s in (0..=max_symbol).rev() {
-            if s == largest_sym || norm[s] <= 1 {
-                continue;
-            }
-            let take = std::cmp::min(remaining, norm[s] as i32 - 1);
-            norm[s] -= take as i16;
-            remaining -= take;
-            if remaining <= 0 {
-                break;
-            }
-        }
+    // Adjust largest symbol to distribute remaining
+    if -still_to_distribute >= (norm[largest_sym] >> 1) as i32 {
+        // Pathological case: use proportional redistribution
+        normalize_counts_m2(&mut norm, counts, max_symbol, table_log, total);
+    } else {
+        norm[largest_sym] += still_to_distribute as i16;
     }
 
     norm
+}
+
+/// Fallback normalization for pathological distributions (port of FSE_normalizeM2).
+fn normalize_counts_m2(norm: &mut [i16], counts: &[u32], max_symbol: usize, table_log: u32, total: u64) {
+    let table_size = 1u32 << table_log;
+
+    // Reset and recalculate
+    let mut to_distribute = table_size as i32;
+
+    // First pass: identify symbols that will get probability >= 1
+    let low_one = (total * 3) / ((to_distribute as u64) * 2);
+    for s in 0..=max_symbol {
+        if counts[s] == 0 {
+            norm[s] = 0;
+        } else if (counts[s] as u64) <= low_one {
+            norm[s] = -1;
+            to_distribute -= 1;
+        } else {
+            norm[s] = 0; // will be set in second pass
+        }
+    }
+
+    // Second pass: proportional scaling for remaining symbols
+    let remaining_total: u64 = counts[..=max_symbol].iter().enumerate()
+        .filter(|&(s, _)| norm[s] == 0 && counts[s] > 0)
+        .map(|(_, &c)| c as u64)
+        .sum();
+
+    if remaining_total == 0 || to_distribute <= 0 {
+        return;
+    }
+
+    let v_step_log = 62u32.saturating_sub(table_log);
+    let r_step = ((1u128 << v_step_log) * to_distribute as u128 + remaining_total as u128 / 2) / remaining_total as u128;
+
+    let mut tmp_total = 0u128;
+    for s in 0..=max_symbol {
+        if norm[s] == 0 && counts[s] > 0 {
+            let end = tmp_total + counts[s] as u128 * r_step;
+            let s_start = (tmp_total >> v_step_log) as i16;
+            let s_end = (end >> v_step_log) as i16;
+            let proba = s_end - s_start;
+            norm[s] = std::cmp::max(1, proba);
+            tmp_total = end;
+        }
+    }
 }
 
 /// Encode an FSE probability header (the variable-bit format from the spec).
@@ -2142,6 +2223,21 @@ fn encode_fse_header(norm: &[i16], max_symbol: usize, table_log: u32) -> Vec<u8>
 }
 
 /// Estimate the compressed size (in bits) of encoding `codes` with a given normalized distribution.
+
+/// Cross-entropy cost of encoding `counts` using distribution `norm` at `table_log`.
+/// Returns approximate total bits needed to encode all symbols.
+fn cross_entropy_cost(norm: &[i16], table_log: u32, counts: &[u32; 256], max_sym: usize) -> u64 {
+    let mut cost = 0u64;
+    for s in 0..=max_sym {
+        if counts[s] == 0 { continue; }
+        if s >= norm.len() || norm[s] == 0 { return u64::MAX; }
+        let prob = if norm[s] == -1 { 1u64 } else { norm[s] as u64 };
+        // bits per symbol ≈ table_log - floor(log2(prob))
+        let log2_prob = 63 - (prob as u64).leading_zeros() as u64;
+        cost += counts[s] as u64 * (table_log as u64 - log2_prob);
+    }
+    cost + table_log as u64 // add state init cost
+}
 
 /// Choose best mode considering Repeat from previous block.
 fn choose_seq_mode_with_repeat(
@@ -2269,40 +2365,33 @@ fn choose_seq_mode(
 
     let header_bytes = encode_fse_header(&custom_norm, max_sym, table_log);
 
-    // Estimate costs: predefined vs custom using cross-entropy against each distribution
-    let total = codes.len() as f64;
-    let default_table_size = (1u64 << default_log) as f64;
+    // Bit-cost comparison (port of C zstd's ZSTD_selectEncodingType approach)
+    let _nb_seq = codes.len();
 
-    // Predefined cost: sum of -log2(predefined_prob(s)) for each symbol occurrence
-    let predefined_bits = if predefined_ok {
-        let mut bits = 0.0f64;
-        for s in 0..=max_sym {
-            if counts[s] > 0 {
-                let norm_val = default_norm[s];
-                let prob = if norm_val == -1 { 1.0 } else { norm_val as f64 };
-                // Each symbol costs approximately log2(table_size / prob) bits
-                bits += counts[s] as f64 * (default_table_size / prob).log2();
-            }
-        }
-        // Add FSE state overhead (table_log bits for initial states × 3 tables shared)
-        (bits.ceil() as u64).saturating_add(default_log as u64)
+    // Cross-entropy cost for predefined table: sum of log2(tableSize/prob) per symbol
+    let predefined_cost = if predefined_ok {
+        cross_entropy_cost(default_norm, default_log, &counts, max_sym)
     } else {
         u64::MAX
     };
 
-    // Custom cost: header + Shannon entropy (lower bound on custom FSE cost)
-    let custom_header_bits = header_bytes.len() as u64 * 8;
-    let mut custom_stream_bits = 0.0f64;
+    // Custom FSE cost: header bytes + cross-entropy with custom table
+    let _custom_table_size = 1u64 << table_log;
+    let mut custom_stream_cost = 0u64;
     for s in 0..=max_sym {
         if counts[s] > 0 {
-            let p = counts[s] as f64 / total;
-            custom_stream_bits += counts[s] as f64 * (-p.log2());
+            let prob = if custom_norm[s] == -1 { 1u64 } else { custom_norm[s] as u64 };
+            if prob == 0 { custom_stream_cost = u64::MAX; break; }
+            // Cost in 256ths of a bit: count * log2(tableSize/prob) * 256
+            // log2(tableSize/prob) = table_log - log2(prob)
+            let log2_prob = 63 - (prob as u64).leading_zeros() as u64;
+            custom_stream_cost += counts[s] as u64 * (table_log as u64 - log2_prob);
         }
     }
-    // Add table_log bits for initial state + rounding overhead
-    let custom_total_bits = custom_header_bits + custom_stream_bits.ceil() as u64 + table_log as u64 + 8;
+    let custom_header_cost = header_bytes.len() as u64 * 8;
+    let custom_total_cost = custom_header_cost + custom_stream_cost + table_log as u64;
 
-    if predefined_ok && predefined_bits <= custom_total_bits {
+    if predefined_ok && predefined_cost <= custom_total_cost {
         SeqTableMode::Predefined
     } else {
         SeqTableMode::Fse {
