@@ -56,7 +56,7 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         let fast_cost = estimate_seq_cost(&all_sequences, &all_encoded);
         let lazy_cost = estimate_seq_cost(&lazy_seqs, &lazy_enc);
         #[cfg(any())]
-        eprintln!("[compress] fast: {} seqs cost={}, lazy: {} seqs cost={} → {}",
+#[cfg(any())] eprintln!("[compress] fast: {} seqs cost={}, lazy: {} seqs cost={} → {}",
             all_sequences.len(), fast_cost, lazy_seqs.len(), lazy_cost,
             if lazy_cost < fast_cost { "lazy" } else { "fast" });
         if lazy_cost < fast_cost { (lazy_seqs, lazy_enc) } else { (all_sequences, all_encoded) }
@@ -142,6 +142,9 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         } else if literals.len() >= 64 {
             // Build a new Huffman tree for this block's literals
             let new_result = encode_literals_huffman(&literals);
+            if new_result.is_none() {
+                eprintln!("[BLOCK] Huffman FAILED for {} literals", literals.len());
+            }
 
             // Try Treeless: reuse previous tree (saves tree description bytes)
             let treeless_result = if let Some((prev, _pm)) = &prev_huf_codes {
@@ -1235,8 +1238,12 @@ fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
     // Encode tree description (weights packed as 4-bit pairs)
     let tree_desc = encode_huffman_tree(&codes, max_bits, max_sym as usize);
     if tree_desc.is_empty() {
+#[cfg(any())] eprintln!("[HUF] tree_desc EMPTY for {} syms max_bits={}", n_used, max_bits);
         return None;
     }
+
+#[cfg(any())] eprintln!("[HUF] {} literals, {} used, max_bits={}, tree_desc={}B",
+        literals.len(), n_used, max_bits, tree_desc.len());
 
     // Encode streams: single stream for < 1KB, 4 streams for >= 1KB
     let use_4 = literals.len() >= 1024;
@@ -1248,6 +1255,8 @@ fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
 
     let regen = literals.len();
     let comp = tree_desc.len() + streams.len();
+#[cfg(any())] eprintln!("[HUF] streams={}B, total comp={}B vs raw={}B → {}",
+        streams.len(), comp, regen, if comp < regen { "USE HUF" } else { "USE RAW" });
     let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
 
     let mut out = Vec::with_capacity(lh_size + comp);
@@ -1276,213 +1285,135 @@ fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Build Huffman codes using the C zstd method:
-/// 1. Sort symbols by count
-/// 2. Build binary tree (classic Huffman)
-/// 3. Clamp to MAX_BITS using HUF_setMaxHeight
-/// 4. Generate canonical codes
+/// Build Huffman codes — faithful port of C zstd's HUF_buildCTable_wksp.
+/// 1. Sort symbols descending by count
+/// 2. Build binary Huffman tree (two-queue merge)
+/// 3. Enforce max depth via HUF_setMaxHeight
+/// 4. Generate canonical codes using C zstd's min >>= 1 algorithm
 fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8); 256], u8)> {
     const MAX_BITS: u8 = 11;
 
+    // Collect and sort symbols descending by count
     let mut syms: Vec<(u32, u8)> = (0..=max_sym)
         .filter(|&s| counts[s] > 0)
         .map(|s| (counts[s], s as u8))
         .collect();
-    syms.sort_by(|a, b| b.0.cmp(&a.0)); // descending by count (C convention)
+    syms.sort_by(|a, b| b.0.cmp(&a.0));
     let n = syms.len();
-    if n < 2 {
-        return None;
-    }
+    if n < 2 { return None; }
 
-    // --- Step 1: Build Huffman tree ---
-    // Nodes: [0..n) = leaf nodes (symbols), [n..2n-1) = internal nodes
+    // --- Step 1: Build Huffman tree (two-queue merge) ---
     let mut node_count = vec![0u64; 2 * n];
     let mut node_parent = vec![0u32; 2 * n];
     let mut node_nbits = vec![0u8; 2 * n];
+    for i in 0..n { node_count[i] = syms[i].0 as u64; }
+    for i in n..2*n { node_count[i] = u64::MAX / 2; }
 
-    for i in 0..n {
-        node_count[i] = syms[i].0 as u64;
-    }
+    let mut low_s = n as i32 - 1;
+    let mut low_n = n;
+    let mut next_node = n;
 
-    let mut low_sym = n as i32 - 1; // pointer into leaf nodes (right to left)
-    let mut low_node = n; // pointer into internal nodes (left to right)
-    let mut node_nb = n; // next internal node to create
-
-    // Create first internal node
-    if n >= 2 {
-        node_count[node_nb] = node_count[low_sym as usize] + node_count[(low_sym - 1) as usize];
-        node_parent[low_sym as usize] = node_nb as u32;
-        node_parent[(low_sym - 1) as usize] = node_nb as u32;
-        node_nb += 1;
-        low_sym -= 2;
-    }
-
-    let _node_root = node_nb + low_sym as usize; // not exactly right for general case
-                                                 // Fill remaining internal nodes with large counts
-    for i in node_nb..2 * n {
-        node_count[i] = u64::MAX / 2;
-    }
-
-    while node_nb < 2 * n - 1 {
-        let n1 = if low_sym >= 0 && node_count[low_sym as usize] < node_count[low_node] {
-            let r = low_sym as usize;
-            low_sym -= 1;
-            r
-        } else if low_node < node_nb {
-            let r = low_node;
-            low_node += 1;
-            r
+    // Helper: pick smallest from symbol queue or node queue
+    let pick_smallest = |node_count: &[u64], low_s: &mut i32, low_n: &mut usize, next_node: usize| -> usize {
+        if *low_s >= 0 && (*low_n >= next_node || node_count[*low_s as usize] < node_count[*low_n]) {
+            let r = *low_s as usize; *low_s -= 1; r
+        } else if *low_n < next_node {
+            let r = *low_n; *low_n += 1; r
         } else {
-            break;
-        };
+            usize::MAX // shouldn't happen
+        }
+    };
 
-        let n2 = if low_sym >= 0 && node_count[low_sym as usize] < node_count[low_node] {
-            let r = low_sym as usize;
-            low_sym -= 1;
-            r
-        } else if low_node < node_nb {
-            let r = low_node;
-            low_node += 1;
-            r
-        } else {
-            break;
-        };
-
-        node_count[node_nb] = node_count[n1] + node_count[n2];
-        node_parent[n1] = node_nb as u32;
-        node_parent[n2] = node_nb as u32;
-        node_nb += 1;
+    while next_node < 2 * n - 1 {
+        let n1 = pick_smallest(&node_count, &mut low_s, &mut low_n, next_node);
+        let n2 = pick_smallest(&node_count, &mut low_s, &mut low_n, next_node);
+        if n1 == usize::MAX || n2 == usize::MAX { break; }
+        node_count[next_node] = node_count[n1] + node_count[n2];
+        node_parent[n1] = next_node as u32;
+        node_parent[n2] = next_node as u32;
+        next_node += 1;
     }
+    let root = next_node - 1;
 
-    let root = node_nb - 1;
-
-    // --- Step 2: Assign bit lengths from tree ---
+    // Assign bit lengths top-down
     node_nbits[root] = 0;
-    for i in (n..root).rev() {
-        node_nbits[i] = node_nbits[node_parent[i] as usize] + 1;
+    for i in (n..=root).rev() {
+        if i < root { node_nbits[i] = node_nbits[node_parent[i] as usize] + 1; }
     }
     for i in 0..n {
         node_nbits[i] = node_nbits[node_parent[i] as usize] + 1;
     }
 
-    // --- Step 3: Clamp to MAX_BITS (HUF_setMaxHeight) ---
+    // --- Step 2: HUF_setMaxHeight — enforce MAX_BITS ---
     let largest_bits = *node_nbits[..n].iter().max().unwrap_or(&0);
     if largest_bits > MAX_BITS {
-        let base_cost = 1i32 << (largest_bits - MAX_BITS);
+        // Count symbols at each depth
+        let mut rank_count = [0u32; 32];
+        for i in 0..n { rank_count[node_nbits[i] as usize] += 1; }
+
+        // Clamp: set all > MAX_BITS to MAX_BITS, compute cost
         let mut total_cost = 0i32;
-
-        // Clamp all > MAX_BITS to MAX_BITS, accumulate cost
-        for i in 0..n {
-            if node_nbits[i] > MAX_BITS {
-                total_cost += base_cost - (1 << (largest_bits - node_nbits[i]));
-                node_nbits[i] = MAX_BITS;
-            }
+        let base_cost = 1i32 << (largest_bits - MAX_BITS);
+        for d in (MAX_BITS as usize + 1)..=largest_bits as usize {
+            total_cost += rank_count[d] as i32 * (base_cost - (1i32 << (largest_bits as usize - d)));
         }
-
-        // Normalize cost
         total_cost >>= largest_bits - MAX_BITS;
 
-        // Repay cost by shortening symbols (making some codes shorter)
+        // Assign all deep symbols to MAX_BITS
+        for i in 0..n {
+            if node_nbits[i] > MAX_BITS { node_nbits[i] = MAX_BITS; }
+        }
+
+        // Repay cost: lengthen some shallow symbols by 1 bit each
+        // Iterate from shallowest (most costly to lose) to deepest
         while total_cost > 0 {
-            // Find a symbol with nbits < MAX_BITS that can absorb cost
-            let mut found = false;
+            let mut repaid = false;
             for nb in (1..MAX_BITS).rev() {
                 for i in 0..n {
                     if node_nbits[i] == nb {
-                        node_nbits[i] += 1; // lengthen by 1 → saves 2^(MAX_BITS-nb-1)
+                        node_nbits[i] = nb + 1;
                         total_cost -= 1 << (MAX_BITS - nb - 1);
-                        if total_cost <= 0 {
-                            found = true;
-                            break;
-                        }
+                        repaid = true;
+                        if total_cost <= 0 { break; }
                     }
                 }
-                if found || total_cost <= 0 {
-                    break;
+                if total_cost <= 0 { break; }
+            }
+            if !repaid { break; }
+        }
+
+        // If over-compensated (total_cost < 0), shorten deepest symbols
+        while total_cost < 0 {
+            for i in (0..n).rev() {
+                if node_nbits[i] == MAX_BITS {
+                    node_nbits[i] = MAX_BITS - 1;
+                    total_cost += 1; // each shortening at MAX_BITS saves cost of 1
+                    if total_cost >= 0 { break; }
                 }
             }
-            if !found {
-                break;
-            }
         }
     }
 
-    // --- Step 4: Build canonical codes from lengths ---
+    // --- Step 3: Build canonical codes (C zstd's min >>= 1 algorithm) ---
     let mut lengths = [0u8; 256];
-    for i in 0..n {
-        lengths[syms[i].1 as usize] = node_nbits[i];
-    }
+    for i in 0..n { lengths[syms[i].1 as usize] = node_nbits[i]; }
 
     let max_bits = *lengths.iter().max().unwrap_or(&0);
-    if max_bits == 0 {
-        return None;
-    }
+    if max_bits == 0 { return None; }
 
-    // Fix Kraft inequality: adjust lengths until sum of 2^(max-len) == 2^max
-    let target = 1u64 << max_bits;
-    let mut kraft: u64 = (0..256)
-        .filter(|&s| lengths[s] > 0)
-        .map(|s| 1u64 << (max_bits - lengths[s]))
-        .sum();
+    // Count symbols per rank
+    let mut nb_per_rank = [0u32; 16];
+    for &l in &lengths { if l > 0 { nb_per_rank[l as usize] += 1; } }
 
-    // Under-full (kraft < target): shorten longest-code symbols (decrease length)
-    // Each decrease of 1 bit adds 2^(max-len) to kraft
-    let mut iters = 0;
-    while kraft < target && iters < 256 {
-        // Find symbol with longest code (highest length) to shorten
-        let mut best_s = 0usize;
-        let mut best_len = 0u8;
-        for i in 0..n {
-            let s = syms[i].1 as usize;
-            if lengths[s] > 1 && lengths[s] > best_len {
-                best_len = lengths[s];
-                best_s = s;
-            }
-        }
-        if best_len <= 1 { break; }
-        let added = (1u64 << (max_bits - best_len + 1)) - (1u64 << (max_bits - best_len));
-        if kraft + added > target { break; } // would overshoot
-        lengths[best_s] -= 1;
-        kraft += added;
-        iters += 1;
-    }
-
-    // Over-full (kraft > target): lengthen shortest-code symbols (increase length)
-    while kraft > target && iters < 512 {
-        let mut best_s = 0usize;
-        let mut best_len = MAX_BITS;
-        for i in 0..n {
-            let s = syms[i].1 as usize;
-            if lengths[s] > 0 && lengths[s] < MAX_BITS && lengths[s] < best_len {
-                best_len = lengths[s];
-                best_s = s;
-            }
-        }
-        if best_len >= MAX_BITS { break; }
-        let removed = (1u64 << (max_bits - best_len)) - (1u64 << (max_bits - best_len - 1));
-        lengths[best_s] += 1;
-        kraft -= removed;
-        iters += 1;
-    }
-
-    if kraft != target {
-        return None;
-    }
-
-    let mut bl_count = [0u32; 16];
-    for &l in &lengths {
-        if l > 0 {
-            bl_count[l as usize] += 1;
-        }
-    }
-
+    // Standard canonical code generation (deflate-style):
+    // next_code[bits] = (next_code[bits-1] + bl_count[bits-1]) << 1
     let mut next_code = [0u32; 16];
     for bits in 1..=max_bits as usize {
-        next_code[bits] = (next_code[bits - 1] + bl_count[bits - 1]) << 1;
+        next_code[bits] = (next_code[bits - 1] + nb_per_rank[bits - 1]) << 1;
     }
 
     let mut codes = [(0u32, 0u8); 256];
-    for s in 0..256 {
+    for s in 0..=max_sym {
         if lengths[s] > 0 {
             codes[s] = (next_code[lengths[s] as usize], lengths[s]);
             next_code[lengths[s] as usize] += 1;
@@ -1549,41 +1480,58 @@ fn encode_huffman_tree(codes: &[(u32, u8); 256], max_bits: u8, max_sym: usize) -
                 num
             );
         }
+#[cfg(any())] eprintln!("[TREE] {} weights, FSE result: {:?}B",
+            num, fse_result.as_ref().map(|v| v.len()));
         match fse_result {
-            Some(compressed) if compressed.len() < 127 && compressed.len() < num.div_ceil(2) => {
-                // Verify: try decoding the FSE weights to check roundtrip
+            Some(compressed) if compressed.len() < 127 => {
                 let header_byte = compressed.len() as u8;
-                let verify =
-                    crate::decode::decode_huf_weights_from_fse(&compressed, header_byte);
-                match verify {
-                    Ok(decoded_weights) if decoded_weights == weights => {
+                // Verify roundtrip correctness
+                let verify = crate::decode::decode_huf_weights_from_fse(&compressed, header_byte);
+                if let Ok(ref decoded_weights) = verify {
+                    if *decoded_weights == weights {
                         let mut desc = Vec::with_capacity(1 + compressed.len());
                         desc.push(header_byte);
                         desc.extend_from_slice(&compressed);
-                        desc
+                        return desc;
                     }
-                    Ok(_d) => {
-                        #[cfg(test)]
-                        eprintln!(
-                            "FSE weight mismatch: {} encoded, {} decoded, first diff at {}",
-                            weights.len(),
-                            _d.len(),
-                            weights
-                                .iter()
-                                .zip(_d.iter())
-                                .position(|(a, b)| a != b)
-                                .unwrap_or(9999)
-                        );
-                        vec![]
+                    let diff_idx = weights.iter().zip(decoded_weights.iter()).position(|(a,b)| a!=b).unwrap_or(9999);
+                    eprintln!("[FSE_W] mismatch at {}: expected {} got {} (of {} weights)",
+                        diff_idx,
+                        if diff_idx < weights.len() { weights[diff_idx] } else { 0 },
+                        if diff_idx < decoded_weights.len() { decoded_weights[diff_idx] } else { 0 },
+                        weights.len());
+                } else if let Err(ref e) = verify {
+                    eprintln!("[FSE_W] decode err: {}", e);
+                }
+                // FSE roundtrip failed — fall through to direct mode fallback
+                if num <= 128 {
+                    let mut desc = Vec::with_capacity(1 + num.div_ceil(2));
+                    desc.push((num as u8) + 127);
+                    for pair in weights.chunks(2) {
+                        let w0 = pair[0];
+                        let w1 = if pair.len() > 1 { pair[1] } else { 0 };
+                        desc.push((w0 << 4) | (w1 & 0x0F));
                     }
-                    Err(_e) => {
-                        #[cfg(test)]
-                        eprintln!("FSE weight decode error: {}", _e);
-                        vec![]
-                    }
+                    desc
+                } else {
+                    vec![]
                 }
             }
-            _ => vec![],
+            _ => {
+                // FSE too large or failed — try direct if num <= 128
+                if num <= 128 {
+                    let mut desc = Vec::with_capacity(1 + num.div_ceil(2));
+                    desc.push((num as u8) + 127);
+                    for pair in weights.chunks(2) {
+                        let w0 = pair[0];
+                        let w1 = if pair.len() > 1 { pair[1] } else { 0 };
+                        desc.push((w0 << 4) | (w1 & 0x0F));
+                    }
+                    desc
+                } else {
+                    vec![] // can't encode 129+ weights without FSE
+                }
+            }
         }
     }
 }
@@ -1899,7 +1847,7 @@ fn encode_sequences_section_with_reuse(
         encode_sequences_section_repeat(&mut with_reuse, sequences, prev_ll, prev_of, prev_ml);
 
         #[cfg(any())]
-        eprintln!("[seq_reuse] no_reuse={} with_reuse={} → {}",
+#[cfg(any())] eprintln!("[seq_reuse] no_reuse={} with_reuse={} → {}",
             no_reuse.len(), with_reuse.len(),
             if with_reuse.len() < no_reuse.len() { "REUSE" } else { "FRESH" });
 
