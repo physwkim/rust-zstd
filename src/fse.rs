@@ -73,7 +73,11 @@ impl FseCTable {
         let _sym_count_tt = vec![0u32; max_symbol + 1];
         let mut total = 0u32;
         for s in 0..=max_symbol {
-            let prob = if norm[s] == -1 { 1 } else { norm[s].max(0) as u32 };
+            let prob = if norm[s] == -1 {
+                1
+            } else {
+                norm[s].max(0) as u32
+            };
             if prob == 0 {
                 symbol_tt[s].delta_nb_bits = ((table_log + 1) << 16) - table_size;
             } else if prob == 1 {

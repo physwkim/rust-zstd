@@ -2,19 +2,19 @@ use std::process::Command;
 use std::time::Instant;
 
 fn bench_rust(data: &[u8], level: i32, iters: u32) -> (f64, f64, usize) {
-    let compressed = zstd_rs::compress(data, level);
-    let _ = zstd_rs::decompress(&compressed);
+    let compressed = rust_zstd::compress(data, level);
+    let _ = rust_zstd::decompress(&compressed);
 
     let start = Instant::now();
     let mut c = Vec::new();
     for _ in 0..iters {
-        c = zstd_rs::compress(data, level);
+        c = rust_zstd::compress(data, level);
     }
     let ct = start.elapsed().as_secs_f64() / iters as f64;
 
     let start = Instant::now();
     for _ in 0..iters {
-        let _ = zstd_rs::decompress(&c);
+        let _ = rust_zstd::decompress(&c);
     }
     let dt = start.elapsed().as_secs_f64() / iters as f64;
 

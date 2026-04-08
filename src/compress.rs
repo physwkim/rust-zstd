@@ -47,7 +47,12 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     // For level 1-2: try both fast and lazy strategies, pick smaller
     if params.lazy_depth == 0 {
-        let lazy_params = MatchParams { lazy_depth: 1, hash_log: 17, hash_bytes: 5, search_depth: 8 };
+        let lazy_params = MatchParams {
+            lazy_depth: 1,
+            hash_log: 17,
+            hash_bytes: 5,
+            search_depth: 8,
+        };
 
         #[cfg(feature = "parallel")]
         let lazy_seqs = {
@@ -67,7 +72,9 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         let lazy_enc = resolve_repeat_offsets(&lazy_seqs);
         let fast_cost = estimate_seq_cost(&all_sequences, &fast_enc);
         let lazy_cost = estimate_seq_cost(&lazy_seqs, &lazy_enc);
-        if lazy_cost < fast_cost { all_sequences = lazy_seqs; }
+        if lazy_cost < fast_cost {
+            all_sequences = lazy_seqs;
+        }
     }
 
     // Split oversized sequences first, then resolve repeat offsets.
@@ -84,12 +91,10 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     for (i, raw) in all_sequences.iter().enumerate() {
         let seq_output = raw.ll as usize + raw.ml as usize;
-        if block_output + seq_output > ZSTD_BLOCKSIZE_MAX {
-            if i > seq_start {
-                block_ranges.push((seq_start, i, data_pos));
-                seq_start = i;
-                block_output = 0;
-            }
+        if block_output + seq_output > ZSTD_BLOCKSIZE_MAX && i > seq_start {
+            block_ranges.push((seq_start, i, data_pos));
+            seq_start = i;
+            block_output = 0;
         }
         block_output += seq_output;
         data_pos += seq_output;
@@ -111,15 +116,14 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     // Precompute d_start for each block (cumulative sum of ll+ml)
     let mut d_starts = Vec::with_capacity(n_blocks);
-    let cumul = 0usize;
     for &(s_start, _, _) in &block_ranges {
-        if s_start == 0 { d_starts.push(0); }
-        else {
-            while cumul < all_sequences.len() && d_starts.len() < block_ranges.len() {
-                break; // will compute inline
-            }
+        if s_start == 0 {
+            d_starts.push(0);
+        } else {
             let mut p = 0usize;
-            for s in &all_sequences[..s_start] { p += s.ll as usize + s.ml as usize; }
+            for s in &all_sequences[..s_start] {
+                p += s.ll as usize + s.ml as usize;
+            }
             d_starts.push(p);
         }
     }
@@ -171,7 +175,10 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
     #[cfg(feature = "parallel")]
     let encoded_blocks: Vec<(Vec<u8>, Vec<u8>)> = {
         use rayon::prelude::*;
-        (0..n_blocks).into_par_iter().map(&encode_block_content).collect()
+        (0..n_blocks)
+            .into_par_iter()
+            .map(&encode_block_content)
+            .collect()
     };
 
     #[cfg(not(feature = "parallel"))]
@@ -211,12 +218,19 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
                 let treeless_result = if let Some((prev_codes, _)) = &prev_huf {
                     if literals.iter().all(|&b| prev_codes[b as usize].1 > 0) {
                         encode_literals_treeless(&literals, prev_codes)
-                    } else { None }
-                } else { None };
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 let mut used_treeless = false;
                 match (&new_result, &treeless_result) {
-                    (Some(_), Some(te)) if te.len() <= new_result.as_ref().unwrap().len() && te.len() < literals.len() => {
+                    (Some(_), Some(te))
+                        if te.len() <= new_result.as_ref().unwrap().len()
+                            && te.len() < literals.len() =>
+                    {
                         block.extend_from_slice(te);
                         used_huf = true;
                         used_treeless = true;
@@ -238,7 +252,12 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
                 if used_huf && !used_treeless {
                     let mut counts = [0u32; 256];
                     let mut ms = 0u8;
-                    for &b in &literals { counts[b as usize] += 1; if b > ms { ms = b; } }
+                    for &b in &literals {
+                        counts[b as usize] += 1;
+                        if b > ms {
+                            ms = b;
+                        }
+                    }
                     if let Some((codes, mb)) = build_huffman_codes(&counts, ms as usize) {
                         prev_huf = Some((codes, mb));
                     }
@@ -363,8 +382,7 @@ fn write_raw_block(out: &mut Vec<u8>, data: &[u8], is_last: bool) {
 }
 
 fn write_rle_block(out: &mut Vec<u8>, byte: u8, repeat_count: usize, is_last: bool) {
-    let header =
-        (is_last as u32) | ((BLOCK_TYPE_RLE as u32) << 1) | ((repeat_count as u32) << 3);
+    let header = (is_last as u32) | ((BLOCK_TYPE_RLE as u32) << 1) | ((repeat_count as u32) << 3);
     out.extend_from_slice(&header.to_le_bytes()[..3]);
     out.push(byte);
 }
@@ -409,9 +427,9 @@ struct EncodedSequence {
 /// Match finder parameters, derived from compression level.
 struct MatchParams {
     hash_log: u32,
-    hash_bytes: usize,    // 4, 5, 6, or 7 — number of bytes used by hash function
-    lazy_depth: u32,      // 0=greedy, 1=lazy, 2=lazy2
-    search_depth: u32,    // hash chain search depth
+    hash_bytes: usize, // 4, 5, 6, or 7 — number of bytes used by hash function
+    lazy_depth: u32,   // 0=greedy, 1=lazy, 2=lazy2
+    search_depth: u32, // hash chain search depth
 }
 
 impl MatchParams {
@@ -425,8 +443,8 @@ impl MatchParams {
     fn from_level(level: i32) -> Self {
         match level {
             0..=2 => Self {
-                hash_log: 14,      // C zstd level 1 uses hashLog=14
-                hash_bytes: 7,     // 7-byte hash like C zstd level 1 (minMatch=7)
+                hash_log: 14,  // C zstd level 1 uses hashLog=14
+                hash_bytes: 7, // 7-byte hash like C zstd level 1 (minMatch=7)
                 lazy_depth: 0,
                 search_depth: 4,
             },
@@ -451,7 +469,6 @@ impl MatchParams {
         }
     }
 }
-
 
 /// Resolve repeat offsets per zstd spec (RFC 8878 §3.1.2.5).
 ///
@@ -520,8 +537,12 @@ fn resolve_repeat_offsets(sequences: &[Sequence]) -> Vec<EncodedSequence> {
 
 /// Split raw sequences where ll+ml > BLOCKSIZE_MAX. Called BEFORE resolve_repeat_offsets.
 fn split_long_raw_sequences(sequences: Vec<Sequence>) -> Vec<Sequence> {
-    let needs_split = sequences.iter().any(|s| s.ll as usize + s.ml as usize > ZSTD_BLOCKSIZE_MAX);
-    if !needs_split { return sequences; }
+    let needs_split = sequences
+        .iter()
+        .any(|s| s.ll as usize + s.ml as usize > ZSTD_BLOCKSIZE_MAX);
+    if !needs_split {
+        return sequences;
+    }
 
     let mut out = Vec::with_capacity(sequences.len() + 16);
     for seq in sequences {
@@ -532,14 +553,22 @@ fn split_long_raw_sequences(sequences: Vec<Sequence>) -> Vec<Sequence> {
             // First chunk: all literals + partial match
             let max_ml = ZSTD_BLOCKSIZE_MAX.saturating_sub(seq.ll as usize);
             let ml_first = std::cmp::max(ZSTD_MINMATCH, std::cmp::min(seq.ml as usize, max_ml));
-            out.push(Sequence { ll: seq.ll, off: seq.off, ml: ml_first as u32 });
+            out.push(Sequence {
+                ll: seq.ll,
+                off: seq.off,
+                ml: ml_first as u32,
+            });
             let mut remaining = seq.ml as usize - ml_first;
             // Continuation: use ll=1 (not ll=0!) to avoid the ll=0 offset shift
             // in resolve_repeat_offsets. With ll=1, of_value=1 → rep1 = this offset.
             // We "borrow" 1 byte from the match to use as a literal.
-            while remaining >= ZSTD_MINMATCH + 1 {
+            while remaining > ZSTD_MINMATCH {
                 let ml = std::cmp::min(remaining - 1, ZSTD_BLOCKSIZE_MAX - 1);
-                out.push(Sequence { ll: 1, off: seq.off, ml: ml as u32 });
+                out.push(Sequence {
+                    ll: 1,
+                    off: seq.off,
+                    ml: ml as u32,
+                });
                 remaining -= ml + 1; // 1 literal + ml match
             }
         }
@@ -609,7 +638,9 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
 
         let mut ip1 = ip0 + 1;
 
-        if ip1 > ilimit { break; }
+        if ip1 > ilimit {
+            break;
+        }
 
         // Pre-hash ip0
         let mut h0 = hash_n(&data[ip0..], (hash_size - 1) as u32, mls);
@@ -617,7 +648,9 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
         loop {
             let ip2 = ip0 + step;
             let ip3 = ip1 + step;
-            if ip3 > ilimit { break 'outer; }
+            if ip3 > ilimit {
+                break 'outer;
+            }
 
             // Get match candidate from hash table for ip0
             let match_idx0 = ht[h0] as usize;
@@ -629,7 +662,8 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
             // === Rep-code check at ip2 (before hash match) ===
             if rep1 > 0 && ip2 >= rep1 as usize {
                 let rep_cand = ip2 - rep1 as usize;
-                if rep_cand + 4 <= data.len() && ip2 + 4 <= data.len()
+                if rep_cand + 4 <= data.len()
+                    && ip2 + 4 <= data.len()
                     && read32(data, ip2) == read32(data, rep_cand)
                 {
                     // Rep match at ip2! Write hash for ip1 first
@@ -639,26 +673,45 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                     // Backward extension
                     let mut start = ip2;
                     let mut mstart = rep_cand;
-                    while start > anchor && mstart > 0 && mlen < MAX_MATCH_LEN && data[start - 1] == data[mstart - 1] {
+                    while start > anchor
+                        && mstart > 0
+                        && mlen < MAX_MATCH_LEN
+                        && data[start - 1] == data[mstart - 1]
+                    {
                         start -= 1;
                         mstart -= 1;
                         mlen += 1;
                     }
 
                     let ll = (start - anchor) as u32;
-                    sequences.push(Sequence { ll, off: rep1, ml: mlen as u32 });
+                    sequences.push(Sequence {
+                        ll,
+                        off: rep1,
+                        ml: mlen as u32,
+                    });
                     ip0 = start + mlen;
                     anchor = ip0;
 
                     // Rep-code chaining: check rep2 at new position
-                    rep_chain(data, &mut ip0, &mut anchor, &mut sequences,
-                              &mut rep1, &mut rep2, &mut ht, hlog, mls, ilimit);
+                    rep_chain(
+                        data,
+                        &mut ip0,
+                        &mut anchor,
+                        &mut sequences,
+                        &mut rep1,
+                        &mut rep2,
+                        &mut ht,
+                        hlog,
+                        mls,
+                        ilimit,
+                    );
                     continue 'outer;
                 }
             }
 
             // === Hash match check at ip0 ===
-            if match_idx0 < ip0 && ip0 - match_idx0 <= (1 << 24)
+            if match_idx0 < ip0
+                && ip0 - match_idx0 <= (1 << 24)
                 && match_idx0 + 4 <= data.len()
                 && read32(data, ip0) == read32(data, match_idx0)
             {
@@ -679,7 +732,11 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                 rep1 = offset;
 
                 let ll = (start - anchor) as u32;
-                sequences.push(Sequence { ll, off: offset, ml: mlen as u32 });
+                sequences.push(Sequence {
+                    ll,
+                    off: offset,
+                    ml: mlen as u32,
+                });
                 ip0 = start + mlen;
                 anchor = ip0;
 
@@ -688,8 +745,18 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                     ht[hash_n(&data[ip0 - 2..], (hash_size - 1) as u32, mls)] = (ip0 - 2) as u32;
                 }
 
-                rep_chain(data, &mut ip0, &mut anchor, &mut sequences,
-                          &mut rep1, &mut rep2, &mut ht, hlog, mls, ilimit);
+                rep_chain(
+                    data,
+                    &mut ip0,
+                    &mut anchor,
+                    &mut sequences,
+                    &mut rep1,
+                    &mut rep2,
+                    &mut ht,
+                    hlog,
+                    mls,
+                    ilimit,
+                );
                 continue 'outer;
             }
 
@@ -698,7 +765,8 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
             h0 = hash_n(&data[ip2..], (hash_size - 1) as u32, mls);
             ht[h1] = ip1 as u32;
 
-            if match_idx1 < ip1 && ip1 - match_idx1 <= (1 << 24)
+            if match_idx1 < ip1
+                && ip1 - match_idx1 <= (1 << 24)
                 && match_idx1 + 4 <= data.len()
                 && read32(data, ip1) == read32(data, match_idx1)
             {
@@ -717,7 +785,11 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                 rep1 = offset;
 
                 let ll = (start - anchor) as u32;
-                sequences.push(Sequence { ll, off: offset, ml: mlen as u32 });
+                sequences.push(Sequence {
+                    ll,
+                    off: offset,
+                    ml: mlen as u32,
+                });
                 ip0 = start + mlen;
                 anchor = ip0;
 
@@ -725,8 +797,18 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                     ht[hash_n(&data[ip0 - 2..], (hash_size - 1) as u32, mls)] = (ip0 - 2) as u32;
                 }
 
-                rep_chain(data, &mut ip0, &mut anchor, &mut sequences,
-                          &mut rep1, &mut rep2, &mut ht, hlog, mls, ilimit);
+                rep_chain(
+                    data,
+                    &mut ip0,
+                    &mut anchor,
+                    &mut sequences,
+                    &mut rep1,
+                    &mut rep2,
+                    &mut ht,
+                    hlog,
+                    mls,
+                    ilimit,
+                );
                 continue 'outer;
             }
 
@@ -746,12 +828,19 @@ fn find_matches_fast(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
 }
 
 /// Rep-code chaining: after a match, check if the next position matches rep2.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn rep_chain(
-    data: &[u8], ip: &mut usize, anchor: &mut usize,
+    data: &[u8],
+    ip: &mut usize,
+    anchor: &mut usize,
     sequences: &mut Vec<Sequence>,
-    rep1: &mut u32, rep2: &mut u32,
-    ht: &mut [u32], hlog: u32, mls: usize, _ilimit: usize,
+    rep1: &mut u32,
+    rep2: &mut u32,
+    ht: &mut [u32],
+    hlog: u32,
+    mls: usize,
+    _ilimit: usize,
 ) {
     let hash_size = 1usize << hlog;
     while *rep2 > 0 && *ip + 4 <= data.len() && *ip >= *rep2 as usize {
@@ -761,16 +850,18 @@ fn rep_chain(
         }
         let mlen = 4 + count_match(data, *ip + 4, cand + 4);
         // Swap rep codes
-        let tmp = *rep2;
-        *rep2 = *rep1;
-        *rep1 = tmp;
+        std::mem::swap(rep1, rep2);
 
         // Update hash table
         if *ip + 8 <= data.len() {
             ht[hash_n(&data[*ip..], (hash_size - 1) as u32, mls)] = *ip as u32;
         }
 
-        sequences.push(Sequence { ll: 0, off: *rep1, ml: mlen as u32 });
+        sequences.push(Sequence {
+            ll: 0,
+            off: *rep1,
+            ml: mlen as u32,
+        });
         *ip += mlen;
         *anchor = *ip;
     }
@@ -778,7 +869,7 @@ fn rep_chain(
 
 #[inline]
 fn read32(data: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]])
+    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
 }
 
 /// Max match length. Capped to ensure ll+ml fits in BLOCKSIZE_MAX for any literal length.
@@ -791,8 +882,8 @@ fn count_match(data: &[u8], mut a: usize, mut b: usize) -> usize {
     let max_extend = MAX_MATCH_LEN - 4;
     let limit = std::cmp::min(data.len(), start + max_extend);
     while a + 8 <= limit && b + 8 <= data.len() {
-        let va = u64::from_le_bytes(data[a..a+8].try_into().unwrap());
-        let vb = u64::from_le_bytes(data[b..b+8].try_into().unwrap());
+        let va = u64::from_le_bytes(data[a..a + 8].try_into().unwrap());
+        let vb = u64::from_le_bytes(data[b..b + 8].try_into().unwrap());
         if va != vb {
             return a - start + (va ^ vb).trailing_zeros() as usize / 8;
         }
@@ -821,7 +912,7 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     let hash_mask = (hash_size - 1) as u32;
     let long_hash_size = 1usize << std::cmp::min(params.hash_log, 17);
     let long_hash_mask = (long_hash_size - 1) as u32;
-    let mut ht_short = vec![0u32; hash_size];     // 4-byte hash → position
+    let mut ht_short = vec![0u32; hash_size]; // 4-byte hash → position
     let mut ht_long = vec![0u32; long_hash_size]; // 7-byte hash → position
     let mut chain = vec![0u32; data.len()];
     let mut sequences = Vec::new();
@@ -848,25 +939,47 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                 // For high-entropy data, a 6-byte rep match at ll=2 is marginal.
                 // Require ml >= 7 to skip borderline short matches that
                 // produce too many sequences (key insight from C zstd analysis).
-                if ml * 5 > 40 { Some((rep1 as usize, ml)) } else { None }
-            } else { None }
-        } else { None };
+                if ml * 5 > 40 {
+                    Some((rep1 as usize, ml))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // === 2. Hash-chain match using configured hash_bytes ===
-        let short_match = find_best_at_n(data, ip, &ht_short, &chain, hash_mask, params.search_depth, std::cmp::min(params.hash_bytes, 4));
+        let short_match = find_best_at_n(
+            data,
+            ip,
+            &ht_short,
+            &chain,
+            hash_mask,
+            params.search_depth,
+            std::cmp::min(params.hash_bytes, 4),
+        );
 
         // === 3. Long hash match (7-byte, single lookup, for long-range) ===
         let long_match = if ip + 7 <= data.len() {
             let lh = hash7(&data[ip..], long_hash_mask);
             let lidx = ht_long[lh] as usize;
             ht_long[lh] = ip as u32;
-            if lidx < ip && ip - lidx <= (1 << 24) && lidx + 4 <= data.len()
+            if lidx < ip
+                && ip - lidx <= (1 << 24)
+                && lidx + 4 <= data.len()
                 && read32(data, ip) == read32(data, lidx)
             {
                 let ml = 4 + count_match(data, ip + 4, lidx + 4);
                 Some((ip - lidx, ml))
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // === 4. Pick best overall ===
         // Filter hash matches for profitability (rep matches are always free)
@@ -875,7 +988,11 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
 
         let best_hash = match (short_match, long_match) {
             (Some((so, sl)), Some((lo, ll))) => {
-                if ll >= sl + 2 { Some((lo, ll)) } else { Some((so, sl)) }
+                if ll >= sl + 2 {
+                    Some((lo, ll))
+                } else {
+                    Some((so, sl))
+                }
             }
             (Some(s), None) => Some(s),
             (None, Some(l)) => Some(l),
@@ -885,8 +1002,11 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
         let chosen = match (rep_match, best_hash) {
             (Some((roff, rml)), Some((hoff, hml))) => {
                 let off_bits = 32u32.saturating_sub((hoff as u32).leading_zeros());
-                if rml + (off_bits as usize / 4) >= hml { Some((roff, rml)) }
-                else { Some((hoff, hml)) }
+                if rml + (off_bits as usize / 4) >= hml {
+                    Some((roff, rml))
+                } else {
+                    Some((hoff, hml))
+                }
             }
             (Some(r), None) => Some(r),
             (None, Some(h)) => Some(h),
@@ -907,14 +1027,23 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
                     let c = ip + 1 - rep1 as usize;
                     if c + 4 <= data.len() && read32(data, ip + 1) == read32(data, c) {
                         let rl = 4 + count_match(data, ip + 5, c + 4);
-                        if rl > final_len { next_best = Some((rep1 as usize, rl)); }
+                        if rl > final_len {
+                            next_best = Some((rep1 as usize, rl));
+                        }
                     }
                 }
                 // Hash chain at ip+1
                 if let Some((off2, len2)) = find_best_at_n(
-                    data, ip + 1, &ht_short, &chain, hash_mask, params.search_depth, 4,
+                    data,
+                    ip + 1,
+                    &ht_short,
+                    &chain,
+                    hash_mask,
+                    params.search_depth,
+                    4,
                 ) {
-                    if len2 > final_len + 1 && (next_best.is_none() || len2 > next_best.unwrap().1) {
+                    if len2 > final_len + 1 && (next_best.is_none() || len2 > next_best.unwrap().1)
+                    {
                         next_best = Some((off2, len2));
                     }
                 }
@@ -928,7 +1057,11 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
             }
 
             let ll = (final_ip - anchor) as u32;
-            sequences.push(Sequence { ll, off: final_off as u32, ml: final_len as u32 });
+            sequences.push(Sequence {
+                ll,
+                off: final_off as u32,
+                ml: final_len as u32,
+            });
 
             if final_off as u32 != rep1 {
                 rep2 = rep1;
@@ -949,12 +1082,20 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
             // === Rep-code chaining: check rep2 ===
             while rep2 > 0 && ip + 4 <= data.len() && ip >= rep2 as usize {
                 let cand = ip - rep2 as usize;
-                if cand + 4 > data.len() || read32(data, ip) != read32(data, cand) { break; }
+                if cand + 4 > data.len() || read32(data, ip) != read32(data, cand) {
+                    break;
+                }
                 let mlen = 4 + count_match(data, ip + 4, cand + 4);
-                if mlen < ZSTD_MINMATCH { break; }
+                if mlen < ZSTD_MINMATCH {
+                    break;
+                }
 
-                let tmp = rep2; rep2 = rep1; rep1 = tmp;
-                sequences.push(Sequence { ll: 0, off: rep1, ml: mlen as u32 });
+                std::mem::swap(&mut rep2, &mut rep1);
+                sequences.push(Sequence {
+                    ll: 0,
+                    off: rep1,
+                    ml: mlen as u32,
+                });
 
                 let end2 = std::cmp::min(ip + mlen, data.len().saturating_sub(4));
                 for p in ip..end2 {
@@ -990,7 +1131,11 @@ fn find_matches_lazy(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
 /// For match_len=4, offset=1000: saves 20 bits, costs ~27 bits → unprofitable!
 #[inline]
 fn is_match_profitable(match_len: usize, offset: usize) -> bool {
-    let off_code = if offset > 1 { 32 - (offset as u32).leading_zeros() } else { 1 };
+    let off_code = if offset > 1 {
+        32 - (offset as u32).leading_zeros()
+    } else {
+        1
+    };
     // Sequence overhead: ~6 (LL) + 5 (OF_FSE) + off_code (OF extra) + 6 (ML) = 17 + off_code bits
     // Match saves: match_len * literal_bits_per_byte
     // Use literal cost of 5 bits/byte (conservative Huffman estimate)
@@ -1002,7 +1147,14 @@ fn is_match_profitable(match_len: usize, offset: usize) -> bool {
 /// After a match ends, immediately check for a rep-code match at the current
 /// position using rep[1] (the second repeat offset). This chains consecutive
 /// matches without re-entering the main loop, matching C zstd behavior.
-fn insert_hash_n(hash_table: &mut [u32], chain: &mut [u32], data: &[u8], pos: usize, mask: u32, hash_bytes: usize) {
+fn insert_hash_n(
+    hash_table: &mut [u32],
+    chain: &mut [u32],
+    data: &[u8],
+    pos: usize,
+    mask: u32,
+    hash_bytes: usize,
+) {
     if pos + hash_bytes > data.len() {
         return;
     }
@@ -1033,7 +1185,9 @@ fn hash6(data: &[u8], mask: u32) -> usize {
 /// Critical for f64 data where first 4-6 bytes are often identical (0x00).
 #[inline]
 fn hash7(data: &[u8], mask: u32) -> usize {
-    let v = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], 0]);
+    let v = u64::from_le_bytes([
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], 0,
+    ]);
     ((v.wrapping_mul(58295818150454627u64)) >> 24) as usize & mask as usize
 }
 
@@ -1068,7 +1222,10 @@ fn find_best_at_n(
             // Cap match length at spec maximum (ML code 52: 65539 + 65535 = 131074)
             let max_ml = std::cmp::min(ZSTD_BLOCKSIZE_MAX, data.len() - pos);
             let cand_max = std::cmp::min(max_ml, data.len() - candidate);
-            let ml = common_prefix_len(&data[candidate..candidate + cand_max], &data[pos..pos + cand_max]);
+            let ml = common_prefix_len(
+                &data[candidate..candidate + cand_max],
+                &data[pos..pos + cand_max],
+            );
             if ml > best_len {
                 best_len = ml;
                 best_off = pos - candidate;
@@ -1127,28 +1284,42 @@ fn hash4(data: &[u8], mask: u32) -> usize {
 // Huffman literal compression
 // =========================================================================
 
-
-
 /// Build codes for Treeless reuse. Roundtrip-verifies through encode_huffman_tree
 /// + decode to ensure encoder codes exactly match what decoder reconstructs.
 /// Encode literals using a previous Huffman tree (Treeless_Literals_Block, type=3).
 #[cfg(not(feature = "parallel"))]
 fn encode_literals_treeless(literals: &[u8], prev_codes: &[(u32, u8); 256]) -> Option<Vec<u8>> {
     let use_4 = literals.len() >= 1024;
-    let streams = if use_4 { encode_huf_4streams(literals, prev_codes) }
-    else { encode_huf_1stream(literals, prev_codes) };
+    let streams = if use_4 {
+        encode_huf_4streams(literals, prev_codes)
+    } else {
+        encode_huf_1stream(literals, prev_codes)
+    };
     let regen = literals.len();
     let comp = streams.len();
-    if comp >= regen { return None; }
+    if comp >= regen {
+        return None;
+    }
     let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
     let mut out = Vec::with_capacity(lh_size + comp);
     let htype = LIT_TYPE_TREELESS as u32;
     match lh_size {
-        3 => { let sf = if use_4 { 1u32 } else { 0 };
-            out.extend_from_slice(&(htype|(sf<<2)|((regen as u32)<<4)|((comp as u32)<<14)).to_le_bytes()[..3]); }
-        4 => out.extend_from_slice(&(htype|(2u32<<2)|((regen as u32)<<4)|((comp as u32)<<18)).to_le_bytes()[..4]),
-        _ => { let v = htype|(3u32<<2)|((regen as u32)<<4)|((comp as u32)<<22);
-            out.extend_from_slice(&v.to_le_bytes()[..4]); out.push((comp >> 10) as u8); }
+        3 => {
+            let sf = if use_4 { 1u32 } else { 0 };
+            out.extend_from_slice(
+                &(htype | (sf << 2) | ((regen as u32) << 4) | ((comp as u32) << 14)).to_le_bytes()
+                    [..3],
+            );
+        }
+        4 => out.extend_from_slice(
+            &(htype | (2u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 18)).to_le_bytes()
+                [..4],
+        ),
+        _ => {
+            let v = htype | (3u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 22);
+            out.extend_from_slice(&v.to_le_bytes()[..4]);
+            out.push((comp >> 10) as u8);
+        }
     }
     out.extend_from_slice(&streams);
     Some(out)
@@ -1231,34 +1402,49 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         .collect();
     syms.sort_by(|a, b| b.0.cmp(&a.0));
     let n = syms.len();
-    if n < 2 { return None; }
+    if n < 2 {
+        return None;
+    }
 
     // --- Step 1: Build Huffman tree (two-queue merge) ---
     let mut node_count = vec![0u64; 2 * n];
     let mut node_parent = vec![0u32; 2 * n];
     let mut node_nbits = vec![0u8; 2 * n];
-    for i in 0..n { node_count[i] = syms[i].0 as u64; }
-    for i in n..2*n { node_count[i] = u64::MAX / 2; }
+    for i in 0..n {
+        node_count[i] = syms[i].0 as u64;
+    }
+    for i in n..2 * n {
+        node_count[i] = u64::MAX / 2;
+    }
 
     let mut low_s = n as i32 - 1;
     let mut low_n = n;
     let mut next_node = n;
 
     // Helper: pick smallest from symbol queue or node queue
-    let pick_smallest = |node_count: &[u64], low_s: &mut i32, low_n: &mut usize, next_node: usize| -> usize {
-        if *low_s >= 0 && (*low_n >= next_node || node_count[*low_s as usize] < node_count[*low_n]) {
-            let r = *low_s as usize; *low_s -= 1; r
-        } else if *low_n < next_node {
-            let r = *low_n; *low_n += 1; r
-        } else {
-            usize::MAX // shouldn't happen
-        }
-    };
+    let pick_smallest =
+        |node_count: &[u64], low_s: &mut i32, low_n: &mut usize, next_node: usize| -> usize {
+            if *low_s >= 0
+                && (*low_n >= next_node || node_count[*low_s as usize] < node_count[*low_n])
+            {
+                let r = *low_s as usize;
+                *low_s -= 1;
+                r
+            } else if *low_n < next_node {
+                let r = *low_n;
+                *low_n += 1;
+                r
+            } else {
+                usize::MAX // shouldn't happen
+            }
+        };
 
     while next_node < 2 * n - 1 {
         let n1 = pick_smallest(&node_count, &mut low_s, &mut low_n, next_node);
         let n2 = pick_smallest(&node_count, &mut low_s, &mut low_n, next_node);
-        if n1 == usize::MAX || n2 == usize::MAX { break; }
+        if n1 == usize::MAX || n2 == usize::MAX {
+            break;
+        }
         node_count[next_node] = node_count[n1] + node_count[n2];
         node_parent[n1] = next_node as u32;
         node_parent[n2] = next_node as u32;
@@ -1269,7 +1455,9 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
     // Assign bit lengths top-down
     node_nbits[root] = 0;
     for i in (n..=root).rev() {
-        if i < root { node_nbits[i] = node_nbits[node_parent[i] as usize] + 1; }
+        if i < root {
+            node_nbits[i] = node_nbits[node_parent[i] as usize] + 1;
+        }
     }
     for i in 0..n {
         node_nbits[i] = node_nbits[node_parent[i] as usize] + 1;
@@ -1291,7 +1479,9 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         while node_nbits[last_non_null] > target {
             total_cost += base_cost - (1i32 << (largest_bits - node_nbits[last_non_null]));
             node_nbits[last_non_null] = target;
-            if last_non_null == 0 { break; }
+            if last_non_null == 0 {
+                break;
+            }
             last_non_null -= 1;
         }
         total_cost >>= largest_bits - target;
@@ -1303,7 +1493,9 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         {
             let mut current_bits = target;
             for pos in (0..=last_non_null).rev() {
-                if node_nbits[pos] >= current_bits { continue; }
+                if node_nbits[pos] >= current_bits {
+                    continue;
+                }
                 current_bits = node_nbits[pos];
                 rank_last[(target - current_bits) as usize] = pos as u32;
             }
@@ -1312,7 +1504,7 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         // Phase 2: Repay cost by lengthening symbols (increasing their nbBits)
         while total_cost > 0 {
             // Find the best rank to decrease: target the next power-of-2 chunk
-            let mut n_bits_to_decrease = (32 - (total_cost as u32).leading_zeros()) as u32;
+            let mut n_bits_to_decrease = 32 - (total_cost as u32).leading_zeros();
             // but don't exceed available ranks
             if n_bits_to_decrease > largest_bits as u32 - target as u32 + 1 {
                 n_bits_to_decrease = largest_bits as u32 - target as u32 + 1;
@@ -1322,11 +1514,18 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
             while n_bits_to_decrease > 1 {
                 let high_pos = rank_last[n_bits_to_decrease as usize];
                 let low_pos = rank_last[n_bits_to_decrease as usize - 1];
-                if high_pos == NO_SYMBOL { n_bits_to_decrease -= 1; continue; }
-                if low_pos == NO_SYMBOL { break; }
+                if high_pos == NO_SYMBOL {
+                    n_bits_to_decrease -= 1;
+                    continue;
+                }
+                if low_pos == NO_SYMBOL {
+                    break;
+                }
                 let high_total = syms[high_pos as usize].0;
                 let low_total = 2 * syms[low_pos as usize].0;
-                if high_total <= low_total { break; }
+                if high_total <= low_total {
+                    break;
+                }
                 n_bits_to_decrease -= 1;
             }
 
@@ -1336,7 +1535,9 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
             {
                 n_bits_to_decrease += 1;
             }
-            if n_bits_to_decrease as usize > 14 || rank_last[n_bits_to_decrease as usize] == NO_SYMBOL {
+            if n_bits_to_decrease as usize > 14
+                || rank_last[n_bits_to_decrease as usize] == NO_SYMBOL
+            {
                 break; // can't repay
             }
 
@@ -1368,7 +1569,9 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
             if rank_last[1] == NO_SYMBOL {
                 // No rank-1 symbols. Find last rank-0 symbol and demote it.
                 let mut p = last_non_null;
-                while p > 0 && node_nbits[p] == target { p -= 1; }
+                while p > 0 && node_nbits[p] == target {
+                    p -= 1;
+                }
                 // p+1 is a rank-0 symbol (using target bits)
                 if p + 1 < n && node_nbits[p + 1] == target {
                     node_nbits[p + 1] -= 1; // demote: target → target-1
@@ -1394,20 +1597,28 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
 
         // If still not zero, fall back
         if total_cost != 0 {
-            for i in 0..n { node_nbits[i] = 0; } // will fail Kraft
+            for i in 0..n {
+                node_nbits[i] = 0;
+            } // will fail Kraft
         }
     }
 
     // --- Step 3: Extract code lengths and validate ---
     let mut lengths = [0u8; 256];
-    for i in 0..n { lengths[syms[i].1 as usize] = node_nbits[i]; }
+    for i in 0..n {
+        lengths[syms[i].1 as usize] = node_nbits[i];
+    }
 
     let max_bits = *lengths.iter().max().unwrap_or(&0);
-    if max_bits == 0 { return None; }
+    if max_bits == 0 {
+        return None;
+    }
 
     // Verify Kraft inequality: sum of 2^(max-len) must equal 2^max
-    let kraft: u64 = (0..=max_sym).filter(|&s| lengths[s] > 0)
-        .map(|s| 1u64 << (max_bits - lengths[s])).sum();
+    let kraft: u64 = (0..=max_sym)
+        .filter(|&s| lengths[s] > 0)
+        .map(|s| 1u64 << (max_bits - lengths[s]))
+        .sum();
     if kraft != (1u64 << max_bits) {
         return None;
     }
@@ -1419,7 +1630,11 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
 
     // Count symbols per rank
     let mut nb_per_rank = [0u32; 16];
-    for &l in &lengths { if l > 0 { nb_per_rank[l as usize] += 1; } }
+    for &l in &lengths {
+        if l > 0 {
+            nb_per_rank[l as usize] += 1;
+        }
+    }
 
     // zstd-style canonical code generation — exact mirror of decoder's rank_indexes.
     // Decoder: rank_indexes[max_bits] = 0
@@ -1428,8 +1643,8 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
     let mut rank_indexes = [0u32; 16];
     rank_indexes[max_bits as usize] = 0;
     for bits in (1..=max_bits as usize).rev() {
-        rank_indexes[bits - 1] = rank_indexes[bits]
-            + nb_per_rank[bits] * (1u32 << (max_bits as usize - bits));
+        rank_indexes[bits - 1] =
+            rank_indexes[bits] + nb_per_rank[bits] * (1u32 << (max_bits as usize - bits));
     }
 
     // Assign codes: within each bit length, symbols get consecutive codes
@@ -1621,24 +1836,49 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
             bb |= ((value + low_threshold) as u64) << bp;
             bp += bits_to_read;
         }
-        while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
+        while bp >= 8 {
+            hdr.push(bb as u8);
+            bb >>= 8;
+            bp -= 8;
+        }
 
-        if prob > 0 { counter += prob as u32; }
-        else if prob == -1 { counter += 1; }
+        if prob > 0 {
+            counter += prob as u32;
+        } else if prob == -1 {
+            counter += 1;
+        }
 
         if prob == 0 {
             let mut repeat = 0u32;
             while s + 1 + repeat as usize <= max_w as usize
-                && norm[s + 1 + repeat as usize] == 0 && repeat < 3 { repeat += 1; }
-            bb |= (repeat as u64) << bp; bp += 2;
-            while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
+                && norm[s + 1 + repeat as usize] == 0
+                && repeat < 3
+            {
+                repeat += 1;
+            }
+            bb |= (repeat as u64) << bp;
+            bp += 2;
+            while bp >= 8 {
+                hdr.push(bb as u8);
+                bb >>= 8;
+                bp -= 8;
+            }
             s += repeat as usize;
             while repeat == 3 {
                 repeat = 0;
                 while s + 1 + repeat as usize <= max_w as usize
-                    && norm[s + 1 + repeat as usize] == 0 && repeat < 3 { repeat += 1; }
-                bb |= (repeat as u64) << bp; bp += 2;
-                while bp >= 8 { hdr.push(bb as u8); bb >>= 8; bp -= 8; }
+                    && norm[s + 1 + repeat as usize] == 0
+                    && repeat < 3
+                {
+                    repeat += 1;
+                }
+                bb |= (repeat as u64) << bp;
+                bp += 2;
+                while bp >= 8 {
+                    hdr.push(bb as u8);
+                    bb >>= 8;
+                    bp -= 8;
+                }
                 s += repeat as usize;
             }
         }
@@ -1671,12 +1911,17 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     // Spread remaining symbols
     let mut pos = 0usize;
     for s in 0..=max_w as usize {
-        if norm[s] <= 0 { continue; }
+        if norm[s] <= 0 {
+            continue;
+        }
         for _ in 0..norm[s] {
             dec_symbol[pos] = s as u8;
             pos += (ts >> 1) + (ts >> 3) + 3;
             pos &= ts - 1;
-            while pos >= neg_idx { pos += (ts >> 1) + (ts >> 3) + 3; pos &= ts - 1; }
+            while pos >= neg_idx {
+                pos += (ts >> 1) + (ts >> 3) + 3;
+                pos &= ts - 1;
+            }
         }
     }
 
@@ -1690,7 +1935,11 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
 
     // Init with LAST symbol of each stream (= first encoded, last decoded)
     let mut st1 = fse.init_state(*stream1.last().unwrap() as usize);
-    let mut st2 = if len2 > 0 { fse.init_state(*stream2.last().unwrap() as usize) } else { 0 };
+    let mut st2 = if len2 > 0 {
+        fse.init_state(*stream2.last().unwrap() as usize)
+    } else {
+        0
+    };
 
     let mut bw = super::bitstream::BackwardBitWriter::new();
 
@@ -1701,10 +1950,7 @@ fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     // Encode each stream from second-to-last down to first.
     // init handles the last element, so encode [0..last-1].
     // Interleave order: decoder reads st1 update first, so write st2 first (backward).
-    let max_encode = std::cmp::max(
-        if len1 > 1 { len1 - 1 } else { 0 },
-        if len2 > 1 { len2 - 1 } else { 0 },
-    );
+    let max_encode = std::cmp::max(len1.saturating_sub(1), len2.saturating_sub(1));
     for i in (0..max_encode).rev() {
         if i < len2.saturating_sub(1) {
             let (bits, nb, ns) = fse.encode_symbol(st2, stream2[i] as usize);
@@ -1860,18 +2106,44 @@ fn encode_sequences_section(out: &mut Vec<u8>, sequences: &[EncodedSequence]) {
     }
 
     // Choose best mode for each table: Predefined vs RLE vs Custom FSE
-    let ll_mode = choose_seq_mode(&ll_codes_v, MAX_LL, LL_DEFAULT_NORM_LOG, &LL_DEFAULT_NORM, LL_FSE_LOG);
-    let of_mode = choose_seq_mode(&off_codes_v, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG, &OF_DEFAULT_NORM, OFF_FSE_LOG);
-    let ml_mode = choose_seq_mode(&ml_codes_v, MAX_ML, ML_DEFAULT_NORM_LOG, &ML_DEFAULT_NORM, ML_FSE_LOG);
+    let ll_mode = choose_seq_mode(
+        &ll_codes_v,
+        MAX_LL,
+        LL_DEFAULT_NORM_LOG,
+        &LL_DEFAULT_NORM,
+        LL_FSE_LOG,
+    );
+    let of_mode = choose_seq_mode(
+        &off_codes_v,
+        OF_DEFAULT_NORM.len() - 1,
+        OF_DEFAULT_NORM_LOG,
+        &OF_DEFAULT_NORM,
+        OFF_FSE_LOG,
+    );
+    let ml_mode = choose_seq_mode(
+        &ml_codes_v,
+        MAX_ML,
+        ML_DEFAULT_NORM_LOG,
+        &ML_DEFAULT_NORM,
+        ML_FSE_LOG,
+    );
 
     // Write compression modes byte
     let mode_byte = (ll_mode.tag() << 6) | (of_mode.tag() << 4) | (ml_mode.tag() << 2);
     out.push(mode_byte);
 
     // Write table descriptions for non-predefined modes, then build tables
-    let ll_table = write_seq_table_and_build(out, &ll_mode, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-    let of_table = write_seq_table_and_build(out, &of_mode, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
-    let ml_table = write_seq_table_and_build(out, &ml_mode, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+    let ll_table =
+        write_seq_table_and_build(out, &ll_mode, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+    let of_table = write_seq_table_and_build(
+        out,
+        &of_mode,
+        &OF_DEFAULT_NORM,
+        OF_DEFAULT_NORM.len() - 1,
+        OF_DEFAULT_NORM_LOG,
+    );
+    let ml_table =
+        write_seq_table_and_build(out, &ml_mode, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
 
     // Encode with FSE sequence encoder
     let bitstream = super::fse::encode_sequences(
@@ -1990,7 +2262,13 @@ fn normalize_counts(counts: &[u32], max_symbol: usize, table_log: u32) -> Vec<i1
 }
 
 /// Fallback normalization for pathological distributions (port of FSE_normalizeM2).
-fn normalize_counts_m2(norm: &mut [i16], counts: &[u32], max_symbol: usize, table_log: u32, total: u64) {
+fn normalize_counts_m2(
+    norm: &mut [i16],
+    counts: &[u32],
+    max_symbol: usize,
+    table_log: u32,
+    total: u64,
+) {
     let table_size = 1u32 << table_log;
 
     // Reset and recalculate
@@ -2010,7 +2288,9 @@ fn normalize_counts_m2(norm: &mut [i16], counts: &[u32], max_symbol: usize, tabl
     }
 
     // Second pass: proportional scaling for remaining symbols
-    let remaining_total: u64 = counts[..=max_symbol].iter().enumerate()
+    let remaining_total: u64 = counts[..=max_symbol]
+        .iter()
+        .enumerate()
         .filter(|&(s, _)| norm[s] == 0 && counts[s] > 0)
         .map(|(_, &c)| c as u64)
         .sum();
@@ -2020,7 +2300,8 @@ fn normalize_counts_m2(norm: &mut [i16], counts: &[u32], max_symbol: usize, tabl
     }
 
     let v_step_log = 62u32.saturating_sub(table_log);
-    let r_step = ((1u128 << v_step_log) * to_distribute as u128 + remaining_total as u128 / 2) / remaining_total as u128;
+    let r_step = ((1u128 << v_step_log) * to_distribute as u128 + remaining_total as u128 / 2)
+        / remaining_total as u128;
 
     let mut tmp_total = 0u128;
     for s in 0..=max_symbol {
@@ -2128,17 +2409,20 @@ fn encode_fse_header(norm: &[i16], max_symbol: usize, table_log: u32) -> Vec<u8>
 }
 
 /// Estimate the compressed size (in bits) of encoding `codes` with a given normalized distribution.
-
 /// Cross-entropy cost of encoding `counts` using distribution `norm` at `table_log`.
 /// Returns approximate total bits needed to encode all symbols.
 fn cross_entropy_cost(norm: &[i16], table_log: u32, counts: &[u32; 256], max_sym: usize) -> u64 {
     let mut cost = 0u64;
     for s in 0..=max_sym {
-        if counts[s] == 0 { continue; }
-        if s >= norm.len() || norm[s] == 0 { return u64::MAX; }
+        if counts[s] == 0 {
+            continue;
+        }
+        if s >= norm.len() || norm[s] == 0 {
+            return u64::MAX;
+        }
         let prob = if norm[s] == -1 { 1u64 } else { norm[s] as u64 };
         // bits per symbol ≈ table_log - floor(log2(prob))
-        let log2_prob = 63 - (prob as u64).leading_zeros() as u64;
+        let log2_prob = 63 - prob.leading_zeros() as u64;
         cost += counts[s] as u64 * (table_log as u64 - log2_prob);
     }
     cost + table_log as u64 // add state init cost
@@ -2185,7 +2469,9 @@ fn choose_seq_mode(
     // Choose table_log: use max_log for best compression, but cap by number of symbols
     let table_log = {
         let min_log = 5u32;
-        let symbol_log = if n_used <= 2 { min_log } else {
+        let symbol_log = if n_used <= 2 {
+            min_log
+        } else {
             std::cmp::min(max_log, (32 - (n_used as u32).leading_zeros()).max(min_log))
         };
         std::cmp::min(max_log, std::cmp::max(min_log, symbol_log))
@@ -2224,11 +2510,18 @@ fn choose_seq_mode(
     let mut custom_stream_cost = 0u64;
     for s in 0..=max_sym {
         if counts[s] > 0 {
-            let prob = if custom_norm[s] == -1 { 1u64 } else { custom_norm[s] as u64 };
-            if prob == 0 { custom_stream_cost = u64::MAX; break; }
+            let prob = if custom_norm[s] == -1 {
+                1u64
+            } else {
+                custom_norm[s] as u64
+            };
+            if prob == 0 {
+                custom_stream_cost = u64::MAX;
+                break;
+            }
             // Cost in 256ths of a bit: count * log2(tableSize/prob) * 256
             // log2(tableSize/prob) = table_log - log2(prob)
-            let log2_prob = 63 - (prob as u64).leading_zeros() as u64;
+            let log2_prob = 63 - prob.leading_zeros() as u64;
             custom_stream_cost += counts[s] as u64 * (table_log as u64 - log2_prob);
         }
     }

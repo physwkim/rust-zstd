@@ -17,8 +17,8 @@ fn compression_ratios_by_level() {
     for (name, data) in &patterns {
         eprintln!("\n{} ({} bytes):", name, data.len());
         for level in [0, 1, 3, 7, 11] {
-            let compressed = zstd_rs::compress(data, level);
-            let decompressed = zstd_rs::decompress(&compressed)
+            let compressed = rust_zstd::compress(data, level);
+            let decompressed = rust_zstd::decompress(&compressed)
                 .unwrap_or_else(|e| panic!("{} level {} decompress: {}", name, level, e));
             assert_eq!(decompressed.len(), data.len(), "{} level {}", name, level);
             assert_eq!(&decompressed, data, "{} level {}", name, level);

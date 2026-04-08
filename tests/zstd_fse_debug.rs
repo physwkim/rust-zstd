@@ -5,8 +5,8 @@ fn tiny_fse_weight_test() {
     let data: Vec<u8> = (0..50)
         .flat_map(|_| (0..130u8).collect::<Vec<_>>())
         .collect();
-    let c = zstd_rs::compress(&data, 1);
-    let d = zstd_rs::decompress(&c).unwrap();
+    let c = rust_zstd::compress(&data, 1);
+    let d = rust_zstd::decompress(&c).unwrap();
     assert_eq!(d, data);
     eprintln!(
         "130-sym uniform: {} -> {} ({:.1}%)",
@@ -28,8 +28,8 @@ fn tiny_fse_weight_test() {
             data2.push(b);
         }
     }
-    let c2 = zstd_rs::compress(&data2, 1);
-    let d2 = zstd_rs::decompress(&c2).unwrap();
+    let c2 = rust_zstd::compress(&data2, 1);
+    let d2 = rust_zstd::decompress(&c2).unwrap();
     assert_eq!(d2, data2);
     eprintln!(
         "200-sym skewed: {} -> {} ({:.1}%)",
@@ -49,8 +49,8 @@ fn tiny_fse_weight_test() {
         data3.push(0);
         data3.push(1);
     } // heavy skew
-    let c3 = zstd_rs::compress(&data3, 1);
-    let d3 = zstd_rs::decompress(&c3).unwrap();
+    let c3 = rust_zstd::compress(&data3, 1);
+    let d3 = rust_zstd::decompress(&c3).unwrap();
     assert_eq!(d3, data3);
     eprintln!(
         "256-sym skewed: {} -> {} ({:.1}%)",

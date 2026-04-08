@@ -2,21 +2,21 @@ use std::time::Instant;
 
 fn bench_level(_name: &str, data: &[u8], level: i32, iterations: u32) -> (f64, f64, usize) {
     // Warmup
-    let compressed = zstd_rs::compress(data, level);
-    let _ = zstd_rs::decompress(&compressed);
+    let compressed = rust_zstd::compress(data, level);
+    let _ = rust_zstd::decompress(&compressed);
 
     // Compress benchmark
     let start = Instant::now();
     let mut comp_out = Vec::new();
     for _ in 0..iterations {
-        comp_out = zstd_rs::compress(data, level);
+        comp_out = rust_zstd::compress(data, level);
     }
     let comp_time = start.elapsed().as_secs_f64() / iterations as f64;
 
     // Decompress benchmark
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = zstd_rs::decompress(&comp_out);
+        let _ = rust_zstd::decompress(&comp_out);
     }
     let decomp_time = start.elapsed().as_secs_f64() / iterations as f64;
 
