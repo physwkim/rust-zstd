@@ -1489,10 +1489,6 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
     // ensuring both Kraft inequality and valid weight-sum.
     let largest_bits = *node_nbits[..n].iter().max().unwrap_or(&0);
     if largest_bits > MAX_BITS {
-        // Tree too deep — give up and fall back to raw literals
-        return None;
-    }
-    if false {  // disabled setMaxHeight
         let target = MAX_BITS;
 
         // Phase 1: Clamp all > target to target, compute totalCost
@@ -1552,18 +1548,7 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
                 break; // can't repay
             }
 
-            // Promote the symbol: increase its nbBits by 1
-            let repay = 1i32 << (n_bits_to_decrease - 1);
-            if repay > total_cost && n_bits_to_decrease > 1 {
-                // Would overshoot — try smaller rank
-                n_bits_to_decrease = 1;
-                while n_bits_to_decrease as usize <= 14
-                    && rank_last[n_bits_to_decrease as usize] == NO_SYMBOL
-                { n_bits_to_decrease += 1; }
-                if n_bits_to_decrease as usize > 14 || rank_last[n_bits_to_decrease as usize] == NO_SYMBOL {
-                    break;
-                }
-            }
+            // Promote the symbol: increase its nbBits by 1 (C allows overshoot here)
             total_cost -= 1i32 << (n_bits_to_decrease - 1);
             let pos = rank_last[n_bits_to_decrease as usize] as usize;
             node_nbits[pos] += 1;
@@ -1585,12 +1570,39 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
             }
         }
 
-        // If totalCost != 0 after Phase 2, the tree is invalid.
-        // C's Phase 3 corrects overshoot, but our port has edge cases.
-        // Fall back to raw literals for safety.
+        // Phase 3: Overshoot correction (totalCost < 0)
+        // Port of C zstd: demote rank-0 symbols to rank-1 (decrease nbBits by 1)
+        while total_cost < 0 {
+            if rank_last[1] == NO_SYMBOL {
+                // No rank-1 symbols. Find last rank-0 symbol and demote it.
+                let mut p = last_non_null;
+                while p > 0 && node_nbits[p] == target { p -= 1; }
+                // p+1 is a rank-0 symbol (using target bits)
+                if p + 1 < n && node_nbits[p + 1] == target {
+                    node_nbits[p + 1] -= 1; // demote: target → target-1
+                    rank_last[1] = (p + 1) as u32;
+                    total_cost += 1;
+                } else {
+                    break; // can't correct
+                }
+            } else {
+                // Demote the symbol just after rankLast[1] boundary
+                let next = rank_last[1] as usize + 1;
+                if next < n && node_nbits[next] == target {
+                    node_nbits[next] -= 1;
+                    rank_last[1] += 1;
+                    total_cost += 1;
+                } else {
+                    // rankLast[1]+1 is not a rank-0 symbol, need to find one
+                    rank_last[1] = NO_SYMBOL;
+                    // Will retry with the NO_SYMBOL path above
+                }
+            }
+        }
+
+        // If still not zero, fall back
         if total_cost != 0 {
-            // Mark as failed — will fall through to None via Kraft check
-            for i in 0..n { node_nbits[i] = 0; }
+            for i in 0..n { node_nbits[i] = 0; } // will fail Kraft
         }
     }
 
