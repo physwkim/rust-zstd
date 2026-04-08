@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::needless_range_loop, clippy::len_without_is_empty)]
+#![allow(clippy::needless_range_loop, clippy::len_without_is_empty)]
 //! Pure Rust Zstandard codec — compress + decompress, zero external dependencies.
 
 pub mod bitstream;
