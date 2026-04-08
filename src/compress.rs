@@ -1481,124 +1481,137 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
         node_nbits[i] = node_nbits[node_parent[i] as usize] + 1;
     }
 
-    // --- Step 2: HUF_setMaxHeight — enforce MAX_BITS ---
+    // --- Step 2: HUF_setMaxHeight — exact port of C zstd's algorithm ---
+    // Uses rankLast[] to track the least-frequent symbol at each depth,
+    // ensuring both Kraft inequality and valid weight-sum.
     let largest_bits = *node_nbits[..n].iter().max().unwrap_or(&0);
     if largest_bits > MAX_BITS {
-        // Count symbols at each depth
-        let mut rank_count = [0u32; 32];
-        for i in 0..n { rank_count[node_nbits[i] as usize] += 1; }
+        let target = MAX_BITS;
 
-        // Clamp: set all > MAX_BITS to MAX_BITS, compute cost
+        // Phase 1: Clamp all > target to target, compute totalCost
+        let base_cost = 1i32 << (largest_bits - target);
         let mut total_cost = 0i32;
-        let base_cost = 1i32 << (largest_bits - MAX_BITS);
-        for d in (MAX_BITS as usize + 1)..=largest_bits as usize {
-            total_cost += rank_count[d] as i32 * (base_cost - (1i32 << (largest_bits as usize - d)));
+        // Scan backward (least frequent first, they have the longest codes)
+        let mut last_non_null = n - 1;
+        while node_nbits[last_non_null] > target {
+            total_cost += base_cost - (1i32 << (largest_bits - node_nbits[last_non_null]));
+            node_nbits[last_non_null] = target;
+            if last_non_null == 0 { break; }
+            last_non_null -= 1;
         }
-        total_cost >>= largest_bits - MAX_BITS;
+        total_cost >>= largest_bits - target;
 
-        // Assign all deep symbols to MAX_BITS
-        for i in 0..n {
-            if node_nbits[i] > MAX_BITS { node_nbits[i] = MAX_BITS; }
-        }
-
-        // Repay cost by lengthening symbols. Process from MAX_BITS-1 downward
-        // (smallest cost unit = 1 at MAX_BITS-1, largest = 2^(MAX_BITS-2) at nb=1).
-        // This ensures we can hit total_cost=0 exactly.
-        let mut nb_to_repay = MAX_BITS - 1;
-        while total_cost > 0 && nb_to_repay >= 1 {
-            let unit_cost = 1i32 << (MAX_BITS - nb_to_repay - 1);
-            while total_cost >= unit_cost {
-                // Find a symbol at depth nb_to_repay to lengthen
-                let mut found = false;
-                for i in 0..n {
-                    if node_nbits[i] == nb_to_repay {
-                        node_nbits[i] += 1;
-                        total_cost -= unit_cost;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found { break; }
+        // Build rankLast[]: position of last (least frequent) symbol at each rank
+        // rankLast[k] = index of least-frequent symbol using (target - k) bits
+        const NO_SYMBOL: u32 = 0xF0F0F0F0;
+        let mut rank_last = [NO_SYMBOL; 16];
+        {
+            let mut current_bits = target;
+            for pos in (0..=last_non_null).rev() {
+                if node_nbits[pos] >= current_bits { continue; }
+                current_bits = node_nbits[pos];
+                rank_last[(target - current_bits) as usize] = pos as u32;
             }
-            if nb_to_repay == 0 { break; }
-            nb_to_repay -= 1;
+        }
+
+        // Phase 2: Repay cost by lengthening symbols (increasing their nbBits)
+        while total_cost > 0 {
+            // Find the best rank to decrease: target the next power-of-2 chunk
+            let mut n_bits_to_decrease = (32 - (total_cost as u32).leading_zeros()) as u32;
+            // but don't exceed available ranks
+            if n_bits_to_decrease > largest_bits as u32 - target as u32 + 1 {
+                n_bits_to_decrease = largest_bits as u32 - target as u32 + 1;
+            }
+
+            // Try to find best rank: prefer promoting cheap symbols
+            while n_bits_to_decrease > 1 {
+                let high_pos = rank_last[n_bits_to_decrease as usize];
+                let low_pos = rank_last[n_bits_to_decrease as usize - 1];
+                if high_pos == NO_SYMBOL { n_bits_to_decrease -= 1; continue; }
+                if low_pos == NO_SYMBOL { break; }
+                let high_total = syms[high_pos as usize].0;
+                let low_total = 2 * syms[low_pos as usize].0;
+                if high_total <= low_total { break; }
+                n_bits_to_decrease -= 1;
+            }
+
+            // Find a non-empty rank if current is empty
+            while n_bits_to_decrease as usize <= 14
+                && rank_last[n_bits_to_decrease as usize] == NO_SYMBOL
+            {
+                n_bits_to_decrease += 1;
+            }
+            if n_bits_to_decrease as usize > 14 || rank_last[n_bits_to_decrease as usize] == NO_SYMBOL {
+                break; // can't repay
+            }
+
+            // Promote the symbol: increase its nbBits by 1
+            total_cost -= 1i32 << (n_bits_to_decrease - 1);
+            let pos = rank_last[n_bits_to_decrease as usize] as usize;
+            node_nbits[pos] += 1;
+
+            // Update rankLast for the new rank
+            if rank_last[n_bits_to_decrease as usize - 1] == NO_SYMBOL {
+                rank_last[n_bits_to_decrease as usize - 1] = rank_last[n_bits_to_decrease as usize];
+            }
+
+            // Update rankLast for the old rank
+            if rank_last[n_bits_to_decrease as usize] == 0 {
+                rank_last[n_bits_to_decrease as usize] = NO_SYMBOL;
+            } else {
+                let prev = rank_last[n_bits_to_decrease as usize] - 1;
+                rank_last[n_bits_to_decrease as usize] = prev;
+                if node_nbits[prev as usize] != target - n_bits_to_decrease as u8 {
+                    rank_last[n_bits_to_decrease as usize] = NO_SYMBOL;
+                }
+            }
+        }
+
+        // Phase 3: Overshoot correction (totalCost < 0)
+        while total_cost < 0 {
+            if rank_last[1] == NO_SYMBOL {
+                // Find last rank-0 symbol and demote it
+                let mut p = last_non_null;
+                while p > 0 && node_nbits[p] == target { p -= 1; }
+                if p + 1 < n {
+                    node_nbits[p + 1] -= 1;
+                    rank_last[1] = (p + 1) as u32;
+                }
+                total_cost += 1;
+            } else {
+                let next = rank_last[1] as usize + 1;
+                if next < n {
+                    node_nbits[next] -= 1;
+                }
+                rank_last[1] += 1;
+                total_cost += 1;
+            }
         }
     }
 
-    // --- Verify and fix Kraft inequality ---
-    // sum of 2^(max_bits - nbits) for all symbols must equal 2^max_bits
+    // --- Step 3: Extract code lengths and validate ---
     let mut lengths = [0u8; 256];
     for i in 0..n { lengths[syms[i].1 as usize] = node_nbits[i]; }
 
     let max_bits = *lengths.iter().max().unwrap_or(&0);
     if max_bits == 0 { return None; }
 
-    let target = 1u64 << max_bits;
-    let mut kraft: u64 = (0..=max_sym)
-        .filter(|&s| lengths[s] > 0)
-        .map(|s| 1u64 << (max_bits - lengths[s]))
-        .sum();
+    // Verify Kraft inequality: sum of 2^(max-len) must equal 2^max
+    let kraft: u64 = (0..=max_sym).filter(|&s| lengths[s] > 0)
+        .map(|s| 1u64 << (max_bits - lengths[s])).sum();
+    if kraft != (1u64 << max_bits) { return None; }
 
-    // Fix under-full: shorten least-frequent symbols with longest codes
-    let mut iters = 0;
-    while kraft < target && iters < 512 {
-        // Find symbol with longest code (most bits) and least frequency
-        let mut best_i = None;
-        let mut best_len = 0u8;
-        for i in 0..n {
-            let s = syms[i].1 as usize;
-            if lengths[s] > 1 && lengths[s] >= best_len {
-                if lengths[s] > best_len || best_i.is_none() {
-                    best_len = lengths[s];
-                    best_i = Some(s);
-                }
-            }
-        }
-        let Some(s) = best_i else { break };
-        let delta = (1u64 << (max_bits - lengths[s] + 1)) - (1u64 << (max_bits - lengths[s]));
-        if kraft + delta <= target {
-            kraft += delta;
-            lengths[s] -= 1;
-        } else {
-            break;
-        }
-        iters += 1;
-    }
-
-    // Fix over-full: lengthen most-frequent symbols with shortest codes
-    while kraft > target && iters < 1024 {
-        let mut best_i = None;
-        let mut best_len = MAX_BITS;
-        for i in 0..n {
-            let s = syms[i].1 as usize;
-            if lengths[s] > 0 && lengths[s] < MAX_BITS && lengths[s] <= best_len {
-                if lengths[s] < best_len || best_i.is_none() {
-                    best_len = lengths[s];
-                    best_i = Some(s);
-                }
-            }
-        }
-        let Some(s) = best_i else { break };
-        let delta = (1u64 << (max_bits - lengths[s])) - (1u64 << (max_bits - lengths[s] - 1));
-        kraft -= delta;
-        lengths[s] += 1;
-        iters += 1;
-    }
-
-    if kraft != target { return None; }
-
-    // Verify weight sum is valid for Huffman tree description:
-    // sum of 2^(weight-1) for all active symbols must leave a valid leftover
-    // (the leftover = 2^max_bits - weight_sum must be a power of 2)
+    // Verify weight-sum: leftover must be power of 2 (for implicit last weight)
+    // weight = max_bits + 1 - nbits; weight_sum = sum of 2^(weight-1) for active symbols
+    // Decoder computes last_weight from: 2^last_weight_minus_1 = next_p2(weight_sum) - weight_sum
+    // This must be a power of 2.
     {
-        let ws: u64 = (0..=max_sym)
-            .filter(|&s| lengths[s] > 0)
-            .map(|s| 1u64 << (max_bits + 1 - lengths[s] - 1))
-            .sum();
+        let ws: u64 = (0..=max_sym).filter(|&s| lengths[s] > 0)
+            .map(|s| 1u64 << (max_bits + 1 - lengths[s] - 1)).sum();
         let np2 = ws.next_power_of_two();
         let leftover = np2 - ws;
-        if !leftover.is_power_of_two() || leftover == 0 {
-            return None; // tree can't be described with implicit last weight
+        if leftover == 0 || !leftover.is_power_of_two() {
+            return None;
         }
     }
 
@@ -1606,15 +1619,15 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
     let mut nb_per_rank = [0u32; 16];
     for &l in &lengths { if l > 0 { nb_per_rank[l as usize] += 1; } }
 
-    // zstd-style canonical code generation:
-    // rank_indexes[max_bits] = 0 (longest codes first in decode table)
-    // rank_indexes[bits-1] = rank_indexes[bits] + nb_per_rank[bits] * (1 << (max_bits - bits))
-    // Code for symbol = rank_indexes[bits] / (1 << (max_bits - bits))
+    // zstd-style canonical code generation — exact mirror of decoder's rank_indexes.
+    // Decoder: rank_indexes[max_bits] = 0
+    //          rank_indexes[bits-1] = rank_indexes[bits] + bit_ranks[bits] * (1 << (max_bits - bits))
+    // Code for a symbol at rank `bits` = rank_indexes[bits] / (1 << (max_bits - bits))
     let mut rank_indexes = [0u32; 16];
     rank_indexes[max_bits as usize] = 0;
-    for bits in (1..max_bits as usize).rev() {
-        rank_indexes[bits] = rank_indexes[bits + 1]
-            + nb_per_rank[bits + 1] * (1u32 << (max_bits as usize - bits - 1));
+    for bits in (1..=max_bits as usize).rev() {
+        rank_indexes[bits - 1] = rank_indexes[bits]
+            + nb_per_rank[bits] * (1u32 << (max_bits as usize - bits));
     }
 
     // Assign codes: within each bit length, symbols get consecutive codes
