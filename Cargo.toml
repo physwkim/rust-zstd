@@ -1,5 +1,5 @@
 [package]
-name = "zstd-rs"
+name = "rust-zstd"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Rust Zstandard codec — compress + decompress, zero external dependencies"
