@@ -11,5 +11,5 @@ rayon = { version = "1", optional = true }
 [dev-dependencies]
 
 [features]
-default = []
+default = ["parallel"]
 parallel = ["rayon"]
