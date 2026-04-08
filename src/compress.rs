@@ -1831,38 +1831,38 @@ pub fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
     }
 
     // CTable-based 2-stream interleaved encoding.
-    // init_state from decoder table (correct symbol mapping).
-    // encode_symbol from CTable (valid transitions, but decoder-table init).
+    // FSE backward encoding: init with LAST symbol, encode second-to-last down to first.
+    // After all encodes, the final state carries the FIRST symbol (decoder's first output).
     let stream1: Vec<u8> = weights.iter().step_by(2).copied().collect();
     let stream2: Vec<u8> = weights.iter().skip(1).step_by(2).copied().collect();
     let len1 = stream1.len();
     let len2 = stream2.len();
 
-    // Find decoder-table-compatible init states: scan decode table for first
-    // occurrence of each symbol, then convert to CTable state range.
-    let find_init = |sym: u8| -> u32 {
-        for i in 0..ts {
-            if dec_symbol[i] == sym {
-                // Convert decode table index to CTable state: table_size + index
-                return table_size + i as u32;
-            }
-        }
-        fse.init_state(sym as usize)
-    };
-    let mut st1 = find_init(stream1[0]);
-    let mut st2 = if len2 > 0 { find_init(stream2[0]) } else { 0 };
+    // Init with LAST symbol of each stream (= first encoded, last decoded)
+    let mut st1 = fse.init_state(*stream1.last().unwrap() as usize);
+    let mut st2 = if len2 > 0 { fse.init_state(*stream2.last().unwrap() as usize) } else { 0 };
 
     let mut bw = super::bitstream::BackwardBitWriter::new();
 
-    let max_idx = std::cmp::max(len1, len2);
-    for i in (1..max_idx).rev() {
-        if i < len2 {
+    // Encode from second-to-last down to first (index 0).
+    // After all encodes, state carries stream[0]'s symbol.
+    // Decoder reads: init(state) → peek(stream[0]) → update → peek(stream[1]) → ...
+    let _max_idx = std::cmp::max(len1, len2);
+    // Encode each stream from second-to-last down to first.
+    // init handles the last element, so encode [0..last-1].
+    // Interleave order: decoder reads st1 update first, so write st2 first (backward).
+    let max_encode = std::cmp::max(
+        if len1 > 1 { len1 - 1 } else { 0 },
+        if len2 > 1 { len2 - 1 } else { 0 },
+    );
+    for i in (0..max_encode).rev() {
+        if i < len2.saturating_sub(1) {
             let (bits, nb, ns) = fse.encode_symbol(st2, stream2[i] as usize);
             bw.add_bits(bits as u64, nb);
             bw.flush_bits();
             st2 = ns;
         }
-        if i < len1 {
+        if i < len1.saturating_sub(1) {
             let (bits, nb, ns) = fse.encode_symbol(st1, stream1[i] as usize);
             bw.add_bits(bits as u64, nb);
             bw.flush_bits();
