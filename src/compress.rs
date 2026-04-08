@@ -119,10 +119,18 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         let block_data = &data[d_start..d_end];
 
         if block_seqs.is_empty() {
-            if is_rle_block(block_data) {
-                write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
-            } else {
-                write_raw_block(&mut out, block_data, is_last);
+            // No sequences — write as raw/rle, splitting if needed
+            let mut rem = block_data;
+            while !rem.is_empty() {
+                let sz = std::cmp::min(rem.len(), ZSTD_BLOCKSIZE_MAX);
+                let chunk = &rem[..sz];
+                let last = is_last && sz == rem.len();
+                if is_rle_block(chunk) {
+                    write_rle_block(&mut out, chunk[0], chunk.len(), last);
+                } else {
+                    write_raw_block(&mut out, chunk, last);
+                }
+                rem = &rem[sz..];
             }
             continue;
         }
