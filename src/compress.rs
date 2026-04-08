@@ -45,10 +45,24 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
     let params = MatchParams::from_level(level);
     let mut all_sequences = find_matches(data, &params);
 
-    // For level 1-2: also try the other strategy and pick smaller
+    // For level 1-2: try both fast and lazy strategies, pick smaller
     if params.lazy_depth == 0 {
         let lazy_params = MatchParams { lazy_depth: 1, hash_log: 17, hash_bytes: 5, search_depth: 8 };
+
+        #[cfg(feature = "parallel")]
+        let lazy_seqs = {
+            // Run lazy match finder in parallel with the fast one already computed
+            let lazy_params_clone = lazy_params;
+            rayon::spawn(|| {}); // warm up thread pool
+            let (_, lazy) = rayon::join(
+                || (), // fast already done above
+                || find_matches_lazy(data, &lazy_params_clone),
+            );
+            lazy
+        };
+        #[cfg(not(feature = "parallel"))]
         let lazy_seqs = find_matches_lazy(data, &lazy_params);
+
         let fast_enc = resolve_repeat_offsets(&all_sequences);
         let lazy_enc = resolve_repeat_offsets(&lazy_seqs);
         let fast_cost = estimate_seq_cost(&all_sequences, &fast_enc);
@@ -95,32 +109,79 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
 
     let n_blocks = block_ranges.len();
 
-    // Cross-block state: previous Huffman codes (for Treeless reuse) and FSE tables
-    let mut prev_huf: Option<([(u32, u8); 256], u8)> = None; // (codes, max_bits)
-    let mut prev_ll_mode: Option<SeqTableMode> = None;
-    let mut prev_of_mode: Option<SeqTableMode> = None;
-    let mut prev_ml_mode: Option<SeqTableMode> = None;
+    // Precompute d_start for each block (cumulative sum of ll+ml)
+    let mut d_starts = Vec::with_capacity(n_blocks);
+    let cumul = 0usize;
+    for &(s_start, _, _) in &block_ranges {
+        if s_start == 0 { d_starts.push(0); }
+        else {
+            while cumul < all_sequences.len() && d_starts.len() < block_ranges.len() {
+                break; // will compute inline
+            }
+            let mut p = 0usize;
+            for s in &all_sequences[..s_start] { p += s.ll as usize + s.ml as usize; }
+            d_starts.push(p);
+        }
+    }
 
-    for (bi, &(s_start, s_end, d_end)) in block_ranges.iter().enumerate() {
-        let is_last = bi == n_blocks - 1;
+    // Encode each block's content (literals + sequences) — parallelizable
+    let encode_block_content = |bi: usize| -> (Vec<u8>, Vec<u8>) {
+        let (s_start, s_end, d_end) = block_ranges[bi];
         let block_seqs = &all_encoded[s_start..s_end];
         let raw_seqs = &all_sequences[s_start..s_end];
-
-        // Determine the byte range for this block
-        let d_start = if s_start == 0 {
-            0
-        } else {
-            let mut p = 0usize;
-            for s in &all_sequences[..s_start] {
-                p += s.ll as usize + s.ml as usize;
-            }
-            p
-        };
+        let d_start = d_starts[bi];
         let block_data = &data[d_start..d_end];
 
         if block_seqs.is_empty() {
-            // No sequences — write as raw/rle, splitting if needed
-            let mut rem = block_data;
+            return (vec![], block_data.to_vec()); // raw/rle — return block_data
+        }
+
+        let mut literals = Vec::with_capacity(block_data.len());
+        let mut pos = 0usize;
+        for seq in raw_seqs {
+            literals.extend_from_slice(&block_data[pos..pos + seq.ll as usize]);
+            pos += seq.ll as usize + seq.ml as usize;
+        }
+        literals.extend_from_slice(&block_data[pos..]);
+
+        let mut block = Vec::with_capacity(block_data.len());
+        let mut used_huf = false;
+        if !literals.is_empty() && literals.iter().all(|&b| b == literals[0]) {
+            encode_literals_rle(&mut block, literals[0], literals.len());
+            used_huf = true;
+        } else if literals.len() >= 64 {
+            if let Some(huf) = encode_literals_huffman(&literals) {
+                if huf.len() < literals.len() {
+                    block.extend_from_slice(&huf);
+                    used_huf = true;
+                }
+            }
+        }
+        if !used_huf {
+            encode_literals_raw(&mut block, &literals);
+        }
+        encode_sequences_section(&mut block, block_seqs);
+        (block, block_data.to_vec())
+    };
+
+    // Encode blocks — parallel when feature enabled
+    #[cfg(feature = "parallel")]
+    let encoded_blocks: Vec<(Vec<u8>, Vec<u8>)> = {
+        use rayon::prelude::*;
+        (0..n_blocks).into_par_iter().map(encode_block_content).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let encoded_blocks: Vec<(Vec<u8>, Vec<u8>)> = {
+        (0..n_blocks).map(encode_block_content).collect()
+    };
+
+    // Write blocks to output (sequential — must maintain order)
+    for (bi, (block, block_data)) in encoded_blocks.iter().enumerate() {
+        let is_last = bi == n_blocks - 1;
+
+        if block.is_empty() {
+            // No sequences — raw/rle sub-blocks
+            let mut rem = &block_data[..];
             while !rem.is_empty() {
                 let sz = std::cmp::min(rem.len(), ZSTD_BLOCKSIZE_MAX);
                 let chunk = &rem[..sz];
@@ -135,103 +196,28 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
             continue;
         }
 
-        // Collect literals for this block
-        let mut literals = Vec::with_capacity(block_data.len());
-        let mut pos = 0usize;
-        for seq in raw_seqs {
-            literals.extend_from_slice(&block_data[pos..pos + seq.ll as usize]);
-            pos += seq.ll as usize + seq.ml as usize;
-        }
-        literals.extend_from_slice(&block_data[pos..]);
-
-        // Encode block
-        let mut block = Vec::with_capacity(block_data.len());
-
-        // === Literals section: RLE → Huffman/Treeless → Raw ===
-        let mut used_huf = false;
-
-        // Try RLE literals first (all same byte)
-        if !literals.is_empty() && literals.iter().all(|&b| b == literals[0]) {
-            encode_literals_rle(&mut block, literals[0], literals.len());
-            used_huf = true;
-        } else if literals.len() >= 64 {
-            // Try Huffman: new tree, or Treeless (reuse previous tree)
-            let new_result = encode_literals_huffman(&literals);
-
-            // Try Treeless: reuse previous tree if it covers all symbols
-            let treeless_result = if let Some((prev_codes, _prev_mb)) = &prev_huf {
-                let all_covered = literals.iter().all(|&b| prev_codes[b as usize].1 > 0);
-                if all_covered {
-                    encode_literals_treeless(&literals, prev_codes)
-                } else { None }
-            } else { None };
-
-            // Pick smallest: treeless vs new tree
-            match (&new_result, &treeless_result) {
-                (Some(new_enc), Some(tl_enc)) if tl_enc.len() <= new_enc.len() && tl_enc.len() < literals.len() => {
-                    block.extend_from_slice(tl_enc);
-                    used_huf = true;
-                    // Keep prev_huf unchanged (we reused it)
-                    // But also build new codes for future blocks
-                    if let Some((codes, mb)) = build_huf_codes_for_prev(&literals) {
-                        prev_huf = Some((codes, mb));
-                    }
-                }
-                (Some(new_enc), _) if new_enc.len() < literals.len() => {
-                    block.extend_from_slice(new_enc);
-                    used_huf = true;
-                    if let Some((codes, mb)) = build_huf_codes_for_prev(&literals) {
-                        prev_huf = Some((codes, mb));
-                    }
-                }
-                (None, Some(tl_enc)) if tl_enc.len() < literals.len() => {
-                    block.extend_from_slice(tl_enc);
-                    used_huf = true;
-                }
-                _ => {}
-            }
-        }
-        if !used_huf {
-            encode_literals_raw(&mut block, &literals);
-        }
-
-        encode_sequences_section_with_reuse(
-            &mut block, block_seqs,
-            &mut prev_ll_mode, &mut prev_of_mode, &mut prev_ml_mode,
-        );
-
-        // Choose smallest block type.
-        // Compressed blocks: Block_Size = compressed size (must be <= BLOCKSIZE_MAX).
-        // Raw/RLE blocks: Block_Size = decompressed size (must be <= BLOCKSIZE_MAX).
-        // For compressed, the decompressed size may exceed BLOCKSIZE_MAX IF the
-        // compressed size fits. But spec says both must fit, so we need to ensure
-        // decompressed size <= BLOCKSIZE_MAX too.
         if block_data.len() <= ZSTD_BLOCKSIZE_MAX {
             if is_rle_block(block_data) {
                 write_rle_block(&mut out, block_data[0], block_data.len(), is_last);
             } else if block.len() < block_data.len() && block.len() <= ZSTD_BLOCKSIZE_MAX {
-                write_compressed_block(&mut out, &block, is_last);
+                write_compressed_block(&mut out, block, is_last);
             } else {
                 write_raw_block(&mut out, block_data, is_last);
             }
+        } else if block.len() < block_data.len() && block.len() <= ZSTD_BLOCKSIZE_MAX {
+            write_compressed_block(&mut out, block, is_last);
         } else {
-            // Decompressed size exceeds limit — use compressed if it fits,
-            // otherwise split into raw/rle sub-blocks
-            if block.len() < block_data.len() && block.len() <= ZSTD_BLOCKSIZE_MAX {
-                write_compressed_block(&mut out, &block, is_last);
-            } else {
-                let mut remaining = block_data;
-                while !remaining.is_empty() {
-                    let chunk_size = std::cmp::min(remaining.len(), ZSTD_BLOCKSIZE_MAX);
-                    let chunk = &remaining[..chunk_size];
-                    let chunk_last = is_last && chunk_size == remaining.len();
-                    if is_rle_block(chunk) {
-                        write_rle_block(&mut out, chunk[0], chunk.len(), chunk_last);
-                    } else {
-                        write_raw_block(&mut out, chunk, chunk_last);
-                    }
-                    remaining = &remaining[chunk_size..];
+            let mut remaining = &block_data[..];
+            while !remaining.is_empty() {
+                let sz = std::cmp::min(remaining.len(), ZSTD_BLOCKSIZE_MAX);
+                let chunk = &remaining[..sz];
+                let last = is_last && sz == remaining.len();
+                if is_rle_block(chunk) {
+                    write_rle_block(&mut out, chunk[0], chunk.len(), last);
+                } else {
+                    write_raw_block(&mut out, chunk, last);
                 }
+                remaining = &remaining[sz..];
             }
         }
     }
@@ -1066,55 +1052,6 @@ fn hash4(data: &[u8], mask: u32) -> usize {
 
 /// Build codes for Treeless reuse. Roundtrip-verifies through encode_huffman_tree
 /// + decode to ensure encoder codes exactly match what decoder reconstructs.
-fn build_huf_codes_for_prev(literals: &[u8]) -> Option<([(u32, u8); 256], u8)> {
-    let mut counts = [0u32; 256];
-    let mut max_sym = 0u8;
-    for &b in literals { counts[b as usize] += 1; if b > max_sym { max_sym = b; } }
-    if counts.iter().filter(|&&c| c > 0).count() < 2 { return None; }
-    let (codes, max_bits) = build_huffman_codes(&counts, max_sym as usize)?;
-    let tree_desc = encode_huffman_tree(&codes, max_bits, max_sym as usize);
-    if tree_desc.is_empty() { return None; }
-
-    // Treeless is disabled until HUF_setMaxHeight is fully compatible with decoder.
-    // The roundtrip verification below catches the mismatch but the fix requires
-    // ensuring encode_huffman_tree's weights produce the exact same codes when
-    // the decoder reconstructs them.
-    let _ = tree_desc;
-    None
-}
-
-/// Encode literals using a previous Huffman tree (Treeless_Literals_Block, type=3).
-fn encode_literals_treeless(literals: &[u8], prev_codes: &[(u32, u8); 256]) -> Option<Vec<u8>> {
-    let use_4 = literals.len() >= 1024;
-    let streams = if use_4 {
-        encode_huf_4streams(literals, prev_codes)
-    } else {
-        encode_huf_1stream(literals, prev_codes)
-    };
-    let regen = literals.len();
-    let comp = streams.len();
-    if comp >= regen { return None; }
-    let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
-    let mut out = Vec::with_capacity(lh_size + comp);
-    let htype = LIT_TYPE_TREELESS as u32;
-    match lh_size {
-        3 => {
-            let sf = if use_4 { 1u32 } else { 0u32 };
-            out.extend_from_slice(&(htype | (sf << 2) | ((regen as u32) << 4) | ((comp as u32) << 14)).to_le_bytes()[..3]);
-        }
-        4 => {
-            out.extend_from_slice(&(htype | (2u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 18)).to_le_bytes()[..4]);
-        }
-        _ => {
-            let lhc = htype | (3u32 << 2) | ((regen as u32) << 4) | ((comp as u32) << 22);
-            out.extend_from_slice(&lhc.to_le_bytes()[..4]);
-            out.push((comp >> 10) as u8);
-        }
-    }
-    out.extend_from_slice(&streams);
-    Some(out)
-}
-
 fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
     // Count frequencies
     let mut counts = [0u32; 256];
@@ -1776,120 +1713,6 @@ fn encode_literals_raw(out: &mut Vec<u8>, literals: &[u8]) {
 /// Encode sequences with cross-block Repeat mode support.
 /// If the current block's symbol distribution matches the previous block, use Repeat mode
 /// (no table header needed). Otherwise choose best of Predefined/RLE/Custom FSE.
-fn encode_sequences_section_with_reuse(
-    out: &mut Vec<u8>,
-    sequences: &[EncodedSequence],
-    prev_ll: &mut Option<SeqTableMode>,
-    prev_of: &mut Option<SeqTableMode>,
-    prev_ml: &mut Option<SeqTableMode>,
-) {
-    // Encode without reuse first
-    let mut no_reuse = Vec::new();
-    encode_sequences_section(&mut no_reuse, sequences);
-
-    // Try encoding with Repeat mode if previous tables exist
-    if prev_ll.is_some() || prev_of.is_some() || prev_ml.is_some() {
-        let mut with_reuse = Vec::new();
-        encode_sequences_section_repeat(&mut with_reuse, sequences, prev_ll, prev_of, prev_ml);
-
-        if with_reuse.len() < no_reuse.len() {
-            out.extend_from_slice(&with_reuse);
-            return;
-        }
-    }
-
-    out.extend_from_slice(&no_reuse);
-    update_prev_modes(sequences, prev_ll, prev_of, prev_ml);
-}
-
-/// Encode sequences using Repeat mode for all three tables.
-fn encode_sequences_section_repeat(
-    out: &mut Vec<u8>,
-    sequences: &[EncodedSequence],
-    prev_ll: &Option<SeqTableMode>,
-    prev_of: &Option<SeqTableMode>,
-    prev_ml: &Option<SeqTableMode>,
-) {
-    let nb_seq = sequences.len();
-    if nb_seq < 128 { out.push(nb_seq as u8); }
-    else if nb_seq < 0x7F00 { out.push(((nb_seq >> 8) as u8) + 128); out.push(nb_seq as u8); }
-    else { out.push(255); out.extend_from_slice(&((nb_seq - 0x7F00) as u16).to_le_bytes()); }
-    if nb_seq == 0 { return; }
-
-    let mut ll_codes_v = Vec::with_capacity(nb_seq);
-    let mut ml_codes_v = Vec::with_capacity(nb_seq);
-    let mut off_codes_v = Vec::with_capacity(nb_seq);
-    let mut ll_values = Vec::with_capacity(nb_seq);
-    let mut ml_values = Vec::with_capacity(nb_seq);
-    let mut off_values = Vec::with_capacity(nb_seq);
-
-    for seq in sequences {
-        let llc = ll_code(seq.ll);
-        let mlc = ml_code(seq.ml - ZSTD_MINMATCH as u32);
-        let ofc = off_code(seq.of_value);
-        ll_codes_v.push(llc);
-        ml_codes_v.push(mlc);
-        off_codes_v.push(ofc);
-        ll_values.push(seq.ll - LL_BASE[llc as usize]);
-        ml_values.push(seq.ml - ML_BASE[mlc as usize]);
-        off_values.push(if ofc > 0 { seq.of_value - (1u32 << ofc) } else { 0 });
-    }
-
-    // Use Repeat for tables that have a previous mode, otherwise use best fresh mode
-    let ll_mode = if can_repeat(&ll_codes_v, prev_ll) { SeqTableMode::Repeat }
-        else { choose_seq_mode(&ll_codes_v, MAX_LL, LL_DEFAULT_NORM_LOG, &LL_DEFAULT_NORM, LL_FSE_LOG) };
-    let of_mode = if can_repeat(&off_codes_v, prev_of) { SeqTableMode::Repeat }
-        else { choose_seq_mode(&off_codes_v, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG, &OF_DEFAULT_NORM, OFF_FSE_LOG) };
-    let ml_mode = if can_repeat(&ml_codes_v, prev_ml) { SeqTableMode::Repeat }
-        else { choose_seq_mode(&ml_codes_v, MAX_ML, ML_DEFAULT_NORM_LOG, &ML_DEFAULT_NORM, ML_FSE_LOG) };
-
-    let mode_byte = (ll_mode.tag() << 6) | (of_mode.tag() << 4) | (ml_mode.tag() << 2);
-    out.push(mode_byte);
-
-    let ll_table = write_seq_table_and_build(out, &ll_mode, prev_ll, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-    let of_table = write_seq_table_and_build(out, &of_mode, prev_of, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
-    let ml_table = write_seq_table_and_build(out, &ml_mode, prev_ml, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
-
-    let bitstream = super::fse::encode_sequences(
-        &ll_table, &of_table, &ml_table,
-        &ll_codes_v, &off_codes_v, &ml_codes_v,
-        &ll_values, &ml_values, &off_values,
-    );
-    out.extend_from_slice(&bitstream);
-}
-
-fn can_repeat(codes: &[u8], prev: &Option<SeqTableMode>) -> bool {
-    let Some(prev_mode) = prev else { return false; };
-    match prev_mode {
-        SeqTableMode::Rle(sym) => codes.iter().all(|&c| c == *sym),
-        SeqTableMode::Fse { norm, max_symbol, .. } => {
-            codes.iter().all(|&c| (c as usize) <= *max_symbol && norm[c as usize] != 0)
-        }
-        SeqTableMode::Predefined => true, // predefined always valid for standard codes
-        SeqTableMode::Repeat => false,
-    }
-}
-
-fn update_prev_modes(
-    sequences: &[EncodedSequence],
-    prev_ll: &mut Option<SeqTableMode>,
-    prev_of: &mut Option<SeqTableMode>,
-    prev_ml: &mut Option<SeqTableMode>,
-) {
-    if sequences.is_empty() { return; }
-    let mut ll_codes = Vec::with_capacity(sequences.len());
-    let mut of_codes = Vec::with_capacity(sequences.len());
-    let mut ml_codes = Vec::with_capacity(sequences.len());
-    for seq in sequences {
-        ll_codes.push(ll_code(seq.ll));
-        ml_codes.push(ml_code(seq.ml - ZSTD_MINMATCH as u32));
-        of_codes.push(off_code(seq.of_value));
-    }
-    *prev_ll = Some(choose_seq_mode(&ll_codes, MAX_LL, LL_DEFAULT_NORM_LOG, &LL_DEFAULT_NORM, LL_FSE_LOG));
-    *prev_of = Some(choose_seq_mode(&of_codes, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG, &OF_DEFAULT_NORM, OFF_FSE_LOG));
-    *prev_ml = Some(choose_seq_mode(&ml_codes, MAX_ML, ML_DEFAULT_NORM_LOG, &ML_DEFAULT_NORM, ML_FSE_LOG));
-}
-
 fn encode_sequences_section(out: &mut Vec<u8>, sequences: &[EncodedSequence]) {
     let nb_seq = sequences.len();
 
@@ -1944,10 +1767,9 @@ fn encode_sequences_section(out: &mut Vec<u8>, sequences: &[EncodedSequence]) {
     out.push(mode_byte);
 
     // Write table descriptions for non-predefined modes, then build tables
-    let no_prev = None;
-    let ll_table = write_seq_table_and_build(out, &ll_mode, &no_prev, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-    let of_table = write_seq_table_and_build(out, &of_mode, &no_prev, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
-    let ml_table = write_seq_table_and_build(out, &ml_mode, &no_prev, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+    let ll_table = write_seq_table_and_build(out, &ll_mode, &LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+    let of_table = write_seq_table_and_build(out, &of_mode, &OF_DEFAULT_NORM, OF_DEFAULT_NORM.len() - 1, OF_DEFAULT_NORM_LOG);
+    let ml_table = write_seq_table_and_build(out, &ml_mode, &ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
 
     // Encode with FSE sequence encoder
     let bitstream = super::fse::encode_sequences(
@@ -1978,7 +1800,6 @@ enum SeqTableMode {
         table_log: u32,
         header_bytes: Vec<u8>,
     },
-    Repeat, // Reuse previous block's table (no header written)
 }
 
 impl SeqTableMode {
@@ -1987,7 +1808,6 @@ impl SeqTableMode {
             SeqTableMode::Predefined => SEQ_MODE_PREDEFINED,
             SeqTableMode::Rle(_) => SEQ_MODE_RLE,
             SeqTableMode::Fse { .. } => SEQ_MODE_FSE,
-            SeqTableMode::Repeat => SEQ_MODE_REPEAT,
         }
     }
 }
@@ -2329,7 +2149,6 @@ fn choose_seq_mode(
 fn write_seq_table_and_build(
     out: &mut Vec<u8>,
     mode: &SeqTableMode,
-    prev_mode: &Option<SeqTableMode>,
     default_norm: &[i16],
     default_max_symbol: usize,
     default_log: u32,
@@ -2350,19 +2169,6 @@ fn write_seq_table_and_build(
         } => {
             out.extend_from_slice(header_bytes);
             super::fse::FseCTable::build(norm, *max_symbol, *table_log)
-        }
-        SeqTableMode::Repeat => {
-            // No header written. Rebuild table from previous block's mode.
-            match prev_mode {
-                Some(SeqTableMode::Predefined) => {
-                    super::fse::FseCTable::build(default_norm, default_max_symbol, default_log)
-                }
-                Some(SeqTableMode::Rle(sym)) => super::fse::FseCTable::build_rle(*sym),
-                Some(SeqTableMode::Fse { norm, max_symbol, table_log, .. }) => {
-                    super::fse::FseCTable::build(norm, *max_symbol, *table_log)
-                }
-                _ => super::fse::FseCTable::build(default_norm, default_max_symbol, default_log),
-            }
         }
     }
 }

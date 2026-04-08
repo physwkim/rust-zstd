@@ -93,46 +93,6 @@ pub fn decode_huf_weights_from_fse(source: &[u8], header: u8) -> Result<Vec<u8>,
 
 /// Decode a Huffman tree description and reconstruct canonical codes.
 /// Returns codes array matching compress.rs format: [(code, nbits); 256].
-pub fn decode_huffman_tree_for_verify(tree_desc: &[u8], max_sym: usize) -> Option<[(u32, u8); 256]> {
-    let mut ht = HuffmanTable::new();
-    // tree_desc is the raw tree description without the header byte for Treeless
-    // We need to feed it as if it were a complete header: header byte = tree_desc content
-    // Actually, tree_desc is exactly what encode_huffman_tree produces,
-    // which starts with the header byte (either direct mode or FSE mode).
-    if ht.read_weights(tree_desc).is_err() { return None; }
-    if ht.build_decoder(tree_desc).is_err() { return None; }
-
-    // Reconstruct canonical codes from the decode table
-    let max_bits = ht.max_num_bits;
-    if max_bits == 0 { return None; }
-
-    // Count symbols per rank (same as compress.rs)
-    let mut nb_per_rank = [0u32; 16];
-    for &b in &ht.bits { if b > 0 { nb_per_rank[b as usize] += 1; } }
-
-    // zstd-style canonical code generation (same as compress.rs)
-    let mut rank_indexes = [0u32; 16];
-    rank_indexes[max_bits as usize] = 0;
-    for bits in (1..=max_bits as usize).rev() {
-        rank_indexes[bits - 1] = rank_indexes[bits]
-            + nb_per_rank[bits] * (1u32 << (max_bits as usize - bits));
-    }
-    let mut next_code = [0u32; 16];
-    for bits in 1..=max_bits as usize {
-        next_code[bits] = rank_indexes[bits] >> (max_bits as usize - bits);
-    }
-    let mut codes = [(0u32, 0u8); 256];
-    for s in 0..=max_sym {
-        if s < ht.bits.len() && ht.bits[s] > 0 {
-            codes[s] = (next_code[ht.bits[s] as usize], ht.bits[s]);
-            next_code[ht.bits[s] as usize] += 1;
-        }
-    }
-    Some(codes)
-}
-
-/// Parse FSE normalized probabilities from encoded header bytes.
-/// Returns (accuracy_log, probabilities, bytes_consumed).
 pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usize), String> {
     let mut table = FSETable::new(255);
     let bytes = table.read_probabilities(source, max_log)?;
