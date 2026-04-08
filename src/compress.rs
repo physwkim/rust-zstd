@@ -125,6 +125,7 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
     }
 
     // Encode each block's content (literals + sequences) — parallelizable
+    #[cfg(feature = "parallel")]
     let encode_block_content = |bi: usize| -> (Vec<u8>, Vec<u8>) {
         let (s_start, s_end, d_end) = block_ranges[bi];
         let block_seqs = &all_encoded[s_start..s_end];
@@ -164,15 +165,93 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         (block, block_data.to_vec())
     };
 
-    // Encode blocks — parallel when feature enabled
+    // Encode blocks
+    // Parallel: blocks encoded independently (no Treeless)
+    // Sequential: blocks encoded with Treeless reuse from previous block
     #[cfg(feature = "parallel")]
     let encoded_blocks: Vec<(Vec<u8>, Vec<u8>)> = {
         use rayon::prelude::*;
-        (0..n_blocks).into_par_iter().map(encode_block_content).collect()
+        (0..n_blocks).into_par_iter().map(&encode_block_content).collect()
     };
+
     #[cfg(not(feature = "parallel"))]
     let encoded_blocks: Vec<(Vec<u8>, Vec<u8>)> = {
-        (0..n_blocks).map(encode_block_content).collect()
+        let mut prev_huf: Option<([(u32, u8); 256], u8)> = None;
+        let mut results = Vec::with_capacity(n_blocks);
+        for bi in 0..n_blocks {
+            let (s_start, s_end, d_end) = block_ranges[bi];
+            let block_seqs = &all_encoded[s_start..s_end];
+            let raw_seqs = &all_sequences[s_start..s_end];
+            let d_start = d_starts[bi];
+            let block_data = &data[d_start..d_end];
+
+            if block_seqs.is_empty() {
+                results.push((vec![], block_data.to_vec()));
+                continue;
+            }
+
+            let mut literals = Vec::with_capacity(block_data.len());
+            let mut pos = 0usize;
+            for seq in raw_seqs {
+                literals.extend_from_slice(&block_data[pos..pos + seq.ll as usize]);
+                pos += seq.ll as usize + seq.ml as usize;
+            }
+            literals.extend_from_slice(&block_data[pos..]);
+
+            let mut block = Vec::with_capacity(block_data.len());
+            let mut used_huf = false;
+
+            if !literals.is_empty() && literals.iter().all(|&b| b == literals[0]) {
+                encode_literals_rle(&mut block, literals[0], literals.len());
+                used_huf = true;
+            } else if literals.len() >= 64 {
+                let new_result = encode_literals_huffman(&literals);
+
+                // Treeless: reuse previous Huffman tree if it covers all symbols
+                let treeless_result = if let Some((prev_codes, _)) = &prev_huf {
+                    if literals.iter().all(|&b| prev_codes[b as usize].1 > 0) {
+                        encode_literals_treeless(&literals, prev_codes)
+                    } else { None }
+                } else { None };
+
+                let mut used_treeless = false;
+                match (&new_result, &treeless_result) {
+                    (Some(_), Some(te)) if te.len() <= new_result.as_ref().unwrap().len() && te.len() < literals.len() => {
+                        block.extend_from_slice(te);
+                        used_huf = true;
+                        used_treeless = true;
+                    }
+                    (Some(ne), _) if ne.len() < literals.len() => {
+                        block.extend_from_slice(ne);
+                        used_huf = true;
+                    }
+                    (None, Some(te)) if te.len() < literals.len() => {
+                        block.extend_from_slice(te);
+                        used_huf = true;
+                        used_treeless = true;
+                    }
+                    _ => {}
+                }
+
+                // Update prev_huf ONLY when a NEW tree was used (Compressed, not Treeless).
+                // When Treeless is used, the decoder keeps the previous tree — so must we.
+                if used_huf && !used_treeless {
+                    let mut counts = [0u32; 256];
+                    let mut ms = 0u8;
+                    for &b in &literals { counts[b as usize] += 1; if b > ms { ms = b; } }
+                    if let Some((codes, mb)) = build_huffman_codes(&counts, ms as usize) {
+                        prev_huf = Some((codes, mb));
+                    }
+                }
+            }
+
+            if !used_huf {
+                encode_literals_raw(&mut block, &literals);
+            }
+            encode_sequences_section(&mut block, block_seqs);
+            results.push((block, block_data.to_vec()));
+        }
+        results
     };
 
     // Write blocks to output (sequential — must maintain order)
@@ -1052,6 +1131,29 @@ fn hash4(data: &[u8], mask: u32) -> usize {
 
 /// Build codes for Treeless reuse. Roundtrip-verifies through encode_huffman_tree
 /// + decode to ensure encoder codes exactly match what decoder reconstructs.
+/// Encode literals using a previous Huffman tree (Treeless_Literals_Block, type=3).
+#[cfg(not(feature = "parallel"))]
+fn encode_literals_treeless(literals: &[u8], prev_codes: &[(u32, u8); 256]) -> Option<Vec<u8>> {
+    let use_4 = literals.len() >= 1024;
+    let streams = if use_4 { encode_huf_4streams(literals, prev_codes) }
+    else { encode_huf_1stream(literals, prev_codes) };
+    let regen = literals.len();
+    let comp = streams.len();
+    if comp >= regen { return None; }
+    let lh_size = 3 + (regen >= 1024) as usize + (regen >= 16384) as usize;
+    let mut out = Vec::with_capacity(lh_size + comp);
+    let htype = LIT_TYPE_TREELESS as u32;
+    match lh_size {
+        3 => { let sf = if use_4 { 1u32 } else { 0 };
+            out.extend_from_slice(&(htype|(sf<<2)|((regen as u32)<<4)|((comp as u32)<<14)).to_le_bytes()[..3]); }
+        4 => out.extend_from_slice(&(htype|(2u32<<2)|((regen as u32)<<4)|((comp as u32)<<18)).to_le_bytes()[..4]),
+        _ => { let v = htype|(3u32<<2)|((regen as u32)<<4)|((comp as u32)<<22);
+            out.extend_from_slice(&v.to_le_bytes()[..4]); out.push((comp >> 10) as u8); }
+    }
+    out.extend_from_slice(&streams);
+    Some(out)
+}
+
 fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
     // Count frequencies
     let mut counts = [0u32; 256];
