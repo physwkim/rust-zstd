@@ -1427,7 +1427,7 @@ fn encode_literals_huffman(literals: &[u8]) -> Option<Vec<u8>> {
 /// 2. Build binary Huffman tree (two-queue merge)
 /// 3. Enforce max depth via HUF_setMaxHeight
 /// 4. Generate canonical codes using C zstd's min >>= 1 algorithm
-fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8); 256], u8)> {
+pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8); 256], u8)> {
     const MAX_BITS: u8 = 11;
 
     // Collect and sort symbols descending by count
@@ -1525,22 +1525,102 @@ fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32, u8
         }
     }
 
-    // --- Step 3: Build canonical codes (C zstd's min >>= 1 algorithm) ---
+    // --- Verify and fix Kraft inequality ---
+    // sum of 2^(max_bits - nbits) for all symbols must equal 2^max_bits
     let mut lengths = [0u8; 256];
     for i in 0..n { lengths[syms[i].1 as usize] = node_nbits[i]; }
 
     let max_bits = *lengths.iter().max().unwrap_or(&0);
     if max_bits == 0 { return None; }
 
+    let target = 1u64 << max_bits;
+    let mut kraft: u64 = (0..=max_sym)
+        .filter(|&s| lengths[s] > 0)
+        .map(|s| 1u64 << (max_bits - lengths[s]))
+        .sum();
+
+    // Fix under-full: shorten least-frequent symbols with longest codes
+    let mut iters = 0;
+    while kraft < target && iters < 512 {
+        // Find symbol with longest code (most bits) and least frequency
+        let mut best_i = None;
+        let mut best_len = 0u8;
+        for i in 0..n {
+            let s = syms[i].1 as usize;
+            if lengths[s] > 1 && lengths[s] >= best_len {
+                if lengths[s] > best_len || best_i.is_none() {
+                    best_len = lengths[s];
+                    best_i = Some(s);
+                }
+            }
+        }
+        let Some(s) = best_i else { break };
+        let delta = (1u64 << (max_bits - lengths[s] + 1)) - (1u64 << (max_bits - lengths[s]));
+        if kraft + delta <= target {
+            kraft += delta;
+            lengths[s] -= 1;
+        } else {
+            break;
+        }
+        iters += 1;
+    }
+
+    // Fix over-full: lengthen most-frequent symbols with shortest codes
+    while kraft > target && iters < 1024 {
+        let mut best_i = None;
+        let mut best_len = MAX_BITS;
+        for i in 0..n {
+            let s = syms[i].1 as usize;
+            if lengths[s] > 0 && lengths[s] < MAX_BITS && lengths[s] <= best_len {
+                if lengths[s] < best_len || best_i.is_none() {
+                    best_len = lengths[s];
+                    best_i = Some(s);
+                }
+            }
+        }
+        let Some(s) = best_i else { break };
+        let delta = (1u64 << (max_bits - lengths[s])) - (1u64 << (max_bits - lengths[s] - 1));
+        kraft -= delta;
+        lengths[s] += 1;
+        iters += 1;
+    }
+
+    if kraft != target { return None; }
+
+    // Verify weight sum is valid for Huffman tree description:
+    // sum of 2^(weight-1) for all active symbols must leave a valid leftover
+    // (the leftover = 2^max_bits - weight_sum must be a power of 2)
+    {
+        let ws: u64 = (0..=max_sym)
+            .filter(|&s| lengths[s] > 0)
+            .map(|s| 1u64 << (max_bits + 1 - lengths[s] - 1))
+            .sum();
+        let np2 = ws.next_power_of_two();
+        let leftover = np2 - ws;
+        if !leftover.is_power_of_two() || leftover == 0 {
+            return None; // tree can't be described with implicit last weight
+        }
+    }
+
     // Count symbols per rank
     let mut nb_per_rank = [0u32; 16];
     for &l in &lengths { if l > 0 { nb_per_rank[l as usize] += 1; } }
 
-    // Standard canonical code generation (deflate-style):
-    // next_code[bits] = (next_code[bits-1] + bl_count[bits-1]) << 1
+    // zstd-style canonical code generation:
+    // rank_indexes[max_bits] = 0 (longest codes first in decode table)
+    // rank_indexes[bits-1] = rank_indexes[bits] + nb_per_rank[bits] * (1 << (max_bits - bits))
+    // Code for symbol = rank_indexes[bits] / (1 << (max_bits - bits))
+    let mut rank_indexes = [0u32; 16];
+    rank_indexes[max_bits as usize] = 0;
+    for bits in (1..max_bits as usize).rev() {
+        rank_indexes[bits] = rank_indexes[bits + 1]
+            + nb_per_rank[bits + 1] * (1u32 << (max_bits as usize - bits - 1));
+    }
+
+    // Assign codes: within each bit length, symbols get consecutive codes
     let mut next_code = [0u32; 16];
     for bits in 1..=max_bits as usize {
-        next_code[bits] = (next_code[bits - 1] + nb_per_rank[bits - 1]) << 1;
+        next_code[bits] = rank_indexes[bits] >> (max_bits as usize - bits);
     }
 
     let mut codes = [(0u32, 0u8); 256];
