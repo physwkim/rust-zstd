@@ -6,7 +6,6 @@ pub mod compress;
 pub mod constants;
 pub mod decode;
 pub mod fse;
-pub mod huf;
 
 pub use compress::{compress, compress_to_vec};
 pub use decode::decompress;
