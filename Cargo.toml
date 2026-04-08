@@ -3,7 +3,11 @@ name = "zstd-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Rust Zstandard codec — compress + decompress, zero external dependencies"
-license = "BSD-3-Clause"
+license = "BSD-3-Clause AND MIT"
+repository = "https://github.com/physwkim/rust-zstd"
+readme = "README.md"
+keywords = ["zstd", "zstandard", "compression", "decompression", "lz77"]
+categories = ["compression"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
