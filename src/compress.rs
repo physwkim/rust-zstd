@@ -1546,6 +1546,17 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
             }
 
             // Promote the symbol: increase its nbBits by 1
+            let repay = 1i32 << (n_bits_to_decrease - 1);
+            if repay > total_cost && n_bits_to_decrease > 1 {
+                // Would overshoot — try smaller rank
+                n_bits_to_decrease = 1;
+                while n_bits_to_decrease as usize <= 14
+                    && rank_last[n_bits_to_decrease as usize] == NO_SYMBOL
+                { n_bits_to_decrease += 1; }
+                if n_bits_to_decrease as usize > 14 || rank_last[n_bits_to_decrease as usize] == NO_SYMBOL {
+                    break;
+                }
+            }
             total_cost -= 1i32 << (n_bits_to_decrease - 1);
             let pos = rank_last[n_bits_to_decrease as usize] as usize;
             node_nbits[pos] += 1;
@@ -1599,21 +1610,14 @@ pub fn build_huffman_codes(counts: &[u32; 256], max_sym: usize) -> Option<([(u32
     // Verify Kraft inequality: sum of 2^(max-len) must equal 2^max
     let kraft: u64 = (0..=max_sym).filter(|&s| lengths[s] > 0)
         .map(|s| 1u64 << (max_bits - lengths[s])).sum();
-    if kraft != (1u64 << max_bits) { return None; }
-
-    // Verify weight-sum: leftover must be power of 2 (for implicit last weight)
-    // weight = max_bits + 1 - nbits; weight_sum = sum of 2^(weight-1) for active symbols
-    // Decoder computes last_weight from: 2^last_weight_minus_1 = next_p2(weight_sum) - weight_sum
-    // This must be a power of 2.
-    {
-        let ws: u64 = (0..=max_sym).filter(|&s| lengths[s] > 0)
-            .map(|s| 1u64 << (max_bits + 1 - lengths[s] - 1)).sum();
-        let np2 = ws.next_power_of_two();
-        let leftover = np2 - ws;
-        if leftover == 0 || !leftover.is_power_of_two() {
-            return None;
-        }
+    if kraft != (1u64 << max_bits) {
+        return None;
     }
+
+    // Weight-sum is automatically valid when Kraft is valid:
+    // encode_huffman_tree pops the last non-zero weight, and the remaining
+    // weight_sum = kraft_sum - 2^(last_weight-1) = 2^max - 2^k, which
+    // leaves a valid power-of-2 leftover for the implicit last weight.
 
     // Count symbols per rank
     let mut nb_per_rank = [0u32; 16];
