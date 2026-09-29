@@ -108,25 +108,21 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// Supports one or more concatenated zstd frames. Skippable frames are skipped.
 /// Dictionary frames are not supported.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut cursor = std::io::Cursor::new(data);
     let mut output = Vec::new();
-    let mut decoder = FrameDecoder::new();
+    let mut scratch: Option<DecoderScratch> = None;
+    let mut pos = 0usize;
 
-    loop {
-        // Check if we have consumed all the data
-        if cursor.position() as usize >= data.len() {
-            break;
-        }
-
-        match decoder.reset(&mut cursor) {
-            Ok(()) => {}
+    while pos < data.len() {
+        let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
+            Ok(parsed) => parsed,
             Err(e) => {
                 if let Some(skip_len) = e.skip_frame_length() {
-                    let new_pos = cursor.position() + skip_len as u64;
-                    if new_pos as usize > data.len() {
-                        return Err("Skippable frame extends past end of input".to_string());
-                    }
-                    cursor.set_position(new_pos);
+                    let end = pos
+                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
+                        .and_then(|p| p.checked_add(skip_len as usize))
+                        .filter(|&end| end <= data.len())
+                        .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
+                    pos = end;
                     continue;
                 }
                 // If we already have output and hit an error, it might just be trailing data
@@ -135,15 +131,20 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
                 }
                 return Err(format!("Frame header error: {}", e));
             }
+        };
+        pos += header_len;
+
+        let window_size = frame_header.window_size()?;
+        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
+            return Err(format!(
+                "Window size {} exceeds maximum allowed {}",
+                window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
+            ));
         }
 
-        // Decode all blocks in this frame
-        decoder.decode_all_blocks(&mut cursor)?;
-
-        // Collect the output
-        if let Some(mut collected) = decoder.collect() {
-            output.append(&mut collected);
-        }
+        let scratch = scratch.get_or_insert_with(DecoderScratch::new);
+        scratch.reset();
+        decode_frame(&frame_header, data, &mut pos, scratch, &mut output)?;
     }
 
     Ok(output)
@@ -1513,12 +1514,9 @@ struct FSEScratch {
 struct DecoderScratch {
     huf: HuffmanScratch,
     fse: FSEScratch,
-    /// Decoded output of the current frame; matches reference into it.
-    buffer: Vec<u8>,
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
-    block_content_buffer: Vec<u8>,
 }
 
 impl DecoderScratch {
@@ -1532,9 +1530,7 @@ impl DecoderScratch {
                 literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             },
-            buffer: Vec::new(),
             offset_hist: [1, 4, 8],
-            block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
         }
     }
@@ -1542,8 +1538,6 @@ impl DecoderScratch {
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.block_content_buffer.clear();
-        self.buffer.clear();
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
@@ -1604,13 +1598,14 @@ impl FrameDescriptor {
 struct FrameHeader {
     descriptor: FrameDescriptor,
     window_descriptor: u8,
-    frame_content_size: u64,
+    /// Frame_Content_Size, or None when the header omits it.
+    frame_content_size: Option<u64>,
 }
 
 impl FrameHeader {
     fn window_size(&self) -> Result<u64, String> {
         if self.descriptor.single_segment_flag() {
-            Ok(self.frame_content_size)
+            Ok(self.frame_content_size.unwrap_or(0))
         } else {
             let exp = self.window_descriptor >> 3;
             let mantissa = self.window_descriptor & 0x7;
@@ -1631,7 +1626,7 @@ impl FrameHeader {
         }
     }
 
-    fn frame_content_size(&self) -> u64 {
+    fn frame_content_size(&self) -> Option<u64> {
         self.frame_content_size
     }
 }
@@ -1672,22 +1667,27 @@ impl std::fmt::Display for FrameDecoderError {
 }
 
 // ============================================================
-// Frame header reading
+// Frame header parsing
 // ============================================================
 
-fn read_frame_header(r: &mut dyn std::io::Read) -> Result<(FrameHeader, u8), FrameDecoderError> {
-    let mut buf = [0u8; 4];
+/// Magic number plus Frame_Size of a skippable frame.
+const SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
 
-    r.read_exact(&mut buf)
-        .map_err(|e| FrameDecoderError::new(format!("Error reading magic number: {}", e)))?;
-    let mut bytes_read: usize = 4;
-    let magic_num = u32::from_le_bytes(buf);
+fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderError> {
+    let magic_num = src
+        .get(..4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| FrameDecoderError::new("Error reading magic number: truncated".into()))?;
+    let mut pos = 4;
 
     // Skippable frames
     if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
-        r.read_exact(&mut buf)
-            .map_err(|e| FrameDecoderError::new(format!("Error reading skip frame size: {}", e)))?;
-        let skip_size = u32::from_le_bytes(buf);
+        let skip_size = src
+            .get(4..8)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| {
+                FrameDecoderError::new("Error reading skip frame size: truncated".into())
+            })?;
         return Err(FrameDecoderError::skip(skip_size));
     }
 
@@ -1698,65 +1698,64 @@ fn read_frame_header(r: &mut dyn std::io::Read) -> Result<(FrameHeader, u8), Fra
         )));
     }
 
-    r.read_exact(&mut buf[0..1])
-        .map_err(|e| FrameDecoderError::new(format!("Error reading frame descriptor: {}", e)))?;
-    let desc = FrameDescriptor(buf[0]);
-    bytes_read += 1;
+    let desc = FrameDescriptor(*src.get(pos).ok_or_else(|| {
+        FrameDecoderError::new("Error reading frame descriptor: truncated".into())
+    })?);
+    pos += 1;
 
     let mut frame_header = FrameHeader {
         descriptor: FrameDescriptor(desc.0),
-        frame_content_size: 0,
+        frame_content_size: None,
         window_descriptor: 0,
     };
 
     if !desc.single_segment_flag() {
-        r.read_exact(&mut buf[0..1]).map_err(|e| {
-            FrameDecoderError::new(format!("Error reading window descriptor: {}", e))
+        frame_header.window_descriptor = *src.get(pos).ok_or_else(|| {
+            FrameDecoderError::new("Error reading window descriptor: truncated".into())
         })?;
-        frame_header.window_descriptor = buf[0];
-        bytes_read += 1;
+        pos += 1;
     }
 
+    // We don't support dictionaries, but we still need to skip these bytes
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
-    if dict_id_len != 0 {
-        let buf = &mut buf[..dict_id_len];
-        r.read_exact(buf)
-            .map_err(|e| FrameDecoderError::new(format!("Error reading dictionary id: {}", e)))?;
-        bytes_read += dict_id_len;
-        // We don't support dictionaries, but we still need to skip these bytes
+    if src.len() < pos + dict_id_len {
+        return Err(FrameDecoderError::new(
+            "Error reading dictionary id: truncated".into(),
+        ));
     }
+    pos += dict_id_len;
 
     let fcs_len = desc
         .frame_content_size_bytes()
         .map_err(FrameDecoderError::new)? as usize;
     if fcs_len != 0 {
-        let mut fcs_buf = [0u8; 8];
-        let fcs_buf = &mut fcs_buf[..fcs_len];
-        r.read_exact(fcs_buf).map_err(|e| {
-            FrameDecoderError::new(format!("Error reading frame content size: {}", e))
+        let fcs_bytes = src.get(pos..pos + fcs_len).ok_or_else(|| {
+            FrameDecoderError::new("Error reading frame content size: truncated".into())
         })?;
-        bytes_read += fcs_len;
+        pos += fcs_len;
         let mut fcs = 0u64;
-        for i in 0..fcs_len {
-            fcs += (fcs_buf[i] as u64) << (8 * i);
+        for (i, &b) in fcs_bytes.iter().enumerate() {
+            fcs += u64::from(b) << (8 * i);
         }
         if fcs_len == 2 {
             fcs += 256;
         }
-        frame_header.frame_content_size = fcs;
+        frame_header.frame_content_size = Some(fcs);
     }
 
-    Ok((frame_header, bytes_read as u8))
+    Ok((frame_header, pos))
 }
 
 // ============================================================
-// Block header reading
+// Block header parsing
 // ============================================================
 
-fn read_block_header(r: &mut dyn std::io::Read) -> Result<(BlockHeader, u8), String> {
-    let mut buf = [0u8; 3];
-    r.read_exact(&mut buf)
-        .map_err(|e| format!("Error reading block header: {}", e))?;
+fn parse_block_header(src: &[u8]) -> Result<(BlockHeader, usize), String> {
+    let buf: [u8; 3] = src
+        .get(..3)
+        .ok_or_else(|| "Error reading block header: truncated".to_string())?
+        .try_into()
+        .unwrap();
 
     let last_block = buf[0] & 0x1 == 1;
     let block_type_raw = (buf[0] >> 1) & 0x3;
@@ -2026,9 +2025,10 @@ fn build_sequence_table(
     }
 }
 
-/// Decode every sequence of the block and execute it straight into `out`.
+/// Decode every sequence of the block and execute it straight into `out`;
+/// matches may reach back no further than `prefix_start`.
 ///
-/// `literals` must hold `literals_len` decoded bytes followed by at least
+/// `literals` holds the block's decoded literals followed by exactly
 /// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
 /// plus slack up front so that all copies use fixed-size chunks and may
 /// overshoot; it is truncated to the real length on return.
@@ -2037,10 +2037,11 @@ fn decode_and_execute_sequences(
     bit_stream: &[u8],
     fse: &FSEScratch,
     literals: &[u8],
-    literals_len: usize,
     offset_hist: &mut [u32; 3],
+    prefix_start: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
     let base = out.len();
     let oend = base + MAX_BLOCK_SIZE as usize;
     out.resize(oend + WILDCOPY_OVERLENGTH, 0);
@@ -2052,6 +2053,7 @@ fn decode_and_execute_sequences(
         literals_len,
         offset_hist,
         out.as_mut_slice(),
+        prefix_start,
         base,
         oend,
     );
@@ -2076,6 +2078,7 @@ fn run_sequences(
     literals_len: usize,
     offset_hist: &mut [u32; 3],
     buf: &mut [u8],
+    prefix_start: usize,
     mut op: usize,
     oend: usize,
 ) -> Result<usize, String> {
@@ -2170,6 +2173,7 @@ fn run_sequences(
 
         op = exec_sequence(
             buf,
+            prefix_start,
             op,
             oend,
             literals,
@@ -2203,6 +2207,7 @@ fn run_sequences(
 #[allow(clippy::too_many_arguments)]
 fn exec_sequence(
     buf: &mut [u8],
+    prefix_start: usize,
     op: usize,
     oend: usize,
     literals: &[u8],
@@ -2233,10 +2238,11 @@ fn exec_sequence(
     }
     *lit_pos = lit_start + ll;
 
-    if offset > o_lit_end {
+    if offset > o_lit_end - prefix_start {
         return Err(format!(
-            "Offset {} exceeds buffer length {}",
-            offset, o_lit_end
+            "Offset {} exceeds decoded length {}",
+            offset,
+            o_lit_end - prefix_start
         ));
     }
     let mut src = o_lit_end - offset;
@@ -2370,77 +2376,79 @@ fn overlap_copy8(buf: &mut [u8], dst: &mut usize, src: &mut usize, offset: usize
 // Block decoder
 // ============================================================
 
-fn decode_block_content(
-    header: &BlockHeader,
-    workspace: &mut DecoderScratch,
-    source: &mut dyn std::io::Read,
-) -> Result<u64, String> {
-    match header.block_type {
-        BlockType::RLE => {
-            const BATCH_SIZE: usize = 512;
-            let mut buf = [0u8; BATCH_SIZE];
-            let full_reads = header.decompressed_size / BATCH_SIZE as u32;
-            let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
+/// Decode every block of one frame from `data[*pos..]` straight into
+/// `output`, then skip the checksum. Matches may only reach back to the
+/// frame's own start (ZSTD_decompressFrame).
+fn decode_frame(
+    header: &FrameHeader,
+    data: &[u8],
+    pos: &mut usize,
+    scratch: &mut DecoderScratch,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    let frame_base = output.len();
 
-            source
-                .read_exact(&mut buf[0..1])
-                .map_err(|e| format!("Error reading RLE byte: {}", e))?;
+    if let Some(fcs) = header.frame_content_size() {
+        // Room for the whole frame plus one block of copy slack, so that
+        // no block has to grow the buffer (and move everything decoded).
+        let want = usize::try_from(fcs)
+            .ok()
+            .and_then(|n| n.checked_add(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH))
+            .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
+        output
+            .try_reserve(want)
+            .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))?;
+    }
 
-            for i in 1..BATCH_SIZE {
-                buf[i] = buf[0];
+    loop {
+        let (block, header_len) = parse_block_header(&data[*pos..])?;
+        *pos += header_len;
+        let content = data
+            .get(*pos..*pos + block.content_size as usize)
+            .ok_or_else(|| "Block content extends past end of input".to_string())?;
+        *pos += content.len();
+
+        match block.block_type {
+            BlockType::Raw => output.extend_from_slice(content),
+            BlockType::RLE => {
+                output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
-
-            for _ in 0..full_reads {
-                workspace.buffer.extend_from_slice(&buf[..]);
-            }
-            let smaller = &buf[..single_read_size as usize];
-            workspace.buffer.extend_from_slice(smaller);
-
-            Ok(1)
+            BlockType::Compressed => decompress_block(content, scratch, frame_base, output)?,
+            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
-        BlockType::Raw => {
-            const BATCH_SIZE: usize = 128 * 1024;
-            let mut buf = [0u8; BATCH_SIZE];
-            let full_reads = header.decompressed_size / BATCH_SIZE as u32;
-            let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
 
-            for _ in 0..full_reads {
-                source
-                    .read_exact(&mut buf[..])
-                    .map_err(|e| format!("Error reading raw block: {}", e))?;
-                workspace.buffer.extend_from_slice(&buf[..]);
-            }
-
-            let smaller = &mut buf[..single_read_size as usize];
-            source
-                .read_exact(smaller)
-                .map_err(|e| format!("Error reading raw block: {}", e))?;
-            workspace.buffer.extend_from_slice(smaller);
-
-            Ok(u64::from(header.decompressed_size))
-        }
-        BlockType::Reserved => Err("Reserved block type encountered".to_string()),
-        BlockType::Compressed => {
-            decompress_block(header, workspace, source)?;
-            Ok(u64::from(header.content_size))
+        if block.last_block {
+            break;
         }
     }
+
+    // Skip the checksum if present; this decoder does not verify it.
+    if header.descriptor.content_checksum_flag() {
+        if data.len() - *pos < 4 {
+            return Err("Error reading checksum: truncated".to_string());
+        }
+        *pos += 4;
+    }
+
+    if let Some(fcs) = header.frame_content_size() {
+        let decoded = (output.len() - frame_base) as u64;
+        if decoded != fcs {
+            return Err(format!(
+                "Frame content size mismatch: header says {}, decoded {}",
+                fcs, decoded
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn decompress_block(
-    header: &BlockHeader,
+    raw: &[u8],
     workspace: &mut DecoderScratch,
-    source: &mut dyn std::io::Read,
+    frame_base: usize,
+    output: &mut Vec<u8>,
 ) -> Result<(), String> {
-    workspace
-        .block_content_buffer
-        .resize(header.content_size as usize, 0);
-
-    source
-        .read_exact(workspace.block_content_buffer.as_mut_slice())
-        .map_err(|e| format!("Error reading compressed block: {}", e))?;
-    let raw = workspace.block_content_buffer.as_slice();
-
+    let content_size = raw.len() as u32;
     let mut section = LiteralsSection::new();
     let bytes_in_literals_header = section.parse_from_header(raw)?;
     let raw = &raw[bytes_in_literals_header as usize..];
@@ -2494,7 +2502,7 @@ fn decompress_block(
             + bytes_used_in_literals_section
             + u32::from(bytes_in_sequence_header)
             + raw.len() as u32
-            == header.content_size
+            == content_size
     );
 
     if seq_section.num_sequences != 0 {
@@ -2504,9 +2512,9 @@ fn decompress_block(
             &raw[table_bytes..],
             &workspace.fse,
             &workspace.literals_buffer,
-            literals_len,
             &mut workspace.offset_hist,
-            &mut workspace.buffer,
+            frame_base,
+            output,
         )?;
     } else {
         if !raw.is_empty() {
@@ -2515,90 +2523,10 @@ fn decompress_block(
                 raw.len() as isize * 8
             ));
         }
-        workspace
-            .buffer
-            .extend_from_slice(&workspace.literals_buffer[..literals_len]);
+        output.extend_from_slice(&workspace.literals_buffer[..literals_len]);
     }
 
     Ok(())
-}
-
-// ============================================================
-// Frame Decoder (top-level)
-// ============================================================
-
-struct FrameDecoder {
-    scratch: Option<DecoderScratch>,
-    frame_header: Option<FrameHeader>,
-    frame_finished: bool,
-}
-
-impl FrameDecoder {
-    fn new() -> FrameDecoder {
-        FrameDecoder {
-            scratch: None,
-            frame_header: None,
-            frame_finished: false,
-        }
-    }
-
-    fn reset(&mut self, source: &mut dyn std::io::Read) -> Result<(), FrameDecoderError> {
-        let (frame_header, _header_size) = read_frame_header(source)?;
-        let window_size = frame_header.window_size().map_err(FrameDecoderError::new)?;
-
-        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-            return Err(FrameDecoderError::new(format!(
-                "Window size {} exceeds maximum allowed {}",
-                window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
-            )));
-        }
-
-        match &mut self.scratch {
-            Some(s) => s.reset(),
-            None => {
-                self.scratch = Some(DecoderScratch::new());
-            }
-        }
-
-        self.frame_header = Some(frame_header);
-        self.frame_finished = false;
-        Ok(())
-    }
-
-    fn decode_all_blocks(&mut self, source: &mut dyn std::io::Read) -> Result<(), String> {
-        let scratch = self
-            .scratch
-            .as_mut()
-            .ok_or_else(|| "Decoder not initialized".to_string())?;
-
-        loop {
-            let (block_header, _block_header_size) = read_block_header(source)?;
-
-            decode_block_content(&block_header, scratch, source)?;
-
-            if block_header.last_block {
-                self.frame_finished = true;
-
-                // Read and discard checksum if present
-                if let Some(ref fh) = self.frame_header {
-                    if fh.descriptor.content_checksum_flag() {
-                        let mut chksum = [0u8; 4];
-                        source
-                            .read_exact(&mut chksum)
-                            .map_err(|e| format!("Error reading checksum: {}", e))?;
-                        // We skip checksum verification in this simplified decoder
-                    }
-                }
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn collect(&mut self) -> Option<Vec<u8>> {
-        self.scratch.as_mut().map(|s| std::mem::take(&mut s.buffer))
-    }
 }
 
 #[cfg(test)]
