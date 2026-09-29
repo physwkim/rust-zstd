@@ -2025,6 +2025,25 @@ fn build_sequence_table(
     }
 }
 
+/// Why a sequence could not be executed; turned into a message only after
+/// the hot loop has exited.
+#[derive(Clone, Copy)]
+enum SeqError {
+    NotEnoughLiterals,
+    BlockTooLarge,
+    OffsetTooFar,
+}
+
+#[cold]
+#[inline(never)]
+fn seq_error_message(e: SeqError) -> String {
+    match e {
+        SeqError::NotEnoughLiterals => "Sequence needs more literals than the block has".into(),
+        SeqError::BlockTooLarge => "Block content exceeds block size limit".into(),
+        SeqError::OffsetTooFar => "Match offset reaches before the frame start".into(),
+    }
+}
+
 /// Decode every sequence of the block and execute it straight into `out`;
 /// matches may reach back no further than `prefix_start`.
 ///
@@ -2041,25 +2060,20 @@ fn decode_and_execute_sequences(
     prefix_start: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
     let base = out.len();
-    let oend = base + MAX_BLOCK_SIZE as usize;
-    out.resize(oend + WILDCOPY_OVERLENGTH, 0);
+    out.resize(base + MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH, 0);
     let result = run_sequences(
         num_sequences,
         bit_stream,
         fse,
         literals,
-        literals_len,
         offset_hist,
-        out.as_mut_slice(),
-        prefix_start,
-        base,
-        oend,
+        &mut out[prefix_start..],
+        base - prefix_start,
     );
     match result {
         Ok(end) => {
-            out.truncate(end);
+            out.truncate(prefix_start + end);
             Ok(())
         }
         Err(e) => {
@@ -2069,18 +2083,16 @@ fn decode_and_execute_sequences(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `buf` starts at the frame's first byte and ends `WILDCOPY_OVERLENGTH`
+/// bytes past the block's output limit; `op` is where this block starts.
 fn run_sequences(
     num_sequences: u32,
     bit_stream: &[u8],
     fse: &FSEScratch,
     literals: &[u8],
-    literals_len: usize,
     offset_hist: &mut [u32; 3],
     buf: &mut [u8],
-    prefix_start: usize,
     mut op: usize,
-    oend: usize,
 ) -> Result<usize, String> {
     let ll_dt = &fse.literal_lengths.decode[..];
     let of_dt = &fse.offsets.decode[..];
@@ -2088,6 +2100,8 @@ fn run_sequences(
     if ll_dt.is_empty() || of_dt.is_empty() || ml_dt.is_empty() {
         return Err("FSE table is uninitialized".to_string());
     }
+    let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
+    let oend = buf.len() - WILDCOPY_OVERLENGTH;
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
@@ -2171,18 +2185,8 @@ fn run_sequences(
             br.reload();
         }
 
-        op = exec_sequence(
-            buf,
-            prefix_start,
-            op,
-            oend,
-            literals,
-            literals_len,
-            &mut lit_pos,
-            ll,
-            ml,
-            offset,
-        )?;
+        op = exec_sequence(buf, op, literals, &mut lit_pos, ll, ml, offset)
+            .map_err(seq_error_message)?;
     }
 
     if !br.is_finished() {
@@ -2192,7 +2196,7 @@ fn run_sequences(
     // Last literals segment.
     let rest = literals_len - lit_pos;
     if op + rest > oend {
-        return Err("Block content exceeds block size limit".to_string());
+        return Err(seq_error_message(SeqError::BlockTooLarge));
     }
     buf[op..op + rest].copy_from_slice(&literals[lit_pos..literals_len]);
     op += rest;
@@ -2202,33 +2206,26 @@ fn run_sequences(
 }
 
 /// Copy `ll` literals then `ml` match bytes from `offset` back
-/// (ZSTD_execSequence). Returns the new output position.
+/// (ZSTD_execSequence). Returns the new output position. Both slices carry
+/// `WILDCOPY_OVERLENGTH` bytes of slack past their logical end.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn exec_sequence(
     buf: &mut [u8],
-    prefix_start: usize,
     op: usize,
-    oend: usize,
     literals: &[u8],
-    literals_len: usize,
     lit_pos: &mut usize,
     ll: usize,
     ml: usize,
     offset: usize,
-) -> Result<usize, String> {
+) -> Result<usize, SeqError> {
     let lit_start = *lit_pos;
     let o_lit_end = op + ll;
     let o_match_end = o_lit_end + ml;
-    if lit_start + ll > literals_len {
-        return Err(format!(
-            "Not enough literals for sequence: wanted {}, have {}",
-            lit_start + ll,
-            literals_len
-        ));
+    if lit_start + ll + WILDCOPY_OVERLENGTH > literals.len() {
+        return Err(SeqError::NotEnoughLiterals);
     }
-    if o_match_end > oend {
-        return Err("Block content exceeds block size limit".to_string());
+    if o_match_end + WILDCOPY_OVERLENGTH > buf.len() {
+        return Err(SeqError::BlockTooLarge);
     }
 
     // Literals: nearly always at most 16 bytes.
@@ -2238,12 +2235,8 @@ fn exec_sequence(
     }
     *lit_pos = lit_start + ll;
 
-    if offset > o_lit_end - prefix_start {
-        return Err(format!(
-            "Offset {} exceeds decoded length {}",
-            offset,
-            o_lit_end - prefix_start
-        ));
+    if offset > o_lit_end {
+        return Err(SeqError::OffsetTooFar);
     }
     let mut src = o_lit_end - offset;
     let mut dst = o_lit_end;
