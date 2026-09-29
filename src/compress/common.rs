@@ -104,6 +104,29 @@ pub fn prefetch(src: &[u8], pos: usize) {
     }
 }
 
+/// `PREFETCH_L1(src + pos)` without the bound check of [`prefetch`]: the
+/// hint never faults, so the address may lie outside `src`. Which of the
+/// two a search loop calls is a register-allocation matter (both sit in the
+/// once-per-128-positions step bump): dfast's loop keeps `src` and the step
+/// in registers only with this one, fast's loop only with [`prefetch`].
+#[inline(always)]
+pub fn prefetch_unbounded(src: &[u8], pos: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint that never faults, whatever the address;
+    // `wrapping_add` keeps the address computation defined when `pos` is
+    // outside `src`.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            src.as_ptr().wrapping_add(pos) as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        )
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (src, pos);
+    }
+}
+
 const PRIME4: u32 = 2654435761;
 const PRIME5: u64 = 889523592379;
 const PRIME6: u64 = 227718039650203;

@@ -9,8 +9,8 @@
 //! [`super::fast`].
 
 use super::common::{
-    byte, candidate_valid, count, hash_ptr, prefetch, read32, read64, tget, tset, HASH_READ_SIZE,
-    K_SEARCH_STRENGTH,
+    byte, candidate_valid, count, hash_ptr, prefetch_unbounded, read32, read64, tget, tset,
+    HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
@@ -206,8 +206,8 @@ fn compress_block_generic<const MLS: u32>(
                 }
 
                 if ip1 >= next_step {
-                    prefetch(src, ip1 + 64);
-                    prefetch(src, ip1 + 128);
+                    prefetch_unbounded(src, ip1 + 64);
+                    prefetch_unbounded(src, ip1 + 128);
                     step += 1;
                     next_step += K_STEP_INCR;
                 }
