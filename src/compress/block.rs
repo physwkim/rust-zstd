@@ -154,6 +154,10 @@ fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
 /// the nextToUpdate clamp, run the strategy's block compressor and store the
 /// trailing literals (`ZSTD_storeLastLiterals`). `rep` holds the committed
 /// repeat offsets on entry and the block's candidates on return.
+///
+/// Out of line so that every caller, tests/stage_bench.rs included, runs
+/// the one instantiation the frame writer runs.
+#[inline(never)]
 pub fn build_seq_store(
     ms: &mut MatchState,
     src: &[u8],
