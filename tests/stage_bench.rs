@@ -1,10 +1,12 @@
 //! Compressor stage split on the QA corpus: end-to-end `compress_with`
-//! against the block stage (`MatchState` setup, prefix load and
-//! `build_seq_store`), the literal stage (`compress_literals_with`) and the
-//! sequence stage (`encode_sequences_section_with`), each timed in place
-//! inside a replica of the driver's job and block loop whose output is
-//! checked byte for byte against the real frame. The remainder is driver
-//! overhead. Ignored by default; run pinned and in release:
+//! (fresh), the same frame through one reused [`Compressor`] (reuse), and
+//! libzstd 1.5.7 through a reused `ZSTD_CCtx` (C), against the block stage
+//! (`MatchState` setup, prefix load and `build_seq_store`), the literal
+//! stage (`compress_literals_with`) and the sequence stage
+//! (`encode_sequences_section_with`), each timed in place inside a replica
+//! of the driver's job and block loop whose output is checked byte for byte
+//! against the real frame. The remainder is driver overhead of the fresh
+//! path. Ignored by default; run pinned and in release:
 //!
 //! ```text
 //! taskset -c 3 cargo test --release --offline --test stage_bench -- --ignored --nocapture
@@ -18,7 +20,7 @@ use rust_zstd::compress::block::{
 };
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{
-    compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
+    compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions, Compressor,
 };
 use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
 use rust_zstd::{fse, huf};
@@ -148,8 +150,9 @@ fn stage_split() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ITERS);
     eprintln!(
-        "\n{:<13} {:>3} {:>4} {:>6} {:>9} {:>8} {:>7} {:>8} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5}",
-        "dataset", "L", "jobs", "blocks", "size", "e2e ms", "MB/s", "pass ms",
+        "\n{:<13} {:>3} {:>4} {:>6} {:>9} {:>9} | {:>8} {:>8} {:>6} {:>7} {:>6} {:>7} | {:>8} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5}",
+        "dataset", "L", "jobs", "blocks", "size", "C size",
+        "fresh ms", "reuse ms", "MB/s", "C ms", "MB/s", "reuse/C", "pass ms",
         "block ms", "%", "lits ms", "%", "seqs ms", "%", "rem ms", "%"
     );
     for file in FILES {
@@ -167,15 +170,30 @@ fn stage_split() {
                 job_size: None,
             };
             let cparams = CParams::for_level(level, data.len());
+            let mut cx = Compressor::new(opts.clone());
+            let mut czstd = zstd::bulk::Compressor::new(level).unwrap();
             let mut frame = Vec::new();
+            let mut c_frame = Vec::new();
             let mut e2e = Vec::with_capacity(iters);
+            let mut reuse = Vec::with_capacity(iters);
+            let mut c_e2e = Vec::with_capacity(iters);
             let mut runs = Vec::with_capacity(iters);
             let mut layout = Layout::default();
-            // Interleaved so that clock drift hits both sides alike.
+            // Interleaved so that clock drift hits every side alike.
             for _ in 0..iters {
                 let t = Instant::now();
                 frame = compress_with(&data, &opts);
                 e2e.push(t.elapsed());
+                let t = Instant::now();
+                let reused = cx.compress_to_vec(&data);
+                reuse.push(t.elapsed());
+                assert!(
+                    reused == frame,
+                    "{file} L{level}: reused Compressor diverged from compress_with"
+                );
+                let t = Instant::now();
+                c_frame = czstd.compress(&data).unwrap();
+                c_e2e.push(t.elapsed());
                 let mut st = Stages::default();
                 let blocks = stage_pass(&data, cparams, &mut st, &mut layout);
                 assert!(
@@ -185,16 +203,20 @@ fn stage_split() {
                 runs.push(st);
             }
             let e2e = median(e2e);
+            let reuse = median(reuse);
+            let c_e2e = median(c_e2e);
             let block = median(runs.iter().map(|s| s.block).collect());
             let lits = median(runs.iter().map(|s| s.lits).collect());
             let seqs = median(runs.iter().map(|s| s.seqs).collect());
             let pass = median(runs.iter().map(|s| s.pass).collect());
             let rem = e2e.as_secs_f64() - (block + lits + seqs).as_secs_f64();
             let pct = |d: f64| 100.0 * d / e2e.as_secs_f64();
+            let mbs = |d: Duration| data.len() as f64 / (1 << 20) as f64 / d.as_secs_f64();
             eprintln!(
-                "{:<13} {:>3} {:>4} {:>6} {:>9} {:>8.2} {:>7.1} {:>8.2} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1}",
-                file, level, layout.jobs, layout.blocks, frame.len(),
-                ms(e2e), data.len() as f64 / (1 << 20) as f64 / e2e.as_secs_f64(), ms(pass),
+                "{:<13} {:>3} {:>4} {:>6} {:>9} {:>9} | {:>8.2} {:>8.2} {:>6.1} {:>7.2} {:>6.1} {:>7.3} | {:>8.2} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1} | {:>8.2} {:>5.1}",
+                file, level, layout.jobs, layout.blocks, frame.len(), c_frame.len(),
+                ms(e2e), ms(reuse), mbs(reuse), ms(c_e2e), mbs(c_e2e),
+                reuse.as_secs_f64() / c_e2e.as_secs_f64(), ms(pass),
                 ms(block), pct(block.as_secs_f64()),
                 ms(lits), pct(lits.as_secs_f64()),
                 ms(seqs), pct(seqs.as_secs_f64()),
