@@ -153,20 +153,24 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
         };
         let mut current0;
 
+        // C tests `(MEM_read32(ip2) == rval) & (rep_offset1 > 0)`; with
+        // rep_offset1 == 0 rval is read at ip2 itself, so flipping one bit
+        // of it makes the same test fail without a second condition.
+        let rep_mask = (rep_offset1 == 0) as u32;
         // SAFETY: (I1) for every ip-derived read, (I2) for the candidate
         // reads inside match4_found, (I3) for `ip2 - rep_offset1` and the
         // bytes before it, (I4) for every table access.
         let found = unsafe {
             loop {
                 // load repcode match for ip[2]
-                let rval = read32(src, ip2 - rep_offset1 as usize);
+                let rval = read32(src, ip2 - rep_offset1 as usize) ^ rep_mask;
 
                 // write back hash table entry
                 current0 = ip0;
                 tset(hash_table, hash0, current0);
 
                 // check repcode at ip[2]
-                if (read32(src, ip2) == rval) & (rep_offset1 > 0) {
+                if read32(src, ip2) == rval {
                     ip0 = ip2;
                     let mut match0 = ip0 - rep_offset1 as usize;
                     let m_length = (byte(src, ip0 - 1) == byte(src, match0 - 1)) as usize;
