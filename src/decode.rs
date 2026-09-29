@@ -380,7 +380,10 @@ struct FSETable {
     decode: Vec<FSEEntry>,
     accuracy_log: u8,
     symbol_probabilities: Vec<i32>,
+    /// Per-symbol next-state counter while building (libzstd symbolNext).
     symbol_counter: Vec<u32>,
+    /// Symbols laid out in order before spreading (libzstd spread).
+    spread: Vec<u8>,
     /// True while `decode` holds a predefined sequence distribution, so the
     /// next block in Predefined mode can reuse it without rebuilding.
     predefined: bool,
@@ -392,6 +395,7 @@ impl FSETable {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256),
             symbol_counter: Vec::with_capacity(256),
+            spread: Vec::new(),
             decode: Vec::new(),
             accuracy_log: 0,
             predefined: false,
@@ -416,16 +420,6 @@ impl FSETable {
         self.predefined = false;
     }
 
-    /// Replace each cell's symbol with the sequence code's base value and
-    /// extra-bit count (the last loop of ZSTD_buildFSETable_body).
-    fn apply_sequence_codes(&mut self, base: &[u32], bits: &[u8]) {
-        for entry in &mut self.decode {
-            let symbol = entry.base_value as usize;
-            entry.extra_bits = bits[symbol];
-            entry.base_value = base[symbol];
-        }
-    }
-
     /// One-cell table for an RLE-coded sequence section
     /// (ZSTD_buildSeqTable_rle): accuracy log 0, no state bits.
     fn build_rle(&mut self, symbol: u8, base: &[u32], bits: &[u8]) {
@@ -438,15 +432,28 @@ impl FSETable {
         });
     }
 
-    fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, String> {
+    /// Parse an FSE table description and build the decoding table. With
+    /// `codes`, each cell carries the sequence code's base value and extra
+    /// bits; without, it carries the symbol.
+    fn build_decoder(
+        &mut self,
+        source: &[u8],
+        max_log: u8,
+        codes: Option<(&[u32], &[u8])>,
+    ) -> Result<usize, String> {
         self.accuracy_log = 0;
         self.predefined = false;
         let bytes_read = self.read_probabilities(source, max_log)?;
-        self.build_decoding_table()?;
+        self.build_decoding_table(codes)?;
         Ok(bytes_read)
     }
 
-    fn build_from_probabilities(&mut self, acc_log: u8, probs: &[i32]) -> Result<(), String> {
+    fn build_from_probabilities(
+        &mut self,
+        acc_log: u8,
+        probs: &[i32],
+        codes: Option<(&[u32], &[u8])>,
+    ) -> Result<(), String> {
         if acc_log == 0 {
             return Err("Accuracy log is zero".to_string());
         }
@@ -454,67 +461,102 @@ impl FSETable {
         self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
         self.predefined = false;
-        self.build_decoding_table()
+        self.build_decoding_table(codes)
     }
 
-    fn build_decoding_table(&mut self) -> Result<(), String> {
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
+    /// Port of ZSTD_buildFSETable_body: lay low-probability symbols at the
+    /// top, spread the rest, then derive each cell's bit count and next
+    /// state from a per-symbol counter in one pass.
+    fn build_decoding_table(&mut self, codes: Option<(&[u32], &[u8])>) -> Result<(), String> {
+        let num_symbols = self.symbol_probabilities.len();
+        if num_symbols > self.max_symbol as usize + 1 {
             return Err(format!(
                 "Too many symbols: {}, max: {}",
-                self.symbol_probabilities.len(),
+                num_symbols,
                 self.max_symbol + 1
+            ));
+        }
+        let table_log = u32::from(self.accuracy_log);
+        let table_size = 1usize << table_log;
+        let total: i64 = self
+            .symbol_probabilities
+            .iter()
+            .map(|&p| if p < 0 { 1 } else { i64::from(p) })
+            .sum();
+        if total != table_size as i64 {
+            return Err(format!(
+                "FSE probabilities sum to {}, expected {}",
+                total, table_size
             ));
         }
 
         self.decode.clear();
-
-        let table_size = 1 << self.accuracy_log;
         self.decode.resize(table_size, FSEEntry::default());
+        self.symbol_counter.clear();
+        self.symbol_counter.resize(num_symbols, 0);
 
-        let mut negative_idx = table_size;
-
-        for symbol in 0..self.symbol_probabilities.len() {
-            if self.symbol_probabilities[symbol] == -1 {
-                negative_idx -= 1;
-                let entry = &mut self.decode[negative_idx];
-                entry.base_value = symbol as u32;
-                entry.next_state = 0;
-                entry.num_bits = self.accuracy_log;
+        // Low-probability symbols occupy the highest cells.
+        let mut high_threshold = table_size;
+        for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
+            if prob == -1 {
+                high_threshold -= 1;
+                self.decode[high_threshold].base_value = symbol as u32;
+                self.symbol_counter[symbol] = 1;
+            } else {
+                self.symbol_counter[symbol] = prob as u32;
             }
         }
 
-        let mut position = 0;
-        for idx in 0..self.symbol_probabilities.len() {
-            let symbol = idx as u8;
-            if self.symbol_probabilities[idx] <= 0 {
-                continue;
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+        let mask = table_size - 1;
+        if high_threshold == table_size {
+            // No low-probability symbols: lay the symbols down in order with
+            // 8-byte writes, then scatter them across the table, so neither
+            // loop has a data-dependent trip count.
+            self.spread.clear();
+            self.spread.resize(table_size + 8, 0);
+            let mut pos = 0;
+            for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
+                let n = prob as usize;
+                let sv = [symbol as u8; 8];
+                self.spread[pos..pos + 8].copy_from_slice(&sv);
+                let mut i = 8;
+                while i < n {
+                    self.spread[pos + i..pos + i + 8].copy_from_slice(&sv);
+                    i += 8;
+                }
+                pos += n;
             }
-            let prob = self.symbol_probabilities[idx];
-            for _ in 0..prob {
-                let entry = &mut self.decode[position];
-                entry.base_value = u32::from(symbol);
-                position = fse_next_position(position, table_size);
-                while position >= negative_idx {
-                    position = fse_next_position(position, table_size);
+            let mut position = 0;
+            for s in (0..table_size).step_by(2) {
+                self.decode[position].base_value = u32::from(self.spread[s]);
+                self.decode[(position + step) & mask].base_value = u32::from(self.spread[s + 1]);
+                position = (position + 2 * step) & mask;
+            }
+        } else {
+            let mut position = 0;
+            for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
+                for _ in 0..prob.max(0) {
+                    self.decode[position].base_value = symbol as u32;
+                    position = (position + step) & mask;
+                    while position >= high_threshold {
+                        position = (position + step) & mask;
+                    }
                 }
             }
         }
 
-        self.symbol_counter.clear();
-        self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
-        for idx in 0..negative_idx {
-            let symbol = self.decode[idx].base_value as usize;
-            let prob = self.symbol_probabilities[symbol];
-            let symbol_count = self.symbol_counter[symbol];
-            let (bl, nb) =
-                fse_calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            assert!(nb <= self.accuracy_log);
+        for cell in &mut self.decode {
+            let symbol = cell.base_value as usize;
+            let next_state = self.symbol_counter[symbol];
             self.symbol_counter[symbol] += 1;
-
-            self.decode[idx].next_state = bl as u16;
-            self.decode[idx].num_bits = nb;
+            let nb_bits = table_log - (u32::BITS - 1 - next_state.leading_zeros());
+            cell.num_bits = nb_bits as u8;
+            cell.next_state = ((next_state << nb_bits) - table_size as u32) as u16;
+            if let Some((base, bits)) = codes {
+                cell.extra_bits = bits[symbol];
+                cell.base_value = base[symbol];
+            }
         }
         Ok(())
     }
@@ -605,27 +647,6 @@ fn fse_next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
     p &= table_size - 1;
     p
-}
-
-/// Compute baseline and numbits for FSE decode table entry.
-/// Port of C zstd educational decoder / reference FSE_buildDTable:
-///   state_desc = num_states_symbol + state_number
-///   num_bits = accuracy_log - floor(log2(state_desc))
-///   baseline = (state_desc << num_bits) - table_size
-pub(crate) fn fse_calc_baseline_and_numbits(
-    num_states_total: u32,
-    num_states_symbol: u32,
-    state_number: u32,
-) -> (u32, u8) {
-    if num_states_symbol == 0 {
-        return (0, 0);
-    }
-    let accuracy_log = highest_bit_set(num_states_total) - 1;
-    let state_desc = num_states_symbol + state_number;
-    let hsb = highest_bit_set(state_desc) - 1; // floor(log2(state_desc))
-    let num_bits = accuracy_log - hsb;
-    let baseline = (state_desc << num_bits) - num_states_total;
-    (baseline, num_bits as u8)
 }
 
 pub(crate) fn highest_bit_set(x: u32) -> u32 {
@@ -744,7 +765,7 @@ impl HuffmanTable {
                         header
                     ));
                 }
-                let bytes_used_by_fse_header = self.fse_table.build_decoder(fse_stream, 6)?;
+                let bytes_used_by_fse_header = self.fse_table.build_decoder(fse_stream, 6, None)?;
 
                 if bytes_used_by_fse_header > header as usize {
                     return Err(format!(
@@ -1993,11 +2014,7 @@ fn build_sequence_table(
     name: &str,
 ) -> Result<usize, String> {
     match mode {
-        ModeType::FSECompressed => {
-            let bytes = table.build_decoder(source, max_log)?;
-            table.apply_sequence_codes(base, bits);
-            Ok(bytes)
-        }
+        ModeType::FSECompressed => table.build_decoder(source, max_log, Some((base, bits))),
         ModeType::RLE => {
             let Some(&code) = source.first() else {
                 return Err(format!("Missing byte for RLE {} table", name));
@@ -2010,8 +2027,11 @@ fn build_sequence_table(
         }
         ModeType::Predefined => {
             if !table.predefined {
-                table.build_from_probabilities(default_log, default_distribution)?;
-                table.apply_sequence_codes(base, bits);
+                table.build_from_probabilities(
+                    default_log,
+                    default_distribution,
+                    Some((base, bits)),
+                )?;
                 table.predefined = true;
             }
             Ok(0)
