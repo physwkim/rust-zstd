@@ -2893,7 +2893,7 @@ fn run_sequences(
     literals: &[u8],
     offset_hist: &mut [u32; 3],
     buf: &mut [u8],
-    mut op: usize,
+    op: usize,
 ) -> Result<usize, String> {
     let ll_dt = &fse.literal_lengths.decode[..];
     let of_dt = &fse.offsets.decode[..];
@@ -2911,6 +2911,7 @@ fn run_sequences(
     }
     let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
     let oend = buf.len() - WILDCOPY_OVERLENGTH;
+    debug_assert!(op <= oend);
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
@@ -2931,17 +2932,35 @@ fn run_sequences(
             offset_hist[2] as usize,
         ],
     };
-    let mut lit_pos = 0usize;
+    let out = buf.as_mut_ptr();
+    let lit_start = literals.as_ptr();
+    // SAFETY: `op <= oend < buf.len()` and `literals_len < literals.len()`,
+    // so every pointer below stays inside its slice.
+    let mut cur = unsafe {
+        SeqCursor {
+            op: out.add(op),
+            lit: lit_start,
+        }
+    };
+    let lim = unsafe {
+        SeqLimits {
+            oend_w: out.add(oend),
+            lit_limit: lit_start.add(literals_len),
+            prefix: out,
+        }
+    };
 
     for _ in 1..num_sequences {
         let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
-        op = exec_sequence(buf, op, literals, &mut lit_pos, ll, ml, offset)
-            .map_err(seq_error_message)?;
+        exec_sequence(&mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     }
     let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
-    op = exec_sequence(buf, op, literals, &mut lit_pos, ll, ml, offset)
-        .map_err(seq_error_message)?;
+    exec_sequence(&mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     let hist = st.hist;
+    // Both cursors only ever advance within their slices (see
+    // `exec_sequence`), so these differences are in-bounds indexes.
+    let mut op = cur.op as usize - out as usize;
+    let lit_pos = cur.lit as usize - lit_start as usize;
 
     if !br.is_finished() {
         return Err("Sequence bitstream not fully consumed".to_string());
@@ -2965,6 +2984,24 @@ struct SeqState {
     ml: usize,
     of: usize,
     hist: [usize; 3],
+}
+
+/// Where the next sequence writes its output and reads its literals.
+///
+/// Invariant: `op <= SeqLimits::oend_w` and `lit <= SeqLimits::lit_limit`
+/// of the limits it is executed against, so both point into their buffers.
+struct SeqCursor {
+    op: *mut u8,
+    lit: *const u8,
+}
+
+/// Bounds of one block's sequence execution: the output limit less
+/// `WILDCOPY_OVERLENGTH`, the literals end less `WILDCOPY_OVERLENGTH`, and
+/// the earliest byte a match may copy from.
+struct SeqLimits {
+    oend_w: *mut u8,
+    lit_limit: *const u8,
+    prefix: *mut u8,
 }
 
 /// Decode one sequence (ZSTD_decodeSequence): literal length, match
@@ -3055,55 +3092,54 @@ fn decode_sequence(
 }
 
 /// Copy `ll` literals then `ml` match bytes from `offset` back
-/// (ZSTD_execSequence). Returns the new output position. Both slices carry
-/// `WILDCOPY_OVERLENGTH` bytes of slack past their logical end.
+/// (ZSTD_execSequenceSplitLitBuffer) and advance `cur`. Both buffers carry
+/// `WILDCOPY_OVERLENGTH` bytes of slack past their limits.
 #[inline(always)]
 fn exec_sequence(
-    buf: &mut [u8],
-    op: usize,
-    literals: &[u8],
-    lit_pos: &mut usize,
+    cur: &mut SeqCursor,
+    lim: &SeqLimits,
     ll: usize,
     ml: usize,
     offset: usize,
-) -> Result<usize, SeqError> {
-    let lit_start = *lit_pos;
-    let o_lit_end = op + ll;
+) -> Result<(), SeqError> {
+    let op = cur.op;
+    let lit = cur.lit;
+    // Addresses are compared as integers: `ll` and `ml` are below 2^32
+    // and pointers are below 2^63, so these sums cannot wrap.
+    let o_lit_end = op as usize + ll;
     let o_match_end = o_lit_end + ml;
-    if lit_start + ll + WILDCOPY_OVERLENGTH > literals.len() {
+    if lit as usize + ll > lim.lit_limit as usize {
         return Err(SeqError::NotEnoughLiterals);
     }
-    if o_match_end + WILDCOPY_OVERLENGTH > buf.len() {
+    if o_match_end > lim.oend_w as usize {
         return Err(SeqError::BlockTooLarge);
     }
     // Rejects offset 0 as well (it wraps to usize::MAX).
-    if offset.wrapping_sub(1) >= o_lit_end {
+    if offset.wrapping_sub(1) >= o_lit_end - lim.prefix as usize {
         return Err(SeqError::OffsetTooFar);
     }
-    *lit_pos = lit_start + ll;
 
     // SAFETY: the three checks above give, with `ml >= 1`,
-    //   lit_start + ll + 31 < literals.len(),
-    //   o_match_end + 31 < buf.len(),
-    //   1 <= offset <= o_lit_end.
+    //   lit + ll <= lit_limit, which has 32 readable bytes after it,
+    //   o_match_end <= oend_w, which has 32 writable bytes after it,
+    //   prefix <= o_lit_end - offset < o_lit_end.
     // Every copy below reads and writes within those ranges: literals are
-    // read from `lit_start` and written from `op` with at most 31 bytes of
+    // read from `lit` and written from `op` with at most 31 bytes of
     // overshoot; the match reads from `o_lit_end - offset` and writes from
     // `o_lit_end`, both ending at most 31 bytes past `o_match_end`. Each
     // fixed-size copy is non-overlapping because `dst - src` is at least
-    // its size (16 with `offset >= 16`, 8 after `overlap_copy8`).
+    // its size (16 with `offset >= 16`, 8 after `overlap_copy8`). The
+    // advanced cursors keep the `SeqCursor` invariant.
     unsafe {
-        let out = buf.as_mut_ptr();
-        let lit = literals.as_ptr().add(lit_start);
-        let dst = out.add(op);
         // Literals: nearly always at most 16 bytes.
-        copy16(dst, lit);
+        copy16(op, lit);
         if ll > 16 {
-            wildcopy(dst.add(16), lit.add(16), ll - 16);
+            wildcopy(op.add(16), lit.add(16), ll - 16);
         }
+        cur.lit = lit.add(ll);
 
-        let dst = out.add(o_lit_end);
-        let src = out.add(o_lit_end - offset) as *const u8;
+        let dst = op.add(ll);
+        let src = dst.sub(offset) as *const u8;
         if offset >= WILDCOPY_VECLEN {
             // Sequential 16-byte chunks stay correct for overlapping
             // periodic matches because `dst - src >= 16`.
@@ -3116,8 +3152,9 @@ fn exec_sequence(
                 wildcopy_overlap8(dst, src, ml - 8);
             }
         }
+        cur.op = op.add(ll + ml);
     }
-    Ok(o_match_end)
+    Ok(())
 }
 
 /// ZSTD_copy16.
