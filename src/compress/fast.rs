@@ -133,21 +133,22 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
         let mut step = step_size;
         let mut next_step = ip0 + K_STEP_INCR;
 
-        // calculate positions, ip0 - anchor == 0, so we skip step calc
-        let mut ip1 = ip0 + 1;
+        // calculate positions, ip0 - anchor == 0, so we skip step calc.
+        // C keeps four pointers ip0 < ip1 == ip0 + 1 < ip2 < ip3 == ip2 + 1;
+        // the two odd ones are derived where they are used so that the loop
+        // carries two registers less (the C names are kept in the comments).
         let mut ip2 = ip0 + step;
-        let mut ip3 = ip2 + 1;
 
-        if ip3 >= ilimit {
+        if ip2 + 1 >= ilimit {
             break 'start; // _cleanup
         }
 
-        // SAFETY: (I1) for ip0, ip1; (I4) for the table.
+        // SAFETY: (I1) for ip0, ip0 + 1; (I4) for the table.
         let (mut hash0, mut hash1, mut match_idx) = unsafe {
             let hash0 = hash_ptr::<MLS>(src, ip0, hlog);
             (
                 hash0,
-                hash_ptr::<MLS>(src, ip1, hlog),
+                hash_ptr::<MLS>(src, ip0 + 1, hlog),
                 tget(hash_table, hash0),
             )
         };
@@ -162,6 +163,8 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
         // bytes before it, (I4) for every table access.
         let found = unsafe {
             loop {
+                // Here ip1 == ip0 + 1 and ip3 == ip2 + 1.
+
                 // load repcode match for ip[2]
                 let rval = read32(src, ip2 - rep_offset1 as usize) ^ rep_mask;
 
@@ -171,6 +174,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
 
                 // check repcode at ip[2]
                 if read32(src, ip2) == rval {
+                    let ip1 = ip0 + 1;
                     ip0 = ip2;
                     let mut match0 = ip0 - rep_offset1 as usize;
                     let m_length = (byte(src, ip0 - 1) == byte(src, match0 - 1)) as usize;
@@ -190,7 +194,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                     // Write next hash table entry (it's already calculated).
                     // This write is known to be safe because the ip1 == ip0
                     // + 1, so searching will resume after ip1.
-                    tset(hash_table, hash1, ip1);
+                    tset(hash_table, hash1, ip0 + 1);
                     break Found::Offset;
                 }
 
@@ -201,10 +205,10 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                 hash0 = hash1;
                 hash1 = hash_ptr::<MLS>(src, ip2, hlog);
 
-                // advance to next positions
-                ip0 = ip1;
-                ip1 = ip2;
-                ip2 = ip3;
+                // advance to next positions: ip0 = ip1, ip1 = ip2, ip2 = ip3.
+                // From here on ip1 == ip2 (this variable) and C's ip2 is
+                // ip2 + 1.
+                ip0 += 1;
 
                 // write back hash table entry
                 current0 = ip0;
@@ -216,7 +220,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                         // Avoid writing an index if it's >= position where
                         // search will resume. The minimum possible match has
                         // length 4, so search can resume at ip0 + 4.
-                        tset(hash_table, hash1, ip1);
+                        tset(hash_table, hash1, ip2); // ip1
                     }
                     break Found::Offset;
                 }
@@ -226,23 +230,22 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
 
                 // hash ip[2]
                 hash0 = hash1;
-                hash1 = hash_ptr::<MLS>(src, ip2, hlog);
+                hash1 = hash_ptr::<MLS>(src, ip2 + 1, hlog);
 
-                // advance to next positions
-                ip0 = ip1;
-                ip1 = ip2;
-                ip2 = ip0 + step;
-                ip3 = ip1 + step;
+                // advance to next positions: ip0 = ip1, ip1 = ip2, ip2 = ip0
+                // + step, ip3 = ip1 + step == ip2 + 1.
+                ip0 = ip2;
+                ip2 += step;
 
                 // calculate step
                 if ip2 >= next_step {
                     step += 1;
-                    prefetch(src, ip1 + 64);
-                    prefetch(src, ip1 + 128);
+                    prefetch(src, ip0 + 1 + 64); // ip1
+                    prefetch(src, ip0 + 1 + 128);
                     next_step += K_STEP_INCR;
                 }
 
-                if ip3 >= ilimit {
+                if ip2 + 1 >= ilimit {
                     break Found::Cleanup;
                 }
             }
