@@ -553,85 +553,139 @@ impl FSETable {
         Ok(())
     }
 
+    /// Read the normalized counts header (FSE_readNCount): four bits of
+    /// accuracy log, then one count per symbol, with repeat flags after
+    /// each zero count. Returns the header's length in bytes.
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, String> {
-        self.symbol_probabilities.clear();
-
-        let mut br = BitReader::new(source);
-        self.accuracy_log = ACC_LOG_OFFSET + (br.get_bits(4)? as u8);
-        if self.accuracy_log > max_log {
-            return Err(format!(
-                "Accuracy log {} exceeds max {}",
-                self.accuracy_log, max_log
-            ));
-        }
-        if self.accuracy_log == 0 {
-            return Err("Accuracy log is zero".to_string());
-        }
-
-        let probability_sum = 1u32 << self.accuracy_log;
-        let mut probability_counter = 0u32;
-
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_read = highest_bit_set(max_remaining_value);
-
-            let unchecked_value = br.get_bits(bits_to_read as usize)? as u32;
-
-            let low_threshold = ((1 << bits_to_read) - 1) - max_remaining_value;
-            let mask = (1 << (bits_to_read - 1)) - 1;
-            let small_value = unchecked_value & mask;
-
-            let value = if small_value < low_threshold {
-                br.return_bits(1);
-                small_value
-            } else if unchecked_value > mask {
-                unchecked_value - low_threshold
-            } else {
-                unchecked_value
-            };
-
-            let prob = (value as i32) - 1;
-            self.symbol_probabilities.push(prob);
-
-            if prob != 0 {
-                if prob > 0 {
-                    probability_counter += prob as u32;
-                } else {
-                    // probability -1 counts as 1
-                    probability_counter += 1;
-                }
-            } else {
-                loop {
-                    let skip_amount = br.get_bits(2)? as usize;
-                    self.symbol_probabilities
-                        .resize(self.symbol_probabilities.len() + skip_amount, 0);
-                    if skip_amount != 3 {
-                        break;
-                    }
-                }
+        if source.len() < 8 {
+            // The body reads 4 bytes at a time up to the header's end.
+            let mut buffer = [0u8; 8];
+            buffer[..source.len()].copy_from_slice(source);
+            let n = self.read_ncount_body(&buffer, max_log)?;
+            if n > source.len() {
+                return Err("FSE table header extends past its input".to_string());
             }
+            return Ok(n);
         }
+        self.read_ncount_body(source, max_log)
+    }
 
-        if probability_counter != probability_sum {
-            return Err(format!(
-                "Probability counter {} does not match expected sum {}",
-                probability_counter, probability_sum
-            ));
-        }
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
-            return Err(format!(
-                "Too many symbols: {}",
-                self.symbol_probabilities.len()
-            ));
-        }
+    /// FSE_readNCount_body; requires `src.len() >= 8`.
+    fn read_ncount_body(&mut self, src: &[u8], max_log: u8) -> Result<usize, String> {
+        debug_assert!(src.len() >= 8);
+        let iend = src.len();
+        let read32 = |at: usize| u32::from_le_bytes(src[at..at + 4].try_into().unwrap());
+        let max_sv1 = self.max_symbol as usize + 1;
+        let counts = &mut self.symbol_probabilities;
+        counts.clear();
+        counts.resize(max_sv1, 0);
 
-        let bytes_read = if br.bits_read() % 8 == 0 {
-            br.bits_read() / 8
-        } else {
-            (br.bits_read() / 8) + 1
+        let mut ip = 0usize;
+        let mut bit_stream = read32(ip);
+        let mut nb_bits = (bit_stream & 0xF) + u32::from(ACC_LOG_OFFSET);
+        if nb_bits > u32::from(max_log) {
+            return Err(format!("Accuracy log {} exceeds max {}", nb_bits, max_log));
+        }
+        self.accuracy_log = nb_bits as u8;
+        bit_stream >>= 4;
+        let mut bit_count = 4u32;
+        let mut remaining = (1i32 << nb_bits) + 1;
+        let mut threshold = 1i32 << nb_bits;
+        nb_bits += 1;
+        let mut charnum = 0usize;
+        let mut previous0 = false;
+
+        // Advance `ip` by the whole bytes consumed, clamping at the last
+        // 4-byte window, and reload the 32-bit window.
+        let advance = |ip: &mut usize, bit_count: &mut u32| {
+            if *ip + 7 <= iend || *ip + (*bit_count >> 3) as usize + 4 <= iend {
+                *ip += (*bit_count >> 3) as usize;
+                *bit_count &= 7;
+            } else {
+                *bit_count = bit_count.wrapping_sub(8 * (iend - 4 - *ip) as u32) & 31;
+                *ip = iend - 4;
+            }
         };
 
-        Ok(bytes_read)
+        loop {
+            if previous0 {
+                // Each 0b11 repeat code adds three zero-count symbols.
+                let mut repeats = ((!bit_stream | 0x8000_0000).trailing_zeros() >> 1) as usize;
+                while repeats >= 12 {
+                    charnum += 3 * 12;
+                    if ip + 7 <= iend {
+                        ip += 3;
+                    } else {
+                        // `iend - 7 - ip` is negative here (signed in the C).
+                        let back = 8 * (iend as i64 - 7 - ip as i64);
+                        bit_count = (i64::from(bit_count) - back) as u32 & 31;
+                        ip = iend - 4;
+                    }
+                    bit_stream = read32(ip) >> bit_count;
+                    repeats = ((!bit_stream | 0x8000_0000).trailing_zeros() >> 1) as usize;
+                }
+                charnum += 3 * repeats;
+                bit_stream >>= 2 * repeats;
+                bit_count += 2 * repeats as u32;
+                charnum += (bit_stream & 3) as usize;
+                bit_count += 2;
+                if charnum >= max_sv1 {
+                    break;
+                }
+                advance(&mut ip, &mut bit_count);
+                bit_stream = read32(ip) >> bit_count;
+            }
+
+            let max = (2 * threshold - 1) - remaining;
+            let mut count;
+            if ((bit_stream & (threshold as u32 - 1)) as i32) < max {
+                count = (bit_stream & (threshold as u32 - 1)) as i32;
+                bit_count += nb_bits - 1;
+            } else {
+                count = (bit_stream & (2 * threshold as u32 - 1)) as i32;
+                if count >= threshold {
+                    count -= max;
+                }
+                bit_count += nb_bits;
+            }
+            count -= 1;
+            if count >= 0 {
+                remaining -= count;
+            } else {
+                remaining += count;
+            }
+            counts[charnum] = count;
+            charnum += 1;
+            previous0 = count == 0;
+
+            if remaining < threshold {
+                if remaining <= 1 {
+                    break;
+                }
+                nb_bits = highest_bit_set(remaining as u32);
+                threshold = 1 << (nb_bits - 1);
+            }
+            if charnum >= max_sv1 {
+                break;
+            }
+            advance(&mut ip, &mut bit_count);
+            bit_stream = read32(ip) >> bit_count;
+        }
+        if remaining != 1 {
+            return Err(format!(
+                "FSE counts leave {} of {} cells unassigned",
+                remaining - 1,
+                1u32 << self.accuracy_log
+            ));
+        }
+        if charnum > max_sv1 {
+            return Err(format!("Too many symbols: {}", charnum));
+        }
+        if bit_count > 32 {
+            return Err("FSE table header extends past its input".to_string());
+        }
+        counts.truncate(charnum);
+        Ok(ip + ((bit_count + 7) >> 3) as usize)
     }
 }
 
