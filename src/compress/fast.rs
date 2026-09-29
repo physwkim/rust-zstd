@@ -12,11 +12,14 @@
 //! one of the invariants stated in [`compress_block_generic`].
 
 use super::common::{
-    byte, candidate_valid, count, hash_ptr, prefetch, read32, tget, tset, HASH_READ_SIZE,
-    K_SEARCH_STRENGTH,
+    byte, candidate_valid, hash_ptr, prefetch, read32, simd_level, tget, tset, MatchCount,
+    HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use fearless_simd::Avx2;
+use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 
 /// `kStepIncr` of the fast strategy.
@@ -83,7 +86,13 @@ enum Found {
 ///   `1 <= p - rep < p` and `p - rep >= window_low >= 1` (`rep == 0` means
 ///   disabled and reads `p` itself).
 /// * (I4) `hash_ptr` returns `< 1 << hlog == hash_table.len()`.
-fn compress_block_generic<const MLS: u32, const CMOV: bool>(
+///
+/// Forced inline so that the AVX2 monomorphs are compiled inside
+/// [`compress_block_avx2`] with its target features; left to the inliner
+/// they allocate the search loop worse (words L1/L2 -1 to -2%).
+#[inline(always)]
+fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
+    mc: C,
     ms: &mut MatchState,
     src: &[u8],
     block: Range<usize>,
@@ -279,7 +288,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
 
         // _match: requires ip0, match0, offcode. Count the forward length.
         // SAFETY: match0 < ip0 (I2/I3) and ip0 + m_length <= ip2 + 4 < iend.
-        m_length += unsafe { count(src, ip0 + m_length, match0 + m_length, iend) };
+        m_length += unsafe { mc.count(src, ip0 + m_length, match0 + m_length, iend) };
 
         out.store_seq(src, anchor, ip0 - anchor, iend, offcode, m_length);
 
@@ -306,7 +315,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                     {
                         // store sequence
                         let r_length =
-                            count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
+                            mc.count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
                         std::mem::swap(&mut rep_offset1, &mut rep_offset2);
                         tset(hash_table, hash_ptr::<MLS>(src, ip0, hlog), ip0);
                         ip0 += r_length;
@@ -359,17 +368,66 @@ pub fn compress_block(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    match simd_level() {
+        // SAFETY: fearless_simd constructs the witness only after detecting
+        // AVX2 on this CPU.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(w) => unsafe { compress_block_avx2(w, ms, src, block, rep, out) },
+        _ => compress_block_scalar(ms, src, block, rep, out),
+    }
+}
+
+/// [`compress_block`] with the 8-byte [`count`](super::common::count).
+#[inline(never)]
+fn compress_block_scalar(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    compress_block_level(Fallback::new(), ms, src, block, rep, out)
+}
+
+/// [`compress_block`] compiled with AVX2, counting 32 bytes per step.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 (the witness proves it).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_block_avx2(
+    mc: Avx2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    compress_block_level(mc, ms, src, block, rep, out)
+}
+
+#[inline(always)]
+fn compress_block_level<C: MatchCount>(
+    mc: C,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
     // use cmov when "candidate in range" branch is likely unpredictable
     let use_cmov = ms.cparams.window_log < 19;
     match (use_cmov, ms.cparams.min_match) {
-        (true, 5) => compress_block_generic::<5, true>(ms, src, block, rep, out),
-        (true, 6) => compress_block_generic::<6, true>(ms, src, block, rep, out),
-        (true, 7) => compress_block_generic::<7, true>(ms, src, block, rep, out),
-        (true, _) => compress_block_generic::<4, true>(ms, src, block, rep, out),
-        (false, 5) => compress_block_generic::<5, false>(ms, src, block, rep, out),
-        (false, 6) => compress_block_generic::<6, false>(ms, src, block, rep, out),
-        (false, 7) => compress_block_generic::<7, false>(ms, src, block, rep, out),
-        (false, _) => compress_block_generic::<4, false>(ms, src, block, rep, out),
+        (true, 5) => compress_block_generic::<5, true, C>(mc, ms, src, block, rep, out),
+        (true, 6) => compress_block_generic::<6, true, C>(mc, ms, src, block, rep, out),
+        (true, 7) => compress_block_generic::<7, true, C>(mc, ms, src, block, rep, out),
+        (true, _) => compress_block_generic::<4, true, C>(mc, ms, src, block, rep, out),
+        (false, 5) => compress_block_generic::<5, false, C>(mc, ms, src, block, rep, out),
+        (false, 6) => compress_block_generic::<6, false, C>(mc, ms, src, block, rep, out),
+        (false, 7) => compress_block_generic::<7, false, C>(mc, ms, src, block, rep, out),
+        (false, _) => compress_block_generic::<4, false, C>(mc, ms, src, block, rep, out),
     }
 }
 
