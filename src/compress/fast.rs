@@ -1,93 +1,65 @@
-//! Fast (single hash table, greedy) block compressor.
+//! Fast (single hash table) block compressor: port of
+//! `ZSTD_compressBlock_fast_noDict_generic`, `ZSTD_compressBlock_fast` and
+//! `ZSTD_fillHashTable` (zstd_fast.c, libzstd 1.5.7), no-dictionary case.
 //!
-//! Block-scoped form of the previous whole-input `find_matches_fast`,
-//! restructured after `ZSTD_compressBlock_fast_noDict_generic`
-//! (zstd_fast.c, libzstd 1.5.7): persistent `ms.hash_table`, absolute
-//! positions, matches confined to `block`, `off_base` emitted directly.
-//! Temporary implementation; to be replaced by a faithful port.
+//! Positions are absolute indices into `src` (see [`MatchState`]). libzstd
+//! puts the first input byte at index `ZSTD_WINDOW_START_INDEX == 1`; here
+//! `src[0]` sits at index 0, the empty-entry sentinel, so block 0 of a job
+//! starts one byte later than libzstd does. Everything else is index-exact.
+
+// Shared helpers live in common.rs; it is declared here so that the module
+// list in mod.rs stays untouched. `super::fast::common` is its path.
+#[path = "common.rs"]
+pub mod common;
 
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
+use common::{count, hash_ptr, prefetch, read32, HASH_READ_SIZE, K_SEARCH_STRENGTH};
 use std::ops::Range;
 
-/// `HASH_READ_SIZE`: hashing reads up to 8 bytes.
-const HASH_READ_SIZE: usize = 8;
-/// `kSearchStrength`.
-const K_SEARCH_STRENGTH: usize = 8;
+/// `kStepIncr` of the fast strategy.
 const K_STEP_INCR: usize = 1 << (K_SEARCH_STRENGTH - 1);
 
-const PRIME4: u32 = 2654435761;
-const PRIME5: u64 = 889523592379;
-const PRIME6: u64 = 227718039650203;
-const PRIME7: u64 = 58295818150454627;
-const PRIME8: u64 = 0xCF1BBCDCB7A56463;
-
-#[inline]
-fn read32(src: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes(src[pos..pos + 4].try_into().unwrap())
-}
-
-#[inline]
-fn read64(src: &[u8], pos: usize) -> u64 {
-    u64::from_le_bytes(src[pos..pos + 8].try_into().unwrap())
-}
-
-/// `ZSTD_hashPtr(p, hlog, mls)`: hash of the `mls` bytes at `pos`
-/// (`mls` in `4..=8`; other values hash 4 bytes like libzstd's default arm).
-/// Reads 8 bytes for `mls >= 5`, so `pos + 8 <= src.len()` is required.
-#[inline]
-pub fn hash_ptr(src: &[u8], pos: usize, hlog: u32, mls: u32) -> usize {
-    match mls {
-        5 => (((read64(src, pos) << 24).wrapping_mul(PRIME5)) >> (64 - hlog)) as usize,
-        6 => (((read64(src, pos) << 16).wrapping_mul(PRIME6)) >> (64 - hlog)) as usize,
-        7 => (((read64(src, pos) << 8).wrapping_mul(PRIME7)) >> (64 - hlog)) as usize,
-        8 => ((read64(src, pos).wrapping_mul(PRIME8)) >> (64 - hlog)) as usize,
-        _ => (read32(src, pos).wrapping_mul(PRIME4) >> (32 - hlog)) as usize,
+/// `ZSTD_match4Found_cmov` / `ZSTD_match4Found_branch`: does the 4-byte
+/// candidate at `match_idx` (valid iff `>= idx_low_limit`) equal `src[cur..]`?
+#[inline(always)]
+fn match4_found<const CMOV: bool>(
+    src: &[u8],
+    cur: usize,
+    match_idx: usize,
+    idx_low_limit: usize,
+) -> bool {
+    if CMOV {
+        // The C version loads from a dummy array when the index is out of
+        // range so that the range test compiles to a conditional move.
+        // Loading `cur` and flipping a bit guarantees the same mismatch.
+        let valid = match_idx >= idx_low_limit;
+        let pos = if valid { match_idx } else { cur };
+        let mval = read32(src, pos) ^ (!valid as u32);
+        read32(src, cur) == mval
+    } else {
+        let mval = if match_idx >= idx_low_limit {
+            read32(src, match_idx)
+        } else {
+            read32(src, cur) ^ 1 // guaranteed to not match
+        };
+        read32(src, cur) == mval
     }
 }
 
-/// `ZSTD_count(pIn, pMatch, pInLimit)`: length of the common prefix of
-/// `src[a..limit]` and `src[b..]`, with `b < a`.
-#[inline]
-pub fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
-    debug_assert!(b < a && a <= limit);
-    let start = a;
-    let (mut a, mut b) = (a, b);
-    while a + 8 <= limit {
-        let diff = read64(src, a) ^ read64(src, b);
-        if diff != 0 {
-            return a - start + (diff.trailing_zeros() / 8) as usize;
-        }
-        a += 8;
-        b += 8;
-    }
-    while a < limit && src[a] == src[b] {
-        a += 1;
-        b += 1;
-    }
-    a - start
-}
-
-/// `ZSTD_match4Found_branch`.
-#[inline]
-fn match4_found(src: &[u8], cur: usize, match_idx: usize, idx_low_limit: usize) -> bool {
-    match_idx >= idx_low_limit && read32(src, cur) == read32(src, match_idx)
-}
-
-enum Hit {
-    None,
-    Rep,
+/// How the pipelined search loop exited.
+enum Found {
+    /// Repcode hit at `ip2` (`goto _match`): `match0` and `m_length` known.
+    Rep { match0: usize, m_length: usize },
+    /// Hash-table hit at `ip0` (`goto _offset`).
     Offset,
+    /// `while (ip3 < ilimit)` failed (`_cleanup`).
+    Cleanup,
 }
 
-/// Find matches in `src[block]` and store them into `out`. Returns the anchor:
-/// the start of the trailing literals `src[anchor..block.end]`, which the
-/// caller appends to `out.lits` (`ZSTD_storeLastLiterals`).
-///
-/// `rep` is the repeat-offset history on entry and is updated on exit. A
-/// repcode larger than `block.start - window_low` is disabled (`0`) for this
-/// block and restored on exit when no match replaced it, as in libzstd.
-pub fn compress_block(
+/// `ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, srcSize,
+/// mls, useCmov)`, monomorphized over `MLS` and `CMOV`.
+fn compress_block_generic<const MLS: u32, const CMOV: bool>(
     ms: &mut MatchState,
     src: &[u8],
     block: Range<usize>,
@@ -95,165 +67,189 @@ pub fn compress_block(
     out: &mut SeqStore,
 ) -> usize {
     let hlog = ms.cparams.hash_log;
-    let mls = ms.cparams.min_match;
     let target_length = ms.cparams.target_length as usize;
     let step_size = target_length + (target_length == 0) as usize + 1; // min 2
     let istart = block.start;
     let iend = block.end;
-    debug_assert!(iend <= src.len());
-    if iend < istart + HASH_READ_SIZE {
-        return istart;
-    }
-    let ilimit = iend - HASH_READ_SIZE;
+    assert!(istart <= iend && iend <= src.len());
     let prefix_start = ms.lowest_prefix_index(iend);
+    // C: ilimit = iend - HASH_READ_SIZE, possibly below istart; every
+    // comparison against it then sends the loop to _cleanup.
+    let ilimit = iend.saturating_sub(HASH_READ_SIZE);
 
     let mut anchor = istart;
-    // In C the first input byte sits at index ZSTD_WINDOW_START_INDEX ==
-    // lowestValid; here block 0 starts at position 0 < window_low, so clamp
-    // first, then skip the prefix start exactly like `ip0 += (ip0 == prefixStart)`.
+    // C: ip0 = istart; ip0 += (ip0 == prefixStart). Block 0 of a job starts
+    // at position 0 < window_low (src[0] is at the sentinel index), so clamp
+    // to the prefix start first.
     let mut ip0 = istart.max(prefix_start);
     ip0 += (ip0 == prefix_start) as usize;
 
-    let mut rep1 = rep[0];
-    let mut rep2 = rep[1];
-    let (mut saved1, mut saved2) = (0u32, 0u32);
+    let mut rep_offset1 = rep[0];
+    let mut rep_offset2 = rep[1];
+    let (mut offset_saved1, mut offset_saved2) = (0u32, 0u32);
     {
-        let max_rep = (ip0 - prefix_start) as u32;
-        if rep2 > max_rep {
-            saved2 = rep2;
-            rep2 = 0;
+        let window_low = ms.lowest_prefix_index(ip0);
+        let max_rep = (ip0 - window_low) as u32;
+        if rep_offset2 > max_rep {
+            offset_saved2 = rep_offset2;
+            rep_offset2 = 0;
         }
-        if rep1 > max_rep {
-            saved1 = rep1;
-            rep1 = 0;
+        if rep_offset1 > max_rep {
+            offset_saved1 = rep_offset1;
+            rep_offset1 = 0;
         }
     }
 
-    let ht = &mut ms.hash_table[..];
+    let hash_table = &mut ms.hash_table[..];
+    assert_eq!(hash_table.len(), 1usize << hlog);
 
-    // _start
-    loop {
+    // _start: requires ip0
+    'start: loop {
         let mut step = step_size;
         let mut next_step = ip0 + K_STEP_INCR;
+
+        // calculate positions, ip0 - anchor == 0, so we skip step calc
         let mut ip1 = ip0 + 1;
         let mut ip2 = ip0 + step;
         let mut ip3 = ip2 + 1;
+
         if ip3 >= ilimit {
-            break;
+            break 'start; // _cleanup
         }
-        let mut hash0 = hash_ptr(src, ip0, hlog, mls);
-        let mut hash1 = hash_ptr(src, ip1, hlog, mls);
-        let mut match_idx = ht[hash0] as usize;
 
+        let mut hash0 = hash_ptr::<MLS>(src, ip0, hlog);
+        let mut hash1 = hash_ptr::<MLS>(src, ip1, hlog);
+        let mut match_idx = hash_table[hash0] as usize;
         let mut current0;
-        let mut match0 = 0usize;
-        let mut off_base = 0u32;
-        let mut m_len = 0usize;
 
-        let hit = loop {
+        let found = loop {
             // load repcode match for ip[2]
-            let rep_hit = rep1 > 0
-                && ip2 >= rep1 as usize
-                && read32(src, ip2) == read32(src, ip2 - rep1 as usize);
+            let rval = read32(src, ip2 - rep_offset1 as usize);
 
             // write back hash table entry
             current0 = ip0;
-            ht[hash0] = ip0 as u32;
+            hash_table[hash0] = current0 as u32;
 
             // check repcode at ip[2]
-            if rep_hit {
+            if (read32(src, ip2) == rval) & (rep_offset1 > 0) {
                 ip0 = ip2;
-                match0 = ip0 - rep1 as usize;
-                let back = (src[ip0 - 1] == src[match0 - 1]) as usize;
-                ip0 -= back;
-                match0 -= back;
-                off_base = REPCODE1_TO_OFFBASE;
-                m_len = back + 4;
-                // ip1 is before the repcode (ip2), so this write is safe.
-                ht[hash1] = ip1 as u32;
-                break Hit::Rep;
+                let mut match0 = ip0 - rep_offset1 as usize;
+                let m_length = (src[ip0 - 1] == src[match0 - 1]) as usize;
+                ip0 -= m_length;
+                match0 -= m_length;
+                // Write next hash table entry: it's already calculated. This
+                // write is known to be safe because ip1 is before the
+                // repcode (ip2).
+                hash_table[hash1] = ip1 as u32;
+                break Found::Rep {
+                    match0,
+                    m_length: m_length + 4,
+                };
             }
 
-            if match4_found(src, ip0, match_idx, prefix_start) {
-                // ip1 == ip0 + 1, searching will resume after ip1.
-                ht[hash1] = ip1 as u32;
-                break Hit::Offset;
+            if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
+                // Write next hash table entry (it's already calculated). This
+                // write is known to be safe because the ip1 == ip0 + 1, so
+                // searching will resume after ip1.
+                hash_table[hash1] = ip1 as u32;
+                break Found::Offset;
             }
 
-            // lookup ip[1], hash ip[2], advance
-            match_idx = ht[hash1] as usize;
+            // lookup ip[1]
+            match_idx = hash_table[hash1] as usize;
+
+            // hash ip[2]
             hash0 = hash1;
-            hash1 = hash_ptr(src, ip2, hlog, mls);
+            hash1 = hash_ptr::<MLS>(src, ip2, hlog);
+
+            // advance to next positions
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
 
+            // write back hash table entry
             current0 = ip0;
-            ht[hash0] = ip0 as u32;
+            hash_table[hash0] = current0 as u32;
 
-            if match4_found(src, ip0, match_idx, prefix_start) {
-                // Avoid writing an index >= the position where search resumes
-                // (ip0 + 4 at least).
+            if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
+                // Write next hash table entry, since it's already calculated
                 if step <= 4 {
-                    ht[hash1] = ip1 as u32;
+                    // Avoid writing an index if it's >= position where search
+                    // will resume. The minimum possible match has length 4,
+                    // so search can resume at ip0 + 4.
+                    hash_table[hash1] = ip1 as u32;
                 }
-                break Hit::Offset;
+                break Found::Offset;
             }
 
-            match_idx = ht[hash1] as usize;
+            // lookup ip[1]
+            match_idx = hash_table[hash1] as usize;
+
+            // hash ip[2]
             hash0 = hash1;
-            hash1 = hash_ptr(src, ip2, hlog, mls);
+            hash1 = hash_ptr::<MLS>(src, ip2, hlog);
+
+            // advance to next positions
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip0 + step;
             ip3 = ip1 + step;
 
+            // calculate step
             if ip2 >= next_step {
                 step += 1;
+                prefetch(src, ip1 + 64);
+                prefetch(src, ip1 + 128);
                 next_step += K_STEP_INCR;
             }
+
             if ip3 >= ilimit {
-                break Hit::None;
+                break Found::Cleanup;
             }
         };
 
-        match hit {
-            Hit::None => break,
-            Hit::Offset => {
-                match0 = match_idx;
-                rep2 = rep1;
-                rep1 = (ip0 - match0) as u32;
-                off_base = offset_to_offbase(rep1);
-                m_len = 4;
+        let (match0, offcode, mut m_length) = match found {
+            Found::Cleanup => break 'start,
+            Found::Rep { match0, m_length } => (match0, REPCODE1_TO_OFFBASE, m_length),
+            Found::Offset => {
+                // _offset: requires ip0, idx. Compute the offset code.
+                let mut match0 = match_idx;
+                rep_offset2 = rep_offset1;
+                rep_offset1 = (ip0 - match0) as u32;
+                let offcode = offset_to_offbase(rep_offset1);
+                let mut m_length = 4;
                 // Count the backwards match length.
-                while ip0 > anchor && match0 > prefix_start && src[ip0 - 1] == src[match0 - 1] {
+                while ((ip0 > anchor) & (match0 > prefix_start)) && src[ip0 - 1] == src[match0 - 1]
+                {
                     ip0 -= 1;
                     match0 -= 1;
-                    m_len += 1;
+                    m_length += 1;
                 }
+                (match0, offcode, m_length)
             }
-            Hit::Rep => {}
-        }
+        };
 
-        // _match: count the forward length.
-        m_len += count(src, ip0 + m_len, match0 + m_len, iend);
-        out.store_seq(src, anchor, ip0 - anchor, off_base, m_len);
-        ip0 += m_len;
+        // _match: requires ip0, match0, offcode. Count the forward length.
+        m_length += count(src, ip0 + m_length, match0 + m_length, iend);
+
+        out.store_seq(src, anchor, ip0 - anchor, offcode, m_length);
+
+        ip0 += m_length;
         anchor = ip0;
 
         // Fill table and check for immediate repcode.
         if ip0 <= ilimit {
-            ht[hash_ptr(src, current0 + 2, hlog, mls)] = (current0 + 2) as u32;
-            ht[hash_ptr(src, ip0 - 2, hlog, mls)] = (ip0 - 2) as u32;
+            // Fill Table: here because current+2 could be > iend-8
+            hash_table[hash_ptr::<MLS>(src, current0 + 2, hlog)] = (current0 + 2) as u32;
+            hash_table[hash_ptr::<MLS>(src, ip0 - 2, hlog)] = (ip0 - 2) as u32;
 
-            if rep2 > 0 {
-                while ip0 <= ilimit
-                    && ip0 >= rep2 as usize
-                    && read32(src, ip0) == read32(src, ip0 - rep2 as usize)
-                {
-                    let r_length = count(src, ip0 + 4, ip0 + 4 - rep2 as usize, iend) + 4;
-                    std::mem::swap(&mut rep1, &mut rep2);
-                    ht[hash_ptr(src, ip0, hlog, mls)] = ip0 as u32;
+            // rep_offset2 == 0 means rep_offset2 is invalidated
+            if rep_offset2 > 0 {
+                while ip0 <= ilimit && read32(src, ip0) == read32(src, ip0 - rep_offset2 as usize) {
+                    // store sequence
+                    let r_length = count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
+                    std::mem::swap(&mut rep_offset1, &mut rep_offset2);
+                    hash_table[hash_ptr::<MLS>(src, ip0, hlog)] = ip0 as u32;
                     ip0 += r_length;
                     out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
                     anchor = ip0;
@@ -262,82 +258,220 @@ pub fn compress_block(
         }
     }
 
-    // _cleanup: restore repcodes disabled at block start if still unused.
-    if saved1 != 0 && rep1 != 0 {
-        saved2 = saved1;
-    }
-    rep[0] = if rep1 != 0 { rep1 } else { saved1 };
-    rep[1] = if rep2 != 0 { rep2 } else { saved2 };
+    // _cleanup. When the repcodes are outside of the prefix, they were set to
+    // zero before the loop; if still zero they are restored. If rep_offset1
+    // started invalid (offsetSaved1 != 0) and became valid (rep_offset1 !=
+    // 0), then rep[0] = rep_offset1 and rep[1] = offsetSaved1.
+    offset_saved2 = if offset_saved1 != 0 && rep_offset1 != 0 {
+        offset_saved1
+    } else {
+        offset_saved2
+    };
+
+    // save reps for next block
+    rep[0] = if rep_offset1 != 0 {
+        rep_offset1
+    } else {
+        offset_saved1
+    };
+    rep[1] = if rep_offset2 != 0 {
+        rep_offset2
+    } else {
+        offset_saved2
+    };
+
+    // Return the anchor of the last literals
     anchor
 }
 
+/// `ZSTD_compressBlock_fast`: find matches in `src[block]` and store them
+/// into `out`. Returns the anchor: the start of the trailing literals
+/// `src[anchor..block.end]`, which the caller appends to `out.lits`
+/// (`ZSTD_storeLastLiterals`).
+///
+/// `rep` is the repeat-offset history on entry and is updated on exit. A
+/// repcode that would reach below the window at the block start is disabled
+/// (`0`) for this block and restored on exit when no match replaced it.
+pub fn compress_block(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    // use cmov when "candidate in range" branch is likely unpredictable
+    let use_cmov = ms.cparams.window_log < 19;
+    match (use_cmov, ms.cparams.min_match) {
+        (true, 5) => compress_block_generic::<5, true>(ms, src, block, rep, out),
+        (true, 6) => compress_block_generic::<6, true>(ms, src, block, rep, out),
+        (true, 7) => compress_block_generic::<7, true>(ms, src, block, rep, out),
+        (true, _) => compress_block_generic::<4, true>(ms, src, block, rep, out),
+        (false, 5) => compress_block_generic::<5, false>(ms, src, block, rep, out),
+        (false, 6) => compress_block_generic::<6, false>(ms, src, block, rep, out),
+        (false, 7) => compress_block_generic::<7, false>(ms, src, block, rep, out),
+        (false, _) => compress_block_generic::<4, false>(ms, src, block, rep, out),
+    }
+}
+
+/// `ZSTD_fillHashTableForCCtx(ms, end, ZSTD_dtlm_fast)`.
+fn fill_hash_table<const MLS: u32>(ms: &mut MatchState, src: &[u8], start: usize, end: usize) {
+    const FAST_HASH_FILL_STEP: usize = 3;
+    let hbits = ms.cparams.hash_log;
+    let hash_table = &mut ms.hash_table[..];
+    assert_eq!(hash_table.len(), 1usize << hbits);
+    let mut ip = start;
+    // C: for (; ip + fastHashFillStep < iend + 2; ip += fastHashFillStep)
+    // with iend = end - HASH_READ_SIZE. Always insert every
+    // fastHashFillStep position into the hash table.
+    while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
+        hash_table[hash_ptr::<MLS>(src, ip, hbits)] = ip as u32;
+        ip += FAST_HASH_FILL_STEP;
+    }
+}
+
 /// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`: insert
-/// every third position of `src[range]` (from `ms.next_to_update`) into the
+/// every third position of `src[range]` from `ms.next_to_update` into the
 /// hash table, then set `next_to_update = range.end`.
 pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
-    const FAST_HASH_FILL_STEP: usize = 3;
-    let hlog = ms.cparams.hash_log;
-    let mls = ms.cparams.min_match;
     let end = range.end;
-    debug_assert!(end <= src.len());
-    let mut ip = ms.next_to_update.max(range.start).max(ms.window_low);
-    // C: for (; ip + 3 < (end - HASH_READ_SIZE) + 2; ip += 3)
-    while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
-        ms.hash_table[hash_ptr(src, ip, hlog, mls)] = ip as u32;
-        ip += FAST_HASH_FILL_STEP;
+    assert!(end <= src.len());
+    let start = ms.next_to_update.max(range.start);
+    debug_assert!(start >= 1, "position 0 is the empty-entry sentinel");
+    match ms.cparams.min_match {
+        5 => fill_hash_table::<5>(ms, src, start, end),
+        6 => fill_hash_table::<6>(ms, src, start, end),
+        7 => fill_hash_table::<7>(ms, src, start, end),
+        _ => fill_hash_table::<4>(ms, src, start, end),
     }
     ms.next_to_update = end;
 }
 
 #[cfg(test)]
 mod tests {
+    use super::common::testutil::*;
     use super::*;
-    use crate::compress::params::CParams;
+    use crate::compress::params::{CParams, Strategy};
 
-    fn run(src: &[u8], level: i32, block_size: usize) {
-        let cp = CParams::for_level(level, src.len());
-        let mut ms = MatchState::new(cp, 1);
-        let mut rep = [1u32, 4, 8];
-        let mut store = SeqStore::new();
-        let mut start = 0;
-        while start < src.len() {
-            let end = (start + block_size).min(src.len());
-            store.clear();
-            let rep_in = rep;
-            let anchor = compress_block(&mut ms, src, start..end, &mut rep, &mut store);
-            store.lits.extend_from_slice(&src[anchor..end]);
-            let got = store.reconstruct(&src[..start], rep_in);
-            assert_eq!(
-                got,
-                &src[start..end],
-                "block {start}..{end} at level {level}"
-            );
-            for s in &store.seqs {
-                assert!(s.lit_len as usize + s.match_len() as usize <= end - start);
-            }
-            start = end;
+    fn finder() -> Finder {
+        Finder {
+            compress_block,
+            load_prefix,
         }
     }
 
     #[test]
-    fn roundtrip_blocks_via_reconstruct() {
-        let mut text = Vec::new();
-        for i in 0..20000u32 {
-            text.extend_from_slice(
-                format!("line {} of the test corpus {}\n", i, i % 37).as_bytes(),
+    fn roundtrip_crate_sources_128k_blocks() {
+        let data = crate_sources();
+        for level in [1, 2] {
+            let stats = roundtrip_blocks(
+                &finder(),
+                &data,
+                CParams::for_level(level, data.len()),
+                1 << 17,
+                1,
+                [1, 4, 8],
+            );
+            assert!(
+                stats.cross_block_matches > 0,
+                "level {level}: no match reached an earlier block"
             );
         }
-        for level in [1, 2] {
-            run(&text, level, 1 << 17);
-            run(&text, level, 1000);
+    }
+
+    #[test]
+    fn roundtrip_current_exe_128k_blocks() {
+        let data = current_exe_bytes();
+        let stats = roundtrip_blocks(
+            &finder(),
+            &data,
+            CParams::for_level(1, data.len()),
+            1 << 17,
+            1,
+            [1, 4, 8],
+        );
+        assert!(stats.cross_block_matches > 0);
+    }
+
+    #[test]
+    fn job_start_with_overlap_prefix_and_zero_reps() {
+        let data = synthetic_text(600_000, 7);
+        let cp = CParams::for_level(1, data.len());
+        let window_low = 200_001;
+        let job_start = window_low + (1 << 16);
+        let stats = roundtrip_job(
+            &finder(),
+            &data,
+            cp,
+            1 << 17,
+            window_low,
+            job_start,
+            [0, 0, 0],
+        );
+        assert!(
+            stats.prefix_matches > 0,
+            "no match referenced the loaded prefix"
+        );
+    }
+
+    #[test]
+    fn tiny_inputs_and_block_boundary() {
+        let text = synthetic_text((1 << 17) + 1, 3);
+        for len in [0usize, 1, 7, 8, 9, 100, (1 << 17) + 1] {
+            let data = &text[..len];
+            for level in [1, 2] {
+                roundtrip_blocks(
+                    &finder(),
+                    data,
+                    CParams::for_level(level, len),
+                    1 << 17,
+                    1,
+                    [1, 4, 8],
+                );
+            }
         }
-        run(&vec![0u8; 300_000], 1, 1 << 17);
-        let f64s: Vec<u8> = (0..40000u64)
-            .flat_map(|i| (i as f64 * 0.25).to_le_bytes())
-            .collect();
-        run(&f64s, 1, 1 << 17);
-        run(b"short", 1, 1 << 17);
-        run(b"", 1, 1 << 17);
+    }
+
+    #[test]
+    fn every_mls_step_and_cmov_variant() {
+        let data = synthetic_text(400_000, 11);
+        for min_match in 4..=7u32 {
+            for window_log in [18u32, 19] {
+                for target_length in [0u32, 1, 3] {
+                    let cp = CParams {
+                        window_log,
+                        chain_log: 13,
+                        hash_log: 15,
+                        search_log: 1,
+                        min_match,
+                        target_length,
+                        strategy: Strategy::Fast,
+                    };
+                    let stats = roundtrip_blocks(&finder(), &data, cp, 1 << 17, 1, [1, 4, 8]);
+                    assert!(
+                        stats.seqs > 100,
+                        "mls {min_match} wlog {window_log} tl {target_length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn window_limited_matches_stay_inside_the_window() {
+        // window_log 10 with 300 KiB of input: matches must never reach
+        // further back than 1024 bytes.
+        let data = synthetic_text(300_000, 5);
+        let cp = CParams {
+            window_log: 10,
+            chain_log: 10,
+            hash_log: 11,
+            search_log: 1,
+            min_match: 5,
+            target_length: 0,
+            strategy: Strategy::Fast,
+        };
+        roundtrip_blocks(&finder(), &data, cp, 1 << 10, 1, [1, 4, 8]);
+        roundtrip_blocks(&finder(), &data, cp, 1000, 1, [1, 4, 8]);
     }
 
     #[test]
@@ -346,7 +480,7 @@ mod tests {
         let cp = CParams::for_level(1, src.len());
         let mut ms = MatchState::new(cp, 1);
         let mut store = SeqStore::new();
-        // rep[0] = 100 cannot be used from position 1: it is disabled and
+        // rep[0] = 100 cannot be used from position 2: it is disabled and
         // then restored when a new offset replaces rep1 (saved1 -> rep[1]).
         let mut rep = [100u32, 4, 8];
         let anchor = compress_block(&mut ms, &src, 0..src.len(), &mut rep, &mut store);
