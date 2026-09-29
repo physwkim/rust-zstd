@@ -10,6 +10,7 @@ keywords = ["zstd", "zstandard", "compression", "decompression", "lz77"]
 categories = ["compression"]
 
 [dependencies]
+fearless_simd = "0.3.0"
 rayon = { version = "1", optional = true }
 
 [dev-dependencies]

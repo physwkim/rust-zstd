@@ -29,6 +29,15 @@ pub struct MatchState {
     pub next_to_update: usize,
     /// `window.dictLimit` / `window.lowLimit`: lowest valid index (`>= 1`).
     pub window_low: usize,
+    /// `hashSalt`: salt of the row-based finder's hash (`ZSTD_hashPtrSalted`),
+    /// so that a reused tag table does not produce phantom matches. Starts
+    /// at the value a fresh `ZSTD_CCtx` has after its first
+    /// `ZSTD_advanceHashSalt` (both inputs zero), see
+    /// [`super::lazy::initial_hash_salt`].
+    pub hash_salt: u64,
+    /// `hashSaltEntropy`: running sum of the row finder's search hashes,
+    /// mixed into the next salt by `ZSTD_advanceHashSalt` on a context reset.
+    pub hash_salt_entropy: u32,
 }
 
 impl MatchState {
@@ -55,6 +64,8 @@ impl MatchState {
             tag_table,
             next_to_update: window_low,
             window_low,
+            hash_salt: super::lazy::initial_hash_salt(),
+            hash_salt_entropy: 0,
         }
     }
 
