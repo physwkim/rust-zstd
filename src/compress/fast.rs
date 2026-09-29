@@ -278,7 +278,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
         // SAFETY: match0 < ip0 (I2/I3) and ip0 + m_length <= ip2 + 4 < iend.
         m_length += unsafe { count(src, ip0 + m_length, match0 + m_length, iend) };
 
-        out.store_seq(src, anchor, ip0 - anchor, offcode, m_length);
+        out.store_seq(src, anchor, ip0 - anchor, iend, offcode, m_length);
 
         ip0 += m_length;
         anchor = ip0;
@@ -307,7 +307,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                         std::mem::swap(&mut rep_offset1, &mut rep_offset2);
                         tset(hash_table, hash_ptr::<MLS>(src, ip0, hlog), ip0);
                         ip0 += r_length;
-                        out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
+                        out.store_seq(src, anchor, 0, iend, REPCODE1_TO_OFFBASE, r_length);
                         anchor = ip0;
                     }
                 }

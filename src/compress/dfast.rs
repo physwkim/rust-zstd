@@ -130,7 +130,14 @@ fn compress_block_generic<const MLS: u32>(
                 {
                     let m_length = count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
                     ip += 1;
-                    out.store_seq(src, anchor, ip - anchor, REPCODE1_TO_OFFBASE, m_length);
+                    out.store_seq(
+                        src,
+                        anchor,
+                        ip - anchor,
+                        iend,
+                        REPCODE1_TO_OFFBASE,
+                        m_length,
+                    );
                     break Found::Stored { m_length };
                 }
 
@@ -239,6 +246,7 @@ fn compress_block_generic<const MLS: u32>(
                     src,
                     anchor,
                     ip - anchor,
+                    iend,
                     offset_to_offbase(offset),
                     m_length,
                 );
@@ -278,7 +286,7 @@ fn compress_block_generic<const MLS: u32>(
                     std::mem::swap(&mut offset_1, &mut offset_2);
                     tset(hash_small, hash_ptr::<MLS>(src, ip, hbits_s), ip);
                     tset(hash_long, hash_ptr::<8>(src, ip, hbits_l), ip);
-                    out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
+                    out.store_seq(src, anchor, 0, iend, REPCODE1_TO_OFFBASE, r_length);
                     ip += r_length;
                     anchor = ip;
                 }

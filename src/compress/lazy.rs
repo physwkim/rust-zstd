@@ -18,9 +18,8 @@ use super::common::{byte, candidate_valid, count, read32, read64, tget, tset, HA
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
 use super::seqstore::{
-    offbase_is_offset, offbase_to_offset, offset_to_offbase, Seq, SeqStore, REPCODE1_TO_OFFBASE,
+    offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
 };
-use crate::constants::ZSTD_MINMATCH;
 #[cfg(target_arch = "aarch64")]
 use fearless_simd::Neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -43,10 +42,6 @@ const K_SEARCH_STRENGTH: usize = 8;
 /// `kLazySkippingStep`: skipping more than this many bytes at once enters the
 /// lazy-skipping mode (only searched positions are inserted).
 const K_LAZY_SKIPPING_STEP: usize = 8;
-/// `WILDCOPY_OVERLENGTH`: bytes [`store_seq`] may read past the literals and
-/// write past the literal buffer's end; the buffer is oversized by as much
-/// (`ZSTD_resetCCtx_internal`: `litStart = blockSize + WILDCOPY_OVERLENGTH`).
-const WILDCOPY_OVERLENGTH: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Small helpers. Unchecked reads follow `compress/common.rs`: every call site
@@ -55,83 +50,6 @@ const WILDCOPY_OVERLENGTH: usize = 32;
 // in [`compress_block_with`] / [`load_prefix_with`], plus the loop limits
 // (`ip < ilimit`, `ilimit + ILIMIT_MARGIN <= iend`, `ILIMIT_MARGIN >= 8`).
 // ---------------------------------------------------------------------------
-
-/// `ZSTD_copy16`.
-///
-/// # Safety
-/// 16 bytes readable at `src` and writable at `dst`, not overlapping.
-#[inline(always)]
-unsafe fn copy16(dst: *mut u8, src: *const u8) {
-    std::ptr::copy_nonoverlapping(src, dst, 16);
-}
-
-/// `ZSTD_storeSeq(seqStore, litLength, literals = src + anchor, litLimit =
-/// src + iend, offBase, matchLength)`: copy the literals 16 bytes at a time
-/// (`ZSTD_copy16` + `ZSTD_wildcopy`, over-reading and over-writing up to
-/// `WILDCOPY_OVERLENGTH` bytes) when they end `WILDCOPY_OVERLENGTH` before
-/// `iend`, byte-exact otherwise (`ZSTD_safecopyLiterals`), then append the
-/// sequence. The lazy loop's own version of [`SeqStore::store_seq`], which
-/// copies through `memcpy`.
-///
-/// # Safety
-/// `anchor + lit_len <= iend <= src.len()`, and `out.lits` has at least
-/// `lit_len + WILDCOPY_OVERLENGTH` spare capacity ([`lazy_generic`] reserves
-/// `block len + WILDCOPY_OVERLENGTH` once per block).
-#[inline(always)]
-unsafe fn store_seq(
-    out: &mut SeqStore,
-    src: &[u8],
-    anchor: usize,
-    lit_len: usize,
-    iend: usize,
-    off_base: u32,
-    match_len: usize,
-) {
-    debug_assert!(off_base >= 1);
-    debug_assert!(match_len >= ZSTD_MINMATCH);
-    debug_assert!(anchor + lit_len <= iend && iend <= src.len());
-    let len = out.lits.len();
-    debug_assert!(out.lits.capacity() >= len + lit_len + WILDCOPY_OVERLENGTH);
-    if anchor + lit_len + WILDCOPY_OVERLENGTH <= iend {
-        // Common case we can use wildcopy: every read below stays before
-        // `anchor + lit_len + WILDCOPY_OVERLENGTH <= iend` and every write
-        // before `len + lit_len + WILDCOPY_OVERLENGTH <= capacity`.
-        let mut ip = src.as_ptr().add(anchor);
-        let mut op = out.lits.as_mut_ptr().add(len);
-        copy16(op, ip);
-        if lit_len > 16 {
-            // ZSTD_wildcopy(lit + 16, literals + 16, litLength - 16,
-            // ZSTD_no_overlap)
-            let oend = op.add(lit_len);
-            op = op.add(16);
-            ip = ip.add(16);
-            copy16(op, ip);
-            if lit_len - 16 > 16 {
-                op = op.add(16);
-                ip = ip.add(16);
-                loop {
-                    copy16(op, ip);
-                    copy16(op.add(16), ip.add(16));
-                    op = op.add(32);
-                    ip = ip.add(32);
-                    if op >= oend {
-                        break;
-                    }
-                }
-            }
-        }
-        // The first `lit_len` bytes after `len` were written above.
-        out.lits.set_len(len + lit_len);
-    } else {
-        out.lits
-            .extend_from_slice(src.get_unchecked(anchor..anchor + lit_len));
-    }
-    out.seqs.push(Seq {
-        lit_len: lit_len as u32,
-        off_base,
-        ml_base: (match_len - ZSTD_MINMATCH) as u32,
-    });
-}
 
 /// `ZSTD_highbit32`: index of the highest set bit (`v != 0`).
 #[inline(always)]
@@ -941,9 +859,6 @@ fn lazy_generic<S: Search>(
 
     let mut lazy_skipping = false;
     search.refill(ms, src, ilimit);
-    // A block stores at most `iend - istart` literals; `store_seq` writes up
-    // to WILDCOPY_OVERLENGTH bytes beyond them.
-    out.lits.reserve(iend - istart + WILDCOPY_OVERLENGTH);
 
     // SAFETY, for every unchecked read below: `ip <= ilimit` implies `ip +
     // ILIMIT_MARGIN <= iend <= src.len()` with `ILIMIT_MARGIN >= 8` (when
@@ -1087,9 +1002,7 @@ fn lazy_generic<S: Search>(
 
         // store sequence
         let lit_length = start - anchor;
-        // SAFETY: `start <= ip < iend <= src.len()`; `lits` was reserved
-        // above.
-        unsafe { store_seq(out, src, anchor, lit_length, iend, off_base, match_length) };
+        out.store_seq(src, anchor, lit_length, iend, off_base, match_length);
         ip = start + match_length;
         anchor = ip;
 
@@ -1107,9 +1020,7 @@ fn lazy_generic<S: Search>(
         {
             let match_length = unsafe { count(src, ip + 4, ip + 4 - offset_2 as usize, iend) } + 4;
             std::mem::swap(&mut offset_1, &mut offset_2); // swap repcodes
-                                                          // SAFETY: `anchor == ip <= ilimit < iend`; `lits` was reserved
-                                                          // above.
-            unsafe { store_seq(out, src, anchor, 0, iend, REPCODE1_TO_OFFBASE, match_length) };
+            out.store_seq(src, anchor, 0, iend, REPCODE1_TO_OFFBASE, match_length);
             ip += match_length;
             anchor = ip;
         }
