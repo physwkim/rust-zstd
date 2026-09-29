@@ -117,7 +117,16 @@ impl<'a> BitCStream<'a> {
     pub fn flush_bits(&mut self) {
         debug_assert!(self.bit_pos < 64);
         let nb_bytes = (self.bit_pos >> 3) as usize;
-        self.buf[self.ptr..self.ptr + 8].copy_from_slice(&self.bit_container.to_le_bytes());
+        debug_assert!(self.ptr <= self.end_ptr);
+        // SAFETY: `ptr` starts at 0 and every advance below clamps it to
+        // `end_ptr = buf.len() - 8`, so the 8-byte store ends inside `buf`.
+        unsafe {
+            self.buf
+                .as_mut_ptr()
+                .add(self.ptr)
+                .cast::<u64>()
+                .write_unaligned(self.bit_container.to_le());
+        }
         self.ptr = (self.ptr + nb_bytes).min(self.end_ptr);
         self.bit_pos &= 7;
         self.bit_container >>= nb_bytes * 8;
