@@ -1258,12 +1258,29 @@ impl DecodeBuffer {
             return Err("Zero offset in repeat".to_string());
         }
 
-        let start_idx = self.buffer.len() - offset;
-        self.buffer.reserve(match_length);
+        let len = self.buffer.len();
+        let start_idx = len - offset;
 
-        for i in 0..match_length {
-            let byte = self.buffer[start_idx + (i % offset)];
-            self.buffer.push(byte);
+        if offset >= match_length {
+            // Source and destination do not overlap: one memcpy.
+            self.buffer
+                .extend_from_within(start_idx..start_idx + match_length);
+        } else if offset == 1 {
+            // Run of a single byte: memset.
+            let byte = self.buffer[start_idx];
+            self.buffer.resize(len + match_length, byte);
+        } else {
+            // Overlapping copy: the output is periodic with period `offset`.
+            // Copy the period once, then keep appending the whole span
+            // written so far, doubling the chunk size each round.
+            self.buffer.reserve(match_length);
+            let mut copied = 0;
+            while copied < match_length {
+                let available = offset + copied;
+                let chunk = available.min(match_length - copied);
+                self.buffer.extend_from_within(start_idx..start_idx + chunk);
+                copied += chunk;
+            }
         }
 
         Ok(())
