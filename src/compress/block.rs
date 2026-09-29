@@ -163,7 +163,7 @@ fn build_and_entropy_compress(
     let cbuf = &mut scratch.cbuf;
     cbuf.clear();
     let huf = huf::compress_literals(cbuf, &store.lits, &prev.huf);
-    let fse = fse::encode_sequences_section(cbuf, &store.seqs, &prev.fse);
+    let fse = fse::encode_sequences_section_with(cbuf, &store.seqs, &prev.fse, strategy)?;
 
     let max_c_size = block_len - CParams::min_gain(block_len, strategy);
     if cbuf.len() >= max_c_size {
