@@ -1155,6 +1155,7 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
 }
 
 /// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
+#[inline(never)]
 fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt_log = u32::from(table.max_num_bits);
     let dt = &table.decode[..];
@@ -1173,6 +1174,7 @@ fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
 /// last one holds the remainder); stream `i` produces segment `i`. The main
 /// loop advances all four streams in lockstep, 4 symbols each per reload,
 /// so the four dependency chains overlap in the CPU.
+#[inline(never)]
 fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     if src.len() < 10 {
         return Err(format!(
@@ -2071,6 +2073,7 @@ fn seq_error_message(e: SeqError) -> String {
 /// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
 /// plus slack up front so that all copies use fixed-size chunks and may
 /// overshoot; it is truncated to the real length on return.
+#[inline(never)]
 fn decode_and_execute_sequences(
     num_sequences: u32,
     bit_stream: &[u8],
@@ -2392,6 +2395,7 @@ fn overlap_copy8(buf: &mut [u8], dst: &mut usize, src: &mut usize, offset: usize
 /// Decode every block of one frame from `data[*pos..]` straight into
 /// `output`, then skip the checksum. Matches may only reach back to the
 /// frame's own start (ZSTD_decompressFrame).
+#[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
     data: &[u8],
