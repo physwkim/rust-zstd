@@ -13,6 +13,7 @@ categories = ["compression"]
 rayon = { version = "1", optional = true }
 
 [dev-dependencies]
+zstd = "0.13.3"
 
 [features]
 default = ["parallel"]
