@@ -1122,11 +1122,83 @@ fn build_seq_table(
 /// decoder holds afterwards (`nextEntropy->fse`). With `nb_seq == 0` the
 /// tables carry over unchanged (`nextEntropy->fse = prevEntropy->fse`).
 ///
+/// `FSE_NCountWriteBound`: maximum size of an `FSE_writeNCount` table
+/// description for symbols `0..=max_symbol` at `table_log`.
+fn ncount_write_bound(max_symbol: usize, table_log: u32) -> usize {
+    if max_symbol == 0 {
+        return FSE_NCOUNTBOUND;
+    }
+    ((max_symbol + 1) * table_log as usize + 4 + 2) / 8 + 1 + 2
+}
+
+/// Upper bound on the bytes [`encode_sequences_section_with`] appends for
+/// `seqs`, whatever the previous [`FseState`] and the [`CParams`], over
+/// every encoding type `ZSTD_selectEncodingType` can pick per stream:
+/// the sequence-count header, the modes byte, per stream the larger of the
+/// RLE byte and `FSE_NCountWriteBound(max code, *FSELog)` (Basic and
+/// Repeat write nothing), and the bitstream: per sequence its exact extra
+/// bits plus `LLFSELog + OffFSELog + MLFSELog` state bits (no table,
+/// default, repeated or new, exceeds those logs, and `FSE_encodeSymbol`
+/// emits at most `tableLog` bits; the last sequence's symbols seed the
+/// states and the final flushes spend the same budget), then the end mark
+/// and the padding to a byte.
+///
+/// The failure returns of [`encode_sequences_section_with`]:
+/// - `build_ctable` for `Repeat` without a previous table: unreachable,
+///   `select_encoding_type` returns `Repeat` only from a `Valid` repeat
+///   mode or a repeat cost, both of which need the table;
+/// - `normalize_count` failing or returning 0, and `write_ncount` failing:
+///   unreachable, `Compressed` is only picked when no code covers every
+///   sequence (else `Rle`/`Basic`), so at least two codes remain after the
+///   last-symbol decrement, and `optimal_table_log` keeps the log within
+///   `FSE_MIN_TABLELOG..=*FSELog` and at least `FSE_minTableLog`;
+/// - the 1.3.4 workaround (`lastCountSize + bitstreamSize < 4`): a new
+///   table needs two sequences, its description takes at least 2 bytes
+///   and its flush at least `FSE_MIN_TABLELOG` bits, so the bitstream must
+///   fit in 1 byte with at most 2 extra bits. For such `seqs` the bound is
+///   raised above `ZSTD_BLOCKSIZE_MAX`, so it can never prove a block
+///   compressed; it still bounds the section.
+///
+/// When `literals_section_bound + sequences_section_bound < block_len -
+/// ZSTD_minGain` the block is therefore emitted compressed (RLE blocks and
+/// blocks below `MIN_CBLOCK_SIZE` are decided before either stage).
+pub fn sequences_section_bound(seqs: &[Seq]) -> usize {
+    let nb_seq = seqs.len();
+    let header = 1 + (nb_seq >= 128) as usize + (nb_seq >= LONGNBSEQ) as usize;
+    if nb_seq == 0 {
+        return header;
+    }
+    let (mut ll_max, mut of_max, mut ml_max) = (0u8, 0u8, 0u8);
+    let mut extra_bits = 0usize;
+    for seq in seqs {
+        let (ll, of, ml) = (
+            ll_code(seq.lit_len),
+            off_code(seq.off_base),
+            ml_code(seq.ml_base),
+        );
+        ll_max = ll_max.max(ll);
+        of_max = of_max.max(of);
+        ml_max = ml_max.max(ml);
+        extra_bits += LL_BITS[ll as usize] as usize + ML_BITS[ml as usize] as usize + of as usize;
+    }
+    let descriptions = ncount_write_bound(ll_max as usize, LL_FSE_LOG)
+        + ncount_write_bound(of_max as usize, OFF_FSE_LOG)
+        + ncount_write_bound(ml_max as usize, ML_FSE_LOG);
+    let state_bits = nb_seq * (LL_FSE_LOG + OFF_FSE_LOG + ML_FSE_LOG) as usize;
+    let bitstream = (extra_bits + state_bits + 1).div_ceil(8);
+    let bound = header + 1 + descriptions + bitstream;
+    if nb_seq >= 2 && extra_bits <= 2 {
+        // the 1.3.4 workaround may fire: never prove compression
+        return bound.max(ZSTD_BLOCKSIZE_MAX + 1);
+    }
+    bound
+}
+
 /// `None` means the block must be emitted uncompressed: libzstd returns 0
-/// for the 1.3.4 decoder workaround (a 3-byte last table description plus
-/// a 1-byte bitstream) and fails the compression when a table cannot be
-/// built; both end here as a raw block. `out` may then hold a partial
-/// section.
+/// for the 1.3.4 decoder workaround (the last table description plus the
+/// bitstream under 4 bytes) and fails the compression when a table cannot
+/// be built; both end here as a raw block. `out` may then hold a partial
+/// section. [`sequences_section_bound`] lists when each is reachable.
 pub fn encode_sequences_section_with(
     out: &mut Vec<u8>,
     sequences: &[Seq],
