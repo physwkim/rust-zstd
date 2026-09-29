@@ -22,9 +22,9 @@ use std::ops::Range;
 /// `ZSTD_blockHeaderSize`.
 pub const ZSTD_BLOCKHEADERSIZE: usize = 3;
 /// `MIN_CBLOCK_SIZE`: 1 (literals header) + 1 (RLE or RAW).
-const MIN_CBLOCK_SIZE: usize = 2;
+pub const MIN_CBLOCK_SIZE: usize = 2;
 /// `rleMaxLength` in `ZSTD_compressBlock_internal`.
-const RLE_MAX_LENGTH: usize = 25;
+pub const RLE_MAX_LENGTH: usize = 25;
 
 /// `ZSTD_compressedBlockState_t`: what the decoder holds after the last
 /// COMPRESSED block. `Treeless` literals and `Repeat` sequence tables may
@@ -121,7 +121,8 @@ pub fn write_rle_block(out: &mut Vec<u8>, byte: u8, repeat_count: usize, is_last
     out.push(byte);
 }
 
-fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: bool) {
+/// A COMPRESSED block: header then `compressed`.
+pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: bool) {
     let header =
         (is_last as u32) | ((BLOCK_TYPE_COMPRESSED as u32) << 1) | ((compressed.len() as u32) << 3);
     out.extend_from_slice(&header.to_le_bytes()[..ZSTD_BLOCKHEADERSIZE]);
@@ -149,6 +150,39 @@ fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
     }
 }
 
+/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, apply
+/// the nextToUpdate clamp, run the strategy's block compressor and store the
+/// trailing literals (`ZSTD_storeLastLiterals`). `rep` holds the committed
+/// repeat offsets on entry and the block's candidates on return.
+pub fn build_seq_store(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    store: &mut SeqStore,
+) {
+    store.clear();
+    limit_update_after_long_match(ms, block.start);
+    let anchor = match ms.cparams.strategy {
+        Strategy::Fast => fast::compress_block(ms, src, block.clone(), rep, store),
+        Strategy::DFast => dfast::compress_block(ms, src, block.clone(), rep, store),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+            lazy::compress_block(ms, src, block.clone(), rep, store)
+        }
+    };
+    // ZSTD_storeLastLiterals
+    store.lits.extend_from_slice(&src[anchor..block.end]);
+    debug_assert_eq!(
+        store.lits.len()
+            + store
+                .seqs
+                .iter()
+                .map(|s| s.match_len() as usize)
+                .sum::<usize>(),
+        block.len()
+    );
+}
+
 /// `ZSTD_buildSeqStore` + `ZSTD_entropyCompressSeqStore`: fill
 /// `scratch.store` for `src[block]` and write the block payload into
 /// `scratch.cbuf`. Returns the candidate next state when the block is
@@ -166,28 +200,9 @@ fn build_and_entropy_compress(
     if block_len < MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 + 1 {
         return None;
     }
-    let store = &mut scratch.store;
-    store.clear();
     let mut rep = prev.rep;
-    limit_update_after_long_match(ms, block.start);
-    let anchor = match strategy {
-        Strategy::Fast => fast::compress_block(ms, src, block.clone(), &mut rep, store),
-        Strategy::DFast => dfast::compress_block(ms, src, block.clone(), &mut rep, store),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
-            lazy::compress_block(ms, src, block.clone(), &mut rep, store)
-        }
-    };
-    // ZSTD_storeLastLiterals
-    store.lits.extend_from_slice(&src[anchor..block.end]);
-    debug_assert_eq!(
-        store.lits.len()
-            + store
-                .seqs
-                .iter()
-                .map(|s| s.match_len() as usize)
-                .sum::<usize>(),
-        block_len
-    );
+    build_seq_store(ms, src, block, &mut rep, &mut scratch.store);
+    let store = &scratch.store;
 
     let cbuf = &mut scratch.cbuf;
     cbuf.clear();

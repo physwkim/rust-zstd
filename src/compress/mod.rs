@@ -211,7 +211,7 @@ where
 /// `ZSTDMT_initCStream_internal`'s job size: an explicit size clamped to
 /// `[ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX]`, else
 /// `1 << ZSTDMT_computeTargetJobLog` (no long-distance matching).
-fn job_size_for(requested: Option<usize>, window_log: u32) -> usize {
+pub fn job_size_for(requested: Option<usize>, window_log: u32) -> usize {
     match requested {
         Some(n) => n.clamp(JOBSIZE_MIN, JOBSIZE_MAX),
         None => 1usize << 20.max(window_log + 2).min(JOBLOG_MAX),
@@ -220,7 +220,7 @@ fn job_size_for(requested: Option<usize>, window_log: u32) -> usize {
 
 /// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
 /// last job truncated to `len`.
-fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
+pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
     (0..len)
         .step_by(job_size)
         .map(|start| start..(start + job_size).min(len))
@@ -230,7 +230,7 @@ fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
 /// `ZSTDMT_computeOverlapSize` with `overlapLog = 0` (the default) and no
 /// long-distance matching: `ZSTDMT_overlapLog_default` is 7 for `Lazy2` and
 /// 6 for the other strategies, i.e. a quarter or an eighth of the window.
-fn overlap_size(cparams: &CParams) -> usize {
+pub fn overlap_size(cparams: &CParams) -> usize {
     let overlap_log = match cparams.strategy {
         Strategy::Lazy2 => 7,
         Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
