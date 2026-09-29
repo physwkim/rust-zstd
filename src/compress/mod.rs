@@ -12,6 +12,7 @@
 //! without the `parallel` feature, so both builds emit identical frames.
 
 pub mod block;
+pub mod common;
 pub mod dfast;
 pub mod fast;
 pub mod lazy;
