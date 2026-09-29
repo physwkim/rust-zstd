@@ -2,6 +2,7 @@
 //! Ported from zstd C source: lib/common/fse.h, lib/compress/fse_compress.c.
 
 use super::bitstream::BitCStream;
+use super::huf;
 use crate::compress::seqstore::Seq;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -945,31 +946,19 @@ fn build_ctable(
     }
 }
 
-/// `HIST_countFast_wksp` on sequence codes: histogram into
-/// `counts[..=*max]`, lower `*max` to the largest code present and return
-/// the largest count. `codes` is non-empty.
-fn count_codes(counts: &mut [u32; MAX_SEQ + 1], max: &mut usize, codes: &[u8]) -> usize {
-    counts[..=*max].fill(0);
-    for &c in codes {
-        debug_assert!(c as usize <= *max);
-        counts[c as usize] += 1;
-    }
-    while counts[*max] == 0 {
-        *max -= 1;
-    }
-    counts[..=*max].iter().copied().max().unwrap() as usize
-}
-
 /// Select, describe and build one sequence table
 /// (one `ZSTD_selectEncodingType` + `ZSTD_buildCTable` step of
-/// `ZSTD_buildSequencesStatistics`). Returns the table to encode with, the
-/// decoder-side state for the next block, the encoding type and the
-/// description size.
+/// `ZSTD_buildSequencesStatistics`). `counts`, `max` and `most_frequent`
+/// are the `HIST_countFast_wksp` result for `codes`. Returns the table to
+/// encode with, the decoder-side state for the next block, the encoding
+/// type and the description size.
 #[allow(clippy::too_many_arguments)]
 fn build_seq_table(
     out: &mut Vec<u8>,
     codes: &[u8],
-    max_code: usize,
+    counts: &mut [u32; 256],
+    max: usize,
+    most_frequent: usize,
     fse_log: u32,
     prev: &FseTableState,
     default_norm: &[i16],
@@ -978,9 +967,6 @@ fn build_seq_table(
     strategy: Strategy,
 ) -> Option<(FseCTable, FseTableState, SymbolEncodingType, usize)> {
     let nb_seq = codes.len();
-    let mut counts = [0u32; MAX_SEQ + 1];
-    let mut max = max_code;
-    let most_frequent = count_codes(&mut counts, &mut max, codes);
     // We can only use the basic table if max <= DefaultMaxOff, otherwise
     // the offsets are too large (a no-op for LL/ML, whose default tables
     // span every code).
@@ -988,7 +974,7 @@ fn build_seq_table(
     let mut repeat_mode = prev.repeat();
     let ty = select_encoding_type(
         &mut repeat_mode,
-        &counts,
+        &counts[..],
         max,
         most_frequent,
         nb_seq,
@@ -1010,7 +996,7 @@ fn build_seq_table(
         out,
         fse_log,
         ty,
-        &mut counts,
+        &mut counts[..],
         max,
         codes,
         nb_seq,
@@ -1059,27 +1045,49 @@ pub fn encode_sequences_section_with(
     let seq_head = out.len();
     out.push(0);
 
-    // ZSTD_seqToCodes, also totalling the raw bits the bitstream carries
-    let mut ll_codes = Vec::with_capacity(nb_seq);
-    let mut of_codes = Vec::with_capacity(nb_seq);
-    let mut ml_codes = Vec::with_capacity(nb_seq);
-    let mut extra_bits = 0usize;
-    for seq in sequences {
-        let ll = ll_code(seq.lit_len);
-        let of = off_code(seq.off_base);
-        let ml = ml_code(seq.ml_base);
-        extra_bits += (LL_BITS[ll as usize] + ML_BITS[ml as usize]) as usize + of as usize;
-        ll_codes.push(ll);
-        of_codes.push(of);
-        ml_codes.push(ml);
+    // ZSTD_seqToCodes
+    let mut codes = vec![0u8; 3 * nb_seq];
+    let (ll_codes, rest) = codes.split_at_mut(nb_seq);
+    let (of_codes, ml_codes) = rest.split_at_mut(nb_seq);
+    for (((seq, ll), of), ml) in sequences
+        .iter()
+        .zip(&mut *ll_codes)
+        .zip(&mut *of_codes)
+        .zip(&mut *ml_codes)
+    {
+        *ll = ll_code(seq.lit_len);
+        *of = off_code(seq.off_base);
+        *ml = ml_code(seq.ml_base);
     }
+
+    // The `HIST_countFast_wksp` of each `ZSTD_buildSequencesStatistics`
+    // step, taken up front so the histograms also total the raw bits the
+    // bitstream carries.
+    let mut ll_counts = [0u32; 256];
+    let mut of_counts = [0u32; 256];
+    let mut ml_counts = [0u32; 256];
+    let (ll_most, ll_max) = huf::hist_count(&mut ll_counts, ll_codes);
+    let (of_most, of_max) = huf::hist_count(&mut of_counts, of_codes);
+    let (ml_most, ml_max) = huf::hist_count(&mut ml_counts, ml_codes);
+    let raw_bits = |counts: &[u32], bits: &dyn Fn(usize) -> usize| {
+        counts
+            .iter()
+            .enumerate()
+            .map(|(c, &n)| n as usize * bits(c))
+            .sum::<usize>()
+    };
+    let extra_bits = raw_bits(&ll_counts[..=ll_max], &|c| LL_BITS[c] as usize)
+        + raw_bits(&ml_counts[..=ml_max], &|c| ML_BITS[c] as usize)
+        + raw_bits(&of_counts[..=of_max], &|c| c);
 
     // ZSTD_buildSequencesStatistics: LL, then OF, then ML
     let mut last_count_size = 0;
     let (ll_table, ll_next, ll_type, size) = build_seq_table(
         out,
-        &ll_codes,
-        MAX_LL,
+        ll_codes,
+        &mut ll_counts,
+        ll_max,
+        ll_most as usize,
         LL_FSE_LOG,
         &prev.ll,
         &LL_DEFAULT_NORM,
@@ -1092,8 +1100,10 @@ pub fn encode_sequences_section_with(
     }
     let (of_table, of_next, of_type, size) = build_seq_table(
         out,
-        &of_codes,
-        MAX_OFF,
+        of_codes,
+        &mut of_counts,
+        of_max,
+        of_most as usize,
         OFF_FSE_LOG,
         &prev.of,
         &OF_DEFAULT_NORM,
@@ -1106,8 +1116,10 @@ pub fn encode_sequences_section_with(
     }
     let (ml_table, ml_next, ml_type, size) = build_seq_table(
         out,
-        &ml_codes,
-        MAX_ML,
+        ml_codes,
+        &mut ml_counts,
+        ml_max,
+        ml_most as usize,
         ML_FSE_LOG,
         &prev.ml,
         &ML_DEFAULT_NORM,
@@ -1121,8 +1133,7 @@ pub fn encode_sequences_section_with(
     out[seq_head] = ((ll_type as u8) << 6) | ((of_type as u8) << 4) | ((ml_type as u8) << 2);
 
     let bitstream_size = encode_sequences(
-        out, &ll_table, &of_table, &ml_table, &ll_codes, &of_codes, &ml_codes, sequences,
-        extra_bits,
+        out, &ll_table, &of_table, &ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
     );
     // zstd versions <= 1.3.4 mistakenly report corruption when
     // FSE_readNCount() receives a buffer < 4 bytes: emit an uncompressed
