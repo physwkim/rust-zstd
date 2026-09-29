@@ -19,6 +19,10 @@ use super::params::{CParams, Strategy};
 use super::seqstore::{
     offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
 };
+#[cfg(target_arch = "aarch64")]
+use fearless_simd::Neon;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use fearless_simd::{Avx2, Sse4_2};
 use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -335,6 +339,181 @@ impl TagMask for Fallback {
     #[inline(always)]
     fn match_mask<const ROW_LOG: u32>(self, row: &[u8], tag: u8, head_grouped: u32) -> u64 {
         swar_match_mask::<ROW_LOG>(row, tag, head_grouped)
+    }
+}
+
+/// The x86 tag-compare kernels. Each is a `#[target_feature]` function, so
+/// calling one needs the matching fearless_simd witness as proof that the CPU
+/// has the feature; the witnesses are only ever constructed after detection.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86 {
+    use super::{rotate_mask, TagMask};
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+    use fearless_simd::{Avx2, Sse4_2};
+
+    /// `ZSTD_row_getSSEMask(rowEntries / 16, src, tag, head)`: one
+    /// `_mm_cmpeq_epi8` + `_mm_movemask_epi8` per 16 entries, chunk `i` at
+    /// bits `16 * i ..`, then rotated right by `head`.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE2.
+    #[target_feature(enable = "sse2")]
+    #[inline]
+    unsafe fn sse_match_mask<const ROW_LOG: u32>(row: &[u8], tag: u8, head: u32) -> u64 {
+        assert_eq!(row.len(), 1usize << ROW_LOG);
+        let splat = _mm_set1_epi8(tag as i8);
+        let mut matches = 0u64;
+        for i in (0..row.len() / 16).rev() {
+            // SAFETY: `16 * i + 16 <= row.len()` (asserted above); the load
+            // is unaligned.
+            let chunk = unsafe { _mm_loadu_si128(row.as_ptr().add(16 * i).cast::<__m128i>()) };
+            let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, splat)) as u32;
+            matches = (matches << 16) | eq as u64;
+        }
+        rotate_mask::<ROW_LOG>(matches, head)
+    }
+
+    /// The same mask from 256-bit compares (`_mm256_cmpeq_epi8` +
+    /// `_mm256_movemask_epi8` per 32 entries). libzstd has no AVX2 kernel;
+    /// this is bit-identical to [`sse_match_mask`] because movemask bit `j`
+    /// is entry `j` in both widths. 16-entry rows use the SSE kernel.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn avx2_match_mask<const ROW_LOG: u32>(row: &[u8], tag: u8, head: u32) -> u64 {
+        if ROW_LOG == 4 {
+            // SAFETY: AVX2 implies SSE2.
+            return unsafe { sse_match_mask::<ROW_LOG>(row, tag, head) };
+        }
+        assert_eq!(row.len(), 1usize << ROW_LOG);
+        let splat = _mm256_set1_epi8(tag as i8);
+        let mut matches = 0u64;
+        for i in (0..row.len() / 32).rev() {
+            // SAFETY: `32 * i + 32 <= row.len()` (asserted above); the load
+            // is unaligned.
+            let chunk = unsafe { _mm256_loadu_si256(row.as_ptr().add(32 * i).cast::<__m256i>()) };
+            let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, splat)) as u32;
+            matches = (matches << 32) | eq as u64;
+        }
+        rotate_mask::<ROW_LOG>(matches, head)
+    }
+
+    impl TagMask for Sse4_2 {
+        #[inline(always)]
+        fn group_width(_row_entries: u32) -> u32 {
+            1
+        }
+
+        #[inline(always)]
+        fn match_mask<const ROW_LOG: u32>(self, row: &[u8], tag: u8, head_grouped: u32) -> u64 {
+            // SAFETY: `self` proves SSE4.2, a superset of SSE2.
+            unsafe { sse_match_mask::<ROW_LOG>(row, tag, head_grouped) }
+        }
+    }
+
+    impl TagMask for Avx2 {
+        #[inline(always)]
+        fn group_width(_row_entries: u32) -> u32 {
+            1
+        }
+
+        #[inline(always)]
+        fn match_mask<const ROW_LOG: u32>(self, row: &[u8], tag: u8, head_grouped: u32) -> u64 {
+            // SAFETY: `self` proves AVX2.
+            unsafe { avx2_match_mask::<ROW_LOG>(row, tag, head_grouped) }
+        }
+    }
+}
+
+/// The NEON tag-compare kernel (little endian only, like C; Rust has no
+/// big-endian aarch64 target). Not compiled or run on the x86_64 machine
+/// this was written on.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::TagMask;
+    use core::arch::aarch64::*;
+    use fearless_simd::Neon;
+
+    /// `ZSTD_row_getNEONMask(rowEntries, src, tag, headGrouped)`. The mask
+    /// has one 4-bit group per entry for 16-entry rows (match flag in the
+    /// group's top bit, `& 0x88..`), 2-bit groups for 32 (flag in the bottom
+    /// bit, `& 0x55..`) and one bit per entry for 64; the rotation is always
+    /// the 64-bit one, by `headGrouped = head * groupWidth`.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support NEON.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn neon_match_mask<const ROW_LOG: u32>(row: &[u8], tag: u8, head_grouped: u32) -> u64 {
+        assert_eq!(row.len(), 1usize << ROW_LOG);
+        let src = row.as_ptr();
+        let dup = vdupq_n_u8(tag);
+        match ROW_LOG {
+            4 => {
+                // vshrn_n_u16 shifts by 4 every u16 and narrows to 8 lower
+                // bits, so every nibble of the result is one entry's flag.
+                // SAFETY: 16 bytes at `src` (asserted above).
+                let chunk = unsafe { vld1q_u8(src) };
+                let equal = vreinterpretq_u16_u8(vceqq_u8(chunk, dup));
+                let res = vshrn_n_u16::<4>(equal);
+                let matches = vget_lane_u64::<0>(vreinterpret_u64_u8(res));
+                matches.rotate_right(head_grouped) & 0x8888_8888_8888_8888
+            }
+            5 => {
+                // Same idea with de-interleaved even/odd bytes, then two bits
+                // per entry.
+                // SAFETY: 32 bytes at `src` (asserted above).
+                let chunk = unsafe { vld2q_u16(src.cast::<u16>()) };
+                let chunk0 = vreinterpretq_u8_u16(chunk.0);
+                let chunk1 = vreinterpretq_u8_u16(chunk.1);
+                let t0 = vshrn_n_u16::<6>(vreinterpretq_u16_u8(vceqq_u8(chunk0, dup)));
+                let t1 = vshrn_n_u16::<6>(vreinterpretq_u16_u8(vceqq_u8(chunk1, dup)));
+                let res = vsli_n_u8::<4>(t0, t1);
+                let matches = vget_lane_u64::<0>(vreinterpret_u64_u8(res));
+                matches.rotate_right(head_grouped) & 0x5555_5555_5555_5555
+            }
+            _ => {
+                // SAFETY: 64 bytes at `src` (asserted above).
+                let chunk = unsafe { vld4q_u8(src) };
+                let cmp0 = vceqq_u8(chunk.0, dup);
+                let cmp1 = vceqq_u8(chunk.1, dup);
+                let cmp2 = vceqq_u8(chunk.2, dup);
+                let cmp3 = vceqq_u8(chunk.3, dup);
+                let t0 = vsriq_n_u8::<1>(cmp1, cmp0);
+                let t1 = vsriq_n_u8::<1>(cmp3, cmp2);
+                let t2 = vsriq_n_u8::<2>(t1, t0);
+                let t3 = vsriq_n_u8::<4>(t2, t2);
+                let t4 = vshrn_n_u16::<4>(vreinterpretq_u16_u8(t3));
+                let matches = vget_lane_u64::<0>(vreinterpret_u64_u8(t4));
+                matches.rotate_right(head_grouped)
+            }
+        }
+    }
+
+    impl TagMask for Neon {
+        /// `ZSTD_row_matchMaskGroupWidth` with `ZSTD_ARCH_ARM_NEON`.
+        #[inline(always)]
+        fn group_width(row_entries: u32) -> u32 {
+            match row_entries {
+                16 => 4,
+                32 => 2,
+                _ => 1,
+            }
+        }
+
+        #[inline(always)]
+        fn match_mask<const ROW_LOG: u32>(self, row: &[u8], tag: u8, head_grouped: u32) -> u64 {
+            // SAFETY: `self` proves NEON.
+            unsafe { neon_match_mask::<ROW_LOG>(row, tag, head_grouped) }
+        }
     }
 }
 
@@ -855,6 +1034,66 @@ fn row_block_scalar(
     row_block(Fallback::new(), ms, src, block, rep, out, depth)
 }
 
+/// [`row_block`] compiled with SSE4.2 enabled, using the SSE tag compare.
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2, which `mask` attests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "sse4.2")]
+unsafe fn row_block_sse(
+    mask: Sse4_2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    row_block(mask, ms, src, block, rep, out, depth)
+}
+
+/// [`row_block`] compiled with AVX2 enabled, using the AVX2 tag compare.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, which `mask` attests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn row_block_avx2(
+    mask: Avx2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    row_block(mask, ms, src, block, rep, out, depth)
+}
+
+/// [`row_block`] compiled with NEON enabled, using the NEON tag compare.
+///
+/// # Safety
+///
+/// The CPU must support NEON, which `mask` attests.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[target_feature(enable = "neon")]
+unsafe fn row_block_neon(
+    mask: Neon,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    row_block(mask, ms, src, block, rep, out, depth)
+}
+
 /// The hash-chain block loop specialised on `mls`.
 #[inline(never)]
 fn hc_block(
@@ -903,8 +1142,15 @@ pub fn compress_block_with(
     limit_update_after_long_match(ms, block.start);
     match method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
+        // SAFETY (all three): fearless_simd constructs a witness only after
+        // detecting its feature set on this CPU.
         SearchMethod::RowHash => match level {
-            Level::Fallback(_) => row_block_scalar(ms, src, block, rep, out, depth),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Sse4_2(w) => unsafe { row_block_sse(w, ms, src, block, rep, out, depth) },
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Avx2(w) => unsafe { row_block_avx2(w, ms, src, block, rep, out, depth) },
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon(w) => unsafe { row_block_neon(w, ms, src, block, rep, out, depth) },
             _ => row_block_scalar(ms, src, block, rep, out, depth),
         },
     }
@@ -1118,6 +1364,141 @@ mod tests {
                 reference_mask(&row, tag, head),
                 "{row:?} tag {tag} head {head}"
             );
+        }
+    }
+
+    /// Every SIMD level available on this machine besides the fallback, with
+    /// a name for messages. On x86 an AVX2 machine also gets the SSE4.2
+    /// witness so both kernels run.
+    fn simd_levels() -> Vec<(&'static str, Level)> {
+        let mut out = Vec::new();
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("sse4.2") {
+                // SAFETY: detected just above.
+                out.push(("sse4.2", Level::Sse4_2(unsafe { Sse4_2::new_unchecked() })));
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: detected just above.
+                out.push(("avx2", Level::Avx2(unsafe { Avx2::new_unchecked() })));
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(w) = Level::new().as_neon() {
+                out.push(("neon", Level::Neon(w)));
+            }
+        }
+        out
+    }
+
+    /// `reference_mask` in the bit layout of [`TagMask::group_width`]: the
+    /// flag of entry `b` sits at bit `b * g + 3` for `g == 4` (C keeps the
+    /// nibble's top bit, `& 0x88..`), `2 * b` for `g == 2` (`& 0x55..`) and
+    /// `b` for `g == 1`.
+    fn reference_mask_grouped(row: &[u8], tag: u8, head: u32, g: u32) -> u64 {
+        let plain = reference_mask(row, tag, head);
+        let mut m = 0u64;
+        for b in 0..row.len() as u32 {
+            if plain >> b & 1 == 1 {
+                m |= 1 << (b * g + if g == 4 { 3 } else { 0 });
+            }
+        }
+        m
+    }
+
+    fn mask_of_level(level: Level, row: &[u8], tag: u8, head: u32) -> u64 {
+        match level {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Sse4_2(w) => mask_of(w, row, tag, head),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Avx2(w) => mask_of(w, row, tag, head),
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon(w) => mask_of(w, row, tag, head * Neon::group_width(row.len() as u32)),
+            _ => mask_of(Fallback::new(), row, tag, head),
+        }
+    }
+
+    fn group_width_of(level: Level, row_entries: u32) -> u32 {
+        match level {
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon(_) => Neon::group_width(row_entries),
+            _ => {
+                let _ = row_entries;
+                1
+            }
+        }
+    }
+
+    #[test]
+    fn simd_masks_match_reference() {
+        let levels = simd_levels();
+        assert!(
+            !levels.is_empty() || matches!(Level::new(), Level::Fallback(_)),
+            "Level::new() found SIMD but simd_levels() has no witness for it"
+        );
+        for (name, level) in levels {
+            for (row, tag, head) in random_rows(0x1234_5678_9ABC_DEF0, 400) {
+                let g = group_width_of(level, row.len() as u32);
+                assert_eq!(
+                    mask_of_level(level, &row, tag, head),
+                    reference_mask_grouped(&row, tag, head, g),
+                    "{name}: {row:?} tag {tag} head {head}"
+                );
+            }
+        }
+    }
+
+    /// Sequences, literals, final repcodes and anchors of every block.
+    fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
+        let mut ms = MatchState::new(cp, 1);
+        let mut rep = [1u32, 4, 8];
+        let mut all = SeqStore::new();
+        let mut store = SeqStore::new();
+        let mut start = 0;
+        while start < src.len() {
+            let end = (start + block_size).min(src.len());
+            store.clear();
+            let anchor = compress_block_with(
+                &mut ms,
+                src,
+                start..end,
+                &mut rep,
+                &mut store,
+                SearchMethod::RowHash,
+                level,
+            );
+            all.seqs.extend_from_slice(&store.seqs);
+            all.lits.extend_from_slice(&store.lits);
+            all.lits.extend_from_slice(&src[anchor..end]);
+            start = end;
+        }
+        (all, rep)
+    }
+
+    #[test]
+    fn simd_and_scalar_produce_identical_sequences() {
+        let levels = simd_levels();
+        let mut srcs = crate_sources();
+        srcs.extend_from_slice(&current_exe(300_000));
+        // Cover every rowLog (searchLog clamped to 4..6), not only the level
+        // table's.
+        for (level_no, block, search_log) in [
+            (5, ZSTD_BLOCKSIZE_MAX, 3),
+            (7, 5000, 5),
+            (9, ZSTD_BLOCKSIZE_MAX, 6),
+            (11, 40_000, 4),
+        ] {
+            let mut cp = CParams::for_level(level_no, srcs.len());
+            cp.search_log = search_log;
+            let (want, want_rep) = collect(&srcs, cp, block, Level::fallback());
+            assert!(!want.seqs.is_empty());
+            for &(name, level) in &levels {
+                let (got, got_rep) = collect(&srcs, cp, block, level);
+                assert_eq!(got.seqs, want.seqs, "{name} level {level_no} block {block}");
+                assert_eq!(got.lits, want.lits, "{name} level {level_no} block {block}");
+                assert_eq!(got_rep, want_rep, "{name} level {level_no} block {block}");
+            }
         }
     }
 
