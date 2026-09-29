@@ -913,35 +913,280 @@ impl HuffmanTable {
     }
 }
 
-struct HuffmanDecoder<'table> {
-    table: &'table HuffmanTable,
-    state: u64,
+// ------------------------------------------------------------
+// Huffman bit stream and symbol decoding
+//
+// Port of libzstd's BIT_DStream_t (common/bitstream.h) and the X1
+// single-symbol decoders in decompress/huf_decompress.c
+// (HUF_decodeSymbolX1, HUF_decodeStreamX1,
+// HUF_decompress1X1_usingDTable_internal_body,
+// HUF_decompress4X1_usingDTable_internal_body).
+// ------------------------------------------------------------
+
+/// Fewest literals for which the 4-stream layout is legal
+/// (libzstd MIN_LITERALS_FOR_4_STREAMS).
+const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HufStreamStatus {
+    /// At least 57 bits are loaded; keep decoding without checks.
+    Unfinished,
+    /// The container holds the final bytes; fewer than 64 bits are unread.
+    EndOfBuffer,
+    /// Every input bit has been consumed.
+    Completed,
+    /// More bits were consumed than the stream holds (or the fast reload
+    /// reached the last 8 bytes).
+    Overflow,
 }
 
-impl<'t> HuffmanDecoder<'t> {
-    fn new(table: &'t HuffmanTable) -> HuffmanDecoder<'t> {
-        HuffmanDecoder { table, state: 0 }
+/// Backward bit reader over one Huffman stream.
+///
+/// `container` holds the 8 bytes starting at `ptr`; bits are consumed from
+/// its high end (the stream is read from its last byte backwards). Once
+/// `bits_consumed` exceeds the data actually loaded, reads return zeros and
+/// the final `is_finished` check rejects the stream.
+struct HufBitStream<'s> {
+    src: &'s [u8],
+    ptr: usize,
+    container: u64,
+    bits_consumed: u32,
+}
+
+impl<'s> HufBitStream<'s> {
+    fn new(src: &'s [u8]) -> Result<Self, String> {
+        let Some(&last) = src.last() else {
+            return Err("Huffman stream is empty".to_string());
+        };
+        if last == 0 {
+            return Err("Huffman stream has no end mark".to_string());
+        }
+        // Zero padding above the end mark, plus the mark itself.
+        let padding = last.leading_zeros() + 1;
+        if src.len() >= 8 {
+            let ptr = src.len() - 8;
+            Ok(HufBitStream {
+                src,
+                ptr,
+                container: read_le64(src, ptr),
+                bits_consumed: padding,
+            })
+        } else {
+            let mut buf = [0u8; 8];
+            buf[..src.len()].copy_from_slice(src);
+            Ok(HufBitStream {
+                src,
+                ptr: 0,
+                container: u64::from_le_bytes(buf),
+                bits_consumed: padding + (8 - src.len() as u32) * 8,
+            })
+        }
     }
 
-    fn decode_symbol(&mut self) -> u8 {
-        self.table.decode[self.state as usize].symbol
+    /// Next `n` (1..=56) unread bits, without consuming them.
+    #[inline(always)]
+    fn look_bits(&self, n: u32) -> usize {
+        ((self.container << (self.bits_consumed & 63)) >> (64 - n)) as usize
     }
 
-    fn init_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let num_bits = self.table.max_num_bits;
-        let new_bits = br.get_bits(num_bits);
-        self.state = new_bits;
-        num_bits
+    #[inline(always)]
+    fn skip_bits(&mut self, n: u32) {
+        self.bits_consumed += n;
     }
 
-    fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let num_bits = self.table.decode[self.state as usize].num_bits;
-        let new_bits = br.get_bits(num_bits);
-        self.state <<= num_bits;
-        self.state &= self.table.decode.len() as u64 - 1;
-        self.state |= new_bits;
-        num_bits
+    #[inline(always)]
+    fn reload_internal(&mut self) -> HufStreamStatus {
+        self.ptr -= (self.bits_consumed >> 3) as usize;
+        self.bits_consumed &= 7;
+        self.container = read_le64(self.src, self.ptr);
+        HufStreamStatus::Unfinished
     }
+
+    /// Reload for the interleaved main loop. Requires `bits_consumed <= 64`
+    /// and stops (Overflow) once fewer than 8 unread bytes remain.
+    #[inline(always)]
+    fn reload_fast(&mut self) -> HufStreamStatus {
+        if self.ptr < 8 {
+            return HufStreamStatus::Overflow;
+        }
+        self.reload_internal()
+    }
+
+    #[inline(always)]
+    fn reload(&mut self) -> HufStreamStatus {
+        if self.bits_consumed > 64 {
+            return HufStreamStatus::Overflow;
+        }
+        if self.ptr >= 8 {
+            return self.reload_internal();
+        }
+        if self.ptr == 0 {
+            return if self.bits_consumed < 64 {
+                HufStreamStatus::EndOfBuffer
+            } else {
+                HufStreamStatus::Completed
+            };
+        }
+        // 0 < ptr < 8: only `ptr` bytes are left before the stream start.
+        let mut nb_bytes = (self.bits_consumed >> 3) as usize;
+        let mut result = HufStreamStatus::Unfinished;
+        if self.ptr < nb_bytes {
+            nb_bytes = self.ptr;
+            result = HufStreamStatus::EndOfBuffer;
+        }
+        self.ptr -= nb_bytes;
+        self.bits_consumed -= (nb_bytes * 8) as u32;
+        self.container = read_le64(self.src, self.ptr);
+        result
+    }
+
+    /// True when exactly every bit of the stream was consumed.
+    fn is_finished(&self) -> bool {
+        self.ptr == 0 && self.bits_consumed == 64
+    }
+}
+
+#[inline(always)]
+fn read_le64(src: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(src[at..at + 8].try_into().unwrap())
+}
+
+#[inline(always)]
+fn huf_decode_symbol_x1(br: &mut HufBitStream<'_>, dt: &[HuffmanEntry], dt_log: u32) -> u8 {
+    let entry = dt[br.look_bits(dt_log)];
+    br.skip_bits(u32::from(entry.num_bits));
+    entry.symbol
+}
+
+/// Decode `out.len()` symbols from one stream (HUF_decodeStreamX1).
+#[inline(always)]
+fn huf_decode_stream_x1(
+    out: &mut [u8],
+    br: &mut HufBitStream<'_>,
+    dt: &[HuffmanEntry],
+    dt_log: u32,
+) {
+    let end = out.len();
+    let mut p = 0;
+    if end > 3 {
+        // Up to 4 symbols per reload: a reload that reports Unfinished
+        // guarantees at least 57 bits, and a symbol takes at most 11.
+        while br.reload() == HufStreamStatus::Unfinished && p < end - 3 {
+            let a = huf_decode_symbol_x1(br, dt, dt_log);
+            let b = huf_decode_symbol_x1(br, dt, dt_log);
+            let c = huf_decode_symbol_x1(br, dt, dt_log);
+            let d = huf_decode_symbol_x1(br, dt, dt_log);
+            out[p..p + 4].copy_from_slice(&[a, b, c, d]);
+            p += 4;
+        }
+    } else {
+        br.reload();
+    }
+    // Either at most 3 symbols remain with >= 57 bits loaded, or the
+    // container already holds the last bytes of the stream.
+    while p < end {
+        out[p] = huf_decode_symbol_x1(br, dt, dt_log);
+        p += 1;
+    }
+}
+
+/// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
+fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+    let dt_log = u32::from(table.max_num_bits);
+    let dt = &table.decode[..];
+    let mut br = HufBitStream::new(src)?;
+    huf_decode_stream_x1(out, &mut br, dt, dt_log);
+    if !br.is_finished() {
+        return Err("Huffman stream not fully consumed".to_string());
+    }
+    Ok(())
+}
+
+/// Four interleaved literal streams
+/// (HUF_decompress4X1_usingDTable_internal_body).
+///
+/// The output is split into four segments of `(len + 3) / 4` bytes (the
+/// last one holds the remainder); stream `i` produces segment `i`. The main
+/// loop advances all four streams in lockstep, 4 symbols each per reload,
+/// so the four dependency chains overlap in the CPU.
+fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+    if src.len() < 10 {
+        return Err(format!(
+            "Huffman 4-stream input too short: {} bytes",
+            src.len()
+        ));
+    }
+    let dst_size = out.len();
+    if dst_size < MIN_LITERALS_FOR_4_STREAMS {
+        return Err(format!(
+            "Huffman 4-stream output too small: {} bytes",
+            dst_size
+        ));
+    }
+    let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
+    let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
+    let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
+    let body = &src[6..];
+    if len1 + len2 + len3 > body.len() {
+        return Err("Huffman jump table exceeds input".to_string());
+    }
+    let (s1, rest) = body.split_at(len1);
+    let (s2, rest) = rest.split_at(len2);
+    let (s3, s4) = rest.split_at(len3);
+
+    let segment = dst_size.div_ceil(4);
+    if 3 * segment > dst_size {
+        return Err("Huffman 4-stream segments exceed output".to_string());
+    }
+    let (o1, rest) = out.split_at_mut(segment);
+    let (o2, rest) = rest.split_at_mut(segment);
+    let (o3, o4) = rest.split_at_mut(segment);
+
+    let mut b1 = HufBitStream::new(s1)?;
+    let mut b2 = HufBitStream::new(s2)?;
+    let mut b3 = HufBitStream::new(s3)?;
+    let mut b4 = HufBitStream::new(s4)?;
+
+    let dt_log = u32::from(table.max_num_bits);
+    let dt = &table.decode[..];
+
+    // Common write position within each segment; `o4` is the shortest
+    // segment, so bounding `p` by it bounds all four.
+    let mut p = 0;
+    if o4.len() >= 8 {
+        let mut end_signal = true;
+        while end_signal && p + 4 <= o4.len() {
+            let mut w1 = [0u8; 4];
+            let mut w2 = [0u8; 4];
+            let mut w3 = [0u8; 4];
+            let mut w4 = [0u8; 4];
+            for i in 0..4 {
+                w1[i] = huf_decode_symbol_x1(&mut b1, dt, dt_log);
+                w2[i] = huf_decode_symbol_x1(&mut b2, dt, dt_log);
+                w3[i] = huf_decode_symbol_x1(&mut b3, dt, dt_log);
+                w4[i] = huf_decode_symbol_x1(&mut b4, dt, dt_log);
+            }
+            o1[p..p + 4].copy_from_slice(&w1);
+            o2[p..p + 4].copy_from_slice(&w2);
+            o3[p..p + 4].copy_from_slice(&w3);
+            o4[p..p + 4].copy_from_slice(&w4);
+            p += 4;
+            end_signal &= b1.reload_fast() == HufStreamStatus::Unfinished;
+            end_signal &= b2.reload_fast() == HufStreamStatus::Unfinished;
+            end_signal &= b3.reload_fast() == HufStreamStatus::Unfinished;
+            end_signal &= b4.reload_fast() == HufStreamStatus::Unfinished;
+        }
+    }
+
+    huf_decode_stream_x1(&mut o1[p..], &mut b1, dt, dt_log);
+    huf_decode_stream_x1(&mut o2[p..], &mut b2, dt, dt_log);
+    huf_decode_stream_x1(&mut o3[p..], &mut b3, dt, dt_log);
+    huf_decode_stream_x1(&mut o4[p..], &mut b4, dt, dt_log);
+
+    if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
+        return Err("Huffman stream not fully consumed".to_string());
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -1644,113 +1889,40 @@ fn decompress_literals(
     let num_streams = section
         .num_streams
         .ok_or_else(|| "Missing num_streams".to_string())?;
+    let regenerated_size = section.regenerated_size as usize;
+    if regenerated_size > MAX_BLOCK_SIZE as usize {
+        return Err(format!(
+            "Literals size {} exceeds block size limit",
+            regenerated_size
+        ));
+    }
 
-    target.reserve(section.regenerated_size as usize);
     let source = &source[0..compressed_size];
-    let mut bytes_read = 0u32;
+    let mut bytes_read = 0usize;
 
     match section.ls_type {
         LiteralsSectionType::Compressed => {
-            bytes_read += scratch.table.build_decoder(source)?;
+            bytes_read += scratch.table.build_decoder(source)? as usize;
         }
-        LiteralsSectionType::Treeless => {
-            if scratch.table.max_num_bits == 0 {
-                return Err("Uninitialized Huffman table for treeless literals".to_string());
-            }
+        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
+            return Err("Uninitialized Huffman table for treeless literals".to_string());
         }
         _ => {}
     }
 
-    let source = &source[bytes_read as usize..];
+    let source = &source[bytes_read..];
+    let start = target.len();
+    target.resize(start + regenerated_size, 0);
+    let out = &mut target[start..];
 
     if num_streams == 4 {
-        if source.len() < 6 {
-            return Err(format!(
-                "Missing bytes for jump header: have {}",
-                source.len()
-            ));
-        }
-        let jump1 = source[0] as usize + ((source[1] as usize) << 8);
-        let jump2 = jump1 + source[2] as usize + ((source[3] as usize) << 8);
-        let jump3 = jump2 + source[4] as usize + ((source[5] as usize) << 8);
-        bytes_read += 6;
-        let source = &source[6..];
-
-        if source.len() < jump3 {
-            return Err(format!(
-                "Missing bytes for literals: have {}, need {}",
-                source.len(),
-                jump3
-            ));
-        }
-
-        let stream1 = &source[..jump1];
-        let stream2 = &source[jump1..jump2];
-        let stream3 = &source[jump2..jump3];
-        let stream4 = &source[jump3..];
-
-        for stream in &[stream1, stream2, stream3, stream4] {
-            let mut decoder = HuffmanDecoder::new(&scratch.table);
-            let mut br = BitReaderReversed::new(stream);
-            let mut skipped_bits = 0;
-            loop {
-                let val = br.get_bits(1);
-                skipped_bits += 1;
-                if val == 1 || skipped_bits > 8 {
-                    break;
-                }
-            }
-            if skipped_bits > 8 {
-                return Err(format!("Extra padding: {} bits skipped", skipped_bits));
-            }
-            decoder.init_state(&mut br);
-
-            while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-                target.push(decoder.decode_symbol());
-                decoder.next_state(&mut br);
-            }
-            if br.bits_remaining() != -(scratch.table.max_num_bits as isize) {
-                return Err(format!(
-                    "Bitstream read mismatch: {} vs expected {}",
-                    br.bits_remaining(),
-                    -(scratch.table.max_num_bits as isize)
-                ));
-            }
-        }
-
-        bytes_read += source.len() as u32;
+        huf_decompress_4x1(out, source, &scratch.table)?;
     } else {
-        assert!(num_streams == 1);
-        let mut decoder = HuffmanDecoder::new(&scratch.table);
-        let mut br = BitReaderReversed::new(source);
-        let mut skipped_bits = 0;
-        loop {
-            let val = br.get_bits(1);
-            skipped_bits += 1;
-            if val == 1 || skipped_bits > 8 {
-                break;
-            }
-        }
-        if skipped_bits > 8 {
-            return Err(format!("Extra padding: {} bits skipped", skipped_bits));
-        }
-        decoder.init_state(&mut br);
-        while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-            target.push(decoder.decode_symbol());
-            decoder.next_state(&mut br);
-        }
-        bytes_read += source.len() as u32;
+        huf_decompress_1x1(out, source, &scratch.table)?;
     }
+    bytes_read += source.len();
 
-    if target.len() != section.regenerated_size as usize {
-        return Err(format!(
-            "Decoded literal count mismatch: {} vs expected {}",
-            target.len(),
-            section.regenerated_size
-        ));
-    }
-
-    Ok(bytes_read)
+    Ok(bytes_read as u32)
 }
 
 // ============================================================
