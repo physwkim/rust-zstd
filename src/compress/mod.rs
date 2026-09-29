@@ -57,9 +57,17 @@ pub struct CompressOptions {
     /// the thread count, and is the same for a given job size whether or
     /// not the `parallel` feature is enabled. Smaller jobs give more
     /// parallelism and slightly worse ratios, since a job only sees
-    /// `min(window / 8, job start)` bytes of history from the previous job
-    /// (`window / 4` for `Strategy::Lazy2`).
+    /// `min(overlap, job start)` bytes of history from the previous job, see
+    /// `overlap_log`. The job size is raised to the overlap size when it is
+    /// smaller (`ZSTDMT_initCStream_internal`).
     pub job_size: Option<usize>,
+    /// `ZSTD_c_overlapLog`, `0..=9`: the history a job indexes from before
+    /// its start, as a fraction of the window. `0` selects
+    /// `ZSTDMT_overlapLog_default` (6 for `Fast`..`Lazy`, 7 for `Lazy2`),
+    /// `1` means no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
+    /// so `9` is the full window. Values above 9 panic (libzstd rejects
+    /// them with `parameter_outOfBound`).
+    pub overlap_log: u8,
 }
 
 impl Default for CompressOptions {
@@ -67,6 +75,7 @@ impl Default for CompressOptions {
         Self {
             level: ZSTD_CLEVEL_DEFAULT,
             job_size: None,
+            overlap_log: 0,
         }
     }
 }
@@ -79,7 +88,7 @@ pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
         data,
         &CompressOptions {
             level,
-            job_size: None,
+            ..CompressOptions::default()
         },
     )
 }
@@ -153,9 +162,9 @@ impl Compressor {
             return;
         }
 
-        let job_size = job_size_for(self.opts.job_size, cparams.window_log);
+        let overlap = overlap_size(&cparams, self.opts.overlap_log);
+        let job_size = job_size_for(self.opts.job_size, cparams.window_log, overlap);
         let jobs = job_ranges(src.len(), job_size);
-        let overlap = overlap_size(&cparams);
         let n_jobs = jobs.len();
         if self.jobs.len() < n_jobs {
             self.jobs.resize_with(n_jobs, JobContext::default);
@@ -302,14 +311,16 @@ fn run_jobs<F>(
     }
 }
 
-/// `ZSTDMT_initCStream_internal`'s job size: an explicit size clamped to
-/// `[ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX]`, else
-/// `1 << ZSTDMT_computeTargetJobLog` (no long-distance matching).
-pub fn job_size_for(requested: Option<usize>, window_log: u32) -> usize {
-    match requested {
+/// `ZSTDMT_initCStream_internal`'s `targetSectionSize`: an explicit size
+/// clamped to `[ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX]`, else
+/// `1 << ZSTDMT_computeTargetJobLog` (no long-distance matching), and at
+/// least `overlap` ("job size must be >= overlap size").
+pub fn job_size_for(requested: Option<usize>, window_log: u32, overlap: usize) -> usize {
+    let section = match requested {
         Some(n) => n.clamp(JOBSIZE_MIN, JOBSIZE_MAX),
         None => 1usize << 20.max(window_log + 2).min(JOBLOG_MAX),
-    }
+    };
+    section.max(overlap)
 }
 
 /// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
@@ -321,16 +332,29 @@ pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// `ZSTDMT_computeOverlapSize` with `overlapLog = 0` (the default) and no
-/// long-distance matching: `ZSTDMT_overlapLog_default` is 7 for `Lazy2` and
-/// 6 for the other strategies, i.e. a quarter or an eighth of the window.
-pub fn overlap_size(cparams: &CParams) -> usize {
-    let overlap_log = match cparams.strategy {
-        Strategy::Lazy2 => 7,
-        Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
+/// `ZSTDMT_computeOverlapSize` without long-distance matching: `overlap_log`
+/// as `ZSTD_c_overlapLog` (see [`CompressOptions::overlap_log`]); the result
+/// is `0` or `1 << (window_log - (9 - overlap_log))`.
+pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
+    assert!(
+        overlap_log <= 9,
+        "overlap_log {overlap_log} out of range 0..=9"
+    );
+    // ZSTDMT_overlapLog
+    let overlap_log = match overlap_log {
+        // ZSTDMT_overlapLog_default
+        0 => match cparams.strategy {
+            Strategy::Lazy2 => 7,
+            Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
+        },
+        n => n as u32,
     };
     let overlap_rlog = 9 - overlap_log;
-    1usize << (cparams.window_log - overlap_rlog)
+    if overlap_rlog >= 8 {
+        0
+    } else {
+        1usize << (cparams.window_log - overlap_rlog)
+    }
 }
 
 /// `ZSTD_writeFrameHeader` with no dictionary and no checksum:
@@ -481,16 +505,16 @@ mod tests {
     #[test]
     fn job_sizing() {
         // explicit: clamped to [JOBSIZE_MIN, JOBSIZE_MAX], otherwise used as is
-        assert_eq!(job_size_for(Some(0), 19), JOBSIZE_MIN);
-        assert_eq!(job_size_for(Some(1), 19), JOBSIZE_MIN);
-        assert_eq!(job_size_for(Some(JOBSIZE_MIN + 1), 19), JOBSIZE_MIN + 1);
-        assert_eq!(job_size_for(Some(usize::MAX), 19), JOBSIZE_MAX);
+        assert_eq!(job_size_for(Some(0), 19, 0), JOBSIZE_MIN);
+        assert_eq!(job_size_for(Some(1), 19, 0), JOBSIZE_MIN);
+        assert_eq!(job_size_for(Some(JOBSIZE_MIN + 1), 19, 0), JOBSIZE_MIN + 1);
+        assert_eq!(job_size_for(Some(usize::MAX), 19, 0), JOBSIZE_MAX);
         // default: 1 << min(max(20, window_log + 2), 30)
-        assert_eq!(job_size_for(None, 10), 1 << 20);
-        assert_eq!(job_size_for(None, 18), 1 << 20);
-        assert_eq!(job_size_for(None, 19), 1 << 21);
-        assert_eq!(job_size_for(None, 22), 1 << 24);
-        assert_eq!(job_size_for(None, 31), 1 << 30);
+        assert_eq!(job_size_for(None, 10, 0), 1 << 20);
+        assert_eq!(job_size_for(None, 18, 0), 1 << 20);
+        assert_eq!(job_size_for(None, 19, 0), 1 << 21);
+        assert_eq!(job_size_for(None, 22, 0), 1 << 24);
+        assert_eq!(job_size_for(None, 31, 0), 1 << 30);
         assert_eq!(job_ranges(0, 1 << 17), Vec::<Range<usize>>::new());
         assert_eq!(
             job_ranges(1_000_001, 1_000_000),
@@ -502,10 +526,66 @@ mod tests {
             vec![0..1 << 17, 1 << 17..1 << 18, 1 << 18..(1 << 18) + 5]
         );
         let fast = CParams::for_level(1, 8 << 20);
-        assert_eq!(overlap_size(&fast), 1 << (fast.window_log - 3));
+        assert_eq!(overlap_size(&fast, 0), 1 << (fast.window_log - 3));
         let lazy2 = CParams::for_level(11, 8 << 20);
         assert_eq!(lazy2.strategy, Strategy::Lazy2);
-        assert_eq!(overlap_size(&lazy2), 1 << (lazy2.window_log - 2));
+        assert_eq!(overlap_size(&lazy2, 0), 1 << (lazy2.window_log - 2));
+        // ZSTD_c_overlapLog: 1 = none, n = window >> (9 - n), 9 = window.
+        for cp in [fast, lazy2] {
+            assert_eq!(overlap_size(&cp, 1), 0);
+            assert_eq!(overlap_size(&cp, 2), 1 << (cp.window_log - 7));
+            assert_eq!(overlap_size(&cp, 6), 1 << (cp.window_log - 3));
+            assert_eq!(overlap_size(&cp, 9), 1 << cp.window_log);
+        }
+        // A job is at least the overlap; JOBSIZE_MIN applies to explicit sizes.
+        assert_eq!(job_size_for(Some(1), 19, 1 << 22), 1 << 22);
+        assert_eq!(job_size_for(Some(1), 19, 1 << 18), JOBSIZE_MIN);
+        assert_eq!(job_size_for(None, 23, 1 << 23), 1 << 25);
+        assert_eq!(job_size_for(Some(JOBSIZE_MIN), 23, 1 << 23), 1 << 23);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn overlap_log_above_nine_panics() {
+        overlap_size(&CParams::for_level(1, 1 << 20), 10);
+    }
+
+    /// Every overlap boundary (none, smallest, default, full window) yields a
+    /// frame both decoders accept, over several jobs; overlap_log 0 equals
+    /// the strategy's explicit default.
+    #[test]
+    fn overlap_log_boundaries_roundtrip() {
+        let mut data = text(1 << 20);
+        data.extend_from_slice(&noise(256 << 10, 5));
+        data.extend_from_slice(&text(1 << 20));
+        for level in [1, 3, 7, 11] {
+            let default_log = if CParams::for_level(level, data.len()).strategy == Strategy::Lazy2 {
+                7
+            } else {
+                6
+            };
+            let frame = |overlap_log| {
+                compress_with(
+                    &data,
+                    &CompressOptions {
+                        level,
+                        job_size: Some(JOBSIZE_MIN),
+                        overlap_log,
+                    },
+                )
+            };
+            assert!(frame(0) == frame(default_log), "level {level}");
+            for overlap_log in [1, 2, 9] {
+                let f = frame(overlap_log);
+                assert_eq!(
+                    crate::decompress(&f).unwrap(),
+                    data,
+                    "L{level} ov{overlap_log}"
+                );
+                let theirs = zstd::stream::decode_all(&f[..]).unwrap();
+                assert_eq!(theirs, data, "L{level} ov{overlap_log}");
+            }
+        }
     }
 
     /// The parallel and the serial job loop must produce the same bytes.
@@ -518,13 +598,14 @@ mod tests {
             let opts = CompressOptions {
                 level,
                 job_size: Some(512 << 10),
+                overlap_log: 0,
             };
             let cparams = CParams::for_level(level, data.len());
             let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-            let job_size = job_size_for(opts.job_size, cparams.window_log);
+            let overlap = overlap_size(&cparams, opts.overlap_log);
+            let job_size = job_size_for(opts.job_size, cparams.window_log, overlap);
             let jobs = job_ranges(data.len(), job_size);
-            assert!(jobs.len() >= 10, "level {level}: {} jobs", jobs.len());
-            let overlap = overlap_size(&cparams);
+            assert!(jobs.len() >= 5, "level {level}: {} jobs", jobs.len());
             let n = jobs.len();
             let f = |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
                 compress_job(
@@ -568,7 +649,11 @@ mod tests {
         let empty = Vec::new();
         for level in [1, 3, 7, 11] {
             for job_size in [None, Some(512 << 10)] {
-                let opts = CompressOptions { level, job_size };
+                let opts = CompressOptions {
+                    level,
+                    job_size,
+                    overlap_log: 0,
+                };
                 let mut cx = Compressor::new(opts.clone());
                 for input in [&a, &b, &c, &a, &empty] {
                     let reused = cx.compress_to_vec(input);
@@ -594,7 +679,7 @@ mod tests {
         let data = text(300 << 10);
         for level in [1, 3] {
             assert_eq!(
-                job_size_for(None, CParams::for_level(level, data.len()).window_log),
+                job_size_for(None, CParams::for_level(level, data.len()).window_log, 0),
                 1 << 21
             );
             let auto = compress_with(
@@ -602,6 +687,7 @@ mod tests {
                 &CompressOptions {
                     level,
                     job_size: None,
+                    overlap_log: 0,
                 },
             );
             for js in [300 << 10, 512 << 10, 1 << 20] {
@@ -610,6 +696,7 @@ mod tests {
                     &CompressOptions {
                         level,
                         job_size: Some(js),
+                        overlap_log: 0,
                     },
                 );
                 assert!(auto == explicit, "level {level} job_size {js}");
@@ -631,6 +718,7 @@ mod tests {
                 &CompressOptions {
                     level,
                     job_size: Some(JOBSIZE_MIN),
+                    overlap_log: 0,
                 },
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data, "level {level}");
@@ -651,9 +739,10 @@ mod tests {
         let opts = CompressOptions {
             level: 1,
             job_size: Some(job),
+            overlap_log: 0,
         };
         let cparams = CParams::for_level(1, data.len());
-        assert!(overlap_size(&cparams) >= copy);
+        assert!(overlap_size(&cparams, 0) >= copy);
         let frame = compress_with(&data, &opts);
         assert!(
             frame.len() < job + copy / 4,

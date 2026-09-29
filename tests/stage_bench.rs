@@ -51,8 +51,8 @@ struct Layout {
 fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layout) -> Vec<u8> {
     let t_pass = Instant::now();
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-    let jobs = job_ranges(data.len(), job_size_for(None, cparams.window_log));
-    let overlap = overlap_size(&cparams);
+    let overlap = overlap_size(&cparams, 0);
+    let jobs = job_ranges(data.len(), job_size_for(None, cparams.window_log, overlap));
     layout.jobs = jobs.len();
     layout.blocks = 0;
     let mut out = Vec::new();
@@ -167,7 +167,7 @@ fn stage_split() {
         for level in LEVELS {
             let opts = CompressOptions {
                 level,
-                job_size: None,
+                ..CompressOptions::default()
             };
             let cparams = CParams::for_level(level, data.len());
             let mut cx = Compressor::new(opts.clone());
