@@ -2706,10 +2706,6 @@ const WILDCOPY_OVERLENGTH: usize = 32;
 /// (libzstd WILDCOPY_VECLEN).
 const WILDCOPY_VECLEN: usize = 16;
 
-/// Matches longer than this are copied with `copy_within` (memmove)
-/// instead of fixed 16-byte chunks.
-const LONG_COPY_THRESHOLD: usize = 32;
-
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
 fn build_sequence_tables(
@@ -3086,22 +3082,9 @@ fn exec_sequence(
         let dst = out.add(o_lit_end);
         let src = out.add(o_lit_end - offset) as *const u8;
         if offset >= WILDCOPY_VECLEN {
-            if ml <= LONG_COPY_THRESHOLD {
-                wildcopy(dst, src, ml);
-            } else if offset >= ml {
-                ptr::copy_nonoverlapping(src, dst, ml);
-            } else {
-                // Periodic pattern: copy the whole prefix decoded so far,
-                // whose length doubles each round, so long matches take
-                // O(log n) memcpys. `chunk <= offset + done` keeps every
-                // memcpy non-overlapping.
-                let mut done = 0;
-                while done < ml {
-                    let chunk = (offset + done).min(ml - done);
-                    ptr::copy_nonoverlapping(src, dst.add(done), chunk);
-                    done += chunk;
-                }
-            }
+            // Sequential 16-byte chunks stay correct for overlapping
+            // periodic matches because `dst - src >= 16`.
+            wildcopy(dst, src, ml);
         } else {
             // Copy 8 bytes and spread the offset to at least 8, then
             // continue with 8-byte chunks.
