@@ -1,7 +1,12 @@
-use std::process::Command;
-use std::time::Instant;
+//! rust-zstd against libzstd 1.5.7 (the `zstd` crate, in process): sizes,
+//! compression and decompression throughput, and cross-decoding of every
+//! frame in both directions.
 
-fn bench_rust(data: &[u8], level: i32, iters: u32) -> (f64, f64, usize) {
+use std::time::Instant;
+use zstd::bulk::{Compressor, Decompressor};
+
+/// (compress seconds, decompress seconds, frame) for our codec.
+fn bench_rust(data: &[u8], level: i32, iters: u32) -> (f64, f64, Vec<u8>) {
     let compressed = rust_zstd::compress(data, level);
     let _ = rust_zstd::decompress(&compressed);
 
@@ -18,58 +23,37 @@ fn bench_rust(data: &[u8], level: i32, iters: u32) -> (f64, f64, usize) {
     }
     let dt = start.elapsed().as_secs_f64() / iters as f64;
 
-    (ct, dt, c.len())
+    (ct, dt, c)
 }
 
-fn bench_c_zstd(data: &[u8], level: i32, iters: u32) -> (f64, f64, usize) {
-    let tmp_in = "/tmp/zstd_bench_input.bin";
-    let tmp_out = "/tmp/zstd_bench_output.zst";
-    let tmp_dec = "/tmp/zstd_bench_decoded.bin";
-
-    std::fs::write(tmp_in, data).unwrap();
+/// (compress seconds, decompress seconds, frame) for libzstd, one context
+/// per direction reused across iterations like `ZSTD_compressCCtx`.
+fn bench_c_zstd(data: &[u8], level: i32, iters: u32) -> (f64, f64, Vec<u8>) {
+    let mut compressor = Compressor::new(level).unwrap();
+    let mut decompressor = Decompressor::new().unwrap();
 
     // Warmup
-    Command::new("zstd")
-        .args(["-f", &format!("-{}", level), tmp_in, "-o", tmp_out])
-        .output()
-        .unwrap();
+    let c = compressor.compress(data).unwrap();
+    let _ = decompressor.decompress(&c, data.len()).unwrap();
 
-    // Compress
     let start = Instant::now();
+    let mut c = Vec::new();
     for _ in 0..iters {
-        Command::new("zstd")
-            .args(["-f", "-q", &format!("-{}", level), tmp_in, "-o", tmp_out])
-            .output()
-            .unwrap();
+        c = compressor.compress(data).unwrap();
     }
     let ct = start.elapsed().as_secs_f64() / iters as f64;
-    let comp_size = std::fs::metadata(tmp_out).unwrap().len() as usize;
 
-    // Decompress
     let start = Instant::now();
     for _ in 0..iters {
-        Command::new("zstd")
-            .args(["-d", "-f", "-q", tmp_out, "-o", tmp_dec])
-            .output()
-            .unwrap();
+        let _ = decompressor.decompress(&c, data.len()).unwrap();
     }
     let dt = start.elapsed().as_secs_f64() / iters as f64;
 
-    std::fs::remove_file(tmp_in).ok();
-    std::fs::remove_file(tmp_out).ok();
-    std::fs::remove_file(tmp_dec).ok();
-
-    (ct, dt, comp_size)
+    (ct, dt, c)
 }
 
 #[test]
 fn rust_vs_c_zstd() {
-    // Check zstd is available
-    if Command::new("zstd").arg("--version").output().is_err() {
-        eprintln!("skipping: zstd CLI not found");
-        return;
-    }
-
     let datasets: Vec<(&str, Vec<u8>)> = vec![
         ("zeros_1M", vec![0u8; 1_048_576]),
         (
@@ -118,9 +102,30 @@ fn rust_vs_c_zstd() {
         let mb = data.len() as f64 / (1024.0 * 1024.0);
 
         for level in [1, 3, 7, 11] {
-            let (c_ct, c_dt, c_sz) = bench_c_zstd(data, level, iters);
-            let (r_ct, r_dt, r_sz) = bench_rust(data, level, iters);
+            let (c_ct, c_dt, c_frame) = bench_c_zstd(data, level, iters);
+            let (r_ct, r_dt, r_frame) = bench_rust(data, level, iters);
 
+            let ours = rust_zstd::decompress(&r_frame)
+                .unwrap_or_else(|e| panic!("{name} L{level}: our decoder on our frame: {e}"));
+            assert!(
+                ours == *data,
+                "{name} L{level}: our decoder on our frame: wrong bytes"
+            );
+            let theirs = zstd::decode_all(&r_frame[..])
+                .unwrap_or_else(|e| panic!("{name} L{level}: libzstd on our frame: {e}"));
+            assert!(
+                theirs == *data,
+                "{name} L{level}: libzstd on our frame: wrong bytes"
+            );
+            let ours_on_c = rust_zstd::decompress(&c_frame)
+                .unwrap_or_else(|e| panic!("{name} L{level}: our decoder on libzstd frame: {e}"));
+            assert!(
+                ours_on_c == *data,
+                "{name} L{level}: our decoder on libzstd frame: wrong bytes"
+            );
+
+            let c_sz = c_frame.len();
+            let r_sz = r_frame.len();
             let c_comp = mb / c_ct;
             let c_dec = mb / c_dt;
             let r_comp = mb / r_ct;
