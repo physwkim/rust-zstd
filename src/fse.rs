@@ -40,9 +40,18 @@ impl FseCTable {
         let table_mask = table_size - 1;
 
         // 1. Build cumulative counts and place low-probability symbols.
-        let mut cumul = vec![0u16; max_symbol + 2];
+        // `cumul` and `tableSymbol` live in the C workspace; sized for the
+        // largest alphabet and table here.
+        let mut cumul = [0u16; FSE_MAX_SYMBOL_VALUE + 2];
         let mut high_threshold = table_size - 1;
-        let mut table_symbol = vec![0u8; table_size as usize];
+        let mut small_symbol_buf = [0u8; 512];
+        let mut large_symbol_buf = Vec::new();
+        let table_symbol: &mut [u8] = if table_size as usize <= small_symbol_buf.len() {
+            &mut small_symbol_buf[..table_size as usize]
+        } else {
+            large_symbol_buf.resize(table_size as usize, 0);
+            &mut large_symbol_buf
+        };
 
         for s in 0..=max_symbol {
             if norm[s] == -1 {
@@ -84,7 +93,6 @@ impl FseCTable {
         // For each state in the table, compute its decoder-compatible numbits,
         // then derive the CTable's delta_nb_bits and delta_find_state from that.
         let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
-        let _sym_count_tt = vec![0u32; max_symbol + 1];
         let mut total = 0u32;
         for s in 0..=max_symbol {
             let prob = if norm[s] == -1 {
@@ -487,6 +495,8 @@ pub struct FseState {
 pub const FSE_MIN_TABLELOG: u32 = 5;
 /// `FSE_MAX_TABLELOG`.
 pub const FSE_MAX_TABLELOG: u32 = 12;
+/// `FSE_MAX_SYMBOL_VALUE`.
+pub const FSE_MAX_SYMBOL_VALUE: usize = 255;
 /// `FSE_DEFAULT_TABLELOG`.
 pub const FSE_DEFAULT_TABLELOG: u32 = 11;
 
