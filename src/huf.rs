@@ -280,23 +280,28 @@ fn huf_build_tree(nodes: &mut [NodeElt; HUFF_NODE_TABLE_SIZE], max_symbol: usize
     }
     hn!(-1).count = 1 << 31; // fake entry, strong barrier
     while node_nb <= node_root {
-        let n1 = if hn!(low_s).count < hn!(low_n).count {
+        // `n1 = (huffNode[lowS].count < huffNode[lowN].count) ? lowS-- : lowN++`
+        // with the parent store and the count read done inside the arm the
+        // cursor came from.
+        let c1 = if hn!(low_s).count < hn!(low_n).count {
+            hn!(low_s).parent = node_nb as u16;
             low_s -= 1;
-            low_s + 1
+            hn!(low_s + 1).count
         } else {
+            hn!(low_n).parent = node_nb as u16;
             low_n += 1;
-            low_n - 1
+            hn!(low_n - 1).count
         };
-        let n2 = if hn!(low_s).count < hn!(low_n).count {
+        let c2 = if hn!(low_s).count < hn!(low_n).count {
+            hn!(low_s).parent = node_nb as u16;
             low_s -= 1;
-            low_s + 1
+            hn!(low_s + 1).count
         } else {
+            hn!(low_n).parent = node_nb as u16;
             low_n += 1;
-            low_n - 1
+            hn!(low_n - 1).count
         };
-        hn!(node_nb).count = hn!(n1).count + hn!(n2).count;
-        hn!(n1).parent = node_nb as u16;
-        hn!(n2).parent = node_nb as u16;
+        hn!(node_nb).count = c1 + c2;
         node_nb += 1;
     }
     hn!(node_root).nb_bits = 0;
