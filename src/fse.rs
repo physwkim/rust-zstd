@@ -429,134 +429,229 @@ impl SeqTableMode {
     }
 }
 
-/// Normalize symbol counts to probability distribution for FSE table.
-/// Port of C zstd's FSE_normalizeCount() with 62-bit precision scaling.
-pub fn normalize_counts(counts: &[u32], max_symbol: usize, table_log: u32) -> Vec<i16> {
-    let table_size = 1u32 << table_log;
-    let total: u64 = counts[..=max_symbol].iter().map(|&c| c as u64).sum();
-    if total == 0 {
-        return vec![0i16; max_symbol + 1];
+/// `FSE_MIN_TABLELOG`.
+pub const FSE_MIN_TABLELOG: u32 = 5;
+/// `FSE_MAX_TABLELOG`.
+pub const FSE_MAX_TABLELOG: u32 = 12;
+/// `FSE_DEFAULT_TABLELOG`.
+pub const FSE_DEFAULT_TABLELOG: u32 = 11;
+
+/// `ERROR(GENERIC)` / `ERROR(tableLog_tooLarge)` from `FSE_normalizeCount`:
+/// the counts cannot be represented at the requested table log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalizeError;
+
+/// `FSE_minTableLog`: the minimum table log that can represent
+/// `src_size` symbols drawn from `0..=max_symbol`.
+fn min_table_log(src_size: usize, max_symbol: usize) -> u32 {
+    let min_bits_src = highest_bit(src_size as u32) + 1;
+    let min_bits_symbols = highest_bit(max_symbol as u32) + 2;
+    min_bits_src.min(min_bits_symbols)
+}
+
+/// `FSE_optimalTableLog_internal`. `src_size` must be `> 1`.
+pub fn optimal_table_log_internal(
+    max_table_log: u32,
+    src_size: usize,
+    max_symbol: usize,
+    minus: u32,
+) -> u32 {
+    debug_assert!(src_size > 1);
+    // C: unsigned arithmetic, so `highbit(1) - 2` wraps and never lowers
+    // the table log.
+    let max_bits_src = highest_bit((src_size - 1) as u32).wrapping_sub(minus);
+    let min_bits = min_table_log(src_size, max_symbol);
+    let mut table_log = max_table_log;
+    if table_log == 0 {
+        table_log = FSE_DEFAULT_TABLELOG;
+    }
+    if max_bits_src < table_log {
+        table_log = max_bits_src;
+    }
+    if min_bits > table_log {
+        table_log = min_bits;
+    }
+    table_log.clamp(FSE_MIN_TABLELOG, FSE_MAX_TABLELOG)
+}
+
+/// `FSE_optimalTableLog` (`minus == 2`).
+pub fn optimal_table_log(max_table_log: u32, src_size: usize, max_symbol: usize) -> u32 {
+    optimal_table_log_internal(max_table_log, src_size, max_symbol, 2)
+}
+
+/// `FSE_normalizeCount`: scale `counts[..=max_symbol]` (summing to `total`)
+/// to a distribution summing to `1 << table_log`, written to `norm`.
+/// Symbols at or below `total >> table_log` get `-1` when
+/// `use_low_prob_count` (`ZSTD_useLowProbCount`) and `1` otherwise.
+/// Returns the table log used, or `Ok(0)` without touching `norm` when one
+/// symbol carries every count (the caller must emit RLE). `table_log == 0`
+/// selects `FSE_DEFAULT_TABLELOG`.
+pub fn normalize_count(
+    norm: &mut [i16],
+    table_log: u32,
+    counts: &[u32],
+    total: usize,
+    max_symbol: usize,
+    use_low_prob_count: bool,
+) -> Result<u32, NormalizeError> {
+    static RTB_TABLE: [u64; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
+
+    let table_log = if table_log == 0 {
+        FSE_DEFAULT_TABLELOG
+    } else {
+        table_log
+    };
+    if !(FSE_MIN_TABLELOG..=FSE_MAX_TABLELOG).contains(&table_log)
+        || table_log < min_table_log(total, max_symbol)
+    {
+        return Err(NormalizeError);
     }
 
-    let mut norm = vec![0i16; max_symbol + 1];
-
-    // Use C zstd's high-precision scaling: step = (1<<62) / total
-    let scale: u32 = 62 - table_log;
-    let step: u64 = (1u64 << 62) / total;
-    let v_step: u64 = 1u64 << (scale - 20);
-    let low_threshold: u64 = total >> table_log;
-
-    // C zstd's rtbTable for precise rounding of small probabilities
-    static RTB_TABLE: [u32; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000];
-
-    // Use lowProbCount = -1 for large blocks (>= 2048 sequences), 1 otherwise
-    let use_low_prob_count = total >= 2048;
     let low_prob_count: i16 = if use_low_prob_count { -1 } else { 1 };
-
-    let mut still_to_distribute = table_size as i32;
-    let mut largest_sym = 0usize;
-    let mut largest_prob = 0i16;
+    let scale = 62 - table_log;
+    let step = (1u64 << 62) / total as u64;
+    let v_step = 1u64 << (scale - 20);
+    let mut still_to_distribute = 1i32 << table_log;
+    let mut largest = 0usize;
+    let mut largest_p = 0i16;
+    let low_threshold = (total >> table_log) as u32;
 
     for s in 0..=max_symbol {
-        if counts[s] as u64 == total {
-            // Single-symbol dominance
-            norm[s] = table_size as i16;
-            return norm;
+        let count = counts[s];
+        if count as usize == total {
+            return Ok(0);
         }
-        if counts[s] == 0 {
+        if count == 0 {
+            norm[s] = 0;
             continue;
         }
-
-        if (counts[s] as u64) <= low_threshold {
+        if count <= low_threshold {
             norm[s] = low_prob_count;
             still_to_distribute -= 1;
         } else {
-            let mut proba = ((counts[s] as u64 * step) >> scale) as i16;
+            let scaled = count as u64 * step;
+            let mut proba = (scaled >> scale) as i16;
             if proba < 8 {
-                // Use rtbTable for precise rounding
-                let rest_to_beat = v_step as u128 * RTB_TABLE[proba as usize] as u128;
-                let actual = (counts[s] as u128 * step as u128) - ((proba as u128) << scale);
-                if actual > rest_to_beat {
-                    proba += 1;
-                }
+                let rest_to_beat = v_step * RTB_TABLE[proba as usize];
+                proba += (scaled - ((proba as u64) << scale) > rest_to_beat) as i16;
             }
-            if proba > (table_size >> 1) as i16 {
-                proba = (table_size >> 1) as i16; // cap at half table
+            if proba > largest_p {
+                largest_p = proba;
+                largest = s;
             }
-            norm[s] = std::cmp::max(1, proba);
-            still_to_distribute -= norm[s] as i32;
-        }
-
-        if norm[s] > largest_prob {
-            largest_prob = norm[s];
-            largest_sym = s;
+            norm[s] = proba;
+            still_to_distribute -= proba as i32;
         }
     }
-
-    // Adjust largest symbol to distribute remaining
-    if -still_to_distribute >= (norm[largest_sym] >> 1) as i32 {
-        // Pathological case: use proportional redistribution
-        normalize_counts_m2(&mut norm, counts, max_symbol, table_log, total);
+    if -still_to_distribute >= (norm[largest] >> 1) as i32 {
+        // corner case, need another normalization method
+        normalize_m2(norm, table_log, counts, total, max_symbol, low_prob_count)?;
     } else {
-        norm[largest_sym] += still_to_distribute as i16;
+        norm[largest] += still_to_distribute as i16;
     }
-
-    norm
+    Ok(table_log)
 }
 
-/// Fallback normalization for pathological distributions (port of FSE_normalizeM2).
-pub fn normalize_counts_m2(
+/// `FSE_normalizeM2`: secondary normalization, used when the primary
+/// method over-allocates.
+fn normalize_m2(
     norm: &mut [i16],
-    counts: &[u32],
-    max_symbol: usize,
     table_log: u32,
-    total: u64,
-) {
-    let table_size = 1u32 << table_log;
+    counts: &[u32],
+    mut total: usize,
+    max_symbol: usize,
+    low_prob_count: i16,
+) -> Result<(), NormalizeError> {
+    const NOT_YET_ASSIGNED: i16 = -2;
+    let mut distributed = 0u32;
+    let low_threshold = (total >> table_log) as u32;
+    let mut low_one = ((total * 3) >> (table_log + 1)) as u32;
 
-    // Reset and recalculate
-    let mut to_distribute = table_size as i32;
-
-    // First pass: identify symbols that will get probability >= 1
-    let low_one = (total * 3) / ((to_distribute as u64) * 2);
     for s in 0..=max_symbol {
-        if counts[s] == 0 {
+        let count = counts[s];
+        if count == 0 {
             norm[s] = 0;
-        } else if (counts[s] as u64) <= low_one {
-            norm[s] = -1;
-            to_distribute -= 1;
-        } else {
-            norm[s] = 0; // will be set in second pass
+            continue;
         }
+        if count <= low_threshold {
+            norm[s] = low_prob_count;
+            distributed += 1;
+            total -= count as usize;
+            continue;
+        }
+        if count <= low_one {
+            norm[s] = 1;
+            distributed += 1;
+            total -= count as usize;
+            continue;
+        }
+        norm[s] = NOT_YET_ASSIGNED;
+    }
+    let mut to_distribute = (1u32 << table_log) - distributed;
+
+    if to_distribute == 0 {
+        return Ok(());
     }
 
-    // Second pass: proportional scaling for remaining symbols
-    let remaining_total: u64 = counts[..=max_symbol]
-        .iter()
-        .enumerate()
-        .filter(|&(s, _)| norm[s] == 0 && counts[s] > 0)
-        .map(|(_, &c)| c as u64)
-        .sum();
-
-    if remaining_total == 0 || to_distribute <= 0 {
-        return;
+    if (total / to_distribute as usize) as u32 > low_one {
+        // risk of rounding to zero
+        low_one = ((total * 3) / (to_distribute as usize * 2)) as u32;
+        for s in 0..=max_symbol {
+            if norm[s] == NOT_YET_ASSIGNED && counts[s] <= low_one {
+                norm[s] = 1;
+                distributed += 1;
+                total -= counts[s] as usize;
+            }
+        }
+        to_distribute = (1u32 << table_log) - distributed;
     }
 
-    let v_step_log = 62u32.saturating_sub(table_log);
-    let r_step = ((1u128 << v_step_log) * to_distribute as u128 + remaining_total as u128 / 2)
-        / remaining_total as u128;
+    if distributed as usize == max_symbol + 1 {
+        // all values are pretty poor; give all remaining points to max
+        let mut max_v = 0usize;
+        let mut max_c = 0u32;
+        for s in 0..=max_symbol {
+            if counts[s] > max_c {
+                max_v = s;
+                max_c = counts[s];
+            }
+        }
+        norm[max_v] += to_distribute as i16;
+        return Ok(());
+    }
 
-    let mut tmp_total = 0u128;
+    if total == 0 {
+        // all of the symbols were low enough for the lowOne or lowThreshold
+        let mut s = 0usize;
+        while to_distribute > 0 {
+            if norm[s] > 0 {
+                to_distribute -= 1;
+                norm[s] += 1;
+            }
+            s = (s + 1) % (max_symbol + 1);
+        }
+        return Ok(());
+    }
+
+    let v_step_log = 62 - table_log;
+    let mid = (1u64 << (v_step_log - 1)) - 1;
+    // scale on remaining
+    let r_step = ((1u64 << v_step_log) * to_distribute as u64 + mid) / total as u64;
+    let mut tmp_total = mid;
     for s in 0..=max_symbol {
-        if norm[s] == 0 && counts[s] > 0 {
-            let end = tmp_total + counts[s] as u128 * r_step;
-            let s_start = (tmp_total >> v_step_log) as i16;
-            let s_end = (end >> v_step_log) as i16;
-            let proba = s_end - s_start;
-            norm[s] = std::cmp::max(1, proba);
+        if norm[s] == NOT_YET_ASSIGNED {
+            let end = tmp_total + counts[s] as u64 * r_step;
+            let s_start = (tmp_total >> v_step_log) as u32;
+            let s_end = (end >> v_step_log) as u32;
+            let weight = s_end - s_start;
+            if weight < 1 {
+                return Err(NormalizeError);
+            }
+            norm[s] = weight as i16;
             tmp_total = end;
         }
     }
+    Ok(())
 }
 
 /// Encode an FSE probability header (the variable-bit format from the spec).
@@ -713,38 +808,34 @@ pub fn choose_seq_mode(
             s < default_norm.len() && default_norm[s] != 0
         });
 
-    // Try custom FSE table
-    // Choose table_log: use max_log for best compression, but cap by number of symbols
-    let table_log = {
-        let min_log = 5u32;
-        let symbol_log = if n_used <= 2 {
-            min_log
-        } else {
-            std::cmp::min(max_log, (32 - (n_used as u32).leading_zeros()).max(min_log))
-        };
-        std::cmp::min(max_log, std::cmp::max(min_log, symbol_log))
-    };
-
-    let custom_norm = normalize_counts(&counts, max_sym, table_log);
-
-    // Verify all symbols are covered
-    let all_covered = codes.iter().all(|&c| {
-        let s = c as usize;
-        s <= max_sym && custom_norm[s] != 0
-    });
-
-    // normalize_counts is known to yield distributions whose sum is not
-    // 1 << table_log on real data; FseCTable::build cannot represent those.
-    // Predefined always covers our codes: LL/ML defaults have no zero entry
-    // and offset codes stay <= 27 while window_log <= 27.
-    let norm_sum: i64 = custom_norm
-        .iter()
-        .map(|&n| if n == -1 { 1 } else { n as i64 })
-        .sum();
-    if !all_covered || norm_sum != (1i64 << table_log) {
+    // Custom FSE table: `ZSTD_buildCTable` picks `FSE_optimalTableLog` and
+    // normalizes with `ZSTD_useLowProbCount(nbSeq)`. A `GENERIC` failure
+    // falls back to Predefined, which always covers our codes: LL/ML
+    // defaults have no zero entry and offset codes stay <= 27 while
+    // window_log <= 27.
+    let nb_seq = codes.len();
+    let table_log = optimal_table_log(max_log, nb_seq, max_sym);
+    let mut custom_norm = vec![0i16; max_sym + 1];
+    if normalize_count(
+        &mut custom_norm,
+        table_log,
+        &counts,
+        nb_seq,
+        max_sym,
+        nb_seq >= 2048,
+    )
+    .is_err()
+    {
         debug_assert!(predefined_ok);
         return SeqTableMode::Predefined;
     }
+    debug_assert_eq!(
+        custom_norm
+            .iter()
+            .map(|&n| n.unsigned_abs() as u32)
+            .sum::<u32>(),
+        1u32 << table_log
+    );
 
     let header_bytes = encode_fse_header(&custom_norm, max_sym, table_log);
 
@@ -835,6 +926,142 @@ mod tests {
         let table = FseCTable::build(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
         assert_eq!(table.table_log, 6);
         assert_eq!(table.state_table.len(), 64);
+    }
+
+    fn norm_sum(norm: &[i16]) -> u32 {
+        norm.iter().map(|&n| n.unsigned_abs() as u32).sum()
+    }
+
+    /// `normalize_count` on `counts` at every table log from
+    /// `FSE_minTableLog` up to `max_log`: a success must sum to
+    /// `1 << table_log`, and the `FSE_optimalTableLog` choice must succeed.
+    fn check_normalize(counts: &[u32], max_log: u32) {
+        let max_symbol = counts.len() - 1;
+        let total: usize = counts.iter().map(|&c| c as usize).sum();
+        let optimal = optimal_table_log(max_log, total, max_symbol);
+        for use_low_prob in [false, true] {
+            for table_log in FSE_MIN_TABLELOG..=max_log {
+                let mut norm = vec![0i16; max_symbol + 1];
+                let r = normalize_count(
+                    &mut norm,
+                    table_log,
+                    counts,
+                    total,
+                    max_symbol,
+                    use_low_prob,
+                );
+                match r {
+                    Ok(0) => panic!("RLE result for a multi-symbol input {counts:?}"),
+                    Ok(log) => {
+                        assert_eq!(log, table_log);
+                        assert_eq!(
+                            norm_sum(&norm),
+                            1u32 << table_log,
+                            "table_log {table_log} low_prob {use_low_prob} counts {counts:?} norm {norm:?}"
+                        );
+                        for s in 0..=max_symbol {
+                            assert_eq!(counts[s] == 0, norm[s] == 0, "symbol {s} of {counts:?}");
+                        }
+                    }
+                    Err(NormalizeError) => assert_ne!(
+                        table_log, optimal,
+                        "optimal table log {optimal} failed for {counts:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_dominant_symbol_plus_rare() {
+        // One symbol carries almost everything; the rest are rare enough to
+        // hit the lowThreshold / lowOne paths and drive the M2 fallback.
+        for &(dominant, rare_symbols, rare_count) in &[
+            (100_000u32, 40usize, 1u32),
+            (100_000, 40, 3),
+            (50_000, 200, 1),
+            (20_000, 250, 2),
+            (4_000, 60, 1),
+            (1_000, 30, 1),
+            (600, 52, 1),
+            (60, 30, 1),
+            (3_000, 100, 7),
+        ] {
+            let mut counts = vec![rare_count; rare_symbols + 1];
+            counts[0] = dominant;
+            check_normalize(&counts, 9);
+            counts.reverse();
+            check_normalize(&counts, 9);
+            // rare symbols with a geometric tail
+            let mut geometric: Vec<u32> = (0..rare_symbols as u32)
+                .map(|i| (rare_count << (i / 8)).max(1))
+                .collect();
+            geometric.insert(0, dominant);
+            check_normalize(&geometric, 9);
+        }
+    }
+
+    #[test]
+    fn normalize_rle_input_returns_zero() {
+        let counts = [0u32, 17, 0];
+        let mut norm = [7i16; 3];
+        assert_eq!(normalize_count(&mut norm, 6, &counts, 17, 2, false), Ok(0));
+    }
+
+    #[test]
+    fn normalize_rejects_too_small_table_log() {
+        let counts = [3u32; 70];
+        let mut norm = [0i16; 70];
+        // FSE_minTableLog(210, 69) = min(8 + 1, 6 + 2) = 8
+        assert_eq!(
+            normalize_count(&mut norm, 7, &counts, 210, 69, false),
+            Err(NormalizeError)
+        );
+        assert_eq!(
+            normalize_count(&mut norm, 8, &counts, 210, 69, false),
+            Ok(8)
+        );
+        assert_eq!(norm_sum(&norm), 256);
+    }
+
+    #[test]
+    fn optimal_table_log_matches_c() {
+        // FSE_optimalTableLog(9, 586, 18): maxBitsSrc = highbit(585) - 2 = 7,
+        // minBits = min(highbit(586) + 1, highbit(18) + 2) = 6 -> 7
+        assert_eq!(optimal_table_log(9, 586, 18), 7);
+        // srcSize 2: highbit(1) - 2 wraps, tableLog stays at the maximum
+        assert_eq!(optimal_table_log(6, 2, 1), 6);
+        // clamp to FSE_MIN_TABLELOG
+        assert_eq!(optimal_table_log(9, 9, 3), 5);
+        // HUF weights: minus = 1
+        assert_eq!(optimal_table_log_internal(6, 100, 12, 1), 5);
+        assert_eq!(optimal_table_log_internal(6, 255, 12, 1), 6);
+        // capped by maxTableLog
+        assert_eq!(optimal_table_log(8, 100_000, 31), 8);
+    }
+
+    #[test]
+    fn normalize_fixture_count_vectors() {
+        let text = include_str!("../tests/data/minfail_counts.txt");
+        let mut rows = 0;
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let recorded_log: u32 = fields[2].parse().unwrap();
+            let counts: Vec<u32> = fields[5].split(',').map(|c| c.parse().unwrap()).collect();
+            let total: usize = counts.iter().map(|&c| c as usize).sum();
+            assert_eq!(total, fields[3].parse::<usize>().unwrap());
+            // The log the pre-port code chose must now either be exact or be
+            // refused; the offset (8) and LL/ML (9) maxima must both work.
+            let max_symbol = counts.len() - 1;
+            let mut norm = vec![0i16; max_symbol + 1];
+            if normalize_count(&mut norm, recorded_log, &counts, total, max_symbol, false).is_ok() {
+                assert_eq!(norm_sum(&norm), 1u32 << recorded_log, "{line}");
+            }
+            check_normalize(&counts, 8);
+            check_normalize(&counts, 9);
+            rows += 1;
+        }
+        assert_eq!(rows, 46);
     }
 
     #[test]
