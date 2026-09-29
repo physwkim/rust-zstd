@@ -138,6 +138,17 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     }
 }
 
+/// `ZSTD_buildSeqStore`, "limited update after a very long match": when the
+/// previous block left more than 384 positions uninserted (its last match ran
+/// past the block end), insert at most the 192 positions before `curr` (fewer
+/// while the backlog is under 576) instead of the whole backlog.
+#[inline]
+fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
+    if curr > ms.next_to_update + 384 {
+        ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
+    }
+}
+
 /// `ZSTD_buildSeqStore` + `ZSTD_entropyCompressSeqStore`: fill
 /// `scratch.store` for `src[block]` and write the block payload into
 /// `scratch.cbuf`. Returns the candidate next state when the block is
@@ -158,6 +169,7 @@ fn build_and_entropy_compress(
     let store = &mut scratch.store;
     store.clear();
     let mut rep = prev.rep;
+    limit_update_after_long_match(ms, block.start);
     let anchor = match strategy {
         Strategy::Fast => fast::compress_block(ms, src, block.clone(), &mut rep, store),
         Strategy::DFast => dfast::compress_block(ms, src, block.clone(), &mut rep, store),
@@ -229,5 +241,37 @@ pub fn compress_block(
             write_compressed_block(out, &scratch.cbuf, is_last);
             BlockKind::Compressed
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_update_after_long_match_boundaries() {
+        let cp = CParams::for_level(5, 1 << 20);
+        let mut ms = MatchState::new(cp, 1);
+        // Backlog of exactly 384: untouched.
+        ms.next_to_update = 1000;
+        limit_update_after_long_match(&mut ms, 1384);
+        assert_eq!(ms.next_to_update, 1000);
+        // Backlog 385..575: only the excess over 384 gets inserted.
+        ms.next_to_update = 1000;
+        limit_update_after_long_match(&mut ms, 1385);
+        assert_eq!(ms.next_to_update, 1384);
+        ms.next_to_update = 1000;
+        limit_update_after_long_match(&mut ms, 1575);
+        assert_eq!(ms.next_to_update, 1384);
+        // Backlog >= 576: insert only the last 192 positions.
+        ms.next_to_update = 1000;
+        limit_update_after_long_match(&mut ms, 1576);
+        assert_eq!(ms.next_to_update, 1384);
+        ms.next_to_update = 1000;
+        limit_update_after_long_match(&mut ms, 500_000);
+        assert_eq!(ms.next_to_update, 500_000 - 192);
+        // Idempotent.
+        limit_update_after_long_match(&mut ms, 500_000);
+        assert_eq!(ms.next_to_update, 500_000 - 192);
     }
 }

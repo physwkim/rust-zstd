@@ -1143,7 +1143,6 @@ pub fn compress_block_with(
     level: Level,
 ) -> usize {
     let depth = depth_of(ms.cparams.strategy);
-    limit_update_after_long_match(ms, block.start);
     match method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
         // SAFETY (all three): fearless_simd constructs a witness only after
@@ -1157,20 +1156,6 @@ pub fn compress_block_with(
             Level::Neon(w) => unsafe { row_block_neon(w, ms, src, block, rep, out, depth) },
             _ => row_block_scalar(ms, src, block, rep, out, depth),
         },
-    }
-}
-
-/// `ZSTD_buildSeqStore`, "limited update after a very long match": when the
-/// previous block left more than 384 positions uninserted (its last match ran
-/// past the block end), insert at most the 192 positions before `curr` (fewer
-/// while the backlog is under 576) instead of the whole backlog. C applies
-/// this in the block driver for every strategy; it is applied here so that
-/// the lazy compressors produce C's sequences on their own, and applying it
-/// twice is a no-op.
-#[inline]
-fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
-    if curr > ms.next_to_update + 384 {
-        ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
     }
 }
 
@@ -1645,33 +1630,6 @@ mod tests {
         assert_eq!(store.reconstruct(&[], [100, 4, 8]), src);
         assert_eq!(rep[1], 100);
         assert_eq!(rep[2], 8);
-    }
-
-    #[test]
-    fn limit_update_after_long_match_boundaries() {
-        let cp = CParams::for_level(5, 1 << 20);
-        let mut ms = MatchState::new(cp, 1);
-        // Backlog of exactly 384: untouched.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1384);
-        assert_eq!(ms.next_to_update, 1000);
-        // Backlog 385..575: only the excess over 384 gets inserted.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1385);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1575);
-        assert_eq!(ms.next_to_update, 1384);
-        // Backlog >= 576: insert only the last 192 positions.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1576);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
-        // Idempotent, so a block driver applying it too changes nothing.
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
     }
 
     #[test]
