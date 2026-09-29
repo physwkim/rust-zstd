@@ -14,11 +14,13 @@
 //! begins one byte later than C on block 0 (`ip = max(istart, window_low)`
 //! followed by C's own `ip += (dictAndPrefixLength == 0)` skip).
 
+use super::common::{byte, candidate_valid, count, read32, read64, tget, tset, HASH_READ_SIZE};
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
 use super::seqstore::{
-    offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
+    offbase_is_offset, offbase_to_offset, offset_to_offbase, Seq, SeqStore, REPCODE1_TO_OFFBASE,
 };
+use crate::constants::ZSTD_MINMATCH;
 #[cfg(target_arch = "aarch64")]
 use fearless_simd::Neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -27,8 +29,6 @@ use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 use std::sync::OnceLock;
 
-/// `HASH_READ_SIZE`: bytes a hash may read past a position.
-const HASH_READ_SIZE: usize = 8;
 /// `ZSTD_ROW_HASH_TAG_BITS`: low hash bits kept in the tag table.
 const ROW_HASH_TAG_BITS: u32 = 8;
 const ROW_HASH_TAG_MASK: u32 = (1 << ROW_HASH_TAG_BITS) - 1;
@@ -43,19 +43,94 @@ const K_SEARCH_STRENGTH: usize = 8;
 /// `kLazySkippingStep`: skipping more than this many bytes at once enters the
 /// lazy-skipping mode (only searched positions are inserted).
 const K_LAZY_SKIPPING_STEP: usize = 8;
+/// `WILDCOPY_OVERLENGTH`: bytes [`store_seq`] may read past the literals and
+/// write past the literal buffer's end; the buffer is oversized by as much
+/// (`ZSTD_resetCCtx_internal`: `litStart = blockSize + WILDCOPY_OVERLENGTH`).
+const WILDCOPY_OVERLENGTH: usize = 32;
 
 // ---------------------------------------------------------------------------
-// Small helpers (private; the fast-path worker has its own copies).
+// Small helpers. Unchecked reads follow `compress/common.rs`: every call site
+// states the bound that makes it sound. Inside a block those bounds rest on
+// `block.end <= src.len()` and the table sizes, both asserted once per block
+// in [`compress_block_with`] / [`load_prefix_with`], plus the loop limits
+// (`ip < ilimit`, `ilimit + ILIMIT_MARGIN <= iend`, `ILIMIT_MARGIN >= 8`).
 // ---------------------------------------------------------------------------
 
+/// `ZSTD_copy16`.
+///
+/// # Safety
+/// 16 bytes readable at `src` and writable at `dst`, not overlapping.
 #[inline(always)]
-fn read32(src: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes(src[pos..pos + 4].try_into().unwrap())
+unsafe fn copy16(dst: *mut u8, src: *const u8) {
+    std::ptr::copy_nonoverlapping(src, dst, 16);
 }
 
+/// `ZSTD_storeSeq(seqStore, litLength, literals = src + anchor, litLimit =
+/// src + iend, offBase, matchLength)`: copy the literals 16 bytes at a time
+/// (`ZSTD_copy16` + `ZSTD_wildcopy`, over-reading and over-writing up to
+/// `WILDCOPY_OVERLENGTH` bytes) when they end `WILDCOPY_OVERLENGTH` before
+/// `iend`, byte-exact otherwise (`ZSTD_safecopyLiterals`), then append the
+/// sequence. The lazy loop's own version of [`SeqStore::store_seq`], which
+/// copies through `memcpy`.
+///
+/// # Safety
+/// `anchor + lit_len <= iend <= src.len()`, and `out.lits` has at least
+/// `lit_len + WILDCOPY_OVERLENGTH` spare capacity ([`lazy_generic`] reserves
+/// `block len + WILDCOPY_OVERLENGTH` once per block).
 #[inline(always)]
-fn read64(src: &[u8], pos: usize) -> u64 {
-    u64::from_le_bytes(src[pos..pos + 8].try_into().unwrap())
+unsafe fn store_seq(
+    out: &mut SeqStore,
+    src: &[u8],
+    anchor: usize,
+    lit_len: usize,
+    iend: usize,
+    off_base: u32,
+    match_len: usize,
+) {
+    debug_assert!(off_base >= 1);
+    debug_assert!(match_len >= ZSTD_MINMATCH);
+    debug_assert!(anchor + lit_len <= iend && iend <= src.len());
+    let len = out.lits.len();
+    debug_assert!(out.lits.capacity() >= len + lit_len + WILDCOPY_OVERLENGTH);
+    if anchor + lit_len + WILDCOPY_OVERLENGTH <= iend {
+        // Common case we can use wildcopy: every read below stays before
+        // `anchor + lit_len + WILDCOPY_OVERLENGTH <= iend` and every write
+        // before `len + lit_len + WILDCOPY_OVERLENGTH <= capacity`.
+        let mut ip = src.as_ptr().add(anchor);
+        let mut op = out.lits.as_mut_ptr().add(len);
+        copy16(op, ip);
+        if lit_len > 16 {
+            // ZSTD_wildcopy(lit + 16, literals + 16, litLength - 16,
+            // ZSTD_no_overlap)
+            let oend = op.add(lit_len);
+            op = op.add(16);
+            ip = ip.add(16);
+            copy16(op, ip);
+            if lit_len - 16 > 16 {
+                op = op.add(16);
+                ip = ip.add(16);
+                loop {
+                    copy16(op, ip);
+                    copy16(op.add(16), ip.add(16));
+                    op = op.add(32);
+                    ip = ip.add(32);
+                    if op >= oend {
+                        break;
+                    }
+                }
+            }
+        }
+        // The first `lit_len` bytes after `len` were written above.
+        out.lits.set_len(len + lit_len);
+    } else {
+        out.lits
+            .extend_from_slice(src.get_unchecked(anchor..anchor + lit_len));
+    }
+    out.seqs.push(Seq {
+        lit_len: lit_len as u32,
+        off_base,
+        ml_base: (match_len - ZSTD_MINMATCH) as u32,
+    });
 }
 
 /// `ZSTD_highbit32`: index of the highest set bit (`v != 0`).
@@ -65,39 +140,21 @@ fn highbit32(v: u32) -> u32 {
     31 - v.leading_zeros()
 }
 
-/// `ZSTD_count(pIn = src[ip..], pMatch = src[mp..], pInLimit = src[limit])`:
-/// number of equal bytes, with `mp < ip` and `limit <= src.len()`.
-#[inline(always)]
-fn count(src: &[u8], ip: usize, mp: usize, limit: usize) -> usize {
-    debug_assert!(mp < ip && ip <= limit && limit <= src.len());
-    let start = ip;
-    let mut ip = ip;
-    let mut mp = mp;
-    while ip + 8 <= limit {
-        let diff = read64(src, ip) ^ read64(src, mp);
-        if diff != 0 {
-            return ip - start + (diff.trailing_zeros() / 8) as usize;
-        }
-        ip += 8;
-        mp += 8;
-    }
-    while ip < limit && src[ip] == src[mp] {
-        ip += 1;
-        mp += 1;
-    }
-    ip - start
-}
-
 const PRIME4: u32 = 2654435761;
 const PRIME5: u64 = 889523592379;
 const PRIME6: u64 = 227718039650203;
 
 /// `ZSTD_hashPtrSalted(src + pos, hbits, mls, salt)` for `mls` 4..=6 and
 /// `hbits <= 32` (`ZSTD_hashPtr` is the same with `salt == 0`). `mls == 4`
-/// only uses the low 32 bits of the salt, like C.
+/// only uses the low 32 bits of the salt, like C. The result is
+/// `< 1 << hbits`.
+///
+/// # Safety
+/// `pos + HASH_READ_SIZE <= src.len()` (`MLS >= 5` reads 8 bytes).
 #[inline(always)]
-fn hash_salted<const MLS: u32>(src: &[u8], pos: usize, hbits: u32, salt: u64) -> u32 {
-    debug_assert!(hbits <= 32);
+unsafe fn hash_salted<const MLS: u32>(src: &[u8], pos: usize, hbits: u32, salt: u64) -> u32 {
+    debug_assert!((1..=32).contains(&hbits));
+    debug_assert!(pos + HASH_READ_SIZE <= src.len());
     match MLS {
         4 => (read32(src, pos).wrapping_mul(PRIME4) ^ (salt as u32)) >> (32 - hbits),
         5 => (((read64(src, pos) << 24).wrapping_mul(PRIME5) ^ salt) >> (64 - hbits)) as u32,
@@ -201,8 +258,12 @@ impl<const MLS: u32> HcSearch<MLS> {
     /// `ZSTD_insertAndFindFirstIndex_internal`: insert `[next_to_update, ip)`
     /// (only one position while lazy skipping) and return the chain head of
     /// `ip`'s hash.
+    ///
+    /// # Safety
+    /// `ip + HASH_READ_SIZE <= src.len()`; `hash_table` and `chain_table`
+    /// hold `1 << hash_log` and `1 << chain_log` entries.
     #[inline(always)]
-    fn insert_and_find_first_index(
+    unsafe fn insert_and_find_first_index(
         ms: &mut MatchState,
         src: &[u8],
         ip: usize,
@@ -212,17 +273,26 @@ impl<const MLS: u32> HcSearch<MLS> {
         let chain_mask = (1usize << ms.cparams.chain_log) - 1;
         let target = ip;
         let mut idx = ms.next_to_update;
+        // Every hashed position is `<= ip`; `h < 1 << hash_log` and
+        // `idx & chain_mask < 1 << chain_log`.
         while idx < target {
             let h = hash_salted::<MLS>(src, idx, hash_log, 0) as usize;
-            ms.chain_table[idx & chain_mask] = ms.hash_table[h];
-            ms.hash_table[h] = idx as u32;
+            tset(
+                &mut ms.chain_table,
+                idx & chain_mask,
+                tget(&ms.hash_table, h),
+            );
+            tset(&mut ms.hash_table, h, idx);
             idx += 1;
             if lazy_skipping {
                 break;
             }
         }
         ms.next_to_update = target;
-        ms.hash_table[hash_salted::<MLS>(src, ip, hash_log, 0) as usize]
+        tget(
+            &ms.hash_table,
+            hash_salted::<MLS>(src, ip, hash_log, 0) as usize,
+        ) as u32
     }
 }
 
@@ -251,14 +321,23 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
         let mut nb_attempts = 1u32 << ms.cparams.search_log;
         let mut ml = 4 - 1;
 
+        // SAFETY: `ip < ilimit` with `ilimit + ILIMIT_MARGIN <= iend <=
+        // src.len()`, `ILIMIT_MARGIN == HASH_READ_SIZE`; table sizes
+        // asserted per block ([`assert_block_bounds`]).
         let mut match_index =
-            Self::insert_and_find_first_index(ms, src, ip, lazy_skipping) as usize;
-        // Every candidate is < ip and >= low_limit >= 1; `ip + ml < iend`
-        // holds because a match reaching iend ends the loop, so the 4-byte
-        // reads at `+ ml - 3` stay inside `src`.
-        while match_index >= low_limit && nb_attempts > 0 {
-            if read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) {
-                let current_ml = count(src, ip, match_index, iend);
+            unsafe { Self::insert_and_find_first_index(ms, src, ip, lazy_skipping) } as usize;
+        // C only tests `matchIndex >= lowLimit`; the upper bound is folded
+        // into the same compare so that a stale table entry is a miss, not
+        // an out-of-bounds read.
+        while candidate_valid(match_index, low_limit, curr) && nb_attempts > 0 {
+            // SAFETY: `match_index < ip` and `ip + ml < iend <= src.len()`
+            // (`ml` starts at 3 with `ip + 8 <= iend`, and a match reaching
+            // `iend` ends the loop), so the reads at `+ ml - 3` and the
+            // count stay inside `src`.
+            let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
+            if better {
+                // SAFETY: `match_index < ip <= iend <= src.len()`.
+                let current_ml = unsafe { count(src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
                     *off_base = offset_to_offbase((curr - match_index) as u32);
@@ -270,7 +349,9 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
             if match_index <= min_chain {
                 break;
             }
-            match_index = ms.chain_table[match_index & chain_mask] as usize;
+            // SAFETY: `match_index & chain_mask < 1 << chain_log ==
+            // chain_table.len()`.
+            match_index = unsafe { tget(&ms.chain_table, match_index & chain_mask) };
             nb_attempts -= 1;
         }
         ml
@@ -314,11 +395,14 @@ fn swar_match_mask<const ROW_LOG: u32>(row: &[u8], tag: u8, head: u32) -> u64 {
     // Multiplying a word whose only set bits are byte MSBs by this constant
     // gathers those MSBs into the top byte without carries.
     const EXTRACT_MAGIC: u64 = (u64::MAX / 0x7F) >> CHUNK;
+    assert_eq!(row.len(), 1usize << ROW_LOG);
     let splat = (tag as u64).wrapping_mul(X01);
     let mut matches = 0u64;
     let mut i = (1usize << ROW_LOG) - CHUNK;
     loop {
-        let mut chunk = read64(row, i) ^ splat;
+        // SAFETY: `i + 8 <= row.len()` (asserted above, `i` steps down by 8
+        // from `len - 8`).
+        let mut chunk = unsafe { read64(row, i) } ^ splat;
         chunk = ((chunk | X80).wrapping_sub(X01) | chunk) & X80; // byte MSB set iff byte != tag
         matches <<= CHUNK;
         matches |= chunk.wrapping_mul(EXTRACT_MAGIC) >> (64 - CHUNK);
@@ -545,11 +629,27 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     }
 
     /// `ZSTD_hashPtrSalted(p, rowHashLog + ZSTD_ROW_HASH_TAG_BITS, mls,
-    /// hashSalt)` with `rowHashLog = hashLog - rowLog`.
+    /// hashSalt)` with `rowHashLog = hashLog - rowLog`. The row index
+    /// `(hash >> 8) << ROW_LOG` is therefore `< 1 << hash_log`, the size of
+    /// the tag and hash tables, and `+ ROW_ENTRIES` stays `<=` it.
+    ///
+    /// # Safety
+    /// `pos + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
-    fn hash(ms: &MatchState, src: &[u8], pos: usize) -> u32 {
+    unsafe fn hash(ms: &MatchState, src: &[u8], pos: usize) -> u32 {
         let hbits = ms.cparams.hash_log - ROW_LOG + ROW_HASH_TAG_BITS;
         hash_salted::<MLS>(src, pos, hbits, ms.hash_salt)
+    }
+
+    /// `&tag_table[rel_row]` (the head byte) for a row index of [`Self::hash`].
+    ///
+    /// # Safety
+    /// `rel_row` came from [`Self::hash`] on a state whose tables are
+    /// `1 << hash_log` long (asserted per block).
+    #[inline(always)]
+    unsafe fn head(ms: &mut MatchState, rel_row: usize) -> &mut u8 {
+        debug_assert!(rel_row + Self::ROW_ENTRIES <= ms.tag_table.len());
+        ms.tag_table.get_unchecked_mut(rel_row)
     }
 
     /// `ZSTD_row_nextIndex`: cycle the head backwards through `1..entries`
@@ -579,11 +679,15 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
 
     /// `ZSTD_row_fillHashCache(ms, base, rowLog, mls, idx, iLimit)`: hash
     /// (and prefetch the rows of) `idx..idx+8`, not beyond `i_limit`.
+    ///
+    /// # Safety
+    /// `i_limit + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
-    fn fill_hash_cache(&mut self, ms: &MatchState, src: &[u8], idx: usize, i_limit: usize) {
+    unsafe fn fill_hash_cache(&mut self, ms: &MatchState, src: &[u8], idx: usize, i_limit: usize) {
         let max_elems = if idx > i_limit { 0 } else { i_limit - idx + 1 };
         let lim = idx + ROW_HASH_CACHE_SIZE.min(max_elems);
         for i in idx..lim {
+            // `i <= i_limit`.
             let hash = Self::hash(ms, src, i);
             Self::prefetch_row(ms, ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize);
             self.hash_cache[i & ROW_HASH_CACHE_MASK] = hash;
@@ -592,8 +696,11 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
 
     /// `ZSTD_row_nextCachedHash`: return the cached hash of `idx`, replace it
     /// by the hash of `idx + 8` and prefetch that row.
+    ///
+    /// # Safety
+    /// `idx + ROW_HASH_CACHE_SIZE + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
-    fn next_cached_hash(&mut self, ms: &MatchState, src: &[u8], idx: usize) -> u32 {
+    unsafe fn next_cached_hash(&mut self, ms: &MatchState, src: &[u8], idx: usize) -> u32 {
         let new_hash = Self::hash(ms, src, idx + ROW_HASH_CACHE_SIZE);
         Self::prefetch_row(ms, ((new_hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize);
         let hash = self.hash_cache[idx & ROW_HASH_CACHE_MASK];
@@ -602,8 +709,12 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     }
 
     /// `ZSTD_row_update_internalImpl`: insert `start..end`.
+    ///
+    /// # Safety
+    /// `end + HASH_READ_SIZE <= src.len()`, plus `end + ROW_HASH_CACHE_SIZE`
+    /// in place of `end` when `use_cache`; tables of `1 << hash_log` entries.
     #[inline(always)]
-    fn update_impl(
+    unsafe fn update_impl(
         &mut self,
         ms: &mut MatchState,
         src: &[u8],
@@ -618,17 +729,28 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
                 Self::hash(ms, src, idx)
             };
             let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
-            let pos = Self::next_index(&mut ms.tag_table[rel_row]);
-            ms.tag_table[rel_row + pos] = (hash & ROW_HASH_TAG_MASK) as u8;
-            ms.hash_table[rel_row + pos] = idx as u32;
+            // `rel_row + pos < rel_row + ROW_ENTRIES <= table len`, see `hash`.
+            let pos = Self::next_index(Self::head(ms, rel_row));
+            *ms.tag_table.get_unchecked_mut(rel_row + pos) = (hash & ROW_HASH_TAG_MASK) as u8;
+            tset(&mut ms.hash_table, rel_row + pos, idx);
         }
     }
 
     /// `ZSTD_row_update_internal`: insert `[next_to_update, ip)`, skipping the
     /// middle of a long gap when the cache is in use, and set
     /// `next_to_update = ip`.
+    ///
+    /// # Safety
+    /// `ip + HASH_READ_SIZE <= src.len()`, plus `ip + ROW_HASH_CACHE_SIZE`
+    /// in place of `ip` when `use_cache`; tables of `1 << hash_log` entries.
     #[inline(always)]
-    fn update_internal(&mut self, ms: &mut MatchState, src: &[u8], ip: usize, use_cache: bool) {
+    unsafe fn update_internal(
+        &mut self,
+        ms: &mut MatchState,
+        src: &[u8],
+        ip: usize,
+        use_cache: bool,
+    ) {
         const K_SKIP_THRESHOLD: usize = 384;
         const K_MAX_MATCH_START_POSITIONS_TO_UPDATE: usize = 96;
         const K_MAX_MATCH_END_POSITIONS_TO_UPDATE: usize = 32;
@@ -653,7 +775,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
 
     #[inline(always)]
     fn refill(&mut self, ms: &MatchState, src: &[u8], ilimit: usize) {
-        self.fill_hash_cache(ms, src, ms.next_to_update, ilimit);
+        // SAFETY: `ilimit + ILIMIT_MARGIN <= iend <= src.len()` with
+        // `ILIMIT_MARGIN >= HASH_READ_SIZE`.
+        unsafe { self.fill_hash_cache(ms, src, ms.next_to_update, ilimit) }
     }
 
     /// `ZSTD_RowFindBestMatch` (`ZSTD_noDict`).
@@ -676,41 +800,55 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         let mut ml = 4 - 1;
 
         // Update the hashTable and tagTable up to (but not including) ip
-        let hash = if !lazy_skipping {
-            self.update_internal(ms, src, ip, true);
-            self.next_cached_hash(ms, src, curr)
-        } else {
-            // Stop inserting every position when in the lazy skipping mode.
-            // The hash cache is also not kept up to date in this mode.
-            ms.next_to_update = curr;
-            Self::hash(ms, src, ip)
+        // SAFETY: `ip < ilimit` and `ilimit + 8 + ROW_HASH_CACHE_SIZE <=
+        // iend <= src.len()`, so every hashed position (`<= ip + 8`) has 8
+        // readable bytes; tables are `1 << hash_log` long (asserted per
+        // block).
+        let hash = unsafe {
+            if !lazy_skipping {
+                self.update_internal(ms, src, ip, true);
+                self.next_cached_hash(ms, src, curr)
+            } else {
+                // Stop inserting every position when in the lazy skipping mode.
+                // The hash cache is also not kept up to date in this mode.
+                ms.next_to_update = curr;
+                Self::hash(ms, src, ip)
+            }
         };
         ms.hash_salt_entropy = ms.hash_salt_entropy.wrapping_add(hash); // collect salt entropy
 
         let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
         let tag = (hash & ROW_HASH_TAG_MASK) as u8;
-        let head_grouped = ((ms.tag_table[rel_row] as u32) & Self::ROW_MASK) * group_width;
+        // SAFETY: `rel_row + ROW_ENTRIES <= tag_table.len()`, see `hash`.
+        let tag_row = unsafe {
+            ms.tag_table
+                .get_unchecked(rel_row..rel_row + Self::ROW_ENTRIES)
+        };
+        let head_grouped = ((tag_row[0] as u32) & Self::ROW_MASK) * group_width;
         let mut num_matches = 0usize;
-        let mut matches = self.mask.match_mask::<ROW_LOG>(
-            &ms.tag_table[rel_row..rel_row + Self::ROW_ENTRIES],
-            tag,
-            head_grouped,
-        );
+        let mut matches = self.mask.match_mask::<ROW_LOG>(tag_row, tag, head_grouped);
 
         // Cycle through the matches and prefetch
         while matches > 0 && nb_attempts > 0 {
             let match_pos =
                 ((head_grouped + matches.trailing_zeros()) / group_width) & Self::ROW_MASK;
             matches &= matches - 1;
-            let match_index = ms.hash_table[rel_row + match_pos as usize];
+            // SAFETY: `match_pos < ROW_ENTRIES`, so `rel_row + match_pos <
+            // hash_table.len()`.
+            let match_index = unsafe { tget(&ms.hash_table, rel_row + match_pos as usize) };
             if match_pos == 0 {
                 continue;
             }
-            if (match_index as usize) < low_limit {
+            // C tests `matchIndex < lowLimit` only; the upper bound is folded
+            // into the same compare so that a stale entry is a miss, not an
+            // out-of-bounds read below.
+            if !candidate_valid(match_index, low_limit, curr) {
                 break;
             }
-            prefetch_l1(src, match_index as usize);
-            self.match_buffer[num_matches] = match_index;
+            prefetch_l1(src, match_index);
+            // SAFETY: at most `nb_attempts <= ROW_ENTRIES <= 64` candidates
+            // are stored, so `num_matches < match_buffer.len()`.
+            unsafe { *self.match_buffer.get_unchecked_mut(num_matches) = match_index as u32 };
             num_matches += 1;
             nb_attempts -= 1;
         }
@@ -718,10 +856,11 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         // Speed opt: insert current byte into hashtable too. This allows us
         // to avoid one iteration of the loop in update_internal() at the next
         // search.
-        {
-            let pos = Self::next_index(&mut ms.tag_table[rel_row]);
-            ms.tag_table[rel_row + pos] = tag;
-            ms.hash_table[rel_row + pos] = ms.next_to_update as u32;
+        // SAFETY: `rel_row + pos < rel_row + ROW_ENTRIES <= table len`.
+        unsafe {
+            let pos = Self::next_index(Self::head(ms, rel_row));
+            *ms.tag_table.get_unchecked_mut(rel_row + pos) = tag;
+            tset(&mut ms.hash_table, rel_row + pos, ms.next_to_update);
             ms.next_to_update += 1;
         }
 
@@ -730,8 +869,14 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
             let match_index = match_index as usize;
             debug_assert!(match_index < curr && match_index >= low_limit);
             // read 4B starting from (match + ml + 1 - sizeof(U32))
-            if read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) {
-                let current_ml = count(src, ip, match_index, iend);
+            // SAFETY: `low_limit <= match_index < ip` (candidate_valid above)
+            // and `ip + ml < iend <= src.len()` (`ml` starts at 3 with `ip +
+            // 16 <= iend`; a match reaching `iend` ends the loop), so the
+            // reads at `+ ml - 3` and the count stay inside `src`.
+            let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
+            if better {
+                // SAFETY: `match_index < ip <= iend <= src.len()`.
+                let current_ml = unsafe { count(src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
                     *off_base = offset_to_offbase((curr - match_index) as u32);
@@ -796,7 +941,17 @@ fn lazy_generic<S: Search>(
 
     let mut lazy_skipping = false;
     search.refill(ms, src, ilimit);
+    // A block stores at most `iend - istart` literals; `store_seq` writes up
+    // to WILDCOPY_OVERLENGTH bytes beyond them.
+    out.lits.reserve(iend - istart + WILDCOPY_OVERLENGTH);
 
+    // SAFETY, for every unchecked read below: `ip <= ilimit` implies `ip +
+    // ILIMIT_MARGIN <= iend <= src.len()` with `ILIMIT_MARGIN >= 8` (when
+    // `ilimit` saturated to 0 no `ip >= 1` passes the tests), so 4-byte reads
+    // at `<= ip + 1` and counts starting `<= ip + 5` stay inside `src`. A rep
+    // offset is `> 0` and `<= ip - window_low` (clamped by `max_rep` above,
+    // or the distance to a candidate `>= low_limit >= window_low >= 1`, and
+    // `ip` only grows), so `ip - offset >= 1`.
     while ip < ilimit {
         let mut match_length = 0usize;
         let mut off_base = REPCODE1_TO_OFFBASE;
@@ -804,8 +959,13 @@ fn lazy_generic<S: Search>(
 
         // check repCode
         let mut rep_at_depth0 = false;
-        if offset_1 > 0 && read32(src, ip + 1 - offset_1 as usize) == read32(src, ip + 1) {
-            match_length = count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
+        // SAFETY: see the loop header.
+        let rep_hit = offset_1 > 0
+            && unsafe { read32(src, ip + 1 - offset_1 as usize) == read32(src, ip + 1) };
+        if rep_hit {
+            // SAFETY: see the loop header.
+            match_length =
+                unsafe { count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) } + 4;
             if depth == 0 {
                 rep_at_depth0 = true; // goto _storeSequence
             }
@@ -835,11 +995,14 @@ fn lazy_generic<S: Search>(
             if depth >= 1 {
                 while ip < ilimit {
                     ip += 1;
-                    if off_base != 0
+                    // SAFETY: see the loop header (`ip <= ilimit`).
+                    let rep_hit = off_base != 0
                         && offset_1 > 0
-                        && read32(src, ip) == read32(src, ip - offset_1 as usize)
-                    {
-                        let ml_rep = count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
+                        && unsafe { read32(src, ip) == read32(src, ip - offset_1 as usize) };
+                    if rep_hit {
+                        // SAFETY: see the loop header.
+                        let ml_rep =
+                            unsafe { count(src, ip + 4, ip + 4 - offset_1 as usize, iend) } + 4;
                         let gain2 = (ml_rep * 3) as i32;
                         let gain1 = (match_length * 3) as i32 - highbit32(off_base) as i32 + 1;
                         if ml_rep >= 4 && gain2 > gain1 {
@@ -865,11 +1028,14 @@ fn lazy_generic<S: Search>(
                     // let's find an even better one
                     if depth == 2 && ip < ilimit {
                         ip += 1;
-                        if off_base != 0
+                        // SAFETY: see the loop header (`ip <= ilimit`).
+                        let rep_hit = off_base != 0
                             && offset_1 > 0
-                            && read32(src, ip) == read32(src, ip - offset_1 as usize)
-                        {
-                            let ml_rep = count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
+                            && unsafe { read32(src, ip) == read32(src, ip - offset_1 as usize) };
+                        if rep_hit {
+                            // SAFETY: see the loop header.
+                            let ml_rep =
+                                unsafe { count(src, ip + 4, ip + 4 - offset_1 as usize, iend) } + 4;
                             let gain2 = (ml_rep * 4) as i32;
                             let gain1 = (match_length * 4) as i32 - highbit32(off_base) as i32 + 1;
                             if ml_rep >= 4 && gain2 > gain1 {
@@ -905,9 +1071,11 @@ fn lazy_generic<S: Search>(
             // catch up
             if offbase_is_offset(off_base) {
                 let offset = offbase_to_offset(off_base) as usize;
+                // SAFETY: `1 <= start - 1 - offset < start - 1 < ip < iend <=
+                // src.len()` (`start > anchor >= 0`, `prefix_lowest >= 1`).
                 while start > anchor
                     && start - offset > prefix_lowest
-                    && src[start - 1] == src[start - 1 - offset]
+                    && unsafe { byte(src, start - 1) == byte(src, start - 1 - offset) }
                 {
                     start -= 1;
                     match_length += 1;
@@ -919,7 +1087,9 @@ fn lazy_generic<S: Search>(
 
         // store sequence
         let lit_length = start - anchor;
-        out.store_seq(src, anchor, lit_length, off_base, match_length);
+        // SAFETY: `start <= ip < iend <= src.len()`; `lits` was reserved
+        // above.
+        unsafe { store_seq(out, src, anchor, lit_length, iend, off_base, match_length) };
         ip = start + match_length;
         anchor = ip;
 
@@ -930,11 +1100,16 @@ fn lazy_generic<S: Search>(
         }
 
         // check immediate repcode
-        while ip <= ilimit && offset_2 > 0 && read32(src, ip) == read32(src, ip - offset_2 as usize)
+        // SAFETY (both): see the loop header (`ip <= ilimit`).
+        while ip <= ilimit
+            && offset_2 > 0
+            && unsafe { read32(src, ip) == read32(src, ip - offset_2 as usize) }
         {
-            let match_length = count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
+            let match_length = unsafe { count(src, ip + 4, ip + 4 - offset_2 as usize, iend) } + 4;
             std::mem::swap(&mut offset_1, &mut offset_2); // swap repcodes
-            out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, match_length);
+                                                          // SAFETY: `anchor == ip <= ilimit < iend`; `lits` was reserved
+                                                          // above.
+            unsafe { store_seq(out, src, anchor, 0, iend, REPCODE1_TO_OFFBASE, match_length) };
             ip += match_length;
             anchor = ip;
         }
@@ -1130,6 +1305,42 @@ pub fn compress_block(
     compress_block_with(ms, src, block, rep, out, method, detected_level())
 }
 
+/// The per-block facts every unchecked access in this module rests on: the
+/// block (or prefix) ends inside `src`, the tables have the sizes
+/// [`MatchState::new`] gives them, and a row hash fits in 32 bits
+/// (`ZSTD_adjustCParams_internal` caps `hashLog` at `rowLog + 24`).
+fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMethod) {
+    let cp = &ms.cparams;
+    assert!(
+        end <= src.len(),
+        "block end {end} past src.len() {}",
+        src.len()
+    );
+    assert_eq!(
+        ms.hash_table.len(),
+        1usize << cp.hash_log,
+        "hash_table size"
+    );
+    match method {
+        SearchMethod::HashChain => {
+            assert_eq!(
+                ms.chain_table.len(),
+                1usize << cp.chain_log,
+                "chain_table size"
+            );
+        }
+        SearchMethod::RowHash => {
+            assert_eq!(ms.tag_table.len(), 1usize << cp.hash_log, "tag_table size");
+            let row_log = row_log_of(cp);
+            assert!(
+                cp.hash_log >= row_log && cp.hash_log - row_log + ROW_HASH_TAG_BITS <= 32,
+                "hash_log {} out of range for row_log {row_log}",
+                cp.hash_log
+            );
+        }
+    }
+}
+
 /// [`compress_block`] with an explicit match finder and SIMD level. Every
 /// combination produces the same sequences for the same method; the level
 /// only selects the tag-compare kernel.
@@ -1143,6 +1354,7 @@ pub fn compress_block_with(
     level: Level,
 ) -> usize {
     let depth = depth_of(ms.cparams.strategy);
+    assert_block_bounds(ms, src, block.end, method);
     match method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
         // SAFETY (all three): fearless_simd constructs a witness only after
@@ -1180,23 +1392,34 @@ pub fn load_prefix_with(
     method: SearchMethod,
 ) {
     let end = range.end;
+    assert_block_bounds(ms, src, end, method);
     let start = ms.next_to_update.max(range.start).max(ms.window_low);
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
+        // SAFETY (both finders): `target + HASH_READ_SIZE == end <= src.len()`
+        // and the table sizes were asserted above.
         match method {
             SearchMethod::HashChain => {
                 match mls_of(&ms.cparams) {
-                    4 => HcSearch::<4>::insert_and_find_first_index(ms, src, target, false),
-                    5 => HcSearch::<5>::insert_and_find_first_index(ms, src, target, false),
-                    _ => HcSearch::<6>::insert_and_find_first_index(ms, src, target, false),
+                    4 => unsafe {
+                        HcSearch::<4>::insert_and_find_first_index(ms, src, target, false)
+                    },
+                    5 => unsafe {
+                        HcSearch::<5>::insert_and_find_first_index(ms, src, target, false)
+                    },
+                    _ => unsafe {
+                        HcSearch::<6>::insert_and_find_first_index(ms, src, target, false)
+                    },
                 };
             }
             SearchMethod::RowHash => {
                 macro_rules! go {
                     ($mls:literal, $row_log:literal) => {
-                        RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
-                            .update_internal(ms, src, target, false)
+                        unsafe {
+                            RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
+                                .update_internal(ms, src, target, false)
+                        }
                     };
                 }
                 match (mls_of(&ms.cparams), row_log_of(&ms.cparams)) {
@@ -1639,20 +1862,19 @@ mod tests {
         assert_eq!(initial_hash_salt(), bitmix(0, 8) ^ bitmix(0, 4));
         assert_ne!(initial_hash_salt(), 0);
         let src = b"abcdefghijklmnop";
+        // SAFETY: `0 + 8 <= src.len()`.
+        let (h4, h5, h6) = unsafe {
+            (
+                hash_salted::<4>(src, 0, 20, 0),
+                hash_salted::<5>(src, 0, 20, 0) as u64,
+                hash_salted::<6>(src, 0, 20, 0) as u64,
+            )
+        };
         // ZSTD_hash4Ptr: (readLE32 * 2654435761) >> (32 - 20)
         let u = u32::from_le_bytes(*b"abcd");
-        assert_eq!(
-            hash_salted::<4>(src, 0, 20, 0),
-            u.wrapping_mul(PRIME4) >> 12
-        );
+        assert_eq!(h4, u.wrapping_mul(PRIME4) >> 12);
         let u = u64::from_le_bytes(src[..8].try_into().unwrap());
-        assert_eq!(
-            hash_salted::<5>(src, 0, 20, 0) as u64,
-            (u << 24).wrapping_mul(PRIME5) >> 44
-        );
-        assert_eq!(
-            hash_salted::<6>(src, 0, 20, 0) as u64,
-            (u << 16).wrapping_mul(PRIME6) >> 44
-        );
+        assert_eq!(h5, (u << 24).wrapping_mul(PRIME5) >> 44);
+        assert_eq!(h6, (u << 16).wrapping_mul(PRIME6) >> 44);
     }
 }
