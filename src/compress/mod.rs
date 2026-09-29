@@ -182,6 +182,7 @@ impl Compressor {
                     job,
                     k == 0,
                     k + 1 == n_jobs,
+                    cfg!(feature = "parallel"),
                     ctx,
                     out,
                 )
@@ -220,6 +221,7 @@ fn compress_job(
     job: Range<usize>,
     first_job: bool,
     last_job: bool,
+    pipelined: bool,
     ctx: &mut JobContext,
     out: &mut Vec<u8>,
 ) {
@@ -241,24 +243,20 @@ fn compress_job(
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
-    let scratch = &mut ctx.scratch;
-    scratch.reserve(block_size);
+    ctx.scratch.reserve(block_size);
     out.reserve(job_bound(job.len(), block_size));
-    let mut start = job.start;
-    while start < job.end {
-        let end = (start + block_size).min(job.end);
-        block::compress_block(
-            &mut ms,
-            data,
-            start..end,
-            first_job && start == job.start,
-            last_job && end == job.end,
-            &mut state,
-            scratch,
-            out,
-        );
-        start = end;
-    }
+    block::compress_blocks(
+        &mut ms,
+        data,
+        job,
+        block_size,
+        first_job,
+        last_job,
+        &mut state,
+        &mut ctx.scratch,
+        out,
+        pipelined,
+    );
     ctx.ms = Some(ms);
 }
 
@@ -607,26 +605,30 @@ mod tests {
             let jobs = job_ranges(data.len(), job_size);
             assert!(jobs.len() >= 5, "level {level}: {} jobs", jobs.len());
             let n = jobs.len();
-            let f = |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
-                compress_job(
-                    data.as_slice(),
-                    cparams,
-                    block_size,
-                    overlap,
-                    job,
-                    k == 0,
-                    k + 1 == n,
-                    ctx,
-                    out,
-                )
+            let src = data.as_slice();
+            let f = |pipelined: bool| {
+                move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
+                    compress_job(
+                        src,
+                        cparams,
+                        block_size,
+                        overlap,
+                        job,
+                        k == 0,
+                        k + 1 == n,
+                        pipelined,
+                        ctx,
+                        out,
+                    )
+                }
             };
             // The same contexts serve both runs, so the serial run also
             // covers the reset of used contexts.
             let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, f, &mut par);
+            run_jobs(&jobs, &mut ctxs, true, f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, f, &mut seq);
+            run_jobs(&jobs, &mut ctxs, false, f(false), &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
             assert!(
@@ -634,6 +636,63 @@ mod tests {
                 "level {level}: frame != header + jobs"
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data);
+        }
+    }
+
+    /// One job through `compress_job`, pipelined or serial.
+    #[cfg(feature = "parallel")]
+    fn one_job(data: &[u8], level: i32, pipelined: bool) -> Vec<u8> {
+        let cparams = CParams::for_level(level, data.len());
+        let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
+        let overlap = overlap_size(&cparams, 0);
+        let mut ctx = JobContext::default();
+        let mut out = Vec::new();
+        let job = 0..data.len();
+        compress_job(
+            data, cparams, block_size, overlap, job, true, true, pipelined, &mut ctx, &mut out,
+        );
+        out
+    }
+
+    /// The pipelined block loop writes the serial loop's bytes: on source
+    /// text (the proof holds and blocks overlap), on random data (every
+    /// block RAW, the proof fails) and with a RAW and an RLE block between
+    /// compressed ones (the next block must start from the committed, not
+    /// the finder's, repeat offsets).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn pipelined_block_loop_matches_serial() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sources = super::common::testutil::crate_sources();
+        let random = noise(1 << 20, 9);
+        let mut mixed = text(300 << 10);
+        mixed.extend_from_slice(&noise(200 << 10, 4));
+        mixed.extend_from_slice(&vec![0u8; 300 << 10]);
+        mixed.extend_from_slice(&text(333 << 10));
+        for level in [1, 3, 5, 11] {
+            for (name, data) in [
+                ("sources", &sources),
+                ("random", &random),
+                ("mixed", &mixed),
+            ] {
+                let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
+                let serial = one_job(data, level, false);
+                let piped = one_job(data, level, true);
+                assert!(piped == serial, "{name} L{level}: pipelined != serial");
+                let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
+                if name != "random" {
+                    assert!(overlapped > 0, "{name} L{level}: never overlapped");
+                }
+                let frame = compress_with(
+                    data,
+                    &CompressOptions {
+                        level,
+                        ..Default::default()
+                    },
+                );
+                assert!(frame.ends_with(&serial), "{name} L{level}: frame != job");
+                assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name} L{level}");
+            }
         }
     }
 
