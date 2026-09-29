@@ -1,0 +1,57 @@
+ndage";
+    /// # let ac = AhoCorasick::builder()
+    /// #    .match_kind(MatchKind::LeftmostFirst)
+    /// #    .build(patterns)
+    /// #    .unwrap();
+    /// let mut result = String::new();
+    /// ac.replace_all_with(haystack, &mut result, |mat, _, dst| {
+    ///     dst.push_str(&mat.pattern().as_usize().to_string());
+    ///     mat.pattern() != PatternID::must(2)
+    /// });
+    /// assert_eq!("0 the 2 to the appendage", result);
+    /// ```
+    pub fn replace_all_with<F>(
+        &self,
+        haystack: &str,
+        dst: &mut String,
+        replace_with: F,
+    ) where
+        F: FnMut(&Match, &str, &mut String) -> bool,
+    {
+        self.try_replace_all_with(haystack, dst, replace_with)
+            .expect("AhoCorasick::try_replace_all_with should not fail")
+    }
+
+    /// Replace all matches using raw bytes with a closure called on each
+    /// match. Matches correspond to the same matches as reported by
+    /// [`AhoCorasick::find_iter`].
+    ///
+    /// The closure accepts three parameters: the match found, the text of
+    /// the match and a byte buffer with which to write the replaced text
+    /// (if any). If the closure returns `true`, then it continues to the next
+    /// match. If the closure returns `false`, then searching is stopped.
+    ///
+    /// This is the infallible version of
+    /// [`AhoCorasick::try_replace_all_with_bytes`].
+    ///
+    /// # Panics
+    ///
+    /// This panics when [`AhoCorasick::try_replace_all_with_bytes`] would
+    /// return an error.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use aho_corasick::{AhoCorasick, MatchKind};
+    ///
+    /// let patterns = &["append", "appendage", "app"];
+    /// let haystack = b"append the app to the appendage";
+    ///
+    /// let ac = AhoCorasick::builder()
+    ///     .match_kind(MatchKind::LeftmostFirst)
+    ///     .build(patterns)
+    ///     .unwrap();
+    /// let mut result = vec![];
+    /// ac.replace_all_with_bytes(haystack, &mut r

@@ -1,13 +1,8 @@
 //! Bit-level stream writers for zstd encoding.
 //!
-//! `BitWriter` — forward bitstream (Huffman literals).
-//! `BackwardBitWriter` — backward bitstream (FSE sequences, FSE weights).
-//!
-//! The backward bitstream matches C zstd's `BIT_CStream_t` exactly:
-//! - Bits accumulate LSB-first in a 64-bit register
-//! - `flush_bits()` writes full bytes to output (forward/LE)
-//! - `finish()` adds sentinel 1-bit, flushes, returns bytes
-//! - Decoder reads this from the END toward the BEGINNING
+//! `BitWriter` — forward bitstream.
+//! `BitCStream` — `BIT_CStream_t`, the backward bitstream (FSE sequences,
+//! FSE-compressed Huffman weights).
 
 /// Forward bitstream writer (Huffman literal streams).
 pub struct BitWriter {
@@ -62,74 +57,81 @@ impl BitWriter {
     }
 }
 
-/// Backward bitstream writer matching C zstd's BIT_CStream_t.
-///
-/// Bits accumulate LSB-first in a 64-bit container. `flush_bits()` writes
-/// complete bytes to the output buffer in LE order. The decoder reads
-/// from the END of this buffer (BitReaderReversed).
-///
-/// Key: bytes are written FORWARD. No reverse needed. The decoder
-/// naturally reads backward from the last byte.
-pub struct BackwardBitWriter {
-    container: u64,
+/// `BIT_CStream_t`: backward bitstream writer over a caller-provided
+/// region. Bits accumulate LSB-first in a 64-bit container; `flush_bits`
+/// stores the whole container as 8 little-endian bytes and advances by the
+/// complete bytes only, so the region must be sized with `capacity_for`
+/// for the bits the caller will add. The decoder reads the result from
+/// its end (`BitReaderReversed`).
+pub struct BitCStream<'a> {
+    bit_container: u64,
     bit_pos: u32,
-    buf: Vec<u8>,
+    buf: &'a mut [u8],
+    ptr: usize,
+    end_ptr: usize,
 }
 
-impl Default for BackwardBitWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BackwardBitWriter {
-    pub fn new() -> Self {
+impl<'a> BitCStream<'a> {
+    /// `BIT_initCStream`: `buf.len()` must exceed 8.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        assert!(buf.len() > 8, "BIT_initCStream: dstSize_tooSmall");
+        let end_ptr = buf.len() - 8;
         Self {
-            container: 0,
+            bit_container: 0,
             bit_pos: 0,
-            buf: Vec::with_capacity(256),
+            buf,
+            ptr: 0,
+            end_ptr,
         }
     }
 
-    /// Add `nbits` from the low bits of `value` to the container.
-    /// Matches: `BIT_addBits(bitC, value, nbBits)`
+    /// Region length that lets `close` succeed after at most `bits` bits
+    /// (the endmark included): `BIT_closeCStream` reports overflow once
+    /// `ptr` reaches `endPtr = capacity - 8`.
+    pub const fn capacity_for(bits: usize) -> usize {
+        bits.div_ceil(8) + 9
+    }
+
+    /// `BIT_addBits`: add the low `nb_bits` (< 32) of `value`.
     #[inline]
-    pub fn add_bits(&mut self, value: u64, nbits: u32) {
-        if nbits == 0 {
-            return;
-        }
-        debug_assert!(nbits <= 57);
-        debug_assert!(self.bit_pos + nbits <= 64);
-        let mask = if nbits >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << nbits) - 1
-        };
-        self.container |= (value & mask) << self.bit_pos;
-        self.bit_pos += nbits;
+    pub fn add_bits(&mut self, value: u64, nb_bits: u32) {
+        debug_assert!(nb_bits < 32);
+        debug_assert!(nb_bits + self.bit_pos < 64);
+        self.bit_container |= (value & ((1u64 << nb_bits) - 1)) << self.bit_pos;
+        self.bit_pos += nb_bits;
     }
 
-    /// Flush complete bytes from the container to the output.
-    /// Matches: `BIT_flushBits(bitC)`
+    /// `BIT_addBitsFast`: `value` has no bit set above `nb_bits`.
+    #[inline]
+    pub fn add_bits_fast(&mut self, value: u64, nb_bits: u32) {
+        debug_assert_eq!(value >> nb_bits, 0);
+        debug_assert!(nb_bits + self.bit_pos < 64);
+        self.bit_container |= value << self.bit_pos;
+        self.bit_pos += nb_bits;
+    }
+
+    /// `BIT_flushBits` (the checked variant): store the container, advance
+    /// by the complete bytes, and stop at `end_ptr` on overflow, which
+    /// `close` then reports.
     #[inline]
     pub fn flush_bits(&mut self) {
-        let nb_bytes = (self.bit_pos / 8) as usize;
-        for i in 0..nb_bytes {
-            self.buf.push((self.container >> (i * 8)) as u8);
-        }
-        self.container >>= nb_bytes * 8;
+        debug_assert!(self.bit_pos < 64);
+        let nb_bytes = (self.bit_pos >> 3) as usize;
+        self.buf[self.ptr..self.ptr + 8].copy_from_slice(&self.bit_container.to_le_bytes());
+        self.ptr = (self.ptr + nb_bytes).min(self.end_ptr);
         self.bit_pos &= 7;
+        self.bit_container >>= nb_bytes * 8;
     }
 
-    /// Finalize: add sentinel 1-bit, flush remaining.
-    /// Matches: `BIT_closeCStream(bitC)`
-    pub fn finish(mut self) -> Vec<u8> {
-        self.add_bits(1, 1);
+    /// `BIT_closeCStream`: add the endmark and return the stream size in
+    /// bytes, or 0 when it did not fit in the region.
+    pub fn close(mut self) -> usize {
+        self.add_bits_fast(1, 1);
         self.flush_bits();
-        if self.bit_pos > 0 {
-            self.buf.push(self.container as u8);
+        if self.ptr >= self.end_ptr {
+            return 0;
         }
-        self.buf
+        self.ptr + (self.bit_pos > 0) as usize
     }
 }
 
@@ -148,23 +150,36 @@ mod tests {
     }
 
     #[test]
-    fn backward_writer_sentinel_only() {
-        let w = BackwardBitWriter::new();
-        let result = w.finish();
-        // Sentinel 1-bit at position 0 → byte 0x01
-        assert_eq!(result, vec![0x01]);
+    fn cstream_sentinel_only() {
+        // the smallest region BIT_initCStream accepts holds the endmark
+        let mut buf = [0u8; 9];
+        let w = BitCStream::new(&mut buf);
+        assert_eq!(w.close(), 1);
+        assert_eq!(buf[0], 0x01);
     }
 
     #[test]
-    fn backward_writer_c_layout() {
-        let mut w = BackwardBitWriter::new();
+    fn cstream_c_layout() {
+        let mut buf = [0u8; BitCStream::capacity_for(17)];
+        let mut w = BitCStream::new(&mut buf);
         w.add_bits(0xFF, 8);
         w.flush_bits();
-        w.add_bits(0xAB, 8);
-        let result = w.finish();
-        // flush: [0xFF], then add 0xAB+sentinel → container=0x1AB, bitPos=9
+        w.add_bits(0x1AB, 8); // bit 8 of the value is masked off
+        let size = w.close();
+        // flush: [0xFF], then 0xAB + endmark -> container 0x1AB, bitPos 9
         // flush 1 byte: [0xAB], remaining 0x01
-        // result: [0xFF, 0xAB, 0x01]
-        assert_eq!(result, vec![0xFF, 0xAB, 0x01]);
+        assert_eq!(size, 3);
+        assert_eq!(&buf[..3], &[0xFF, 0xAB, 0x01]);
+    }
+
+    #[test]
+    fn cstream_overflow_reports_zero() {
+        let mut buf = [0u8; 10];
+        let mut w = BitCStream::new(&mut buf);
+        for _ in 0..8 {
+            w.add_bits(0x5555, 16);
+            w.flush_bits();
+        }
+        assert_eq!(w.close(), 0);
     }
 }
