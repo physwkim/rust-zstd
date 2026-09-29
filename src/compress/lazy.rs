@@ -1575,6 +1575,18 @@ mod tests {
     /// Sequences, literals, final repcodes and anchors of every block.
     fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
         let mut ms = MatchState::new(cp, 1);
+        collect_on(&mut ms, src, block_size, SearchMethod::RowHash, level)
+    }
+
+    /// Every block of `src` on `ms` as prepared by the caller: all sequences
+    /// and literals concatenated, plus the final repeat offsets.
+    fn collect_on(
+        ms: &mut MatchState,
+        src: &[u8],
+        block_size: usize,
+        method: SearchMethod,
+        level: Level,
+    ) -> (SeqStore, [u32; 3]) {
         let mut rep = [1u32, 4, 8];
         let mut all = SeqStore::new();
         let mut store = SeqStore::new();
@@ -1582,21 +1594,57 @@ mod tests {
         while start < src.len() {
             let end = (start + block_size).min(src.len());
             store.clear();
-            let anchor = compress_block_with(
-                &mut ms,
-                src,
-                start..end,
-                &mut rep,
-                &mut store,
-                SearchMethod::RowHash,
-                level,
-            );
+            let anchor =
+                compress_block_with(ms, src, start..end, &mut rep, &mut store, method, level);
             all.seqs.extend_from_slice(&store.seqs);
             all.lits.extend_from_slice(&store.lits);
             all.lits.extend_from_slice(&src[anchor..end]);
             start = end;
         }
         (all, rep)
+    }
+
+    /// `MatchState::reset` on a context that compressed something else, with
+    /// other table sizes, leaves exactly `MatchState::new`'s state (tables,
+    /// update pointer, salt) and therefore the same sequences from both
+    /// finders, in either direction of table growth.
+    #[test]
+    fn reset_context_matches_fresh_context() {
+        let a = crate_sources();
+        let b = current_exe(300_000);
+        // Explicit table sizes: the level tables give both inputs the same
+        // hash_log, and the reset must shrink and grow the allocations.
+        let mut cp_a = lazy_params(11, a.len(), Strategy::Lazy2, 5);
+        cp_a.hash_log = 20;
+        cp_a.chain_log = 20;
+        let mut cp_b = lazy_params(5, b.len(), Strategy::Greedy, 5);
+        cp_b.hash_log = 17;
+        cp_b.chain_log = 16;
+        let level = Level::new();
+        for m in METHODS {
+            for (first, cp_first, second, cp_second) in [(&a, cp_a, &b, cp_b), (&b, cp_b, &a, cp_a)]
+            {
+                let mut reused = MatchState::new(cp_first, 1);
+                collect_on(&mut reused, first, 40_000, m, level);
+                assert!(reused.hash_table.iter().any(|&e| e != 0));
+                reused.reset(cp_second, 1);
+                let mut fresh = MatchState::new(cp_second, 1);
+                assert_eq!(reused.hash_table, fresh.hash_table);
+                assert_eq!(reused.chain_table, fresh.chain_table);
+                assert_eq!(reused.tag_table, fresh.tag_table);
+                assert_eq!(reused.next_to_update, fresh.next_to_update);
+                assert_eq!(reused.window_low, fresh.window_low);
+                assert_eq!(reused.hash_salt, fresh.hash_salt);
+                assert_eq!(reused.hash_salt_entropy, fresh.hash_salt_entropy);
+                assert_eq!(reused.cparams, fresh.cparams);
+                let (r_store, r_rep) = collect_on(&mut reused, second, 40_000, m, level);
+                let (f_store, f_rep) = collect_on(&mut fresh, second, 40_000, m, level);
+                assert_eq!(r_store.seqs, f_store.seqs, "{m:?} {cp_second:?}");
+                assert_eq!(r_store.lits, f_store.lits);
+                assert_eq!(r_rep, f_rep);
+                assert!(r_store.seqs.len() > 1000);
+            }
+        }
     }
 
     #[test]
