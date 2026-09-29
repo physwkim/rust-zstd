@@ -40,6 +40,8 @@
     dead_code
 )]
 
+use std::ptr;
+
 // ============================================================
 // Constants
 // ============================================================
@@ -1317,11 +1319,17 @@ impl<'s> BitDStream<'s> {
         value
     }
 
+    /// Requires `ptr >= 8` and `bits_consumed <= 64`.
     #[inline(always)]
     fn reload_internal(&mut self) -> HufStreamStatus {
+        debug_assert!(self.ptr >= 8 && self.bits_consumed <= 64);
         self.ptr -= (self.bits_consumed >> 3) as usize;
         self.bits_consumed &= 7;
-        self.container = read_le64(self.src, self.ptr);
+        // SAFETY: `ptr + 8 <= src.len()` is a struct invariant: `new` sets
+        // `ptr = src.len() - 8` when the stream has 8 bytes or more, `ptr`
+        // only ever decreases, and a shorter stream keeps `ptr == 0`, which
+        // no caller of this function accepts.
+        self.container = unsafe { read_le64_unchecked(self.src, self.ptr) };
         HufStreamStatus::Unfinished
     }
 
@@ -1372,6 +1380,26 @@ impl<'s> BitDStream<'s> {
 #[inline(always)]
 fn read_le64(src: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(src[at..at + 8].try_into().unwrap())
+}
+
+/// `MEM_readLE64(src + at)` without a bounds check.
+///
+/// # Safety
+/// `at + 8 <= src.len()`.
+#[inline(always)]
+unsafe fn read_le64_unchecked(src: &[u8], at: usize) -> u64 {
+    debug_assert!(at + 8 <= src.len());
+    u64::from_le_bytes(*(src.as_ptr().add(at) as *const [u8; 8]))
+}
+
+/// `dt[i]` without a bounds check.
+///
+/// # Safety
+/// `i < dt.len()`.
+#[inline(always)]
+unsafe fn table_entry<T: Copy>(dt: &[T], i: usize) -> T {
+    debug_assert!(i < dt.len());
+    *dt.get_unchecked(i)
 }
 
 #[inline(always)]
@@ -2558,7 +2586,15 @@ fn run_sequences(
     let ll_dt = &fse.literal_lengths.decode[..];
     let of_dt = &fse.offsets.decode[..];
     let ml_dt = &fse.match_lengths.decode[..];
-    if ll_dt.is_empty() || of_dt.is_empty() || ml_dt.is_empty() {
+    let ll_log = u32::from(fse.literal_lengths.accuracy_log);
+    let of_log = u32::from(fse.offsets.accuracy_log);
+    let ml_log = u32::from(fse.match_lengths.accuracy_log);
+    // The state lookups below are unchecked: an initial state is
+    // `accuracy_log` bits, and every cell of a table built by
+    // `build_decoding_table` or `build_rle` satisfies
+    // `next_state + (1 << num_bits) <= table size`, so a state is always a
+    // valid index of a table with exactly `1 << accuracy_log` cells.
+    if ll_dt.len() != 1 << ll_log || of_dt.len() != 1 << of_log || ml_dt.len() != 1 << ml_log {
         return Err("FSE table is uninitialized".to_string());
     }
     let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
@@ -2566,11 +2602,11 @@ fn run_sequences(
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
-    let mut ll_state = br.read_bits(u32::from(fse.literal_lengths.accuracy_log));
+    let mut ll_state = br.read_bits(ll_log);
     br.reload();
-    let mut of_state = br.read_bits(u32::from(fse.offsets.accuracy_log));
+    let mut of_state = br.read_bits(of_log);
     br.reload();
-    let mut ml_state = br.read_bits(u32::from(fse.match_lengths.accuracy_log));
+    let mut ml_state = br.read_bits(ml_log);
     br.reload();
 
     let mut hist = [
@@ -2581,9 +2617,14 @@ fn run_sequences(
     let mut lit_pos = 0usize;
 
     for remaining in (1..=num_sequences).rev() {
-        let ll_e = ll_dt[ll_state];
-        let ml_e = ml_dt[ml_state];
-        let of_e = of_dt[of_state];
+        // SAFETY: each state is below its table's length (see above).
+        let (ll_e, ml_e, of_e) = unsafe {
+            (
+                table_entry(ll_dt, ll_state),
+                table_entry(ml_dt, ml_state),
+                table_entry(of_dt, of_state),
+            )
+        };
 
         let mut ll = ll_e.base_value as usize;
         let mut ml = ml_e.base_value as usize;
@@ -2607,7 +2648,9 @@ fn run_sequences(
                 hist[0] = o;
                 o
             } else {
-                let o = of_e.base_value as usize + ll0 + br.read_bits_fast(1);
+                // Offset code 1: base value 1 plus one extra bit selects a
+                // repeat offset 1..=3.
+                let o = 1 + ll0 + br.read_bits_fast(1);
                 let mut temp = if o == 3 {
                     hist[0].wrapping_sub(1)
                 } else {
@@ -2688,100 +2731,92 @@ fn exec_sequence(
     if o_match_end + WILDCOPY_OVERLENGTH > buf.len() {
         return Err(SeqError::BlockTooLarge);
     }
-
-    // Literals: nearly always at most 16 bytes.
-    copy16_from(buf, op, literals, lit_start);
-    if ll > 16 {
-        wildcopy_from(buf, op + 16, literals, lit_start + 16, ll - 16);
+    // Rejects offset 0 as well (it wraps to usize::MAX).
+    if offset.wrapping_sub(1) >= o_lit_end {
+        return Err(SeqError::OffsetTooFar);
     }
     *lit_pos = lit_start + ll;
 
-    if offset > o_lit_end {
-        return Err(SeqError::OffsetTooFar);
-    }
-    let mut src = o_lit_end - offset;
-    let mut dst = o_lit_end;
-    if offset >= WILDCOPY_VECLEN {
-        if ml <= LONG_COPY_THRESHOLD {
-            wildcopy_within(buf, dst, src, ml);
-        } else if offset >= ml {
-            buf.copy_within(src..src + ml, dst);
-        } else {
-            // Periodic pattern: copy the whole prefix decoded so far, whose
-            // length doubles each round, so long matches take O(log n) memcpys.
-            let mut done = 0;
-            while done < ml {
-                let chunk = (offset + done).min(ml - done);
-                buf.copy_within(src..src + chunk, dst + done);
-                done += chunk;
-            }
+    // SAFETY: the three checks above give, with `ml >= 1`,
+    //   lit_start + ll + 31 < literals.len(),
+    //   o_match_end + 31 < buf.len(),
+    //   1 <= offset <= o_lit_end.
+    // Every copy below reads and writes within those ranges: literals are
+    // read from `lit_start` and written from `op` with at most 31 bytes of
+    // overshoot; the match reads from `o_lit_end - offset` and writes from
+    // `o_lit_end`, both ending at most 31 bytes past `o_match_end`. Each
+    // fixed-size copy is non-overlapping because `dst - src` is at least
+    // its size (16 with `offset >= 16`, 8 after `overlap_copy8`).
+    unsafe {
+        let out = buf.as_mut_ptr();
+        let lit = literals.as_ptr().add(lit_start);
+        let dst = out.add(op);
+        // Literals: nearly always at most 16 bytes.
+        copy16(dst, lit);
+        if ll > 16 {
+            wildcopy(dst.add(16), lit.add(16), ll - 16);
         }
-    } else {
-        // Copy 8 bytes and spread the offset to at least 8, then continue
-        // with 8-byte chunks.
-        overlap_copy8(buf, &mut dst, &mut src, offset);
-        if ml > 8 {
-            wildcopy_overlap8(buf, dst, src, ml - 8);
+
+        let dst = out.add(o_lit_end);
+        let src = out.add(o_lit_end - offset) as *const u8;
+        if offset >= WILDCOPY_VECLEN {
+            if ml <= LONG_COPY_THRESHOLD {
+                wildcopy(dst, src, ml);
+            } else if offset >= ml {
+                ptr::copy_nonoverlapping(src, dst, ml);
+            } else {
+                // Periodic pattern: copy the whole prefix decoded so far,
+                // whose length doubles each round, so long matches take
+                // O(log n) memcpys. `chunk <= offset + done` keeps every
+                // memcpy non-overlapping.
+                let mut done = 0;
+                while done < ml {
+                    let chunk = (offset + done).min(ml - done);
+                    ptr::copy_nonoverlapping(src, dst.add(done), chunk);
+                    done += chunk;
+                }
+            }
+        } else {
+            // Copy 8 bytes and spread the offset to at least 8, then
+            // continue with 8-byte chunks.
+            let (dst, src) = overlap_copy8(dst, src, offset);
+            if ml > 8 {
+                wildcopy_overlap8(dst, src, ml - 8);
+            }
         }
     }
     Ok(o_match_end)
 }
 
+/// ZSTD_copy16.
+///
+/// # Safety
+/// 16 bytes readable at `src` and writable at `dst`, not overlapping.
 #[inline(always)]
-fn copy16_from(buf: &mut [u8], dst: usize, src: &[u8], sp: usize) {
-    let chunk: [u8; 16] = src[sp..sp + 16].try_into().unwrap();
-    buf[dst..dst + 16].copy_from_slice(&chunk);
+unsafe fn copy16(dst: *mut u8, src: *const u8) {
+    ptr::copy_nonoverlapping(src, dst, 16);
 }
 
+/// ZSTD_wildcopy(no_overlap): 16-byte chunks that may overshoot `len` by up
+/// to 31 bytes on both sides.
+///
+/// # Safety
+/// `len + 31` bytes readable at `src` and writable at `dst`, and either the
+/// two ranges are disjoint or `dst - src >= 16`.
 #[inline(always)]
-fn copy16_within(buf: &mut [u8], dst: usize, src: usize) {
-    let chunk: [u8; 16] = buf[src..src + 16].try_into().unwrap();
-    buf[dst..dst + 16].copy_from_slice(&chunk);
-}
-
-#[inline(always)]
-fn copy8_within(buf: &mut [u8], dst: usize, src: usize) {
-    let chunk: [u8; 8] = buf[src..src + 8].try_into().unwrap();
-    buf[dst..dst + 8].copy_from_slice(&chunk);
-}
-
-/// ZSTD_wildcopy(no_overlap) from another buffer: 16-byte chunks that may
-/// overshoot `len` by up to 31 bytes on both sides.
-#[inline(always)]
-fn wildcopy_from(buf: &mut [u8], mut dst: usize, src: &[u8], mut sp: usize, len: usize) {
-    copy16_from(buf, dst, src, sp);
+unsafe fn wildcopy(mut dst: *mut u8, mut src: *const u8, len: usize) {
+    copy16(dst, src);
     if len <= 16 {
         return;
     }
-    let end = dst + len;
-    dst += 16;
-    sp += 16;
+    let end = dst.add(len);
+    dst = dst.add(16);
+    src = src.add(16);
     loop {
-        copy16_from(buf, dst, src, sp);
-        copy16_from(buf, dst + 16, src, sp + 16);
-        dst += 32;
-        sp += 32;
-        if dst >= end {
-            break;
-        }
-    }
-}
-
-/// ZSTD_wildcopy(no_overlap) within `buf`; `dst - src >= 16`.
-#[inline(always)]
-fn wildcopy_within(buf: &mut [u8], mut dst: usize, mut src: usize, len: usize) {
-    copy16_within(buf, dst, src);
-    if len <= 16 {
-        return;
-    }
-    let end = dst + len;
-    dst += 16;
-    src += 16;
-    loop {
-        copy16_within(buf, dst, src);
-        copy16_within(buf, dst + 16, src + 16);
-        dst += 32;
-        src += 32;
+        copy16(dst, src);
+        copy16(dst.add(16), src.add(16));
+        dst = dst.add(32);
+        src = src.add(32);
         if dst >= end {
             break;
         }
@@ -2790,40 +2825,45 @@ fn wildcopy_within(buf: &mut [u8], mut dst: usize, mut src: usize, len: usize) {
 
 /// ZSTD_wildcopy(overlap_src_before_dst) with `8 <= dst - src < 16`:
 /// 8-byte chunks, overshooting by up to 7 bytes.
+///
+/// # Safety
+/// `len + 7` bytes readable at `src` and writable at `dst`, `dst - src >= 8`.
 #[inline(always)]
-fn wildcopy_overlap8(buf: &mut [u8], mut dst: usize, mut src: usize, len: usize) {
-    let end = dst + len;
+unsafe fn wildcopy_overlap8(mut dst: *mut u8, mut src: *const u8, len: usize) {
+    let end = dst.add(len);
     loop {
-        copy8_within(buf, dst, src);
-        dst += 8;
-        src += 8;
+        ptr::copy_nonoverlapping(src, dst, 8);
+        dst = dst.add(8);
+        src = src.add(8);
         if dst >= end {
             break;
         }
     }
 }
 
-/// ZSTD_overlapCopy8: copy 8 bytes from `src` to `dst` (`src <= dst`) and
-/// advance both so that afterwards `dst - src >= 8`.
+/// ZSTD_overlapCopy8: copy 8 bytes from `src` to `dst` and return both
+/// advanced so that afterwards `dst - src >= 8`.
+///
+/// # Safety
+/// `dst - src == offset` with `1 <= offset < 16`; 12 bytes readable at `src`
+/// and 8 writable at `dst`, all within one allocation.
 #[inline(always)]
-fn overlap_copy8(buf: &mut [u8], dst: &mut usize, src: &mut usize, offset: usize) {
+unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8, *const u8) {
     if offset < 8 {
         const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
         const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
-        let (d, s) = (*dst, *src);
-        buf[d] = buf[s];
-        buf[d + 1] = buf[s + 1];
-        buf[d + 2] = buf[s + 2];
-        buf[d + 3] = buf[s + 3];
-        let s2 = s + DEC32[offset];
-        let chunk: [u8; 4] = buf[s2..s2 + 4].try_into().unwrap();
-        buf[d + 4..d + 8].copy_from_slice(&chunk);
-        *src = s2 + 8 - DEC64[offset];
+        *dst = *src;
+        *dst.add(1) = *src.add(1);
+        *dst.add(2) = *src.add(2);
+        *dst.add(3) = *src.add(3);
+        // `dst + 4` is at least 4 bytes past `src + DEC32[offset]`.
+        let s2 = src.add(DEC32[offset]);
+        ptr::copy_nonoverlapping(s2, dst.add(4), 4);
+        (dst.add(8), s2.add(8).sub(DEC64[offset]))
     } else {
-        copy8_within(buf, *dst, *src);
-        *src += 8;
+        ptr::copy_nonoverlapping(src, dst, 8);
+        (dst.add(8), src.add(8))
     }
-    *dst += 8;
 }
 
 // ============================================================
