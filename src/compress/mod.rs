@@ -21,7 +21,10 @@ pub mod params;
 pub mod seqstore;
 
 use crate::constants::*;
-use block::{write_raw_block, write_rle_block, BlockScratch, BlockState, CommittedBlockState};
+use block::{
+    write_raw_block, write_rle_block, BlockScratch, BlockState, CommittedBlockState,
+    ZSTD_BLOCKHEADERSIZE,
+};
 use matchstate::MatchState;
 pub use params::{CParams, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
@@ -121,29 +124,39 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
     let jobs = job_ranges(data.len(), job_size);
     let overlap = overlap_size(&cparams);
     let n_jobs = jobs.len();
-    let outputs = run_jobs(&jobs, cfg!(feature = "parallel"), |k, job| {
-        compress_job(
-            data,
-            cparams,
-            block_size,
-            overlap,
-            job,
-            k == 0,
-            k + 1 == n_jobs,
-        )
-    });
-    for o in &outputs {
-        out.extend_from_slice(o);
-    }
+    run_jobs(
+        &jobs,
+        cfg!(feature = "parallel"),
+        |k, job, out| {
+            compress_job(
+                data,
+                cparams,
+                block_size,
+                overlap,
+                job,
+                k == 0,
+                k + 1 == n_jobs,
+                out,
+            )
+        },
+        &mut out,
+    );
     out
 }
 
-/// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks.
-/// Job 0 starts from `repStartValue` with `window_low = 1`; a later job
-/// indexes `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on
-/// the raw-content prefix), starts with invalidated repeat offsets and no
-/// entropy tables, so its first block cannot reference state the decoder
-/// obtained from the previous job.
+/// Upper bound on the blocks a job of `len` bytes produces: every block
+/// RAW with its header.
+fn job_bound(len: usize, block_size: usize) -> usize {
+    len + ZSTD_BLOCKHEADERSIZE * len.div_ceil(block_size)
+}
+
+/// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
+/// appended to `out`. Job 0 starts from `repStartValue` with
+/// `window_low = 1`; a later job indexes `overlap` bytes before its start
+/// (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with
+/// invalidated repeat offsets and no entropy tables, so its first block
+/// cannot reference state the decoder obtained from the previous job.
+#[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
     cparams: CParams,
@@ -152,7 +165,8 @@ fn compress_job(
     job: Range<usize>,
     first_job: bool,
     last_job: bool,
-) -> Vec<u8> {
+    out: &mut Vec<u8>,
+) {
     let window_low = if first_job {
         1
     } else {
@@ -166,7 +180,7 @@ fn compress_job(
     }
     let mut state = CommittedBlockState::new(initial);
     let mut scratch = BlockScratch::new(block_size);
-    let mut out = Vec::with_capacity(job.len() + 3 * job.len().div_ceil(block_size));
+    out.reserve(job_bound(job.len(), block_size));
     let mut start = job.start;
     while start < job.end {
         let end = (start + block_size).min(job.end);
@@ -178,34 +192,49 @@ fn compress_job(
             last_job && end == job.end,
             &mut state,
             &mut scratch,
-            &mut out,
+            out,
         );
         start = end;
     }
-    out
 }
 
-/// Run `f` over every job and return the outputs in job order. `parallel`
-/// selects rayon when the feature is enabled; the serial loop is otherwise
-/// the same, so the concatenated frame is identical either way.
-fn run_jobs<F>(jobs: &[Range<usize>], parallel: bool, f: F) -> Vec<Vec<u8>>
+/// Run `f` over every job, in job order, appending to `out`. Job 0 always
+/// writes straight into `out`. With the feature enabled and `parallel`, the
+/// remaining jobs run on rayon into buffers of their own while job 0 runs,
+/// and are appended afterwards; the serial loop hands every job `out`. The
+/// job function is the same either way, so the frame is identical.
+fn run_jobs<F>(jobs: &[Range<usize>], parallel: bool, f: F, out: &mut Vec<u8>)
 where
-    F: Fn(usize, Range<usize>) -> Vec<u8> + Sync,
+    F: Fn(usize, Range<usize>, &mut Vec<u8>) + Sync,
 {
     #[cfg(feature = "parallel")]
     if parallel {
         use rayon::prelude::*;
-        return jobs
-            .par_iter()
-            .enumerate()
-            .map(|(k, job)| f(k, job.clone()))
-            .collect();
+        let Some((first, rest)) = jobs.split_first() else {
+            return;
+        };
+        let ((), rest_out) = rayon::join(
+            || f(0, first.clone(), out),
+            || {
+                rest.par_iter()
+                    .enumerate()
+                    .map(|(i, job)| {
+                        let mut o = Vec::new();
+                        f(i + 1, job.clone(), &mut o);
+                        o
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        for o in &rest_out {
+            out.extend_from_slice(o);
+        }
+        return;
     }
     let _ = parallel;
-    jobs.iter()
-        .enumerate()
-        .map(|(k, job)| f(k, job.clone()))
-        .collect()
+    for (k, job) in jobs.iter().enumerate() {
+        f(k, job.clone(), out);
+    }
 }
 
 /// `ZSTDMT_initCStream_internal`'s job size: an explicit size clamped to
@@ -432,7 +461,7 @@ mod tests {
             assert!(jobs.len() >= 10, "level {level}: {} jobs", jobs.len());
             let overlap = overlap_size(&cparams);
             let n = jobs.len();
-            let f = |k: usize, job: Range<usize>| {
+            let f = |k: usize, job: Range<usize>, out: &mut Vec<u8>| {
                 compress_job(
                     data.as_slice(),
                     cparams,
@@ -441,15 +470,17 @@ mod tests {
                     job,
                     k == 0,
                     k + 1 == n,
+                    out,
                 )
             };
-            let par = run_jobs(&jobs, true, f);
-            let seq = run_jobs(&jobs, false, f);
+            let mut par = Vec::new();
+            run_jobs(&jobs, true, f, &mut par);
+            let mut seq = Vec::new();
+            run_jobs(&jobs, false, f, &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
-            let blocks: Vec<u8> = seq.concat();
             assert!(
-                frame.ends_with(&blocks),
+                frame.ends_with(&seq),
                 "level {level}: frame != header + jobs"
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data);
