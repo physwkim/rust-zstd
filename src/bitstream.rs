@@ -144,6 +144,20 @@ impl<'a> BitCStream<'a> {
     }
 }
 
+/// `ZSTD_cpuSupportsBmi2`: whether the `DYNAMIC_BMI2` variants of the
+/// bit-stream writers may run on this machine.
+#[inline]
+pub fn cpu_supports_bmi2() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

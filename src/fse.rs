@@ -227,15 +227,71 @@ const fn pad_bits<const N: usize>(bits: &[u8; N]) -> [u8; 256] {
     out
 }
 
-/// `ZSTD_encodeSequences_body` (the `MEM_64bits` variant; `longOffsets`
-/// only exists for 32-bit accumulators): FSE-encode `sequences` with the
-/// three tables into a backward bitstream appended to `out`, and return
-/// its size. `nb_seq >= 1` and the code slices are `nb_seq` long.
-/// `extra_bits` is the total of the raw literal-length, match-length and
-/// offset bits of `sequences`; with the per-symbol FSE bits bounded by the
-/// table logs, it sizes the region the stream is written into.
+/// `ZSTD_encodeSequences`: FSE-encode `sequences` with the three tables
+/// into a backward bitstream appended to `out`, and return its size.
+/// `nb_seq >= 1` and the code slices are `nb_seq` long. `extra_bits` is
+/// the total of the raw literal-length, match-length and offset bits of
+/// `sequences`; with the per-symbol FSE bits bounded by the table logs, it
+/// sizes the region the stream is written into. Runs the BMI2 build of
+/// the body where the CPU has it (`DYNAMIC_BMI2`).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_sequences(
+    out: &mut Vec<u8>,
+    ll_table: &FseCTable,
+    of_table: &FseCTable,
+    ml_table: &FseCTable,
+    ll_codes: &[u8],
+    of_codes: &[u8],
+    ml_codes: &[u8],
+    sequences: &[Seq],
+    extra_bits: usize,
+) -> usize {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if super::bitstream::cpu_supports_bmi2() {
+        // SAFETY: BMI2 was detected just above.
+        return unsafe {
+            encode_sequences_bmi2(
+                out, ll_table, of_table, ml_table, ll_codes, of_codes, ml_codes, sequences,
+                extra_bits,
+            )
+        };
+    }
+    encode_sequences_body(
+        out, ll_table, of_table, ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
+    )
+}
+
+/// `ZSTD_encodeSequences_bmi2`: [`encode_sequences_body`] compiled with
+/// BMI2 enabled.
+///
+/// # Safety
+///
+/// The CPU must support BMI2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "bmi2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_sequences_bmi2(
+    out: &mut Vec<u8>,
+    ll_table: &FseCTable,
+    of_table: &FseCTable,
+    ml_table: &FseCTable,
+    ll_codes: &[u8],
+    of_codes: &[u8],
+    ml_codes: &[u8],
+    sequences: &[Seq],
+    extra_bits: usize,
+) -> usize {
+    encode_sequences_body(
+        out, ll_table, of_table, ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
+    )
+}
+
+/// `ZSTD_encodeSequences_body` (the `MEM_64bits` variant; `longOffsets`
+/// only exists for 32-bit accumulators).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn encode_sequences_body(
     out: &mut Vec<u8>,
     ll_table: &FseCTable,
     of_table: &FseCTable,
