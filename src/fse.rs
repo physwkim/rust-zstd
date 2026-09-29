@@ -1,7 +1,7 @@
 //! FSE (Finite State Entropy) encoder.
 //! Ported from zstd C source: lib/common/fse.h, lib/compress/fse_compress.c.
 
-use super::bitstream::BackwardBitWriter;
+use super::bitstream::BitCStream;
 use crate::compress::seqstore::Seq;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -142,6 +142,7 @@ impl FseCTable {
     }
 
     /// Initialize FSE state for the first symbol (FSE_initCState2).
+    #[inline]
     pub fn init_state(&self, symbol: usize) -> u32 {
         let stt = &self.symbol_tt[symbol];
         let nb_bits = ((stt.delta_nb_bits as u64 + (1 << 15)) >> 16) as u32;
@@ -151,6 +152,7 @@ impl FseCTable {
 
     /// Encode a symbol: output bits from current state, then transition.
     /// Returns (bits_to_output, nb_bits, new_state).
+    #[inline]
     pub fn encode_symbol(&self, state: u32, symbol: usize) -> (u32, u32, u32) {
         let stt = &self.symbol_tt[symbol];
         let nb_bits = (state.wrapping_add(stt.delta_nb_bits)) >> 16;
@@ -170,8 +172,14 @@ fn highest_bit(v: u32) -> u32 {
 
 /// `ZSTD_encodeSequences_body` (the `MEM_64bits` variant; `longOffsets`
 /// only exists for 32-bit accumulators): FSE-encode `sequences` with the
-/// three tables into a backward bitstream. `nb_seq >= 1`.
+/// three tables into a backward bitstream appended to `out`, and return
+/// its size. `nb_seq >= 1`. `extra_bits` is the total of the raw
+/// literal-length, match-length and offset bits of `sequences`; with the
+/// per-symbol FSE bits bounded by the table logs, it sizes the region the
+/// stream is written into.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_sequences(
+    out: &mut Vec<u8>,
     ll_table: &FseCTable,
     of_table: &FseCTable,
     ml_table: &FseCTable,
@@ -179,10 +187,14 @@ pub fn encode_sequences(
     of_codes: &[u8],
     ml_codes: &[u8],
     sequences: &[Seq],
-) -> Vec<u8> {
+    extra_bits: usize,
+) -> usize {
     let nb_seq = sequences.len();
     debug_assert!(nb_seq >= 1);
-    let mut bw = BackwardBitWriter::new();
+    let start = out.len();
+    let max_bits = extra_bits + nb_seq * (LL_FSE_LOG + OFF_FSE_LOG + ML_FSE_LOG) as usize + 1;
+    out.resize(start + BitCStream::capacity_for(max_bits), 0);
+    let mut bw = BitCStream::new(&mut out[start..]);
 
     // first symbols
     let last = nb_seq - 1;
@@ -239,24 +251,31 @@ pub fn encode_sequences(
     bw.add_bits(state_ll as u64, ll_table.table_log);
     bw.flush_bits();
 
-    bw.finish()
+    let size = bw.close();
+    debug_assert!(size != 0, "bitstream exceeded its bound");
+    out.truncate(start + size);
+    size
 }
 
 /// `FSE_compress_usingCTable` (the 64-bit `FSE_compress_usingCTable_generic`):
 /// two interleaved states over `src`, appended to `out` as a backward
-/// bitstream. Returns the byte size, or `0` for `src.len() <= 2`.
+/// bitstream. Returns the byte size, or `0` for `src.len() <= 2`. The
+/// region is `FSE_BLOCKBOUND(srcSize)`, which the stream never exceeds
+/// with a table log of at most 6 bits per symbol.
 pub fn compress_using_ctable(out: &mut Vec<u8>, src: &[u8], ct: &FseCTable) -> usize {
     let mut src_size = src.len();
     if src_size <= 2 {
         return 0;
     }
-    let mut bw = BackwardBitWriter::new();
+    let start = out.len();
+    out.resize(start + src_size + (src_size >> 7) + 4 + 8, 0);
+    let mut bw = BitCStream::new(&mut out[start..]);
     let mut ip = src_size;
     let next = |ip: &mut usize| {
         *ip -= 1;
         src[*ip] as usize
     };
-    let encode = |bw: &mut BackwardBitWriter, state: &mut u32, symbol: usize| {
+    let encode = |bw: &mut BitCStream, state: &mut u32, symbol: usize| {
         let (bits, nb, new_state) = ct.encode_symbol(*state, symbol);
         bw.add_bits(bits as u64, nb);
         *state = new_state;
@@ -295,9 +314,9 @@ pub fn compress_using_ctable(out: &mut Vec<u8>, src: &[u8], ct: &FseCTable) -> u
     bw.flush_bits();
     bw.add_bits(state1 as u64, ct.table_log);
     bw.flush_bits();
-    let stream = bw.finish();
-    out.extend_from_slice(&stream);
-    stream.len()
+    let size = bw.close();
+    out.truncate(start + size);
+    size
 }
 
 /// `SymbolEncodingType_e`: how one sequence table is transmitted.
@@ -1040,14 +1059,19 @@ pub fn encode_sequences_section_with(
     let seq_head = out.len();
     out.push(0);
 
-    // ZSTD_seqToCodes
+    // ZSTD_seqToCodes, also totalling the raw bits the bitstream carries
     let mut ll_codes = Vec::with_capacity(nb_seq);
     let mut of_codes = Vec::with_capacity(nb_seq);
     let mut ml_codes = Vec::with_capacity(nb_seq);
+    let mut extra_bits = 0usize;
     for seq in sequences {
-        ll_codes.push(ll_code(seq.lit_len));
-        of_codes.push(off_code(seq.off_base));
-        ml_codes.push(ml_code(seq.ml_base));
+        let ll = ll_code(seq.lit_len);
+        let of = off_code(seq.off_base);
+        let ml = ml_code(seq.ml_base);
+        extra_bits += (LL_BITS[ll as usize] + ML_BITS[ml as usize]) as usize + of as usize;
+        ll_codes.push(ll);
+        of_codes.push(of);
+        ml_codes.push(ml);
     }
 
     // ZSTD_buildSequencesStatistics: LL, then OF, then ML
@@ -1096,17 +1120,17 @@ pub fn encode_sequences_section_with(
     }
     out[seq_head] = ((ll_type as u8) << 6) | ((of_type as u8) << 4) | ((ml_type as u8) << 2);
 
-    let bitstream = encode_sequences(
-        &ll_table, &of_table, &ml_table, &ll_codes, &of_codes, &ml_codes, sequences,
+    let bitstream_size = encode_sequences(
+        out, &ll_table, &of_table, &ml_table, &ll_codes, &of_codes, &ml_codes, sequences,
+        extra_bits,
     );
     // zstd versions <= 1.3.4 mistakenly report corruption when
     // FSE_readNCount() receives a buffer < 4 bytes: emit an uncompressed
     // block instead.
-    if last_count_size != 0 && last_count_size + bitstream.len() < 4 {
-        debug_assert_eq!(last_count_size + bitstream.len(), 3);
+    if last_count_size != 0 && last_count_size + bitstream_size < 4 {
+        debug_assert_eq!(last_count_size + bitstream_size, 3);
         return None;
     }
-    out.extend_from_slice(&bitstream);
 
     Some(FseState {
         ll: ll_next,
