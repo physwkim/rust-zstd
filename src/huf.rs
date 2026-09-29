@@ -1005,6 +1005,27 @@ fn literals_compression_is_disabled(cparams: &CParams) -> bool {
     cparams.strategy == Strategy::Fast && cparams.target_length > 0
 }
 
+/// Upper bound on the bytes [`compress_literals_with`] appends for
+/// `lit_len` literals, whatever their content, the previous [`HufState`]
+/// and the [`CParams`]: the Raw_Literals_Block, `lit_len` plus its 1, 2
+/// or 3 byte header (`ZSTD_noCompressLiterals`).
+///
+/// [`compress_literals_with`] has no failure return; every path ends in
+/// one of three sections, each within the bound:
+/// - raw, when literal compression is disabled, `lit_len` is below
+///   `ZSTD_minLiteralsToCompress`, `HUF_compress*` returns an error or 0,
+///   or its size is not below `lit_len - ZSTD_minGain`: exactly the bound;
+/// - RLE, when the compressed size is 1: its header is no longer than the
+///   raw header and it carries 1 byte where raw carries `lit_len >= 6`;
+/// - compressed or treeless: `lhSize + cLitSize <= lhSize + lit_len -
+///   minGain - 1` with `minGain >= 2`, and `lhSize - 3` (0, 1 or 2 for
+///   `lit_len` from 1024 and from 16384) never exceeds the raw header
+///   minus 1 (0, 1 or 2 for `lit_len` from 32 and from 4096).
+pub fn literals_section_bound(lit_len: usize) -> usize {
+    let raw_header = 1 + (lit_len > 31) as usize + (lit_len > 4095) as usize;
+    lit_len + raw_header
+}
+
 /// `ZSTD_compressLiterals`: write the literals section for one block and
 /// return the Huffman state the decoder holds afterwards (`nextHuf`).
 /// `nb_seq` is the block's sequence count, from which the caller-side
