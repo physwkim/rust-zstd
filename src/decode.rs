@@ -700,8 +700,10 @@ struct HufEntryX2 {
     length: u8,
 }
 
-/// Table log of every double-symbol table (libzstd HUF_DECODER_FAST_TABLELOG).
-const HUF_X2_TABLE_LOG: u32 = 11;
+/// Table log of every decoding table (libzstd HUF_DECODER_FAST_TABLELOG):
+/// single-symbol tables are scaled up to it so that the 4-stream fast
+/// loops index with a constant shift.
+const HUF_FAST_TABLE_LOG: u32 = 11;
 
 /// Relative cost of the single- and double-symbol decoders, indexed by the
 /// compression ratio quantile (libzstd algoTime: table build time, then
@@ -743,9 +745,9 @@ fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
 }
 
 struct HuffmanTable {
-    /// Single-symbol table, `1 << max_num_bits` cells, when `!is_x2`.
+    /// Single-symbol table, `1 << HUF_FAST_TABLE_LOG` cells, when `!is_x2`.
     decode: Vec<HuffmanEntry>,
-    /// Double-symbol table, `1 << HUF_X2_TABLE_LOG` cells, when `is_x2`.
+    /// Double-symbol table, `1 << HUF_FAST_TABLE_LOG` cells, when `is_x2`.
     decode_x2: Vec<HufEntryX2>,
     is_x2: bool,
     /// Weight per symbol, including the implied last one after a build.
@@ -986,10 +988,14 @@ impl HuffmanTable {
         Ok(())
     }
 
-    /// Fill the single-symbol table: each symbol of `n` bits owns
-    /// `1 << (max_bits - n)` consecutive cells, ordered by code length.
+    /// Fill the single-symbol table at `HUF_FAST_TABLE_LOG` bits
+    /// (HUF_readDTableX1_wksp with HUF_rescaleStats): each symbol of `n`
+    /// bits owns `1 << (HUF_FAST_TABLE_LOG - n)` consecutive cells, ordered
+    /// by code length. Scaling the weights up leaves every code length
+    /// unchanged, so only the cell counts differ from a `max_bits` table.
     fn fill_x1(&mut self) -> Result<(), String> {
         let max_bits = self.max_num_bits;
+        let table_log = HUF_FAST_TABLE_LOG as u8;
         self.bits.clear();
         self.bits.resize(self.weights.len(), 0);
         for symbol in 0..self.weights.len() {
@@ -1008,7 +1014,7 @@ impl HuffmanTable {
         }
 
         self.decode.clear();
-        self.decode.resize(1 << max_bits, HuffmanEntry::default());
+        self.decode.resize(1 << table_log, HuffmanEntry::default());
 
         self.rank_indexes.clear();
         self.rank_indexes.resize((max_bits + 1) as usize, 0);
@@ -1016,7 +1022,7 @@ impl HuffmanTable {
         self.rank_indexes[max_bits as usize] = 0;
         for bits in (1..self.rank_indexes.len() as u8).rev() {
             self.rank_indexes[bits as usize - 1] = self.rank_indexes[bits as usize]
-                + self.bit_ranks[bits as usize] as usize * (1 << (max_bits - bits));
+                + self.bit_ranks[bits as usize] as usize * (1 << (table_log - bits));
         }
 
         if self.rank_indexes[0] != self.decode.len() {
@@ -1031,12 +1037,12 @@ impl HuffmanTable {
             let bits_for_symbol = self.bits[symbol];
             if bits_for_symbol != 0 {
                 let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1 << (max_bits - bits_for_symbol);
+                let len = 1 << (table_log - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
-                for idx in 0..len {
-                    self.decode[base_idx + idx].symbol = symbol as u8;
-                    self.decode[base_idx + idx].num_bits = bits_for_symbol;
-                }
+                self.decode[base_idx..base_idx + len].fill(HuffmanEntry {
+                    symbol: symbol as u8,
+                    num_bits: bits_for_symbol,
+                });
             }
         }
 
@@ -1047,10 +1053,10 @@ impl HuffmanTable {
     /// HUF_readStats): sort symbols by weight, compute where each weight's
     /// run starts for every number of already-consumed bits, then tile the
     /// table so that a cell holds two symbols whenever both fit in
-    /// `HUF_X2_TABLE_LOG` bits.
+    /// `HUF_FAST_TABLE_LOG` bits.
     fn fill_x2(&mut self) {
         let table_log = u32::from(self.max_num_bits);
-        let target_log = HUF_X2_TABLE_LOG;
+        let target_log = HUF_FAST_TABLE_LOG;
         let nb_bits_baseline = table_log + 1;
         let nb_symbols = self.weights.len();
 
@@ -1089,7 +1095,7 @@ impl HuffmanTable {
         // rank_val[consumed][w]: first cell of weight w once `consumed` bits
         // of the lookup have been used by a first symbol.
         let rescale = target_log - table_log; // shift of (w - 1 + rescale)
-        let mut rank_val = [[0u32; MAX_MAX_NUM_BITS as usize + 2]; HUF_X2_TABLE_LOG as usize + 1];
+        let mut rank_val = [[0u32; MAX_MAX_NUM_BITS as usize + 2]; HUF_FAST_TABLE_LOG as usize + 1];
         let mut next_val = 0u32;
         for w in 1..=max_w {
             rank_val[0][w] = next_val;
@@ -1439,64 +1445,351 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
 /// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
 #[inline(never)]
 fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    let dt_log = u32::from(table.max_num_bits);
     let dt = &table.decode[..];
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x1(out, &mut br, dt, dt_log);
+    huf_decode_stream_x1(out, &mut br, dt, HUF_FAST_TABLE_LOG);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
     Ok(())
 }
 
+/// Stream and segment layout of a 4-stream section: the jump table checks
+/// shared by HUF_decompress4X1/4X2_usingDTable_internal_body.
+struct HufStreams {
+    /// First byte of each stream within the section.
+    istart: [usize; 4],
+    /// One past the last byte of each stream within the section.
+    iend: [usize; 4],
+    /// Segment size; stream `s` writes `[s * segment, segment_end(s))`.
+    segment: usize,
+}
+
+impl HufStreams {
+    fn split(src: &[u8], dst_size: usize) -> Result<HufStreams, String> {
+        if src.len() < 10 {
+            return Err(format!(
+                "Huffman 4-stream input too short: {} bytes",
+                src.len()
+            ));
+        }
+        if dst_size < MIN_LITERALS_FOR_4_STREAMS {
+            return Err(format!(
+                "Huffman 4-stream output too small: {} bytes",
+                dst_size
+            ));
+        }
+        let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
+        let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
+        let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
+        if 6 + len1 + len2 + len3 > src.len() {
+            return Err("Huffman jump table exceeds input".to_string());
+        }
+        let istart = [6, 6 + len1, 6 + len1 + len2, 6 + len1 + len2 + len3];
+        let iend = [istart[1], istart[2], istart[3], src.len()];
+        let segment = dst_size.div_ceil(4);
+        if 3 * segment > dst_size {
+            return Err("Huffman 4-stream segments exceed output".to_string());
+        }
+        Ok(HufStreams {
+            istart,
+            iend,
+            segment,
+        })
+    }
+
+    fn stream<'s>(&self, src: &'s [u8], s: usize) -> &'s [u8] {
+        &src[self.istart[s]..self.iend[s]]
+    }
+
+    fn segment_end(&self, s: usize, dst_size: usize) -> usize {
+        ((s + 1) * self.segment).min(dst_size)
+    }
+}
+
+/// Per-stream state of the 4-stream fast loops (HUF_DecompressFastArgs):
+/// `ip[s]` indexes the 8 section bytes held in `bits[s]`, `op[s]` the next
+/// output byte. Each container keeps its unread bits at the top and a
+/// sentinel 1 bit right below them, so `trailing_zeros` is the number of
+/// bits already consumed from the loaded bytes.
+#[derive(Clone, Copy)]
+struct HufFastArgs {
+    ip: [usize; 4],
+    op: [usize; 4],
+    bits: [u64; 4],
+}
+
+/// Set up the fast loops (HUF_DecompressFastArgs_init). `None` sends the
+/// section to the plain loops: each stream must hold 8 bytes to fill a
+/// container, and the fourth segment must not be empty.
+fn huf_fast_args_init(
+    streams: &HufStreams,
+    src: &[u8],
+    dst_size: usize,
+) -> Result<Option<HufFastArgs>, String> {
+    let segment = streams.segment;
+    if 3 * segment >= dst_size {
+        return Ok(None);
+    }
+    let mut ip = [0usize; 4];
+    let mut bits = [0u64; 4];
+    for s in 0..4 {
+        if streams.iend[s] - streams.istart[s] < 8 {
+            return Ok(None);
+        }
+        let last = src[streams.iend[s] - 1];
+        if last == 0 {
+            return Err("Huffman stream has no end mark".to_string());
+        }
+        // HUF_initFastDStream: the padding above the end mark and the mark
+        // itself count as consumed.
+        ip[s] = streams.iend[s] - 8;
+        bits[s] = (read_le64(src, ip[s]) | 1) << (last.leading_zeros() + 1);
+    }
+    Ok(Some(HufFastArgs {
+        ip,
+        op: [0, segment, 2 * segment, 3 * segment],
+        bits,
+    }))
+}
+
+/// Continue stream `s` with the plain decoder (HUF_initRemainingDStream).
+/// The container's consumed-bit count, plus 8 per byte the container sits
+/// below the stream start, is the position within the stream's own bytes.
+fn huf_remaining_dstream<'s>(
+    args: &HufFastArgs,
+    streams: &HufStreams,
+    s: usize,
+    src: &'s [u8],
+) -> Result<BitDStream<'s>, String> {
+    let start = streams.istart[s];
+    let stream = streams.stream(src, s);
+    let ip = args.ip[s];
+    // A fully consumed stream leaves the container at most 8 bytes below
+    // its start; anything lower is corruption.
+    if ip + 8 < start {
+        return Err("Huffman stream overran its start".to_string());
+    }
+    let (ptr, below) = if ip >= start {
+        (ip - start, 0)
+    } else {
+        (0, start - ip)
+    };
+    let bits_consumed = args.bits[s].trailing_zeros() + below as u32 * 8;
+    if bits_consumed > 64 {
+        return Err("Huffman stream overran its start".to_string());
+    }
+    Ok(BitDStream {
+        src: stream,
+        ptr,
+        container: read_le64(stream, ptr),
+        bits_consumed,
+    })
+}
+
+/// Five symbols per stream per iteration, reloading by `trailing_zeros`
+/// (HUF_decompress4X1_usingDTable_internal_fast_c_loop). Each iteration
+/// writes 5 bytes per stream and consumes at most 55 bits, under 7 bytes,
+/// per stream, and every stream's input lies at or above stream 0's; so
+/// `iters` iterations stay inside `src` and `out` without further checks.
+/// A stream that crosses the previous one (corruption) ends the loop.
+///
+/// # Safety
+/// `args` was produced by `huf_fast_args_init` on `src` and an output of
+/// `out.len()` bytes; `dt.len() == 1 << HUF_FAST_TABLE_LOG`.
+unsafe fn huf_4x1_fast_loop(
+    args: &mut HufFastArgs,
+    out: &mut [u8],
+    src: &[u8],
+    dt: &[HuffmanEntry],
+) {
+    let HufFastArgs {
+        mut ip,
+        mut op,
+        mut bits,
+    } = *args;
+    let oend = out.len();
+    let o = out.as_mut_ptr();
+    loop {
+        let oiters = (oend - op[3]) / 5;
+        let iiters = ip[0] / 7;
+        let olimit = op[3] + oiters.min(iiters) * 5;
+        if op[3] == olimit {
+            break;
+        }
+        if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
+            break;
+        }
+        // Table cells hold at most HUF_FAST_TABLE_LOG bits, so the
+        // sentinel stays inside the container between reloads.
+        macro_rules! decode {
+            ($s:expr, $k:expr) => {{
+                let entry = table_entry(dt, (bits[$s] >> (64 - HUF_FAST_TABLE_LOG)) as usize);
+                bits[$s] <<= u32::from(entry.num_bits);
+                *o.add(op[$s] + $k) = entry.symbol;
+            }};
+        }
+        macro_rules! reload {
+            ($s:expr) => {{
+                let ctz = bits[$s].trailing_zeros();
+                op[$s] += 5;
+                ip[$s] -= (ctz >> 3) as usize;
+                bits[$s] = (read_le64_unchecked(src, ip[$s]) | 1) << (ctz & 7);
+            }};
+        }
+        loop {
+            decode!(0, 0);
+            decode!(1, 0);
+            decode!(2, 0);
+            decode!(3, 0);
+            decode!(0, 1);
+            decode!(1, 1);
+            decode!(2, 1);
+            decode!(3, 1);
+            decode!(0, 2);
+            decode!(1, 2);
+            decode!(2, 2);
+            decode!(3, 2);
+            decode!(0, 3);
+            decode!(1, 3);
+            decode!(2, 3);
+            decode!(3, 3);
+            decode!(0, 4);
+            decode!(1, 4);
+            decode!(2, 4);
+            decode!(3, 4);
+            reload!(0);
+            reload!(1);
+            reload!(2);
+            reload!(3);
+            if op[3] >= olimit {
+                break;
+            }
+        }
+    }
+    *args = HufFastArgs { ip, op, bits };
+}
+
+/// Five cells per stream per iteration, up to 10 bytes each
+/// (HUF_decompress4X2_usingDTable_internal_fast_c_loop). Streams advance at
+/// their own pace, so `iters` is the minimum over the four output bounds;
+/// the fourth stream's cells are decoded around the reloads to relieve
+/// register pressure. Every cell write is 2 bytes wide and lands below
+/// the stream's bound because `op[s] + 10 <= oend[s]` at each iteration.
+///
+/// # Safety
+/// `args` was produced by `huf_fast_args_init` on `src` and an output of
+/// `out.len()` bytes; `dt.len() == 1 << HUF_FAST_TABLE_LOG`.
+unsafe fn huf_4x2_fast_loop(args: &mut HufFastArgs, out: &mut [u8], src: &[u8], dt: &[HufEntryX2]) {
+    let HufFastArgs {
+        mut ip,
+        mut op,
+        mut bits,
+    } = *args;
+    let oend = [op[1], op[2], op[3], out.len()];
+    let o = out.as_mut_ptr();
+    loop {
+        let mut iters = ip[0] / 7;
+        for s in 0..4 {
+            iters = iters.min((oend[s] - op[s]) / 10);
+        }
+        let olimit = op[3] + iters * 5;
+        if op[3] == olimit {
+            break;
+        }
+        if ip[1] < ip[0] || ip[2] < ip[1] || ip[3] < ip[2] {
+            break;
+        }
+        macro_rules! decode {
+            ($s:expr) => {{
+                let entry = table_entry(dt, (bits[$s] >> (64 - HUF_FAST_TABLE_LOG)) as usize);
+                ptr::copy_nonoverlapping(entry.sequence.to_le_bytes().as_ptr(), o.add(op[$s]), 2);
+                bits[$s] <<= u32::from(entry.nb_bits);
+                op[$s] += usize::from(entry.length);
+            }};
+        }
+        macro_rules! reload {
+            ($s:expr) => {{
+                decode!(3);
+                let ctz = bits[$s].trailing_zeros();
+                ip[$s] -= (ctz >> 3) as usize;
+                bits[$s] = (read_le64_unchecked(src, ip[$s]) | 1) << (ctz & 7);
+            }};
+        }
+        loop {
+            decode!(0);
+            decode!(1);
+            decode!(2);
+            decode!(0);
+            decode!(1);
+            decode!(2);
+            decode!(0);
+            decode!(1);
+            decode!(2);
+            decode!(0);
+            decode!(1);
+            decode!(2);
+            decode!(0);
+            decode!(1);
+            decode!(2);
+            decode!(3);
+            reload!(0);
+            reload!(1);
+            reload!(2);
+            reload!(3);
+            if op[3] >= olimit {
+                break;
+            }
+        }
+    }
+    *args = HufFastArgs { ip, op, bits };
+}
+
 /// Four interleaved literal streams
-/// (HUF_decompress4X1_usingDTable_internal_body).
+/// (HUF_decompress4X1_usingDTable_internal_body and _fast).
 ///
 /// The output is split into four segments of `(len + 3) / 4` bytes (the
-/// last one holds the remainder); stream `i` produces segment `i`. The main
-/// loop advances all four streams in lockstep, 4 symbols each per reload,
-/// so the four dependency chains overlap in the CPU.
+/// last one holds the remainder); stream `i` produces segment `i`. The fast
+/// loop takes sections with 8 bytes or more per stream; the plain loop
+/// advances all four streams in lockstep, 4 symbols each per reload. Both
+/// finish each stream with `huf_decode_stream_x1`.
 #[inline(never)]
 fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    if src.len() < 10 {
-        return Err(format!(
-            "Huffman 4-stream input too short: {} bytes",
-            src.len()
-        ));
+    let dt = &table.decode[..];
+    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
+        return Err("Huffman table is uninitialized".to_string());
     }
+    let dt_log = HUF_FAST_TABLE_LOG;
     let dst_size = out.len();
-    if dst_size < MIN_LITERALS_FOR_4_STREAMS {
-        return Err(format!(
-            "Huffman 4-stream output too small: {} bytes",
-            dst_size
-        ));
-    }
-    let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
-    let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
-    let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
-    let body = &src[6..];
-    if len1 + len2 + len3 > body.len() {
-        return Err("Huffman jump table exceeds input".to_string());
-    }
-    let (s1, rest) = body.split_at(len1);
-    let (s2, rest) = rest.split_at(len2);
-    let (s3, s4) = rest.split_at(len3);
+    let streams = HufStreams::split(src, dst_size)?;
 
-    let segment = dst_size.div_ceil(4);
-    if 3 * segment > dst_size {
-        return Err("Huffman 4-stream segments exceed output".to_string());
+    if let Some(mut args) = huf_fast_args_init(&streams, src, dst_size)? {
+        // SAFETY: `args` comes from `huf_fast_args_init` on this `src` and
+        // `out`, and `dt` has exactly `1 << HUF_FAST_TABLE_LOG` cells.
+        unsafe { huf_4x1_fast_loop(&mut args, out, src, dt) };
+        for s in 0..4 {
+            let end = streams.segment_end(s, dst_size);
+            if args.op[s] > end {
+                return Err("Huffman stream overran its segment".to_string());
+            }
+            let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
+            huf_decode_stream_x1(&mut out[args.op[s]..end], &mut br, dt, dt_log);
+            if !br.is_finished() {
+                return Err("Huffman stream not fully consumed".to_string());
+            }
+        }
+        return Ok(());
     }
+
+    let segment = streams.segment;
     let (o1, rest) = out.split_at_mut(segment);
     let (o2, rest) = rest.split_at_mut(segment);
     let (o3, o4) = rest.split_at_mut(segment);
 
-    let mut b1 = BitDStream::new(s1)?;
-    let mut b2 = BitDStream::new(s2)?;
-    let mut b3 = BitDStream::new(s3)?;
-    let mut b4 = BitDStream::new(s4)?;
-
-    let dt_log = u32::from(table.max_num_bits);
-    let dt = &table.decode[..];
+    let mut b1 = BitDStream::new(streams.stream(src, 0))?;
+    let mut b2 = BitDStream::new(streams.stream(src, 1))?;
+    let mut b3 = BitDStream::new(streams.stream(src, 2))?;
+    let mut b4 = BitDStream::new(streams.stream(src, 3))?;
 
     // Common write position within each segment; `o4` is the shortest
     // segment, so bounding `p` by it bounds all four.
@@ -1623,7 +1916,7 @@ fn huf_decode_stream_x2(
 fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt = &table.decode_x2[..];
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, HUF_X2_TABLE_LOG);
+    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, HUF_FAST_TABLE_LOG);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
@@ -1631,47 +1924,47 @@ fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
 }
 
 /// Four interleaved literal streams with the double-symbol table
-/// (HUF_decompress4X2_usingDTable_internal_body). Streams write at their
-/// own pace, so the first three are checked against their segment ends
-/// after the shared loop, whose trip count is bounded by the last stream.
+/// (HUF_decompress4X2_usingDTable_internal_body and _fast). Streams write
+/// at their own pace, so each is checked against its segment end after the
+/// shared loop; the plain loop's trip count is bounded by the last stream.
 #[inline(never)]
 fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    if src.len() < 10 {
-        return Err(format!(
-            "Huffman 4-stream input too short: {} bytes",
-            src.len()
-        ));
+    let dt = &table.decode_x2[..];
+    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
+        return Err("Huffman table is uninitialized".to_string());
     }
+    let dt_log = HUF_FAST_TABLE_LOG;
     let oend = out.len();
-    if oend < MIN_LITERALS_FOR_4_STREAMS {
-        return Err(format!("Huffman 4-stream output too small: {} bytes", oend));
-    }
-    let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
-    let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
-    let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
-    let body = &src[6..];
-    if len1 + len2 + len3 > body.len() {
-        return Err("Huffman jump table exceeds input".to_string());
-    }
-    let (s1, rest) = body.split_at(len1);
-    let (s2, rest) = rest.split_at(len2);
-    let (s3, s4) = rest.split_at(len3);
+    let streams = HufStreams::split(src, oend)?;
 
-    let segment = oend.div_ceil(4);
+    if let Some(mut args) = huf_fast_args_init(&streams, src, oend)? {
+        // SAFETY: `args` comes from `huf_fast_args_init` on this `src` and
+        // `out`, and `dt` has exactly `1 << HUF_FAST_TABLE_LOG` cells.
+        unsafe { huf_4x2_fast_loop(&mut args, out, src, dt) };
+        for s in 0..4 {
+            let end = streams.segment_end(s, oend);
+            if args.op[s] > end {
+                return Err("Huffman stream overran its segment".to_string());
+            }
+            let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
+            huf_decode_stream_x2(out, args.op[s], end, &mut br, dt, dt_log);
+            if !br.is_finished() {
+                return Err("Huffman stream not fully consumed".to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    let segment = streams.segment;
     let op_start2 = segment;
     let op_start3 = 2 * segment;
     let op_start4 = 3 * segment;
-    if op_start4 > oend {
-        return Err("Huffman 4-stream segments exceed output".to_string());
-    }
 
-    let mut b1 = BitDStream::new(s1)?;
-    let mut b2 = BitDStream::new(s2)?;
-    let mut b3 = BitDStream::new(s3)?;
-    let mut b4 = BitDStream::new(s4)?;
+    let mut b1 = BitDStream::new(streams.stream(src, 0))?;
+    let mut b2 = BitDStream::new(streams.stream(src, 1))?;
+    let mut b3 = BitDStream::new(streams.stream(src, 2))?;
+    let mut b4 = BitDStream::new(streams.stream(src, 3))?;
 
-    let dt = &table.decode_x2[..];
-    let dt_log = HUF_X2_TABLE_LOG;
     let mut op1 = 0;
     let mut op2 = op_start2;
     let mut op3 = op_start3;
