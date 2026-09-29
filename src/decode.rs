@@ -756,9 +756,6 @@ struct HuffmanTable {
     max_num_bits: u8,
     /// Number of symbols of each weight (libzstd rankStats).
     rank_stats: [u32; MAX_MAX_NUM_BITS as usize + 2],
-    bits: Vec<u8>,
-    bit_ranks: Vec<u32>,
-    rank_indexes: Vec<usize>,
     /// Symbols ordered by weight (libzstd sortedSymbol).
     sorted: Vec<u8>,
     fse_table: FSETable,
@@ -773,9 +770,6 @@ impl HuffmanTable {
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
             rank_stats: [0; MAX_MAX_NUM_BITS as usize + 2],
-            bits: Vec::with_capacity(256),
-            bit_ranks: Vec::with_capacity(11),
-            rank_indexes: Vec::with_capacity(11),
             sorted: Vec::with_capacity(256),
             fse_table: FSETable::new(255),
         }
@@ -787,9 +781,6 @@ impl HuffmanTable {
         self.is_x2 = false;
         self.weights.clear();
         self.max_num_bits = 0;
-        self.bits.clear();
-        self.bit_ranks.clear();
-        self.rank_indexes.clear();
         self.sorted.clear();
         self.fse_table.reset();
     }
@@ -994,56 +985,88 @@ impl HuffmanTable {
     /// by code length. Scaling the weights up leaves every code length
     /// unchanged, so only the cell counts differ from a `max_bits` table.
     fn fill_x1(&mut self) -> Result<(), String> {
-        let max_bits = self.max_num_bits;
-        let table_log = HUF_FAST_TABLE_LOG as u8;
-        self.bits.clear();
-        self.bits.resize(self.weights.len(), 0);
-        for symbol in 0..self.weights.len() {
-            let bits = if self.weights[symbol] > 0 {
-                max_bits + 1 - self.weights[symbol]
-            } else {
-                0
-            };
-            self.bits[symbol] = bits;
-        }
+        let max_bits = u32::from(self.max_num_bits);
+        let table_log = HUF_FAST_TABLE_LOG;
+        let rescale = table_log - max_bits;
+        let nb_symbols = self.weights.len();
 
-        self.bit_ranks.clear();
-        self.bit_ranks.resize((max_bits + 1) as usize, 0);
-        for num_bits in &self.bits {
-            self.bit_ranks[(*num_bits) as usize] += 1;
-        }
-
-        self.decode.clear();
-        self.decode.resize(1 << table_log, HuffmanEntry::default());
-
-        self.rank_indexes.clear();
-        self.rank_indexes.resize((max_bits + 1) as usize, 0);
-
-        self.rank_indexes[max_bits as usize] = 0;
-        for bits in (1..self.rank_indexes.len() as u8).rev() {
-            self.rank_indexes[bits as usize - 1] = self.rank_indexes[bits as usize]
-                + self.bit_ranks[bits as usize] as usize * (1 << (table_log - bits));
-        }
-
-        if self.rank_indexes[0] != self.decode.len() {
+        // Cells covered by every weight class must tile the table exactly.
+        let covered: usize = (1..=max_bits as usize)
+            .map(|w| (self.rank_stats[w] as usize) << (w - 1 + rescale as usize))
+            .sum();
+        if covered != 1 << table_log {
             return Err(format!(
                 "Huffman code lengths cover {} of {} cells",
-                self.rank_indexes[0],
-                self.decode.len()
+                covered,
+                1 << table_log
             ));
         }
 
-        for symbol in 0..self.bits.len() {
-            let bits_for_symbol = self.bits[symbol];
-            if bits_for_symbol != 0 {
-                let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1 << (table_log - bits_for_symbol);
-                self.rank_indexes[bits_for_symbol as usize] += len;
-                self.decode[base_idx..base_idx + len].fill(HuffmanEntry {
-                    symbol: symbol as u8,
-                    num_bits: bits_for_symbol,
-                });
+        // Symbols ordered by weight, then by value (libzstd symbols[]).
+        let mut rank_start = [0usize; MAX_MAX_NUM_BITS as usize + 2];
+        let mut next = 0usize;
+        for w in 0..=max_bits as usize {
+            rank_start[w] = next;
+            next += self.rank_stats[w] as usize;
+        }
+        self.sorted.clear();
+        self.sorted.resize(nb_symbols, 0);
+        for (s, &w) in self.weights.iter().enumerate() {
+            let w = usize::from(w);
+            self.sorted[rank_start[w]] = s as u8;
+            rank_start[w] += 1;
+        }
+
+        // Fill the table one weight at a time, so that the run length is a
+        // constant of each loop and the common short runs are unrolled.
+        self.decode.clear();
+        self.decode.resize(1 << table_log, HuffmanEntry::default());
+        let dt = &mut self.decode[..];
+        let mut symbol = self.rank_stats[0] as usize;
+        let mut u = 0usize;
+        for w in 1..=max_bits as usize {
+            let count = self.rank_stats[w] as usize;
+            let length = 1usize << (w - 1 + rescale as usize);
+            let num_bits = (max_bits + 1 - w as u32) as u8;
+            let syms = &self.sorted[symbol..symbol + count];
+            let entry = |s: u8| HuffmanEntry {
+                symbol: s,
+                num_bits,
+            };
+            match length {
+                1 => {
+                    for &s in syms {
+                        dt[u] = entry(s);
+                        u += 1;
+                    }
+                }
+                2 => {
+                    for &s in syms {
+                        dt[u] = entry(s);
+                        dt[u + 1] = entry(s);
+                        u += 2;
+                    }
+                }
+                4 => {
+                    for &s in syms {
+                        dt[u..u + 4].copy_from_slice(&[entry(s); 4]);
+                        u += 4;
+                    }
+                }
+                8 => {
+                    for &s in syms {
+                        dt[u..u + 8].copy_from_slice(&[entry(s); 8]);
+                        u += 8;
+                    }
+                }
+                _ => {
+                    for &s in syms {
+                        dt[u..u + length].fill(entry(s));
+                        u += length;
+                    }
+                }
             }
+            symbol += count;
         }
 
         Ok(())
