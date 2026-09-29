@@ -2862,37 +2862,47 @@ fn decode_and_execute_sequences(
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let base = out.len();
-    out.resize(base + MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH, 0);
-    let result = run_sequences(
-        num_sequences,
-        bit_stream,
-        fse,
-        literals,
-        offset_hist,
-        &mut out[prefix_start..],
-        base - prefix_start,
-    );
-    match result {
-        Ok(end) => {
-            out.truncate(prefix_start + end);
-            Ok(())
-        }
-        Err(e) => {
-            out.truncate(base);
-            Err(e)
-        }
-    }
+    // Spare capacity only: the block's bytes are written by the copies in
+    // `exec_sequence`, so zero-filling them first is wasted work.
+    out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+    // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
+    // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which is
+    // the extent `run_sequences` may write (see its contract).
+    let end = unsafe {
+        run_sequences(
+            num_sequences,
+            bit_stream,
+            fse,
+            literals,
+            offset_hist,
+            out.as_mut_ptr().add(prefix_start),
+            base - prefix_start,
+        )?
+    };
+    // SAFETY: on success `run_sequences` initialized every byte of
+    // `prefix_start + (base - prefix_start)..prefix_start + end`, and
+    // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length within
+    // the reserved capacity.
+    unsafe { out.set_len(prefix_start + end) };
+    Ok(())
 }
 
-/// `buf` starts at the frame's first byte and ends `WILDCOPY_OVERLENGTH`
-/// bytes past the block's output limit; `op` is where this block starts.
-fn run_sequences(
+/// Execute the block's sequences into the buffer at `out`, which starts at
+/// the frame's first byte; `op` is where this block starts. Returns the
+/// block's end, at most `op + MAX_BLOCK_SIZE`, with every byte of `op..end`
+/// written; bytes past `end` may have been written too, and nothing before
+/// `op` is.
+///
+/// # Safety
+/// `out..out + op` is initialized and
+/// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid for writes.
+unsafe fn run_sequences(
     num_sequences: u32,
     bit_stream: &[u8],
     fse: &FSEScratch,
     literals: &[u8],
     offset_hist: &mut [u32; 3],
-    buf: &mut [u8],
+    out: *mut u8,
     op: usize,
 ) -> Result<usize, String> {
     let ll_dt = &fse.literal_lengths.decode[..];
@@ -2910,8 +2920,7 @@ fn run_sequences(
         return Err("FSE table is uninitialized".to_string());
     }
     let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
-    let oend = buf.len() - WILDCOPY_OVERLENGTH;
-    debug_assert!(op <= oend);
+    let oend = op + MAX_BLOCK_SIZE as usize;
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
@@ -2932,10 +2941,10 @@ fn run_sequences(
             offset_hist[2] as usize,
         ],
     };
-    let out = buf.as_mut_ptr();
     let lit_start = literals.as_ptr();
-    // SAFETY: `op <= oend < buf.len()` and `literals_len < literals.len()`,
-    // so every pointer below stays inside its slice.
+    // SAFETY: `op <= oend` are within the writable range of the function
+    // contract and `literals_len < literals.len()`, so every pointer below
+    // stays inside its buffer.
     let mut cur = unsafe {
         SeqCursor {
             op: out.add(op),
@@ -2971,7 +2980,9 @@ fn run_sequences(
     if op + rest > oend {
         return Err(seq_error_message(SeqError::BlockTooLarge));
     }
-    buf[op..op + rest].copy_from_slice(&literals[lit_pos..literals_len]);
+    // SAFETY: `op + rest <= oend` is writable per the function contract,
+    // and `lit_pos + rest == literals_len <= literals.len()`.
+    ptr::copy_nonoverlapping(literals.as_ptr().add(lit_pos), out.add(op), rest);
     op += rest;
 
     *offset_hist = [hist[0] as u32, hist[1] as u32, hist[2] as u32];
