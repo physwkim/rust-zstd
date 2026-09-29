@@ -402,16 +402,6 @@ impl FSETable {
         }
     }
 
-    fn reinit_from(&mut self, other: &Self) {
-        self.reset();
-        self.symbol_counter.extend_from_slice(&other.symbol_counter);
-        self.symbol_probabilities
-            .extend_from_slice(&other.symbol_probabilities);
-        self.decode.extend_from_slice(&other.decode);
-        self.accuracy_log = other.accuracy_log;
-        self.predefined = other.predefined;
-    }
-
     fn reset(&mut self) {
         self.symbol_counter.clear();
         self.symbol_probabilities.clear();
@@ -692,19 +682,81 @@ impl<'t> FSEDecoder<'t> {
 // Huffman Table and Decoder
 // ============================================================
 
-#[derive(Copy, Clone, Debug)]
+/// Single-symbol table cell (libzstd HUF_DEltX1).
+#[derive(Copy, Clone, Debug, Default)]
 struct HuffmanEntry {
     symbol: u8,
     num_bits: u8,
 }
 
+/// Double-symbol table cell (libzstd HUF_DEltX2): `sequence` holds one or
+/// two symbols little-endian, `length` how many.
+#[derive(Copy, Clone, Debug, Default)]
+struct HufEntryX2 {
+    sequence: u16,
+    nb_bits: u8,
+    length: u8,
+}
+
+/// Table log of every double-symbol table (libzstd HUF_DECODER_FAST_TABLELOG).
+const HUF_X2_TABLE_LOG: u32 = 11;
+
+/// Relative cost of the single- and double-symbol decoders, indexed by the
+/// compression ratio quantile (libzstd algoTime: table build time, then
+/// decode time per 256 bytes).
+const HUF_ALGO_TIME: [[(u32, u32); 2]; 16] = [
+    [(0, 0), (1, 1)],
+    [(0, 0), (1, 1)],
+    [(150, 216), (381, 119)],
+    [(170, 205), (514, 112)],
+    [(177, 199), (539, 110)],
+    [(197, 194), (644, 107)],
+    [(221, 192), (735, 107)],
+    [(256, 189), (881, 106)],
+    [(359, 188), (1167, 109)],
+    [(582, 187), (1570, 114)],
+    [(688, 187), (1712, 122)],
+    [(825, 186), (1965, 136)],
+    [(976, 185), (2131, 150)],
+    [(1180, 186), (2070, 175)],
+    [(1377, 185), (1731, 202)],
+    [(1412, 185), (1695, 202)],
+];
+
+/// Pick the double-symbol decoder when its estimated time is lower
+/// (HUF_selectDecoder).
+fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
+    let q = if src_size >= dst_size {
+        15
+    } else {
+        src_size * 16 / dst_size
+    };
+    let d256 = (dst_size >> 8) as u32;
+    let (t0, d0) = HUF_ALGO_TIME[q][0];
+    let (t1, d1) = HUF_ALGO_TIME[q][1];
+    let time0 = t0 + d0 * d256;
+    let mut time1 = t1 + d1 * d256;
+    time1 += time1 >> 5;
+    time1 < time0
+}
+
 struct HuffmanTable {
+    /// Single-symbol table, `1 << max_num_bits` cells, when `!is_x2`.
     decode: Vec<HuffmanEntry>,
+    /// Double-symbol table, `1 << HUF_X2_TABLE_LOG` cells, when `is_x2`.
+    decode_x2: Vec<HufEntryX2>,
+    is_x2: bool,
+    /// Weight per symbol, including the implied last one after a build.
     weights: Vec<u8>,
+    /// Table log of the Huffman code; 0 while no table is built.
     max_num_bits: u8,
+    /// Number of symbols of each weight (libzstd rankStats).
+    rank_stats: [u32; MAX_MAX_NUM_BITS as usize + 2],
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     rank_indexes: Vec<usize>,
+    /// Symbols ordered by weight (libzstd sortedSymbol).
+    sorted: Vec<u8>,
     fse_table: FSETable,
 }
 
@@ -712,39 +764,52 @@ impl HuffmanTable {
     fn new() -> HuffmanTable {
         HuffmanTable {
             decode: Vec::new(),
+            decode_x2: Vec::new(),
+            is_x2: false,
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
+            rank_stats: [0; MAX_MAX_NUM_BITS as usize + 2],
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
             rank_indexes: Vec::with_capacity(11),
+            sorted: Vec::with_capacity(256),
             fse_table: FSETable::new(255),
         }
     }
 
-    fn reinit_from(&mut self, other: &Self) {
-        self.reset();
-        self.decode.extend_from_slice(&other.decode);
-        self.weights.extend_from_slice(&other.weights);
-        self.max_num_bits = other.max_num_bits;
-        self.bits.extend_from_slice(&other.bits);
-        self.rank_indexes.extend_from_slice(&other.rank_indexes);
-        self.fse_table.reinit_from(&other.fse_table);
-    }
-
     fn reset(&mut self) {
         self.decode.clear();
+        self.decode_x2.clear();
+        self.is_x2 = false;
         self.weights.clear();
         self.max_num_bits = 0;
         self.bits.clear();
         self.bit_ranks.clear();
         self.rank_indexes.clear();
+        self.sorted.clear();
         self.fse_table.reset();
     }
 
-    fn build_decoder(&mut self, source: &[u8]) -> Result<u32, String> {
-        self.decode.clear();
+    /// Read the tree description at the start of `source` (the whole
+    /// compressed literals section) and build the decoding table. Four-stream
+    /// sections pick the table kind by libzstd's cost model; single-stream
+    /// sections always use the single-symbol table
+    /// (ZSTD_decodeLiteralsBlock).
+    fn build_decoder(
+        &mut self,
+        source: &[u8],
+        dst_size: usize,
+        four_streams: bool,
+    ) -> Result<u32, String> {
+        self.max_num_bits = 0;
         let bytes_used = self.read_weights(source)?;
-        self.build_table_from_weights()?;
+        self.weight_stats()?;
+        self.is_x2 = four_streams && huf_select_x2(dst_size, source.len());
+        if self.is_x2 {
+            self.fill_x2();
+        } else {
+            self.fill_x1()?;
+        }
         Ok(bytes_used)
     }
 
@@ -832,6 +897,9 @@ impl HuffmanTable {
                         return Err(format!("Too many weights: {}", self.weights.len()));
                     }
                 }
+                if self.weights.len() > 255 {
+                    return Err(format!("Too many weights: {}", self.weights.len()));
+                }
             }
             _ => {
                 let weights_raw = &source[1..];
@@ -871,10 +939,9 @@ impl HuffmanTable {
         Ok(bytes_read as u32)
     }
 
-    fn build_table_from_weights(&mut self) -> Result<(), String> {
-        self.bits.clear();
-        self.bits.resize(self.weights.len() + 1, 0);
-
+    /// Validate the weights, derive the table log and the implied last
+    /// weight, and count symbols per weight (the checks of HUF_readStats).
+    fn weight_stats(&mut self) -> Result<(), String> {
         let mut weight_sum: u32 = 0;
         for w in &self.weights {
             if *w > MAX_MAX_NUM_BITS {
@@ -888,6 +955,9 @@ impl HuffmanTable {
         }
 
         let max_bits = highest_bit_set(weight_sum) as u8;
+        if max_bits > MAX_MAX_NUM_BITS {
+            return Err(format!("Max bits {} too high", max_bits));
+        }
         let left_over = (1u32 << max_bits) - weight_sum;
 
         if !left_over.is_power_of_two() {
@@ -895,7 +965,31 @@ impl HuffmanTable {
         }
 
         let last_weight = highest_bit_set(left_over) as u8;
+        self.weights.push(last_weight);
 
+        self.rank_stats = [0; MAX_MAX_NUM_BITS as usize + 2];
+        for &w in &self.weights {
+            self.rank_stats[usize::from(w)] += 1;
+        }
+        // A full binary tree has an even number of leaves at its deepest
+        // level, and at least two.
+        if self.rank_stats[1] < 2 || self.rank_stats[1] & 1 != 0 {
+            return Err(format!(
+                "Huffman tree has {} symbols of weight 1",
+                self.rank_stats[1]
+            ));
+        }
+
+        self.max_num_bits = max_bits;
+        Ok(())
+    }
+
+    /// Fill the single-symbol table: each symbol of `n` bits owns
+    /// `1 << (max_bits - n)` consecutive cells, ordered by code length.
+    fn fill_x1(&mut self) -> Result<(), String> {
+        let max_bits = self.max_num_bits;
+        self.bits.clear();
+        self.bits.resize(self.weights.len(), 0);
         for symbol in 0..self.weights.len() {
             let bits = if self.weights[symbol] > 0 {
                 max_bits + 1 - self.weights[symbol]
@@ -905,26 +999,14 @@ impl HuffmanTable {
             self.bits[symbol] = bits;
         }
 
-        self.bits[self.weights.len()] = max_bits + 1 - last_weight;
-        self.max_num_bits = max_bits;
-
-        if max_bits > MAX_MAX_NUM_BITS {
-            return Err(format!("Max bits {} too high", max_bits));
-        }
-
         self.bit_ranks.clear();
         self.bit_ranks.resize((max_bits + 1) as usize, 0);
         for num_bits in &self.bits {
             self.bit_ranks[(*num_bits) as usize] += 1;
         }
 
-        self.decode.resize(
-            1 << self.max_num_bits,
-            HuffmanEntry {
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
+        self.decode.clear();
+        self.decode.resize(1 << max_bits, HuffmanEntry::default());
 
         self.rank_indexes.clear();
         self.rank_indexes.resize((max_bits + 1) as usize, 0);
@@ -935,12 +1017,13 @@ impl HuffmanTable {
                 + self.bit_ranks[bits as usize] as usize * (1 << (max_bits - bits));
         }
 
-        assert!(
-            self.rank_indexes[0] == self.decode.len(),
-            "rank_idx[0]: {} should be: {}",
-            self.rank_indexes[0],
-            self.decode.len()
-        );
+        if self.rank_indexes[0] != self.decode.len() {
+            return Err(format!(
+                "Huffman code lengths cover {} of {} cells",
+                self.rank_indexes[0],
+                self.decode.len()
+            ));
+        }
 
         for symbol in 0..self.bits.len() {
             let bits_for_symbol = self.bits[symbol];
@@ -956,6 +1039,177 @@ impl HuffmanTable {
         }
 
         Ok(())
+    }
+
+    /// Fill the double-symbol table (HUF_readDTableX2_wksp after
+    /// HUF_readStats): sort symbols by weight, compute where each weight's
+    /// run starts for every number of already-consumed bits, then tile the
+    /// table so that a cell holds two symbols whenever both fit in
+    /// `HUF_X2_TABLE_LOG` bits.
+    fn fill_x2(&mut self) {
+        let table_log = u32::from(self.max_num_bits);
+        let target_log = HUF_X2_TABLE_LOG;
+        let nb_bits_baseline = table_log + 1;
+        let nb_symbols = self.weights.len();
+
+        // Highest weight in use; weight 1 is always present.
+        let mut max_w = table_log as usize;
+        while self.rank_stats[max_w] == 0 {
+            max_w -= 1;
+        }
+
+        // rank_start[w]: first index of weight w in the sorted list.
+        let mut rank_start = [0usize; MAX_MAX_NUM_BITS as usize + 3];
+        let mut next = 0usize;
+        for w in 1..=max_w {
+            rank_start[w] = next;
+            next += self.rank_stats[w] as usize;
+        }
+        rank_start[max_w + 1] = next;
+
+        self.sorted.clear();
+        self.sorted.resize(nb_symbols, 0);
+        {
+            let mut fill = rank_start;
+            let mut zero_at = next;
+            for s in 0..nb_symbols {
+                let w = usize::from(self.weights[s]);
+                if w == 0 {
+                    self.sorted[zero_at] = s as u8;
+                    zero_at += 1;
+                } else {
+                    self.sorted[fill[w]] = s as u8;
+                    fill[w] += 1;
+                }
+            }
+        }
+
+        // rank_val[consumed][w]: first cell of weight w once `consumed` bits
+        // of the lookup have been used by a first symbol.
+        let rescale = target_log - table_log; // shift of (w - 1 + rescale)
+        let mut rank_val = [[0u32; MAX_MAX_NUM_BITS as usize + 2]; HUF_X2_TABLE_LOG as usize + 1];
+        let mut next_val = 0u32;
+        for w in 1..=max_w {
+            rank_val[0][w] = next_val;
+            next_val += self.rank_stats[w] << (w as u32 - 1 + rescale);
+        }
+        let min_bits = nb_bits_baseline - max_w as u32;
+        for consumed in min_bits..=(target_log - min_bits) {
+            for w in 1..=max_w {
+                rank_val[consumed as usize][w] = rank_val[0][w] >> consumed;
+            }
+        }
+
+        self.decode_x2.clear();
+        self.decode_x2
+            .resize(1 << target_log, HufEntryX2::default());
+        let dt = &mut self.decode_x2[..];
+        let sorted = &self.sorted[..];
+        let scale_log = nb_bits_baseline as i32 - target_log as i32;
+
+        for w in 1..=max_w {
+            let begin = rank_start[w];
+            let end = rank_start[w + 1];
+            let nb_bits = nb_bits_baseline - w as u32;
+
+            if target_log - nb_bits >= min_bits {
+                // Room for a second symbol.
+                let length = 1usize << (target_log - nb_bits);
+                let min_weight = (nb_bits as i32 + scale_log).max(1) as usize;
+                let mut start = rank_val[0][w] as usize;
+                for &base_seq in &sorted[begin..end] {
+                    huf_fill_x2_level2(
+                        &mut dt[start..start + length],
+                        target_log,
+                        nb_bits,
+                        &rank_val[nb_bits as usize],
+                        min_weight,
+                        max_w + 1,
+                        sorted,
+                        &rank_start,
+                        nb_bits_baseline,
+                        base_seq,
+                    );
+                    start += length;
+                }
+            } else {
+                huf_fill_x2_for_weight(
+                    &mut dt[rank_val[0][w] as usize..],
+                    &sorted[begin..end],
+                    nb_bits,
+                    target_log,
+                    0,
+                    1,
+                );
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn huf_build_x2(symbol: u8, nb_bits: u32, base_seq: u8, level: u8) -> HufEntryX2 {
+    let sequence = if level == 1 {
+        u16::from(symbol)
+    } else {
+        u16::from(base_seq) | (u16::from(symbol) << 8)
+    };
+    HufEntryX2 {
+        sequence,
+        nb_bits: nb_bits as u8,
+        length: level,
+    }
+}
+
+/// Write every symbol of one weight into consecutive runs of
+/// `1 << (target_log - nb_bits)` cells (HUF_fillDTableX2ForWeight).
+fn huf_fill_x2_for_weight(
+    dt: &mut [HufEntryX2],
+    symbols: &[u8],
+    nb_bits: u32,
+    target_log: u32,
+    base_seq: u8,
+    level: u8,
+) {
+    let length = 1usize << (target_log - nb_bits);
+    let mut off = 0;
+    for &symbol in symbols {
+        dt[off..off + length].fill(huf_build_x2(symbol, nb_bits, base_seq, level));
+        off += length;
+    }
+}
+
+/// Fill the cells of first symbol `base_seq` (HUF_fillDTableX2Level2):
+/// second symbols too long to fit get a single-symbol cell, the rest are
+/// laid out by weight.
+#[allow(clippy::too_many_arguments)]
+fn huf_fill_x2_level2(
+    dt: &mut [HufEntryX2],
+    target_log: u32,
+    consumed_bits: u32,
+    rank_val: &[u32],
+    min_weight: usize,
+    max_weight1: usize,
+    sorted: &[u8],
+    rank_start: &[usize],
+    nb_bits_baseline: u32,
+    base_seq: u8,
+) {
+    if min_weight > 1 {
+        let skip = rank_val[min_weight] as usize;
+        dt[..skip].fill(huf_build_x2(base_seq, consumed_bits, 0, 1));
+    }
+    for w in min_weight..max_weight1 {
+        let begin = rank_start[w];
+        let end = rank_start[w + 1];
+        let nb_bits = nb_bits_baseline - w as u32;
+        huf_fill_x2_for_weight(
+            &mut dt[rank_val[w] as usize..],
+            &sorted[begin..end],
+            nb_bits + consumed_bits,
+            target_log,
+            base_seq,
+            2,
+        );
     }
 }
 
@@ -1248,6 +1502,186 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     huf_decode_stream_x1(&mut o2[p..], &mut b2, dt, dt_log);
     huf_decode_stream_x1(&mut o3[p..], &mut b3, dt, dt_log);
     huf_decode_stream_x1(&mut o4[p..], &mut b4, dt, dt_log);
+
+    if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
+        return Err("Huffman stream not fully consumed".to_string());
+    }
+    Ok(())
+}
+
+/// Decode one cell's one or two symbols (HUF_decodeSymbolX2). Always
+/// writes two bytes; the caller keeps `op + 2 <= out.len()`.
+#[inline(always)]
+fn huf_decode_symbol_x2(
+    out: &mut [u8],
+    op: usize,
+    br: &mut BitDStream<'_>,
+    dt: &[HufEntryX2],
+    dt_log: u32,
+) -> usize {
+    let entry = dt[br.look_bits(dt_log)];
+    out[op..op + 2].copy_from_slice(&entry.sequence.to_le_bytes());
+    br.skip_bits(u32::from(entry.nb_bits));
+    op + usize::from(entry.length)
+}
+
+/// Decode the final symbol of a stream (HUF_decodeLastSymbolX2): only the
+/// first symbol of a two-symbol cell is wanted, and the bit count for it
+/// alone is unknown, so consumption is clamped to the container.
+#[inline(always)]
+fn huf_decode_last_symbol_x2(
+    out: &mut [u8],
+    op: usize,
+    br: &mut BitDStream<'_>,
+    dt: &[HufEntryX2],
+    dt_log: u32,
+) -> usize {
+    let entry = dt[br.look_bits(dt_log)];
+    out[op] = entry.sequence as u8;
+    if entry.length == 1 {
+        br.skip_bits(u32::from(entry.nb_bits));
+    } else if br.bits_consumed < 64 {
+        br.skip_bits(u32::from(entry.nb_bits));
+        if br.bits_consumed > 64 {
+            br.bits_consumed = 64;
+        }
+    }
+    op + 1
+}
+
+/// Decode symbols into `out[op..end]` (HUF_decodeStreamX2); returns the
+/// position reached.
+#[inline(always)]
+fn huf_decode_stream_x2(
+    out: &mut [u8],
+    mut op: usize,
+    end: usize,
+    br: &mut BitDStream<'_>,
+    dt: &[HufEntryX2],
+    dt_log: u32,
+) -> usize {
+    if end - op >= 8 {
+        // Up to 10 symbols per reload: 5 cells of at most 11 bits each.
+        while br.reload() == HufStreamStatus::Unfinished && op + 9 < end {
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        }
+    } else {
+        br.reload();
+    }
+
+    if end - op >= 2 {
+        while br.reload() == HufStreamStatus::Unfinished && op + 2 <= end {
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        }
+        // The container holds the last bytes of the stream: no reloads.
+        while op + 2 <= end {
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        }
+    }
+
+    if op < end {
+        op = huf_decode_last_symbol_x2(out, op, br, dt, dt_log);
+    }
+    op
+}
+
+/// Single-stream literals with the double-symbol table
+/// (HUF_decompress1X2_usingDTable_internal_body).
+#[inline(never)]
+fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+    let dt = &table.decode_x2[..];
+    let mut br = BitDStream::new(src)?;
+    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, HUF_X2_TABLE_LOG);
+    if !br.is_finished() {
+        return Err("Huffman stream not fully consumed".to_string());
+    }
+    Ok(())
+}
+
+/// Four interleaved literal streams with the double-symbol table
+/// (HUF_decompress4X2_usingDTable_internal_body). Streams write at their
+/// own pace, so the first three are checked against their segment ends
+/// after the shared loop, whose trip count is bounded by the last stream.
+#[inline(never)]
+fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+    if src.len() < 10 {
+        return Err(format!(
+            "Huffman 4-stream input too short: {} bytes",
+            src.len()
+        ));
+    }
+    let oend = out.len();
+    if oend < MIN_LITERALS_FOR_4_STREAMS {
+        return Err(format!("Huffman 4-stream output too small: {} bytes", oend));
+    }
+    let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
+    let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
+    let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
+    let body = &src[6..];
+    if len1 + len2 + len3 > body.len() {
+        return Err("Huffman jump table exceeds input".to_string());
+    }
+    let (s1, rest) = body.split_at(len1);
+    let (s2, rest) = rest.split_at(len2);
+    let (s3, s4) = rest.split_at(len3);
+
+    let segment = oend.div_ceil(4);
+    let op_start2 = segment;
+    let op_start3 = 2 * segment;
+    let op_start4 = 3 * segment;
+    if op_start4 > oend {
+        return Err("Huffman 4-stream segments exceed output".to_string());
+    }
+
+    let mut b1 = BitDStream::new(s1)?;
+    let mut b2 = BitDStream::new(s2)?;
+    let mut b3 = BitDStream::new(s3)?;
+    let mut b4 = BitDStream::new(s4)?;
+
+    let dt = &table.decode_x2[..];
+    let dt_log = HUF_X2_TABLE_LOG;
+    let mut op1 = 0;
+    let mut op2 = op_start2;
+    let mut op3 = op_start3;
+    let mut op4 = op_start4;
+
+    // 4 cells per stream per iteration, at most 8 bytes each; every stream
+    // stays inside `out` because none can outrun the last one by more than
+    // a factor of two.
+    if oend - op4 >= 8 {
+        let mut end_signal = true;
+        while end_signal && op4 + 8 <= oend {
+            for _ in 0..4 {
+                op1 = huf_decode_symbol_x2(out, op1, &mut b1, dt, dt_log);
+            }
+            for _ in 0..4 {
+                op2 = huf_decode_symbol_x2(out, op2, &mut b2, dt, dt_log);
+            }
+            end_signal &= b1.reload_fast() == HufStreamStatus::Unfinished;
+            end_signal &= b2.reload_fast() == HufStreamStatus::Unfinished;
+            for _ in 0..4 {
+                op3 = huf_decode_symbol_x2(out, op3, &mut b3, dt, dt_log);
+            }
+            for _ in 0..4 {
+                op4 = huf_decode_symbol_x2(out, op4, &mut b4, dt, dt_log);
+            }
+            end_signal &= b3.reload_fast() == HufStreamStatus::Unfinished;
+            end_signal &= b4.reload_fast() == HufStreamStatus::Unfinished;
+        }
+    }
+
+    if op1 > op_start2 || op2 > op_start3 || op3 > op_start4 {
+        return Err("Huffman stream overran its segment".to_string());
+    }
+
+    huf_decode_stream_x2(out, op1, op_start2, &mut b1, dt, dt_log);
+    huf_decode_stream_x2(out, op2, op_start3, &mut b2, dt, dt_log);
+    huf_decode_stream_x2(out, op3, op_start4, &mut b3, dt, dt_log);
+    huf_decode_stream_x2(out, op4, oend, &mut b4, dt, dt_log);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
         return Err("Huffman stream not fully consumed".to_string());
@@ -1874,7 +2308,10 @@ fn decompress_literals(
 
     match section.ls_type {
         LiteralsSectionType::Compressed => {
-            bytes_read += scratch.table.build_decoder(source)? as usize;
+            bytes_read += scratch
+                .table
+                .build_decoder(source, regenerated_size, num_streams == 4)?
+                as usize;
         }
         LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
             return Err("Uninitialized Huffman table for treeless literals".to_string());
@@ -1887,10 +2324,11 @@ fn decompress_literals(
     target.resize(start + regenerated_size, 0);
     let out = &mut target[start..];
 
-    if num_streams == 4 {
-        huf_decompress_4x1(out, source, &scratch.table)?;
-    } else {
-        huf_decompress_1x1(out, source, &scratch.table)?;
+    match (num_streams == 4, scratch.table.is_x2) {
+        (true, true) => huf_decompress_4x2(out, source, &scratch.table)?,
+        (true, false) => huf_decompress_4x1(out, source, &scratch.table)?,
+        (false, true) => huf_decompress_1x2(out, source, &scratch.table)?,
+        (false, false) => huf_decompress_1x1(out, source, &scratch.table)?,
     }
     bytes_read += source.len();
 
