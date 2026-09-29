@@ -9,11 +9,14 @@
 //! [`super::fast`].
 
 use super::common::{
-    byte, candidate_valid, count, hash_ptr, prefetch_unbounded, read32, read64, tget, tset,
-    HASH_READ_SIZE, K_SEARCH_STRENGTH,
+    byte, candidate_valid, hash_ptr, prefetch_unbounded, read32, read64, simd_level, tget, tset,
+    MatchCount, HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use fearless_simd::Avx2;
+use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 
 /// `kStepIncr` of the double-fast strategy: how many positions to search
@@ -48,7 +51,8 @@ enum Found {
 ///   A repcode is only applied at positions `p >=` the `ip` it was derived
 ///   at, hence `1 <= p - offset < p` (`0` means disabled and reads `p`).
 /// * (I4) `hash_ptr` returns `< 1 << hbits == table.len()` for both tables.
-fn compress_block_generic<const MLS: u32>(
+fn compress_block_generic<const MLS: u32, C: MatchCount>(
+    mc: C,
     ms: &mut MatchState,
     src: &[u8],
     block: Range<usize>,
@@ -127,7 +131,8 @@ fn compress_block_generic<const MLS: u32>(
                 // check noDict repcode
                 if (offset_1 > 0) & (read32(src, ip + 1 - offset_1 as usize) == read32(src, ip + 1))
                 {
-                    let m_length = count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
+                    let m_length =
+                        mc.count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
                     ip += 1;
                     out.store_seq(
                         src,
@@ -153,7 +158,7 @@ fn compress_block_generic<const MLS: u32>(
                     // check prefix long match
                     if read64(src, ip) == mval {
                         let mut matchl0 = idxl0;
-                        let mut m_length = count(src, ip + 8, matchl0 + 8, iend) + 8;
+                        let mut m_length = mc.count(src, ip + 8, matchl0 + 8, iend) + 8;
                         let offset = (ip - matchl0) as u32;
                         // catch up
                         while ((ip > anchor) & (matchl0 > prefix_lowest))
@@ -176,14 +181,14 @@ fn compress_block_generic<const MLS: u32>(
                 if read32(src, ip) == mval {
                     // _search_next_long: short match found, check for a longer one
                     let mut matchs0 = idxs0;
-                    let mut m_length = count(src, ip + 4, matchs0 + 4, iend) + 4;
+                    let mut m_length = mc.count(src, ip + 4, matchs0 + 4, iend) + 4;
                     let mut offset = (ip - matchs0) as u32;
 
                     // check long match at +1 position
                     if candidate_valid(idxl1, prefix_lowest_index + 1, ip1)
                         && read64(src, idxl1) == read64(src, ip1)
                     {
-                        let l1len = count(src, ip1 + 8, idxl1 + 8, iend) + 8;
+                        let l1len = mc.count(src, ip1 + 8, idxl1 + 8, iend) + 8;
                         if l1len > m_length {
                             // use the long match instead
                             ip = ip1;
@@ -281,7 +286,7 @@ fn compress_block_generic<const MLS: u32>(
                     && ((offset_2 > 0) & (read32(src, ip) == read32(src, ip - offset_2 as usize)))
                 {
                     // store sequence
-                    let r_length = count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
+                    let r_length = mc.count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
                     std::mem::swap(&mut offset_1, &mut offset_2);
                     tset(hash_small, hash_ptr::<MLS>(src, ip, hbits_s), ip);
                     tset(hash_long, hash_ptr::<8>(src, ip, hbits_l), ip);
@@ -325,11 +330,60 @@ pub fn compress_block(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    match simd_level() {
+        // SAFETY: fearless_simd constructs the witness only after detecting
+        // AVX2 on this CPU.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(w) => unsafe { compress_block_avx2(w, ms, src, block, rep, out) },
+        _ => compress_block_scalar(ms, src, block, rep, out),
+    }
+}
+
+/// [`compress_block`] with the 8-byte [`count`](super::common::count).
+#[inline(never)]
+fn compress_block_scalar(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    compress_block_level(Fallback::new(), ms, src, block, rep, out)
+}
+
+/// [`compress_block`] compiled with AVX2, counting 32 bytes per step.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 (the witness proves it).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn compress_block_avx2(
+    mc: Avx2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    compress_block_level(mc, ms, src, block, rep, out)
+}
+
+#[inline(always)]
+fn compress_block_level<C: MatchCount>(
+    mc: C,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
     match ms.cparams.min_match {
-        5 => compress_block_generic::<5>(ms, src, block, rep, out),
-        6 => compress_block_generic::<6>(ms, src, block, rep, out),
-        7 => compress_block_generic::<7>(ms, src, block, rep, out),
-        _ => compress_block_generic::<4>(ms, src, block, rep, out),
+        5 => compress_block_generic::<5, C>(mc, ms, src, block, rep, out),
+        6 => compress_block_generic::<6, C>(mc, ms, src, block, rep, out),
+        7 => compress_block_generic::<7, C>(mc, ms, src, block, rep, out),
+        _ => compress_block_generic::<4, C>(mc, ms, src, block, rep, out),
     }
 }
 
