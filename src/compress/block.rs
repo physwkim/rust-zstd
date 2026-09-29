@@ -77,6 +77,7 @@ impl CommittedBlockState {
 }
 
 /// Reusable per-block buffers.
+#[derive(Default)]
 pub struct BlockScratch {
     pub store: SeqStore,
     pub cbuf: Vec<u8>,
@@ -84,10 +85,17 @@ pub struct BlockScratch {
 
 impl BlockScratch {
     pub fn new(block_size: usize) -> Self {
-        Self {
-            store: SeqStore::with_capacity(block_size),
-            cbuf: Vec::with_capacity(block_size),
-        }
+        let mut scratch = Self::default();
+        scratch.reserve(block_size);
+        scratch
+    }
+
+    /// Grow to [`BlockScratch::new`]'s sizes for `block_size` if smaller;
+    /// existing allocations are kept.
+    pub fn reserve(&mut self, block_size: usize) {
+        self.store.reserve(block_size);
+        self.cbuf
+            .reserve_exact(block_size.saturating_sub(self.cbuf.len()));
     }
 }
 

@@ -44,29 +44,51 @@ impl MatchState {
     /// Allocate zeroed tables for `cparams.strategy`; positions below
     /// `window_low` (which must be `>= 1`) are never referenced.
     pub fn new(cparams: CParams, window_low: usize) -> Self {
+        let mut ms = Self {
+            cparams,
+            hash_table: Vec::new(),
+            chain_table: Vec::new(),
+            tag_table: Vec::new(),
+            next_to_update: 0,
+            window_low: 0,
+            hash_salt: 0,
+            hash_salt_entropy: 0,
+        };
+        ms.reset(cparams, window_low);
+        ms
+    }
+
+    /// `ZSTD_reset_matchState` with `ZSTDcrp_makeClean` on a reused context:
+    /// size the tables for `cparams`, keeping an allocation that is large
+    /// enough and zeroing it (`ZSTD_cwksp_clean_tables`), and start over at
+    /// `window_low`. The result equals [`MatchState::new`], so a reused
+    /// context compresses identically.
+    ///
+    /// Deviation: libzstd keeps the row finder's stale tag table and
+    /// advances the hash salt instead (`ZSTD_advanceHashSalt`,
+    /// `ZSTD_cwksp_reserve_aligned_init_once`), which makes the frame depend
+    /// on the context's history; the tag table is cleared here and the salt
+    /// stays at its initial value.
+    pub fn reset(&mut self, cparams: CParams, window_low: usize) {
         assert!(
             window_low >= 1,
             "window_low must be >= 1 (0 marks an empty table entry)"
         );
         let hash_size = 1usize << cparams.hash_log;
         let chain_size = 1usize << cparams.chain_log;
-        let (chain_table, tag_table) = match cparams.strategy {
-            Strategy::Fast => (Vec::new(), Vec::new()),
-            Strategy::DFast => (vec![0u32; chain_size], Vec::new()),
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
-                (vec![0u32; chain_size], vec![0u8; hash_size])
-            }
+        let (chain_size, tag_size) = match cparams.strategy {
+            Strategy::Fast => (0, 0),
+            Strategy::DFast => (chain_size, 0),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (chain_size, hash_size),
         };
-        Self {
-            cparams,
-            hash_table: vec![0u32; hash_size],
-            chain_table,
-            tag_table,
-            next_to_update: window_low,
-            window_low,
-            hash_salt: super::lazy::initial_hash_salt(),
-            hash_salt_entropy: 0,
-        }
+        zeroed(&mut self.hash_table, hash_size);
+        zeroed(&mut self.chain_table, chain_size);
+        zeroed(&mut self.tag_table, tag_size);
+        self.cparams = cparams;
+        self.next_to_update = window_low;
+        self.window_low = window_low;
+        self.hash_salt = super::lazy::initial_hash_salt();
+        self.hash_salt_entropy = 0;
     }
 
     /// `ZSTD_getLowestPrefixIndex(ms, cur, windowLog)` without a dictionary:
@@ -81,5 +103,17 @@ impl MatchState {
         } else {
             self.window_low
         }
+    }
+}
+
+/// Leave `table` with exactly `len` zero entries: the existing allocation
+/// memset when it is large enough, else a fresh zeroed one (untouched pages
+/// cost nothing until used).
+fn zeroed<T: Copy + Default>(table: &mut Vec<T>, len: usize) {
+    if table.capacity() < len {
+        *table = vec![T::default(); len];
+    } else {
+        table.clear();
+        table.resize(len, T::default());
     }
 }

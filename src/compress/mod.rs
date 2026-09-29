@@ -38,10 +38,10 @@ pub const JOBSIZE_MAX: usize = 1 << 30;
 /// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the default job size log.
 const JOBLOG_MAX: u32 = 30;
 
-/// Options for [`compress_with`].
+/// Options for [`Compressor`] and [`compress_with`].
 ///
 /// Inputs must be smaller than 4 GiB: match positions are `u32` indices into
-/// the input, and [`compress_with`] asserts the limit.
+/// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
     /// Compression level, `ZSTD_c_compressionLevel`. `<= 0` emits raw/RLE
@@ -89,59 +89,104 @@ pub fn compress_to_vec(data: &[u8]) -> Vec<u8> {
     compress(data, 1)
 }
 
-/// Compress `data` into a zstd frame with `opts`.
+/// Compress `data` into a zstd frame with `opts`, through a one-off
+/// [`Compressor`].
 pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
-    assert!(
-        data.len() < u32::MAX as usize,
-        "inputs of 4 GiB or more are not supported (match indices are u32)"
-    );
-    let cparams = CParams::for_level(opts.level, data.len());
-    let mut out = Vec::with_capacity(data.len() + 64);
-    write_frame_header(&mut out, data.len() as u64, cparams.window_log);
+    Compressor::new(opts.clone()).compress_to_vec(data)
+}
 
-    if data.is_empty() {
-        write_raw_block(&mut out, &[], true);
-        return out;
-    }
+/// A reusable `ZSTD_CCtx`: the options plus, as ZSTDMT keeps one context
+/// per job, a pool of per-job match states and block buffers that grows on
+/// demand and is kept across calls. A call sizes the tables for its input
+/// like `ZSTD_resetCCtx_internal` with `ZSTDcrp_makeClean`: allocations
+/// that are large enough are zeroed and kept, smaller ones replaced. Every
+/// frame is identical to [`compress_with`]'s.
+pub struct Compressor {
+    opts: CompressOptions,
+    jobs: Vec<JobContext>,
+}
 
-    // blockSizeMax = MIN(ZSTD_BLOCKSIZE_MAX, 1 << windowLog)
-    let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-    let n_blocks = data.len().div_ceil(block_size);
+/// One job's reusable state: its match state once a job has run, and its
+/// block buffers.
+#[derive(Default)]
+struct JobContext {
+    ms: Option<MatchState>,
+    scratch: BlockScratch,
+}
 
-    if opts.level <= 0 {
-        for (i, chunk) in data.chunks(block_size).enumerate() {
-            let is_last = i + 1 == n_blocks;
-            if block::is_rle(chunk) {
-                write_rle_block(&mut out, chunk[0], chunk.len(), is_last);
-            } else {
-                write_raw_block(&mut out, chunk, is_last);
-            }
+impl Compressor {
+    pub fn new(opts: CompressOptions) -> Self {
+        Self {
+            opts,
+            jobs: Vec::new(),
         }
-        return out;
     }
 
-    let job_size = job_size_for(opts.job_size, cparams.window_log);
-    let jobs = job_ranges(data.len(), job_size);
-    let overlap = overlap_size(&cparams);
-    let n_jobs = jobs.len();
-    run_jobs(
-        &jobs,
-        cfg!(feature = "parallel"),
-        |k, job, out| {
-            compress_job(
-                data,
-                cparams,
-                block_size,
-                overlap,
-                job,
-                k == 0,
-                k + 1 == n_jobs,
-                out,
-            )
-        },
-        &mut out,
-    );
-    out
+    /// Append one frame holding `src` to `out`.
+    pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
+        assert!(
+            src.len() < u32::MAX as usize,
+            "inputs of 4 GiB or more are not supported (match indices are u32)"
+        );
+        let cparams = CParams::for_level(self.opts.level, src.len());
+        out.reserve(src.len() + 64);
+        write_frame_header(out, src.len() as u64, cparams.window_log);
+
+        if src.is_empty() {
+            write_raw_block(out, &[], true);
+            return;
+        }
+
+        // blockSizeMax = MIN(ZSTD_BLOCKSIZE_MAX, 1 << windowLog)
+        let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
+        let n_blocks = src.len().div_ceil(block_size);
+
+        if self.opts.level <= 0 {
+            for (i, chunk) in src.chunks(block_size).enumerate() {
+                let is_last = i + 1 == n_blocks;
+                if block::is_rle(chunk) {
+                    write_rle_block(out, chunk[0], chunk.len(), is_last);
+                } else {
+                    write_raw_block(out, chunk, is_last);
+                }
+            }
+            return;
+        }
+
+        let job_size = job_size_for(self.opts.job_size, cparams.window_log);
+        let jobs = job_ranges(src.len(), job_size);
+        let overlap = overlap_size(&cparams);
+        let n_jobs = jobs.len();
+        if self.jobs.len() < n_jobs {
+            self.jobs.resize_with(n_jobs, JobContext::default);
+        }
+        run_jobs(
+            &jobs,
+            &mut self.jobs[..n_jobs],
+            cfg!(feature = "parallel"),
+            |k, job, ctx, out| {
+                compress_job(
+                    src,
+                    cparams,
+                    block_size,
+                    overlap,
+                    job,
+                    k == 0,
+                    k + 1 == n_jobs,
+                    ctx,
+                    out,
+                )
+            },
+            out,
+        );
+    }
+
+    /// One frame holding `src`.
+    pub fn compress_to_vec(&mut self, src: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.compress(src, &mut out);
+        out
+    }
 }
 
 /// Upper bound on the blocks a job of `len` bytes produces: every block
@@ -151,11 +196,12 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 }
 
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
-/// appended to `out`. Job 0 starts from `repStartValue` with
-/// `window_low = 1`; a later job indexes `overlap` bytes before its start
-/// (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with
-/// invalidated repeat offsets and no entropy tables, so its first block
-/// cannot reference state the decoder obtained from the previous job.
+/// appended to `out`, on `ctx`'s state reset for this job. Job 0 starts
+/// from `repStartValue` with `window_low = 1`; a later job indexes
+/// `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on the
+/// raw-content prefix), starts with invalidated repeat offsets and no
+/// entropy tables, so its first block cannot reference state the decoder
+/// obtained from the previous job.
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
@@ -165,6 +211,7 @@ fn compress_job(
     job: Range<usize>,
     first_job: bool,
     last_job: bool,
+    ctx: &mut JobContext,
     out: &mut Vec<u8>,
 ) {
     let window_low = if first_job {
@@ -172,14 +219,21 @@ fn compress_job(
     } else {
         job.start.saturating_sub(overlap).max(1)
     };
-    let mut ms = MatchState::new(cparams, window_low);
+    let mut ms = match ctx.ms.take() {
+        Some(mut ms) => {
+            ms.reset(cparams, window_low);
+            ms
+        }
+        None => MatchState::new(cparams, window_low),
+    };
     let mut initial = BlockState::initial();
     if !first_job {
         block::load_prefix(&mut ms, data, window_low..job.start);
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
-    let mut scratch = BlockScratch::new(block_size);
+    let scratch = &mut ctx.scratch;
+    scratch.reserve(block_size);
     out.reserve(job_bound(job.len(), block_size));
     let mut start = job.start;
     while start < job.end {
@@ -191,36 +245,47 @@ fn compress_job(
             first_job && start == job.start,
             last_job && end == job.end,
             &mut state,
-            &mut scratch,
+            scratch,
             out,
         );
         start = end;
     }
+    ctx.ms = Some(ms);
 }
 
-/// Run `f` over every job, in job order, appending to `out`. Job 0 always
-/// writes straight into `out`. With the feature enabled and `parallel`, the
-/// remaining jobs run on rayon into buffers of their own while job 0 runs,
-/// and are appended afterwards; the serial loop hands every job `out`. The
-/// job function is the same either way, so the frame is identical.
-fn run_jobs<F>(jobs: &[Range<usize>], parallel: bool, f: F, out: &mut Vec<u8>)
-where
-    F: Fn(usize, Range<usize>, &mut Vec<u8>) + Sync,
+/// Run `f` over every job, in job order, appending to `out`; `ctxs[k]` is
+/// job `k`'s context. Job 0 always writes straight into `out`. With the
+/// feature enabled and `parallel`, the remaining jobs run on rayon into
+/// buffers of their own while job 0 runs, and are appended afterwards; the
+/// serial loop hands every job `out`. The job function is the same either
+/// way, so the frame is identical.
+fn run_jobs<F>(
+    jobs: &[Range<usize>],
+    ctxs: &mut [JobContext],
+    parallel: bool,
+    f: F,
+    out: &mut Vec<u8>,
+) where
+    F: Fn(usize, Range<usize>, &mut JobContext, &mut Vec<u8>) + Sync,
 {
+    debug_assert_eq!(jobs.len(), ctxs.len());
     #[cfg(feature = "parallel")]
     if parallel {
         use rayon::prelude::*;
-        let Some((first, rest)) = jobs.split_first() else {
+        let (Some((first, rest)), Some((first_ctx, rest_ctxs))) =
+            (jobs.split_first(), ctxs.split_first_mut())
+        else {
             return;
         };
         let ((), rest_out) = rayon::join(
-            || f(0, first.clone(), out),
+            || f(0, first.clone(), first_ctx, out),
             || {
                 rest.par_iter()
+                    .zip(rest_ctxs.par_iter_mut())
                     .enumerate()
-                    .map(|(i, job)| {
+                    .map(|(i, (job, ctx))| {
                         let mut o = Vec::new();
-                        f(i + 1, job.clone(), &mut o);
+                        f(i + 1, job.clone(), ctx, &mut o);
                         o
                     })
                     .collect::<Vec<_>>()
@@ -232,8 +297,8 @@ where
         return;
     }
     let _ = parallel;
-    for (k, job) in jobs.iter().enumerate() {
-        f(k, job.clone(), out);
+    for (k, (job, ctx)) in jobs.iter().zip(ctxs.iter_mut()).enumerate() {
+        f(k, job.clone(), ctx, out);
     }
 }
 
@@ -461,7 +526,7 @@ mod tests {
             assert!(jobs.len() >= 10, "level {level}: {} jobs", jobs.len());
             let overlap = overlap_size(&cparams);
             let n = jobs.len();
-            let f = |k: usize, job: Range<usize>, out: &mut Vec<u8>| {
+            let f = |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
                 compress_job(
                     data.as_slice(),
                     cparams,
@@ -470,13 +535,17 @@ mod tests {
                     job,
                     k == 0,
                     k + 1 == n,
+                    ctx,
                     out,
                 )
             };
+            // The same contexts serve both runs, so the serial run also
+            // covers the reset of used contexts.
+            let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
             let mut par = Vec::new();
-            run_jobs(&jobs, true, f, &mut par);
+            run_jobs(&jobs, &mut ctxs, true, f, &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, false, f, &mut seq);
+            run_jobs(&jobs, &mut ctxs, false, f, &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
             assert!(
@@ -484,6 +553,36 @@ mod tests {
                 "level {level}: frame != header + jobs"
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data);
+        }
+    }
+
+    /// A `Compressor` fed different inputs back to back, so that its tables
+    /// grow, shrink and grow again and its job pool is reused, produces the
+    /// frames fresh `compress_with` calls produce.
+    #[test]
+    fn reused_compressor_matches_fresh_compress_with() {
+        let a = text(1280 << 10);
+        let mut b = noise(384 << 10, 3);
+        b.extend_from_slice(&text(384 << 10));
+        let c = text(100 << 10);
+        let empty = Vec::new();
+        for level in [1, 3, 7, 11] {
+            for job_size in [None, Some(512 << 10)] {
+                let opts = CompressOptions { level, job_size };
+                let mut cx = Compressor::new(opts.clone());
+                for input in [&a, &b, &c, &a, &empty] {
+                    let reused = cx.compress_to_vec(input);
+                    assert!(
+                        reused == compress_with(input, &opts),
+                        "level {level}, job_size {job_size:?}, {} bytes",
+                        input.len()
+                    );
+                }
+                let mut out = b"prefix".to_vec();
+                cx.compress(&b, &mut out);
+                assert!(out.starts_with(b"prefix"));
+                assert!(out[6..] == compress_with(&b, &opts)[..]);
+            }
         }
     }
 

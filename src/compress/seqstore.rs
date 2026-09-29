@@ -130,10 +130,20 @@ impl SeqStore {
     /// WILDCOPY_OVERLENGTH` literals, so that [`SeqStore::store_seq`] never
     /// grows the buffer.
     pub fn with_capacity(block_size: usize) -> Self {
-        Self {
-            lits: Vec::with_capacity(block_size + WILDCOPY_OVERLENGTH),
-            seqs: Vec::with_capacity(block_size / 4 + 1),
-        }
+        let mut store = Self::new();
+        store.reserve(block_size);
+        store
+    }
+
+    /// Grow to [`SeqStore::with_capacity`]'s sizes for `block_size` if
+    /// smaller; existing allocations are kept.
+    pub fn reserve(&mut self, block_size: usize) {
+        let lits = block_size + WILDCOPY_OVERLENGTH;
+        self.lits
+            .reserve_exact(lits.saturating_sub(self.lits.len()));
+        let seqs = block_size / 4 + 1;
+        self.seqs
+            .reserve_exact(seqs.saturating_sub(self.seqs.len()));
     }
 
     /// `ZSTD_storeSeq(seqStore, litLength, literals = src + anchor, litLimit
