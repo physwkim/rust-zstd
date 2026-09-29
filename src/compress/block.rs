@@ -45,6 +45,13 @@ impl BlockState {
             fse: FseState::default(),
         }
     }
+
+    /// `ZSTD_invalidateRepCodes`: a job after the first one does not know
+    /// the repeat offsets the decoder holds, so no repcode may be emitted
+    /// until a real offset has replaced the zero.
+    pub fn invalidate_rep_codes(&mut self) {
+        self.rep = [0; 3];
+    }
 }
 
 /// `prevCBlock`: the committed cross-block state. Replaced only by the
@@ -119,6 +126,16 @@ fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: bool) {
         (is_last as u32) | ((BLOCK_TYPE_COMPRESSED as u32) << 1) | ((compressed.len() as u32) << 3);
     out.extend_from_slice(&header.to_le_bytes()[..ZSTD_BLOCKHEADERSIZE]);
     out.extend_from_slice(compressed);
+}
+
+/// `ZSTD_loadDictionaryContent` for a raw-content prefix: index
+/// `src[range]` into the strategy's tables before the first block of a job.
+pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+    match ms.cparams.strategy {
+        Strategy::Fast => fast::load_prefix(ms, src, range),
+        Strategy::DFast => dfast::load_prefix(ms, src, range),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => lazy::load_prefix(ms, src, range),
+    }
 }
 
 /// `ZSTD_buildSeqStore` + `ZSTD_entropyCompressSeqStore`: fill

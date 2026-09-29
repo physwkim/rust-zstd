@@ -4,6 +4,12 @@
 //! runs per block on a persistent [`MatchState`], sequences never cross a
 //! block boundary, and the entropy stage consumes a per-block [`SeqStore`]
 //! against the committed cross-block [`BlockState`].
+//!
+//! Above that, ZSTDMT's job architecture: the input is cut into jobs, each
+//! compressed independently with its own [`MatchState`] and block state after
+//! indexing an overlap of the preceding bytes (`ZSTDMT_computeOverlapSize`),
+//! and the job outputs are concatenated. The job loop is the same with and
+//! without the `parallel` feature, so both builds emit identical frames.
 
 pub mod block;
 pub mod dfast;
@@ -19,15 +25,32 @@ use matchstate::MatchState;
 pub use params::{CParams, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
+use std::ops::Range;
+
+/// `ZSTDMT_JOBSIZE_MIN`: lower bound of the default job size.
+pub const JOBSIZE_MIN: usize = 512 << 10;
 
 /// Options for [`compress_with`].
+///
+/// Inputs must be smaller than 4 GiB: match positions are `u32` indices into
+/// the input, and [`compress_with`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
     /// Compression level, `ZSTD_c_compressionLevel`. `<= 0` emits raw/RLE
     /// blocks only; `1..=22` map to libzstd's parameter rows.
     pub level: i32,
-    /// Job size for multi-threaded compression. Accepted but not used yet:
-    /// every frame is compressed as a single job.
+    /// Job size in bytes (`ZSTD_c_jobSize`). The input is cut into jobs of
+    /// this many bytes, rounded up to a multiple of the block size; each job
+    /// is compressed independently and, with the `parallel` feature, on its
+    /// own rayon task. `None` selects the default,
+    /// `clamp(len / available_parallelism, 512 KiB, 1 << (window_log + 2))`
+    /// rounded up to a block multiple, so the default frame depends on the
+    /// thread count of the machine; pass `Some` for reproducible output.
+    /// Smaller jobs give more parallelism and slightly worse ratios, since a
+    /// job only sees `min(window / 8, job start)` bytes of history from the
+    /// previous job (`window / 4` for `Strategy::Lazy2`). The frame is the
+    /// same for a given job size whether or not the `parallel` feature is
+    /// enabled.
     pub job_size: Option<usize>,
 }
 
@@ -89,19 +112,65 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
         return out;
     }
 
-    // Single job: rep = repStartValue, window_low = 1.
-    let mut ms = MatchState::new(cparams, 1);
-    let mut state = CommittedBlockState::new(BlockState::initial());
+    let job_size = job_size_for(opts.job_size, data.len(), block_size, cparams.window_log);
+    let jobs = job_ranges(data.len(), job_size);
+    let overlap = overlap_size(&cparams);
+    let n_jobs = jobs.len();
+    let outputs = run_jobs(&jobs, cfg!(feature = "parallel"), |k, job| {
+        compress_job(
+            data,
+            cparams,
+            block_size,
+            overlap,
+            job,
+            k == 0,
+            k + 1 == n_jobs,
+        )
+    });
+    for o in &outputs {
+        out.extend_from_slice(o);
+    }
+    out
+}
+
+/// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks.
+/// Job 0 starts from `repStartValue` with `window_low = 1`; a later job
+/// indexes `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on
+/// the raw-content prefix), starts with invalidated repeat offsets and no
+/// entropy tables, so its first block cannot reference state the decoder
+/// obtained from the previous job.
+fn compress_job(
+    data: &[u8],
+    cparams: CParams,
+    block_size: usize,
+    overlap: usize,
+    job: Range<usize>,
+    first_job: bool,
+    last_job: bool,
+) -> Vec<u8> {
+    let window_low = if first_job {
+        1
+    } else {
+        job.start.saturating_sub(overlap).max(1)
+    };
+    let mut ms = MatchState::new(cparams, window_low);
+    let mut initial = BlockState::initial();
+    if !first_job {
+        block::load_prefix(&mut ms, data, window_low..job.start);
+        initial.invalidate_rep_codes();
+    }
+    let mut state = CommittedBlockState::new(initial);
     let mut scratch = BlockScratch::new(block_size);
-    let mut start = 0usize;
-    while start < data.len() {
-        let end = (start + block_size).min(data.len());
+    let mut out = Vec::with_capacity(job.len() + 3 * job.len().div_ceil(block_size));
+    let mut start = job.start;
+    while start < job.end {
+        let end = (start + block_size).min(job.end);
         block::compress_block(
             &mut ms,
             data,
             start..end,
-            start == 0,
-            end == data.len(),
+            first_job && start == job.start,
+            last_job && end == job.end,
             &mut state,
             &mut scratch,
             &mut out,
@@ -109,6 +178,67 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
         start = end;
     }
     out
+}
+
+/// Run `f` over every job and return the outputs in job order. `parallel`
+/// selects rayon when the feature is enabled; the serial loop is otherwise
+/// the same, so the concatenated frame is identical either way.
+fn run_jobs<F>(jobs: &[Range<usize>], parallel: bool, f: F) -> Vec<Vec<u8>>
+where
+    F: Fn(usize, Range<usize>) -> Vec<u8> + Sync,
+{
+    #[cfg(feature = "parallel")]
+    if parallel {
+        use rayon::prelude::*;
+        return jobs
+            .par_iter()
+            .enumerate()
+            .map(|(k, job)| f(k, job.clone()))
+            .collect();
+    }
+    let _ = parallel;
+    jobs.iter()
+        .enumerate()
+        .map(|(k, job)| f(k, job.clone()))
+        .collect()
+}
+
+/// Effective job size: the requested size (or the default described on
+/// [`CompressOptions::job_size`]) rounded up to a multiple of `block_size`.
+fn job_size_for(requested: Option<usize>, len: usize, block_size: usize, window_log: u32) -> usize {
+    let raw = match requested {
+        Some(n) => n.max(1),
+        None => {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            // Bounds may cross for small inputs (window_log < 17); the upper
+            // bound then still covers the whole input, so it wins.
+            len.div_ceil(threads)
+                .max(JOBSIZE_MIN)
+                .min(1usize << (window_log + 2))
+        }
+    };
+    raw.div_ceil(block_size) * block_size
+}
+
+/// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
+/// last job truncated to `len`.
+fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
+    (0..len)
+        .step_by(job_size)
+        .map(|start| start..(start + job_size).min(len))
+        .collect()
+}
+
+/// `ZSTDMT_computeOverlapSize` with `overlapLog = 0` (the default) and no
+/// long-distance matching: `ZSTDMT_overlapLog_default` is 7 for `Lazy2` and
+/// 6 for the other strategies, i.e. a quarter or an eighth of the window.
+fn overlap_size(cparams: &CParams) -> usize {
+    let overlap_log = match cparams.strategy {
+        Strategy::Lazy2 => 7,
+        Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
+    };
+    let overlap_rlog = 9 - overlap_log;
+    1usize << (cparams.window_log - overlap_rlog)
 }
 
 /// `ZSTD_writeFrameHeader` with no dictionary and no checksum:
@@ -230,6 +360,176 @@ mod tests {
             let c = compress(&data, level);
             assert_eq!(crate::decompress(&c).unwrap(), data, "level {level}");
         }
+    }
+
+    /// Pseudo-random bytes (xorshift64), incompressible.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 56) as u8
+            })
+            .collect()
+    }
+
+    fn text(len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len + 64);
+        let mut i = 0u32;
+        while v.len() < len {
+            v.extend_from_slice(format!("line {} of the corpus {}\n", i, i % 37).as_bytes());
+            i += 1;
+        }
+        v.truncate(len);
+        v
+    }
+
+    #[test]
+    fn job_sizing() {
+        // rounded up to a block multiple; 0 behaves like 1
+        assert_eq!(job_size_for(Some(1), 1 << 20, 1 << 17, 19), 1 << 17);
+        assert_eq!(job_size_for(Some(0), 1 << 20, 1 << 17, 19), 1 << 17);
+        assert_eq!(
+            job_size_for(Some((1 << 17) + 1), 1 << 20, 1 << 17, 19),
+            1 << 18
+        );
+        // default never exceeds 1 << (window_log + 2) nor drops below JOBSIZE_MIN
+        let d = job_size_for(None, 64 << 20, 1 << 17, 19);
+        assert!(
+            (JOBSIZE_MIN..=1 << 21).contains(&d) && d.is_multiple_of(1 << 17),
+            "{d}"
+        );
+        // small input: the crossed bounds resolve to the upper one
+        assert_eq!(job_size_for(None, 1000, 1 << 10, 10), 1 << 12);
+        assert_eq!(job_ranges(0, 1 << 17), Vec::<Range<usize>>::new());
+        assert_eq!(job_ranges(1, 1 << 17), vec![0..1]);
+        assert_eq!(
+            job_ranges((1 << 18) + 5, 1 << 17),
+            vec![0..1 << 17, 1 << 17..1 << 18, 1 << 18..(1 << 18) + 5]
+        );
+        let fast = CParams::for_level(1, 8 << 20);
+        assert_eq!(overlap_size(&fast), 1 << (fast.window_log - 3));
+        let lazy2 = CParams::for_level(11, 8 << 20);
+        assert_eq!(lazy2.strategy, Strategy::Lazy2);
+        assert_eq!(overlap_size(&lazy2), 1 << (lazy2.window_log - 2));
+    }
+
+    /// The parallel and the serial job loop must produce the same bytes.
+    #[test]
+    fn parallel_and_serial_job_loops_agree() {
+        let mut data = text(3 << 20);
+        data.extend_from_slice(&noise(1 << 20, 7));
+        data.extend_from_slice(&text(1 << 20));
+        for level in [1, 3, 7, 11] {
+            let opts = CompressOptions {
+                level,
+                job_size: Some(512 << 10),
+            };
+            let cparams = CParams::for_level(level, data.len());
+            let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
+            let job_size = job_size_for(opts.job_size, data.len(), block_size, cparams.window_log);
+            let jobs = job_ranges(data.len(), job_size);
+            assert!(jobs.len() >= 10, "level {level}: {} jobs", jobs.len());
+            let overlap = overlap_size(&cparams);
+            let n = jobs.len();
+            let f = |k: usize, job: Range<usize>| {
+                compress_job(
+                    data.as_slice(),
+                    cparams,
+                    block_size,
+                    overlap,
+                    job,
+                    k == 0,
+                    k + 1 == n,
+                )
+            };
+            let par = run_jobs(&jobs, true, f);
+            let seq = run_jobs(&jobs, false, f);
+            assert!(par == seq, "level {level}: job outputs differ");
+            let frame = compress_with(&data, &opts);
+            let blocks: Vec<u8> = seq.concat();
+            assert!(
+                frame.ends_with(&blocks),
+                "level {level}: frame != header + jobs"
+            );
+            assert_eq!(crate::decompress(&frame).unwrap(), data);
+        }
+    }
+
+    /// An input smaller than one job compresses identically with the default
+    /// and with any explicit job size that covers it.
+    #[test]
+    fn default_job_size_equals_explicit_for_single_job_input() {
+        let data = text(300 << 10);
+        for level in [1, 3] {
+            let auto = compress_with(
+                &data,
+                &CompressOptions {
+                    level,
+                    job_size: None,
+                },
+            );
+            for js in [300 << 10, 512 << 10, 1 << 20] {
+                let explicit = compress_with(
+                    &data,
+                    &CompressOptions {
+                        level,
+                        job_size: Some(js),
+                    },
+                );
+                assert!(auto == explicit, "level {level} job_size {js}");
+            }
+            assert_eq!(crate::decompress(&auto).unwrap(), data);
+        }
+    }
+
+    /// Two jobs of the same text: job 1 must not reuse job 0's Huffman or
+    /// FSE tables nor its repeat offsets. libzstd rejects the stream if it did.
+    #[test]
+    fn second_job_starts_from_fresh_state() {
+        let unit = text(128 << 10);
+        let mut data = unit.clone();
+        data.extend_from_slice(&unit);
+        for level in [1, 3, 7, 11] {
+            let frame = compress_with(
+                &data,
+                &CompressOptions {
+                    level,
+                    job_size: Some(128 << 10),
+                },
+            );
+            assert_eq!(crate::decompress(&frame).unwrap(), data, "level {level}");
+            let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+            assert_eq!(theirs, data, "level {level}");
+        }
+    }
+
+    /// Job 1 may reference the overlap it indexed from job 0: a copy of the
+    /// bytes right before the job boundary compresses to almost nothing.
+    #[test]
+    fn second_job_matches_into_overlap_of_first_job() {
+        let job = 512 << 10;
+        let copy = 32 << 10;
+        let mut data = noise(job, 11);
+        let tail = data[job - copy..].to_vec();
+        data.extend_from_slice(&tail);
+        let opts = CompressOptions {
+            level: 1,
+            job_size: Some(job),
+        };
+        let cparams = CParams::for_level(1, data.len());
+        assert!(overlap_size(&cparams) >= copy);
+        let frame = compress_with(&data, &opts);
+        assert!(
+            frame.len() < job + copy / 4,
+            "no cross-job matches: {} bytes for {} input",
+            frame.len(),
+            data.len()
+        );
+        assert_eq!(crate::decompress(&frame).unwrap(), data);
+        assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), data);
     }
 
     #[test]

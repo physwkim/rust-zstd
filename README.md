@@ -62,7 +62,7 @@ The decoder reverses this pipeline: parse frame/block headers, decode FSE sequen
 - **Compress + Decompress** — full codec, not decode-only
 - **Spec-compliant** — output is decodable by any standard zstd decoder (C `libzstd`, Python `zstandard`, etc.)
 - **Compression levels 0–11** — from raw storage to deep lazy matching
-- **Parallel compression** — optional rayon-based block encoding (enabled by default)
+- **Parallel compression** — optional rayon job-level parallelism as in ZSTDMT (enabled by default; the frame is identical with and without it)
 - **Competitive ratios** — within 0–5% of C zstd, better on some workloads
 - **Fast decoder** — 1.05–68x faster than C zstd across tested datasets
 - **~5400 lines** of Rust (vs ~30,000 lines in C zstd)
