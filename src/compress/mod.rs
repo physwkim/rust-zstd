@@ -27,8 +27,12 @@ use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
 use std::ops::Range;
 
-/// `ZSTDMT_JOBSIZE_MIN`: lower bound of the default job size.
+/// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
+/// `ZSTDMT_JOBSIZE_MAX` (64-bit): upper bound of an explicit job size.
+pub const JOBSIZE_MAX: usize = 1 << 30;
+/// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the default job size log.
+const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`compress_with`].
 ///
@@ -40,17 +44,17 @@ pub struct CompressOptions {
     /// blocks only; `1..=22` map to libzstd's parameter rows.
     pub level: i32,
     /// Job size in bytes (`ZSTD_c_jobSize`). The input is cut into jobs of
-    /// this many bytes, rounded up to a multiple of the block size; each job
-    /// is compressed independently and, with the `parallel` feature, on its
-    /// own rayon task. `None` selects the default,
-    /// `clamp(len / available_parallelism, 512 KiB, 1 << (window_log + 2))`
-    /// rounded up to a block multiple, so the default frame depends on the
-    /// thread count of the machine; pass `Some` for reproducible output.
-    /// Smaller jobs give more parallelism and slightly worse ratios, since a
-    /// job only sees `min(window / 8, job start)` bytes of history from the
-    /// previous job (`window / 4` for `Strategy::Lazy2`). The frame is the
-    /// same for a given job size whether or not the `parallel` feature is
-    /// enabled.
+    /// this many bytes; each job is compressed independently and, with the
+    /// `parallel` feature, on its own rayon task. `None` selects
+    /// `ZSTDMT_computeTargetJobLog`: `1 << min(max(20, window_log + 2), 30)`,
+    /// i.e. 1 MiB for windows up to 256 KiB and 16 MiB for a 4 MiB window.
+    /// An explicit size is clamped to `[JOBSIZE_MIN, JOBSIZE_MAX]`
+    /// (512 KiB to 1 GiB) and then used as is. The frame never depends on
+    /// the thread count, and is the same for a given job size whether or
+    /// not the `parallel` feature is enabled. Smaller jobs give more
+    /// parallelism and slightly worse ratios, since a job only sees
+    /// `min(window / 8, job start)` bytes of history from the previous job
+    /// (`window / 4` for `Strategy::Lazy2`).
     pub job_size: Option<usize>,
 }
 
@@ -112,7 +116,7 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
         return out;
     }
 
-    let job_size = job_size_for(opts.job_size, data.len(), block_size, cparams.window_log);
+    let job_size = job_size_for(opts.job_size, cparams.window_log);
     let jobs = job_ranges(data.len(), job_size);
     let overlap = overlap_size(&cparams);
     let n_jobs = jobs.len();
@@ -203,21 +207,14 @@ where
         .collect()
 }
 
-/// Effective job size: the requested size (or the default described on
-/// [`CompressOptions::job_size`]) rounded up to a multiple of `block_size`.
-fn job_size_for(requested: Option<usize>, len: usize, block_size: usize, window_log: u32) -> usize {
-    let raw = match requested {
-        Some(n) => n.max(1),
-        None => {
-            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-            // Bounds may cross for small inputs (window_log < 17); the upper
-            // bound then still covers the whole input, so it wins.
-            len.div_ceil(threads)
-                .max(JOBSIZE_MIN)
-                .min(1usize << (window_log + 2))
-        }
-    };
-    raw.div_ceil(block_size) * block_size
+/// `ZSTDMT_initCStream_internal`'s job size: an explicit size clamped to
+/// `[ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX]`, else
+/// `1 << ZSTDMT_computeTargetJobLog` (no long-distance matching).
+fn job_size_for(requested: Option<usize>, window_log: u32) -> usize {
+    match requested {
+        Some(n) => n.clamp(JOBSIZE_MIN, JOBSIZE_MAX),
+        None => 1usize << 20.max(window_log + 2).min(JOBLOG_MAX),
+    }
 }
 
 /// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
@@ -388,22 +385,22 @@ mod tests {
 
     #[test]
     fn job_sizing() {
-        // rounded up to a block multiple; 0 behaves like 1
-        assert_eq!(job_size_for(Some(1), 1 << 20, 1 << 17, 19), 1 << 17);
-        assert_eq!(job_size_for(Some(0), 1 << 20, 1 << 17, 19), 1 << 17);
-        assert_eq!(
-            job_size_for(Some((1 << 17) + 1), 1 << 20, 1 << 17, 19),
-            1 << 18
-        );
-        // default never exceeds 1 << (window_log + 2) nor drops below JOBSIZE_MIN
-        let d = job_size_for(None, 64 << 20, 1 << 17, 19);
-        assert!(
-            (JOBSIZE_MIN..=1 << 21).contains(&d) && d.is_multiple_of(1 << 17),
-            "{d}"
-        );
-        // small input: the crossed bounds resolve to the upper one
-        assert_eq!(job_size_for(None, 1000, 1 << 10, 10), 1 << 12);
+        // explicit: clamped to [JOBSIZE_MIN, JOBSIZE_MAX], otherwise used as is
+        assert_eq!(job_size_for(Some(0), 19), JOBSIZE_MIN);
+        assert_eq!(job_size_for(Some(1), 19), JOBSIZE_MIN);
+        assert_eq!(job_size_for(Some(JOBSIZE_MIN + 1), 19), JOBSIZE_MIN + 1);
+        assert_eq!(job_size_for(Some(usize::MAX), 19), JOBSIZE_MAX);
+        // default: 1 << min(max(20, window_log + 2), 30)
+        assert_eq!(job_size_for(None, 10), 1 << 20);
+        assert_eq!(job_size_for(None, 18), 1 << 20);
+        assert_eq!(job_size_for(None, 19), 1 << 21);
+        assert_eq!(job_size_for(None, 22), 1 << 24);
+        assert_eq!(job_size_for(None, 31), 1 << 30);
         assert_eq!(job_ranges(0, 1 << 17), Vec::<Range<usize>>::new());
+        assert_eq!(
+            job_ranges(1_000_001, 1_000_000),
+            vec![0..1_000_000, 1_000_000..1_000_001]
+        );
         assert_eq!(job_ranges(1, 1 << 17), vec![0..1]);
         assert_eq!(
             job_ranges((1 << 18) + 5, 1 << 17),
@@ -429,7 +426,7 @@ mod tests {
             };
             let cparams = CParams::for_level(level, data.len());
             let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-            let job_size = job_size_for(opts.job_size, data.len(), block_size, cparams.window_log);
+            let job_size = job_size_for(opts.job_size, cparams.window_log);
             let jobs = job_ranges(data.len(), job_size);
             assert!(jobs.len() >= 10, "level {level}: {} jobs", jobs.len());
             let overlap = overlap_size(&cparams);
@@ -459,11 +456,16 @@ mod tests {
     }
 
     /// An input smaller than one job compresses identically with the default
-    /// and with any explicit job size that covers it.
+    /// and with any explicit job size that covers it (300 KiB clamps up to
+    /// JOBSIZE_MIN and still covers the input).
     #[test]
     fn default_job_size_equals_explicit_for_single_job_input() {
         let data = text(300 << 10);
         for level in [1, 3] {
+            assert_eq!(
+                job_size_for(None, CParams::for_level(level, data.len()).window_log),
+                1 << 21
+            );
             let auto = compress_with(
                 &data,
                 &CompressOptions {
@@ -489,7 +491,7 @@ mod tests {
     /// FSE tables nor its repeat offsets. libzstd rejects the stream if it did.
     #[test]
     fn second_job_starts_from_fresh_state() {
-        let unit = text(128 << 10);
+        let unit = text(JOBSIZE_MIN);
         let mut data = unit.clone();
         data.extend_from_slice(&unit);
         for level in [1, 3, 7, 11] {
@@ -497,7 +499,7 @@ mod tests {
                 &data,
                 &CompressOptions {
                     level,
-                    job_size: Some(128 << 10),
+                    job_size: Some(JOBSIZE_MIN),
                 },
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data, "level {level}");
