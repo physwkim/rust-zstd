@@ -361,11 +361,16 @@ impl<'s> BitReaderReversed<'s> {
 // FSE Table and Decoder
 // ============================================================
 
-#[derive(Copy, Clone, Debug)]
+/// One FSE decoding-table cell, laid out like libzstd's `ZSTD_seqSymbol`.
+#[derive(Copy, Clone, Debug, Default)]
 struct FSEEntry {
-    base_line: u32,
+    /// Baseline of the next state; the next `num_bits` stream bits are added.
+    next_state: u16,
     num_bits: u8,
-    symbol: u8,
+    /// Extra bits the sequence code reads from the stream (0 for weight tables).
+    extra_bits: u8,
+    /// Sequence code base value, or the raw symbol for weight tables.
+    base_value: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +380,9 @@ struct FSETable {
     accuracy_log: u8,
     symbol_probabilities: Vec<i32>,
     symbol_counter: Vec<u32>,
+    /// True while `decode` holds a predefined sequence distribution, so the
+    /// next block in Predefined mode can reuse it without rebuilding.
+    predefined: bool,
 }
 
 impl FSETable {
@@ -385,6 +393,7 @@ impl FSETable {
             symbol_counter: Vec::with_capacity(256),
             decode: Vec::new(),
             accuracy_log: 0,
+            predefined: false,
         }
     }
 
@@ -395,6 +404,7 @@ impl FSETable {
             .extend_from_slice(&other.symbol_probabilities);
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
+        self.predefined = other.predefined;
     }
 
     fn reset(&mut self) {
@@ -402,10 +412,34 @@ impl FSETable {
         self.symbol_probabilities.clear();
         self.decode.clear();
         self.accuracy_log = 0;
+        self.predefined = false;
+    }
+
+    /// Replace each cell's symbol with the sequence code's base value and
+    /// extra-bit count (the last loop of ZSTD_buildFSETable_body).
+    fn apply_sequence_codes(&mut self, base: &[u32], bits: &[u8]) {
+        for entry in &mut self.decode {
+            let symbol = entry.base_value as usize;
+            entry.extra_bits = bits[symbol];
+            entry.base_value = base[symbol];
+        }
+    }
+
+    /// One-cell table for an RLE-coded sequence section
+    /// (ZSTD_buildSeqTable_rle): accuracy log 0, no state bits.
+    fn build_rle(&mut self, symbol: u8, base: &[u32], bits: &[u8]) {
+        self.reset();
+        self.decode.push(FSEEntry {
+            next_state: 0,
+            num_bits: 0,
+            extra_bits: bits[symbol as usize],
+            base_value: base[symbol as usize],
+        });
     }
 
     fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, String> {
         self.accuracy_log = 0;
+        self.predefined = false;
         let bytes_read = self.read_probabilities(source, max_log)?;
         self.build_decoding_table()?;
         Ok(bytes_read)
@@ -415,8 +449,10 @@ impl FSETable {
         if acc_log == 0 {
             return Err("Accuracy log is zero".to_string());
         }
-        self.symbol_probabilities = probs.to_vec();
+        self.symbol_probabilities.clear();
+        self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
+        self.predefined = false;
         self.build_decoding_table()
     }
 
@@ -432,14 +468,7 @@ impl FSETable {
         self.decode.clear();
 
         let table_size = 1 << self.accuracy_log;
-        self.decode.resize(
-            table_size,
-            FSEEntry {
-                base_line: 0,
-                num_bits: 0,
-                symbol: 0,
-            },
-        );
+        self.decode.resize(table_size, FSEEntry::default());
 
         let mut negative_idx = table_size;
 
@@ -447,8 +476,8 @@ impl FSETable {
             if self.symbol_probabilities[symbol] == -1 {
                 negative_idx -= 1;
                 let entry = &mut self.decode[negative_idx];
-                entry.symbol = symbol as u8;
-                entry.base_line = 0;
+                entry.base_value = symbol as u32;
+                entry.next_state = 0;
                 entry.num_bits = self.accuracy_log;
             }
         }
@@ -462,7 +491,7 @@ impl FSETable {
             let prob = self.symbol_probabilities[idx];
             for _ in 0..prob {
                 let entry = &mut self.decode[position];
-                entry.symbol = symbol;
+                entry.base_value = u32::from(symbol);
                 position = fse_next_position(position, table_size);
                 while position >= negative_idx {
                     position = fse_next_position(position, table_size);
@@ -474,16 +503,16 @@ impl FSETable {
         self.symbol_counter
             .resize(self.symbol_probabilities.len(), 0);
         for idx in 0..negative_idx {
-            let symbol = self.decode[idx].symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-            let symbol_count = self.symbol_counter[symbol as usize];
+            let symbol = self.decode[idx].base_value as usize;
+            let prob = self.symbol_probabilities[symbol];
+            let symbol_count = self.symbol_counter[symbol];
             let (bl, nb) =
                 fse_calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
 
             assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
+            self.symbol_counter[symbol] += 1;
 
-            self.decode[idx].base_line = bl;
+            self.decode[idx].next_state = bl as u16;
             self.decode[idx].num_bits = nb;
         }
         Ok(())
@@ -611,17 +640,13 @@ struct FSEDecoder<'table> {
 impl<'t> FSEDecoder<'t> {
     fn new(table: &'t FSETable) -> FSEDecoder<'t> {
         FSEDecoder {
-            state: table.decode.first().copied().unwrap_or(FSEEntry {
-                base_line: 0,
-                num_bits: 0,
-                symbol: 0,
-            }),
+            state: table.decode.first().copied().unwrap_or_default(),
             table,
         }
     }
 
     fn decode_symbol(&self) -> u8 {
-        self.state.symbol
+        self.state.base_value as u8
     }
 
     fn init_state(&mut self, bits: &mut BitReaderReversed<'_>) -> Result<(), String> {
@@ -636,9 +661,8 @@ impl<'t> FSEDecoder<'t> {
     fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
-        let base_line = self.state.base_line;
-        let new_state = base_line + add as u32;
-        self.state = self.table.decode[new_state as usize];
+        let new_state = usize::from(self.state.next_state) + add as usize;
+        self.state = self.table.decode[new_state];
     }
 }
 
@@ -914,10 +938,11 @@ impl HuffmanTable {
 }
 
 // ------------------------------------------------------------
-// Huffman bit stream and symbol decoding
+// Backward bit stream and Huffman symbol decoding
 //
-// Port of libzstd's BIT_DStream_t (common/bitstream.h) and the X1
-// single-symbol decoders in decompress/huf_decompress.c
+// Port of libzstd's BIT_DStream_t (common/bitstream.h), shared by the
+// literals and sequences decoders, and of the X1 single-symbol decoders
+// in decompress/huf_decompress.c
 // (HUF_decodeSymbolX1, HUF_decodeStreamX1,
 // HUF_decompress1X1_usingDTable_internal_body,
 // HUF_decompress4X1_usingDTable_internal_body).
@@ -940,20 +965,20 @@ enum HufStreamStatus {
     Overflow,
 }
 
-/// Backward bit reader over one Huffman stream.
+/// Backward bit reader over one Huffman or sequences stream.
 ///
 /// `container` holds the 8 bytes starting at `ptr`; bits are consumed from
 /// its high end (the stream is read from its last byte backwards). Once
 /// `bits_consumed` exceeds the data actually loaded, reads return zeros and
 /// the final `is_finished` check rejects the stream.
-struct HufBitStream<'s> {
+struct BitDStream<'s> {
     src: &'s [u8],
     ptr: usize,
     container: u64,
     bits_consumed: u32,
 }
 
-impl<'s> HufBitStream<'s> {
+impl<'s> BitDStream<'s> {
     fn new(src: &'s [u8]) -> Result<Self, String> {
         let Some(&last) = src.last() else {
             return Err("Huffman stream is empty".to_string());
@@ -965,7 +990,7 @@ impl<'s> HufBitStream<'s> {
         let padding = last.leading_zeros() + 1;
         if src.len() >= 8 {
             let ptr = src.len() - 8;
-            Ok(HufBitStream {
+            Ok(BitDStream {
                 src,
                 ptr,
                 container: read_le64(src, ptr),
@@ -974,7 +999,7 @@ impl<'s> HufBitStream<'s> {
         } else {
             let mut buf = [0u8; 8];
             buf[..src.len()].copy_from_slice(src);
-            Ok(HufBitStream {
+            Ok(BitDStream {
                 src,
                 ptr: 0,
                 container: u64::from_le_bytes(buf),
@@ -989,9 +1014,31 @@ impl<'s> HufBitStream<'s> {
         ((self.container << (self.bits_consumed & 63)) >> (64 - n)) as usize
     }
 
+    /// Next `n` (0..=56) unread bits, without consuming them (BIT_lookBits).
+    #[inline(always)]
+    fn look_bits_any(&self, n: u32) -> usize {
+        (((self.container << (self.bits_consumed & 63)) >> 1) >> ((63 - n) & 63)) as usize
+    }
+
     #[inline(always)]
     fn skip_bits(&mut self, n: u32) {
         self.bits_consumed += n;
+    }
+
+    /// Read `n` (0..=56) bits (BIT_readBits).
+    #[inline(always)]
+    fn read_bits(&mut self, n: u32) -> usize {
+        let value = self.look_bits_any(n);
+        self.skip_bits(n);
+        value
+    }
+
+    /// Read `n` (1..=56) bits (BIT_readBitsFast).
+    #[inline(always)]
+    fn read_bits_fast(&mut self, n: u32) -> usize {
+        let value = self.look_bits(n);
+        self.skip_bits(n);
+        value
     }
 
     #[inline(always)]
@@ -1052,7 +1099,7 @@ fn read_le64(src: &[u8], at: usize) -> u64 {
 }
 
 #[inline(always)]
-fn huf_decode_symbol_x1(br: &mut HufBitStream<'_>, dt: &[HuffmanEntry], dt_log: u32) -> u8 {
+fn huf_decode_symbol_x1(br: &mut BitDStream<'_>, dt: &[HuffmanEntry], dt_log: u32) -> u8 {
     let entry = dt[br.look_bits(dt_log)];
     br.skip_bits(u32::from(entry.num_bits));
     entry.symbol
@@ -1060,12 +1107,7 @@ fn huf_decode_symbol_x1(br: &mut HufBitStream<'_>, dt: &[HuffmanEntry], dt_log: 
 
 /// Decode `out.len()` symbols from one stream (HUF_decodeStreamX1).
 #[inline(always)]
-fn huf_decode_stream_x1(
-    out: &mut [u8],
-    br: &mut HufBitStream<'_>,
-    dt: &[HuffmanEntry],
-    dt_log: u32,
-) {
+fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEntry], dt_log: u32) {
     let end = out.len();
     let mut p = 0;
     if end > 3 {
@@ -1094,7 +1136,7 @@ fn huf_decode_stream_x1(
 fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt_log = u32::from(table.max_num_bits);
     let dt = &table.decode[..];
-    let mut br = HufBitStream::new(src)?;
+    let mut br = BitDStream::new(src)?;
     huf_decode_stream_x1(out, &mut br, dt, dt_log);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
@@ -1142,10 +1184,10 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     let (o2, rest) = rest.split_at_mut(segment);
     let (o3, o4) = rest.split_at_mut(segment);
 
-    let mut b1 = HufBitStream::new(s1)?;
-    let mut b2 = HufBitStream::new(s2)?;
-    let mut b3 = HufBitStream::new(s3)?;
-    let mut b4 = HufBitStream::new(s4)?;
+    let mut b1 = BitDStream::new(s1)?;
+    let mut b2 = BitDStream::new(s2)?;
+    let mut b3 = BitDStream::new(s3)?;
+    let mut b4 = BitDStream::new(s4)?;
 
     let dt_log = u32::from(table.max_num_bits);
     let dt = &table.decode[..];
@@ -1351,13 +1393,6 @@ impl LiteralsSection {
 // Sequences Section
 // ============================================================
 
-#[derive(Clone, Copy)]
-struct Sequence {
-    ll: u32,
-    ml: u32,
-    of: u32,
-}
-
 #[derive(Copy, Clone)]
 struct CompressionModes(u8);
 
@@ -1462,81 +1497,6 @@ impl SequencesHeader {
 }
 
 // ============================================================
-// Decode Buffer (Vec-based, no ringbuffer)
-// ============================================================
-
-struct DecodeBuffer {
-    buffer: Vec<u8>,
-    window_size: usize,
-}
-
-impl DecodeBuffer {
-    fn new(window_size: usize) -> DecodeBuffer {
-        DecodeBuffer {
-            buffer: Vec::new(),
-            window_size,
-        }
-    }
-
-    fn reset(&mut self, window_size: usize) {
-        self.window_size = window_size;
-        self.buffer.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn push(&mut self, data: &[u8]) {
-        self.buffer.extend_from_slice(data);
-    }
-
-    fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), String> {
-        if offset > self.buffer.len() {
-            return Err(format!(
-                "Offset {} exceeds buffer length {}",
-                offset,
-                self.buffer.len()
-            ));
-        }
-        if offset == 0 {
-            return Err("Zero offset in repeat".to_string());
-        }
-
-        let len = self.buffer.len();
-        let start_idx = len - offset;
-
-        if offset >= match_length {
-            // Source and destination do not overlap: one memcpy.
-            self.buffer
-                .extend_from_within(start_idx..start_idx + match_length);
-        } else if offset == 1 {
-            // Run of a single byte: memset.
-            let byte = self.buffer[start_idx];
-            self.buffer.resize(len + match_length, byte);
-        } else {
-            // Overlapping copy: the output is periodic with period `offset`.
-            // Copy the period once, then keep appending the whole span
-            // written so far, doubling the chunk size each round.
-            self.buffer.reserve(match_length);
-            let mut copied = 0;
-            while copied < match_length {
-                let available = offset + copied;
-                let chunk = available.min(match_length - copied);
-                self.buffer.extend_from_within(start_idx..start_idx + chunk);
-                copied += chunk;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn drain(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
-    }
-}
-
-// ============================================================
 // Scratch space
 // ============================================================
 
@@ -1546,57 +1506,47 @@ struct HuffmanScratch {
 
 struct FSEScratch {
     offsets: FSETable,
-    of_rle: Option<u8>,
     literal_lengths: FSETable,
-    ll_rle: Option<u8>,
     match_lengths: FSETable,
-    ml_rle: Option<u8>,
 }
 
 struct DecoderScratch {
     huf: HuffmanScratch,
     fse: FSEScratch,
-    buffer: DecodeBuffer,
+    /// Decoded output of the current frame; matches reference into it.
+    buffer: Vec<u8>,
     offset_hist: [u32; 3],
+    /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
-    sequences: Vec<Sequence>,
     block_content_buffer: Vec<u8>,
 }
 
 impl DecoderScratch {
-    fn new(window_size: usize) -> DecoderScratch {
+    fn new() -> DecoderScratch {
         DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
             },
             fse: FSEScratch {
                 offsets: FSETable::new(MAX_OFFSET_CODE),
-                of_rle: None,
                 literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
-                ll_rle: None,
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-                ml_rle: None,
             },
-            buffer: DecodeBuffer::new(window_size),
+            buffer: Vec::new(),
             offset_hist: [1, 4, 8],
             block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
-            sequences: Vec::new(),
         }
     }
 
-    fn reset(&mut self, window_size: usize) {
+    fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.sequences.clear();
         self.block_content_buffer.clear();
-        self.buffer.reset(window_size);
+        self.buffer.clear();
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
-        self.fse.ll_rle = None;
-        self.fse.ml_rle = None;
-        self.fse.of_rle = None;
         self.huf.table.reset();
     }
 }
@@ -1926,229 +1876,62 @@ fn decompress_literals(
 }
 
 // ============================================================
-// Sequence section decoder
+// Sequence section: FSE tables, then fused decode + execute
+//
+// Port of ZSTD_decodeSequence / ZSTD_execSequence /
+// ZSTD_decompressSequences_body (decompress/zstd_decompress_block.c).
 // ============================================================
 
-fn decode_sequences(
-    section: &SequencesHeader,
-    source: &[u8],
-    scratch: &mut FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), String> {
-    let bytes_read = maybe_update_fse_tables(section, source, scratch)?;
-    let bit_stream = &source[bytes_read..];
+// Base value and extra-bit count per sequence code
+// (libzstd LL_base / LL_bits / ML_base / ML_bits / OF_base / OF_bits).
+const LL_BASE: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
 
-    let mut br = BitReaderReversed::new(bit_stream);
+const LL_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
 
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    if skipped_bits > 8 {
-        return Err(format!("Extra padding: {} bits skipped", skipped_bits));
-    }
+const ML_BASE: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
+    2051, 4099, 8195, 16387, 32771, 65539,
+];
 
-    if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, scratch, target)
-    } else {
-        decode_sequences_without_rle(section, &mut br, scratch, target)
-    }
-}
+const ML_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
 
-fn decode_sequences_with_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), String> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+const OF_BASE: [u32; 32] = [
+    0, 1, 1, 5, 13, 29, 61, 125, 253, 509, 1021, 2045, 4093, 8189, 16381, 32765, 65533, 131069,
+    262141, 524285, 1048573, 2097149, 4194301, 8388605, 16777213, 33554429, 67108861, 134217725,
+    268435453, 536870909, 1073741821, 2147483645,
+];
 
-    if scratch.ll_rle.is_none() {
-        ll_dec.init_state(br)?;
-    }
-    if scratch.of_rle.is_none() {
-        of_dec.init_state(br)?;
-    }
-    if scratch.ml_rle.is_none() {
-        ml_dec.init_state(br)?;
-    }
+const OF_BITS: [u8; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
 
-    target.clear();
-    target.reserve(section.num_sequences as usize);
+/// Bytes of slack kept after the literals and after the block's output
+/// limit so that copies may overshoot by a whole vector
+/// (libzstd WILDCOPY_OVERLENGTH).
+const WILDCOPY_OVERLENGTH: usize = 32;
 
-    for _seq_idx in 0..section.num_sequences {
-        let ll_code = scratch.ll_rle.unwrap_or_else(|| ll_dec.decode_symbol());
-        let ml_code = scratch.ml_rle.unwrap_or_else(|| ml_dec.decode_symbol());
-        let of_code = scratch.of_rle.unwrap_or_else(|| of_dec.decode_symbol());
+/// Copies with offsets at or above this never overlap a 16-byte chunk
+/// (libzstd WILDCOPY_VECLEN).
+const WILDCOPY_VECLEN: usize = 16;
 
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code)?;
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code)?;
+/// Matches longer than this are copied with `copy_within` (memmove)
+/// instead of fixed 16-byte chunks.
+const LONG_COPY_THRESHOLD: usize = 32;
 
-        if of_code > MAX_OFFSET_CODE {
-            return Err(format!("Unsupported offset code: {}", of_code));
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err("Zero offset".to_string());
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            if scratch.ll_rle.is_none() {
-                ll_dec.update_state(br);
-            }
-            if scratch.ml_rle.is_none() {
-                ml_dec.update_state(br);
-            }
-            if scratch.of_rle.is_none() {
-                of_dec.update_state(br);
-            }
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err("Not enough bytes for number of sequences".to_string());
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(format!("Extra bits remaining: {}", br.bits_remaining()))
-    } else {
-        Ok(())
-    }
-}
-
-fn decode_sequences_without_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), String> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
-
-    ll_dec.init_state(br)?;
-    of_dec.init_state(br)?;
-    ml_dec.init_state(br)?;
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    for _seq_idx in 0..section.num_sequences {
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
-        let of_code = of_dec.decode_symbol();
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code)?;
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code)?;
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(format!("Unsupported offset code: {}", of_code));
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err("Zero offset".to_string());
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            ll_dec.update_state(br);
-            ml_dec.update_state(br);
-            of_dec.update_state(br);
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err("Not enough bytes for number of sequences".to_string());
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(format!("Extra bits remaining: {}", br.bits_remaining()))
-    } else {
-        Ok(())
-    }
-}
-
-fn lookup_ll_code(code: u8) -> Result<(u32, u8), String> {
-    let result = match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => return Err(format!("Illegal literal length code: {}", code)),
-    };
-    Ok(result)
-}
-
-fn lookup_ml_code(code: u8) -> Result<(u32, u8), String> {
-    let result = match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => return Err(format!("Illegal match length code: {}", code)),
-    };
-    Ok(result)
-}
-
-fn maybe_update_fse_tables(
+/// Build (or reuse) the three FSE tables for this block's sequences and
+/// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
+fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
@@ -2158,188 +1941,429 @@ fn maybe_update_fse_tables(
         .ok_or_else(|| "Missing compression mode".to_string())?;
 
     let mut bytes_read = 0;
-
-    match modes.ll_mode() {
-        ModeType::FSECompressed => {
-            let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
-            bytes_read += bytes;
-            scratch.ll_rle = None;
-        }
-        ModeType::RLE => {
-            if source.is_empty() {
-                return Err("Missing byte for RLE LL table".to_string());
-            }
-            bytes_read += 1;
-            if source[0] > MAX_LITERAL_LENGTH_CODE {
-                return Err(format!("RLE LL code {} exceeds max", source[0]));
-            }
-            scratch.ll_rle = Some(source[0]);
-        }
-        ModeType::Predefined => {
-            scratch.literal_lengths.build_from_probabilities(
-                LL_DEFAULT_ACC_LOG,
-                &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
-            )?;
-            scratch.ll_rle = None;
-        }
-        ModeType::Repeat => { /* Nothing to do */ }
-    };
-
-    let of_source = &source[bytes_read..];
-
-    match modes.of_mode() {
-        ModeType::FSECompressed => {
-            let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
-            bytes_read += bytes;
-            scratch.of_rle = None;
-        }
-        ModeType::RLE => {
-            if of_source.is_empty() {
-                return Err("Missing byte for RLE OF table".to_string());
-            }
-            bytes_read += 1;
-            if of_source[0] > MAX_OFFSET_CODE {
-                return Err(format!("RLE OF code {} exceeds max", of_source[0]));
-            }
-            scratch.of_rle = Some(of_source[0]);
-        }
-        ModeType::Predefined => {
-            scratch
-                .offsets
-                .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
-            scratch.of_rle = None;
-        }
-        ModeType::Repeat => { /* Nothing to do */ }
-    };
-
-    let ml_source = &source[bytes_read..];
-
-    match modes.ml_mode() {
-        ModeType::FSECompressed => {
-            let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
-            bytes_read += bytes;
-            scratch.ml_rle = None;
-        }
-        ModeType::RLE => {
-            if ml_source.is_empty() {
-                return Err("Missing byte for RLE ML table".to_string());
-            }
-            bytes_read += 1;
-            if ml_source[0] > MAX_MATCH_LENGTH_CODE {
-                return Err(format!("RLE ML code {} exceeds max", ml_source[0]));
-            }
-            scratch.ml_rle = Some(ml_source[0]);
-        }
-        ModeType::Predefined => {
-            scratch
-                .match_lengths
-                .build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)?;
-            scratch.ml_rle = None;
-        }
-        ModeType::Repeat => { /* Nothing to do */ }
-    };
-
+    bytes_read += build_sequence_table(
+        modes.ll_mode(),
+        &source[bytes_read..],
+        &mut scratch.literal_lengths,
+        LL_MAX_LOG,
+        MAX_LITERAL_LENGTH_CODE,
+        LL_DEFAULT_ACC_LOG,
+        &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
+        &LL_BASE,
+        &LL_BITS,
+        "LL",
+    )?;
+    bytes_read += build_sequence_table(
+        modes.of_mode(),
+        &source[bytes_read..],
+        &mut scratch.offsets,
+        OF_MAX_LOG,
+        MAX_OFFSET_CODE,
+        OF_DEFAULT_ACC_LOG,
+        &OFFSET_DEFAULT_DISTRIBUTION,
+        &OF_BASE,
+        &OF_BITS,
+        "OF",
+    )?;
+    bytes_read += build_sequence_table(
+        modes.ml_mode(),
+        &source[bytes_read..],
+        &mut scratch.match_lengths,
+        ML_MAX_LOG,
+        MAX_MATCH_LENGTH_CODE,
+        ML_DEFAULT_ACC_LOG,
+        &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
+        &ML_BASE,
+        &ML_BITS,
+        "ML",
+    )?;
     Ok(bytes_read)
 }
 
-// ============================================================
-// Sequence execution
-// ============================================================
-
-fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), String> {
-    let mut literals_copy_counter = 0;
-    let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0u32;
-
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
-
-        if seq.ll > 0 {
-            let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
-                return Err(format!(
-                    "Not enough bytes for sequence: wanted {}, have {}",
-                    high,
-                    scratch.literals_buffer.len()
-                ));
+#[allow(clippy::too_many_arguments)]
+fn build_sequence_table(
+    mode: ModeType,
+    source: &[u8],
+    table: &mut FSETable,
+    max_log: u8,
+    max_code: u8,
+    default_log: u8,
+    default_distribution: &[i32],
+    base: &[u32],
+    bits: &[u8],
+    name: &str,
+) -> Result<usize, String> {
+    match mode {
+        ModeType::FSECompressed => {
+            let bytes = table.build_decoder(source, max_log)?;
+            table.apply_sequence_codes(base, bits);
+            Ok(bytes)
+        }
+        ModeType::RLE => {
+            let Some(&code) = source.first() else {
+                return Err(format!("Missing byte for RLE {} table", name));
+            };
+            if code > max_code {
+                return Err(format!("RLE {} code {} exceeds max", name, code));
             }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            literals_copy_counter += seq.ll as usize;
-            scratch.buffer.push(literals);
+            table.build_rle(code, base, bits);
+            Ok(1)
         }
-
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
-        if actual_offset == 0 {
-            return Err("Zero offset in sequence execution".to_string());
+        ModeType::Predefined => {
+            if !table.predefined {
+                table.build_from_probabilities(default_log, default_distribution)?;
+                table.apply_sequence_codes(base, bits);
+                table.predefined = true;
+            }
+            Ok(0)
         }
-        if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
+        ModeType::Repeat => {
+            if table.decode.is_empty() {
+                return Err(format!("Repeat mode without a previous {} table", name));
+            }
+            Ok(0)
         }
-
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
     }
-
-    if literals_copy_counter < scratch.literals_buffer.len() {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
-        seq_sum += rest_literals.len() as u32;
-    }
-
-    let diff = scratch.buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
-    );
-    Ok(())
 }
 
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let actual_offset = if lit_len > 0 {
-        match offset_value {
-            1..=3 => scratch[offset_value as usize - 1],
-            _ => offset_value - 3,
+/// Decode every sequence of the block and execute it straight into `out`.
+///
+/// `literals` must hold `literals_len` decoded bytes followed by at least
+/// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
+/// plus slack up front so that all copies use fixed-size chunks and may
+/// overshoot; it is truncated to the real length on return.
+fn decode_and_execute_sequences(
+    num_sequences: u32,
+    bit_stream: &[u8],
+    fse: &FSEScratch,
+    literals: &[u8],
+    literals_len: usize,
+    offset_hist: &mut [u32; 3],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let base = out.len();
+    let oend = base + MAX_BLOCK_SIZE as usize;
+    out.resize(oend + WILDCOPY_OVERLENGTH, 0);
+    let result = run_sequences(
+        num_sequences,
+        bit_stream,
+        fse,
+        literals,
+        literals_len,
+        offset_hist,
+        out.as_mut_slice(),
+        base,
+        oend,
+    );
+    match result {
+        Ok(end) => {
+            out.truncate(end);
+            Ok(())
         }
-    } else {
-        match offset_value {
-            1..=2 => scratch[offset_value as usize],
-            3 => scratch[0].wrapping_sub(1),
-            _ => offset_value - 3,
-        }
-    };
-
-    if lit_len > 0 {
-        match offset_value {
-            1 => { /* nothing */ }
-            2 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
-    } else {
-        match offset_value {
-            1 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
+        Err(e) => {
+            out.truncate(base);
+            Err(e)
         }
     }
+}
 
-    actual_offset
+#[allow(clippy::too_many_arguments)]
+fn run_sequences(
+    num_sequences: u32,
+    bit_stream: &[u8],
+    fse: &FSEScratch,
+    literals: &[u8],
+    literals_len: usize,
+    offset_hist: &mut [u32; 3],
+    buf: &mut [u8],
+    mut op: usize,
+    oend: usize,
+) -> Result<usize, String> {
+    let ll_dt = &fse.literal_lengths.decode[..];
+    let of_dt = &fse.offsets.decode[..];
+    let ml_dt = &fse.match_lengths.decode[..];
+    if ll_dt.is_empty() || of_dt.is_empty() || ml_dt.is_empty() {
+        return Err("FSE table is uninitialized".to_string());
+    }
+
+    let mut br = BitDStream::new(bit_stream)?;
+    // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
+    let mut ll_state = br.read_bits(u32::from(fse.literal_lengths.accuracy_log));
+    br.reload();
+    let mut of_state = br.read_bits(u32::from(fse.offsets.accuracy_log));
+    br.reload();
+    let mut ml_state = br.read_bits(u32::from(fse.match_lengths.accuracy_log));
+    br.reload();
+
+    let mut hist = [
+        offset_hist[0] as usize,
+        offset_hist[1] as usize,
+        offset_hist[2] as usize,
+    ];
+    let mut lit_pos = 0usize;
+
+    for remaining in (1..=num_sequences).rev() {
+        let ll_e = ll_dt[ll_state];
+        let ml_e = ml_dt[ml_state];
+        let of_e = of_dt[of_state];
+
+        let mut ll = ll_e.base_value as usize;
+        let mut ml = ml_e.base_value as usize;
+        let ll_bits = u32::from(ll_e.extra_bits);
+        let ml_bits = u32::from(ml_e.extra_bits);
+        let of_bits = u32::from(of_e.extra_bits);
+        let total_bits = ll_bits + ml_bits + of_bits;
+
+        // Offset and repeat-offset history (ZSTD_decodeSequence).
+        let offset = if of_bits > 1 {
+            let o = of_e.base_value as usize + br.read_bits_fast(of_bits);
+            hist[2] = hist[1];
+            hist[1] = hist[0];
+            hist[0] = o;
+            o
+        } else {
+            let ll0 = usize::from(ll == 0);
+            if of_bits == 0 {
+                let o = hist[ll0];
+                hist[1] = hist[1 - ll0];
+                hist[0] = o;
+                o
+            } else {
+                let o = of_e.base_value as usize + ll0 + br.read_bits_fast(1);
+                let mut temp = if o == 3 {
+                    hist[0].wrapping_sub(1)
+                } else {
+                    hist[o]
+                };
+                if temp == 0 {
+                    // Corrupt input: force an offset that execution rejects.
+                    temp = usize::MAX;
+                }
+                if o != 1 {
+                    hist[2] = hist[1];
+                }
+                hist[1] = hist[0];
+                hist[0] = temp;
+                temp
+            }
+        };
+
+        if ml_bits > 0 {
+            ml += br.read_bits_fast(ml_bits);
+        }
+        // A reload guarantees 57 bits; the three state updates below need
+        // up to 26 more, so reload now if this sequence's extra bits could
+        // leave fewer than that.
+        if total_bits >= 57 - 26 {
+            br.reload();
+        }
+        if ll_bits > 0 {
+            ll += br.read_bits_fast(ll_bits);
+        }
+
+        if remaining > 1 {
+            ll_state = usize::from(ll_e.next_state) + br.read_bits(u32::from(ll_e.num_bits));
+            ml_state = usize::from(ml_e.next_state) + br.read_bits(u32::from(ml_e.num_bits));
+            of_state = usize::from(of_e.next_state) + br.read_bits(u32::from(of_e.num_bits));
+            br.reload();
+        }
+
+        op = exec_sequence(
+            buf,
+            op,
+            oend,
+            literals,
+            literals_len,
+            &mut lit_pos,
+            ll,
+            ml,
+            offset,
+        )?;
+    }
+
+    if !br.is_finished() {
+        return Err("Sequence bitstream not fully consumed".to_string());
+    }
+
+    // Last literals segment.
+    let rest = literals_len - lit_pos;
+    if op + rest > oend {
+        return Err("Block content exceeds block size limit".to_string());
+    }
+    buf[op..op + rest].copy_from_slice(&literals[lit_pos..literals_len]);
+    op += rest;
+
+    *offset_hist = [hist[0] as u32, hist[1] as u32, hist[2] as u32];
+    Ok(op)
+}
+
+/// Copy `ll` literals then `ml` match bytes from `offset` back
+/// (ZSTD_execSequence). Returns the new output position.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn exec_sequence(
+    buf: &mut [u8],
+    op: usize,
+    oend: usize,
+    literals: &[u8],
+    literals_len: usize,
+    lit_pos: &mut usize,
+    ll: usize,
+    ml: usize,
+    offset: usize,
+) -> Result<usize, String> {
+    let lit_start = *lit_pos;
+    let o_lit_end = op + ll;
+    let o_match_end = o_lit_end + ml;
+    if lit_start + ll > literals_len {
+        return Err(format!(
+            "Not enough literals for sequence: wanted {}, have {}",
+            lit_start + ll,
+            literals_len
+        ));
+    }
+    if o_match_end > oend {
+        return Err("Block content exceeds block size limit".to_string());
+    }
+
+    // Literals: nearly always at most 16 bytes.
+    copy16_from(buf, op, literals, lit_start);
+    if ll > 16 {
+        wildcopy_from(buf, op + 16, literals, lit_start + 16, ll - 16);
+    }
+    *lit_pos = lit_start + ll;
+
+    if offset > o_lit_end {
+        return Err(format!(
+            "Offset {} exceeds buffer length {}",
+            offset, o_lit_end
+        ));
+    }
+    let mut src = o_lit_end - offset;
+    let mut dst = o_lit_end;
+    if offset >= WILDCOPY_VECLEN {
+        if ml <= LONG_COPY_THRESHOLD {
+            wildcopy_within(buf, dst, src, ml);
+        } else if offset >= ml {
+            buf.copy_within(src..src + ml, dst);
+        } else {
+            // Periodic pattern: copy the whole prefix decoded so far, whose
+            // length doubles each round, so long matches take O(log n) memcpys.
+            let mut done = 0;
+            while done < ml {
+                let chunk = (offset + done).min(ml - done);
+                buf.copy_within(src..src + chunk, dst + done);
+                done += chunk;
+            }
+        }
+    } else {
+        // Copy 8 bytes and spread the offset to at least 8, then continue
+        // with 8-byte chunks.
+        overlap_copy8(buf, &mut dst, &mut src, offset);
+        if ml > 8 {
+            wildcopy_overlap8(buf, dst, src, ml - 8);
+        }
+    }
+    Ok(o_match_end)
+}
+
+#[inline(always)]
+fn copy16_from(buf: &mut [u8], dst: usize, src: &[u8], sp: usize) {
+    let chunk: [u8; 16] = src[sp..sp + 16].try_into().unwrap();
+    buf[dst..dst + 16].copy_from_slice(&chunk);
+}
+
+#[inline(always)]
+fn copy16_within(buf: &mut [u8], dst: usize, src: usize) {
+    let chunk: [u8; 16] = buf[src..src + 16].try_into().unwrap();
+    buf[dst..dst + 16].copy_from_slice(&chunk);
+}
+
+#[inline(always)]
+fn copy8_within(buf: &mut [u8], dst: usize, src: usize) {
+    let chunk: [u8; 8] = buf[src..src + 8].try_into().unwrap();
+    buf[dst..dst + 8].copy_from_slice(&chunk);
+}
+
+/// ZSTD_wildcopy(no_overlap) from another buffer: 16-byte chunks that may
+/// overshoot `len` by up to 31 bytes on both sides.
+#[inline(always)]
+fn wildcopy_from(buf: &mut [u8], mut dst: usize, src: &[u8], mut sp: usize, len: usize) {
+    copy16_from(buf, dst, src, sp);
+    if len <= 16 {
+        return;
+    }
+    let end = dst + len;
+    dst += 16;
+    sp += 16;
+    loop {
+        copy16_from(buf, dst, src, sp);
+        copy16_from(buf, dst + 16, src, sp + 16);
+        dst += 32;
+        sp += 32;
+        if dst >= end {
+            break;
+        }
+    }
+}
+
+/// ZSTD_wildcopy(no_overlap) within `buf`; `dst - src >= 16`.
+#[inline(always)]
+fn wildcopy_within(buf: &mut [u8], mut dst: usize, mut src: usize, len: usize) {
+    copy16_within(buf, dst, src);
+    if len <= 16 {
+        return;
+    }
+    let end = dst + len;
+    dst += 16;
+    src += 16;
+    loop {
+        copy16_within(buf, dst, src);
+        copy16_within(buf, dst + 16, src + 16);
+        dst += 32;
+        src += 32;
+        if dst >= end {
+            break;
+        }
+    }
+}
+
+/// ZSTD_wildcopy(overlap_src_before_dst) with `8 <= dst - src < 16`:
+/// 8-byte chunks, overshooting by up to 7 bytes.
+#[inline(always)]
+fn wildcopy_overlap8(buf: &mut [u8], mut dst: usize, mut src: usize, len: usize) {
+    let end = dst + len;
+    loop {
+        copy8_within(buf, dst, src);
+        dst += 8;
+        src += 8;
+        if dst >= end {
+            break;
+        }
+    }
+}
+
+/// ZSTD_overlapCopy8: copy 8 bytes from `src` to `dst` (`src <= dst`) and
+/// advance both so that afterwards `dst - src >= 8`.
+#[inline(always)]
+fn overlap_copy8(buf: &mut [u8], dst: &mut usize, src: &mut usize, offset: usize) {
+    if offset < 8 {
+        const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
+        const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
+        let (d, s) = (*dst, *src);
+        buf[d] = buf[s];
+        buf[d + 1] = buf[s + 1];
+        buf[d + 2] = buf[s + 2];
+        buf[d + 3] = buf[s + 3];
+        let s2 = s + DEC32[offset];
+        let chunk: [u8; 4] = buf[s2..s2 + 4].try_into().unwrap();
+        buf[d + 4..d + 8].copy_from_slice(&chunk);
+        *src = s2 + 8 - DEC64[offset];
+    } else {
+        copy8_within(buf, *dst, *src);
+        *src += 8;
+    }
+    *dst += 8;
 }
 
 // ============================================================
@@ -2367,10 +2391,10 @@ fn decode_block_content(
             }
 
             for _ in 0..full_reads {
-                workspace.buffer.push(&buf[..]);
+                workspace.buffer.extend_from_slice(&buf[..]);
             }
             let smaller = &buf[..single_read_size as usize];
-            workspace.buffer.push(smaller);
+            workspace.buffer.extend_from_slice(smaller);
 
             Ok(1)
         }
@@ -2384,14 +2408,14 @@ fn decode_block_content(
                 source
                     .read_exact(&mut buf[..])
                     .map_err(|e| format!("Error reading raw block: {}", e))?;
-                workspace.buffer.push(&buf[..]);
+                workspace.buffer.extend_from_slice(&buf[..]);
             }
 
             let smaller = &mut buf[..single_read_size as usize];
             source
                 .read_exact(smaller)
                 .map_err(|e| format!("Error reading raw block: {}", e))?;
-            workspace.buffer.push(smaller);
+            workspace.buffer.extend_from_slice(smaller);
 
             Ok(u64::from(header.decompressed_size))
         }
@@ -2454,6 +2478,10 @@ fn decompress_block(
         section.regenerated_size
     );
     assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
+    let literals_len = workspace.literals_buffer.len();
+    workspace
+        .literals_buffer
+        .resize(literals_len + WILDCOPY_OVERLENGTH, 0);
 
     let raw = &raw[upper_limit_for_literals..];
 
@@ -2470,13 +2498,16 @@ fn decompress_block(
     );
 
     if seq_section.num_sequences != 0 {
-        decode_sequences(
-            &seq_section,
-            raw,
-            &mut workspace.fse,
-            &mut workspace.sequences,
+        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        decode_and_execute_sequences(
+            seq_section.num_sequences,
+            &raw[table_bytes..],
+            &workspace.fse,
+            &workspace.literals_buffer,
+            literals_len,
+            &mut workspace.offset_hist,
+            &mut workspace.buffer,
         )?;
-        execute_sequences(workspace)?;
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -2484,8 +2515,9 @@ fn decompress_block(
                 raw.len() as isize * 8
             ));
         }
-        workspace.buffer.push(&workspace.literals_buffer);
-        workspace.sequences.clear();
+        workspace
+            .buffer
+            .extend_from_slice(&workspace.literals_buffer[..literals_len]);
     }
 
     Ok(())
@@ -2522,9 +2554,9 @@ impl FrameDecoder {
         }
 
         match &mut self.scratch {
-            Some(s) => s.reset(window_size as usize),
+            Some(s) => s.reset(),
             None => {
-                self.scratch = Some(DecoderScratch::new(window_size as usize));
+                self.scratch = Some(DecoderScratch::new());
             }
         }
 
@@ -2565,7 +2597,7 @@ impl FrameDecoder {
     }
 
     fn collect(&mut self) -> Option<Vec<u8>> {
-        self.scratch.as_mut().map(|s| s.buffer.drain())
+        self.scratch.as_mut().map(|s| std::mem::take(&mut s.buffer))
     }
 }
 
