@@ -139,7 +139,13 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 
 /// `ZSTD_loadDictionaryContent` for a raw-content prefix: index
 /// `src[range]` into the strategy's tables before the first block of a job.
+/// Only the last `1 << min(max(hashLog + 3, chainLog + 1), 31)` bytes are
+/// indexed ("larger than we can reasonably index in our tables"); matches
+/// may still reach the whole prefix, which `window_low` keeps valid.
 pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+    let cp = &ms.cparams;
+    let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
+    let range = range.start.max(range.end.saturating_sub(max_dict_size))..range.end;
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
@@ -274,6 +280,33 @@ pub fn compress_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prefix longer than `1 << max(hashLog + 3, chainLog + 1)` is indexed
+    /// only over that suffix; one byte shorter is indexed whole.
+    #[test]
+    fn load_prefix_indexes_only_the_table_sized_suffix() {
+        let cp = CParams::for_level(1, 8 << 20);
+        let cap = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1);
+        let mut x = 1u32;
+        let src: Vec<u8> = (0..cap + 4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let lowest = |len: usize| {
+            let mut ms = MatchState::new(cp, 1);
+            load_prefix(&mut ms, &src, src.len() - len..src.len());
+            let (hash, _, _) = ms.tables();
+            hash.iter().filter(|&&e| e != 0).min().copied().unwrap() as usize
+        };
+        assert!(lowest(cap + 1000) >= src.len() - cap);
+        assert!(lowest(cap) >= src.len() - cap);
+        assert!(lowest(cap - 1) > src.len() - cap);
+        assert!(lowest(cap + 1000) < src.len() - cap + 64);
+    }
 
     #[test]
     fn limit_update_after_long_match_boundaries() {
