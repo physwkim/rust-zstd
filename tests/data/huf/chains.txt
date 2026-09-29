@@ -1,0 +1,13 @@
+# chain strategy input:nb_seq...  Expected literals sections <chain>__<input>.expected
+# come from libzstd 1.5.7 ZSTD_compressLiterals with prevHuf carried along the chain.
+raw63 1 raw63:5
+rle100 1 rle100:5
+skew200 1 skew200:10
+text2000 3 text2000:100
+skew800_chain_fast 1 skew800_0:40 skew800_1:40 skew800_2:40
+skew3000_chain_lazy2 5 skew3000_0:150 skew3000_1:150 skew3000_2:150
+wide2000 2 wide2000:100
+steep4000 4 steep4000:200
+sampled41000_suspect 1 sampled41000:0
+sampled41000_trusted 1 sampled41000:100000
+ties1000 5 ties1000:50

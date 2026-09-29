@@ -3,7 +3,7 @@
 
 use super::bitstream::BackwardBitWriter;
 use crate::compress::seqstore::Seq;
-use crate::compress::Strategy;
+use crate::compress::{CParams, Strategy};
 use crate::constants::*;
 
 /// `MaxSeq`: the largest sequence code of any kind.
@@ -240,6 +240,64 @@ pub fn encode_sequences(
     bw.flush_bits();
 
     bw.finish()
+}
+
+/// `FSE_compress_usingCTable` (the 64-bit `FSE_compress_usingCTable_generic`):
+/// two interleaved states over `src`, appended to `out` as a backward
+/// bitstream. Returns the byte size, or `0` for `src.len() <= 2`.
+pub fn compress_using_ctable(out: &mut Vec<u8>, src: &[u8], ct: &FseCTable) -> usize {
+    let mut src_size = src.len();
+    if src_size <= 2 {
+        return 0;
+    }
+    let mut bw = BackwardBitWriter::new();
+    let mut ip = src_size;
+    let next = |ip: &mut usize| {
+        *ip -= 1;
+        src[*ip] as usize
+    };
+    let encode = |bw: &mut BackwardBitWriter, state: &mut u32, symbol: usize| {
+        let (bits, nb, new_state) = ct.encode_symbol(*state, symbol);
+        bw.add_bits(bits as u64, nb);
+        *state = new_state;
+    };
+
+    let (mut state1, mut state2);
+    if src_size & 1 != 0 {
+        state1 = ct.init_state(next(&mut ip));
+        state2 = ct.init_state(next(&mut ip));
+        encode(&mut bw, &mut state1, next(&mut ip));
+        bw.flush_bits();
+    } else {
+        state2 = ct.init_state(next(&mut ip));
+        state1 = ct.init_state(next(&mut ip));
+    }
+
+    // join to mod 4
+    src_size -= 2;
+    if src_size & 2 != 0 {
+        encode(&mut bw, &mut state2, next(&mut ip));
+        encode(&mut bw, &mut state1, next(&mut ip));
+        bw.flush_bits();
+    }
+
+    // 4 encoding per loop
+    while ip > 0 {
+        encode(&mut bw, &mut state2, next(&mut ip));
+        encode(&mut bw, &mut state1, next(&mut ip));
+        encode(&mut bw, &mut state2, next(&mut ip));
+        encode(&mut bw, &mut state1, next(&mut ip));
+        bw.flush_bits();
+    }
+
+    // FSE_flushCState
+    bw.add_bits(state2 as u64, ct.table_log);
+    bw.flush_bits();
+    bw.add_bits(state1 as u64, ct.table_log);
+    bw.flush_bits();
+    let stream = bw.finish();
+    out.extend_from_slice(&stream);
+    stream.len()
 }
 
 /// `SymbolEncodingType_e`: how one sequence table is transmitted.
@@ -960,8 +1018,9 @@ pub fn encode_sequences_section_with(
     out: &mut Vec<u8>,
     sequences: &[Seq],
     prev: &FseState,
-    strategy: Strategy,
+    cparams: &CParams,
 ) -> Option<FseState> {
+    let strategy = cparams.strategy;
     let nb_seq = sequences.len();
 
     // Sequences Header
@@ -1222,12 +1281,25 @@ mod tests {
             .collect()
     }
 
+    /// A `CParams` whose only field the sequences encoder reads is `strategy`.
+    fn cparams(strategy: Strategy) -> CParams {
+        CParams {
+            window_log: 19,
+            chain_log: 12,
+            hash_log: 12,
+            search_log: 1,
+            min_match: 4,
+            target_length: 0,
+            strategy,
+        }
+    }
+
     /// Encoding types from the Sequences_Section_Header written by
     /// `encode_sequences_section_with` for `seqs` (`nb_seq >= 128` and
     /// `< LONGNBSEQ` assumed, so the count takes 2 bytes).
     fn section_types(seqs: &[Seq], prev: &FseState, strategy: Strategy) -> (u8, u8, u8, FseState) {
         let mut out = Vec::new();
-        let next = encode_sequences_section_with(&mut out, seqs, prev, strategy).unwrap();
+        let next = encode_sequences_section_with(&mut out, seqs, prev, &cparams(strategy)).unwrap();
         assert!((128..LONGNBSEQ).contains(&seqs.len()));
         let head = out[2];
         (head >> 6, (head >> 4) & 3, (head >> 2) & 3, next)
@@ -1276,13 +1348,23 @@ mod tests {
         // dynamicFse_nbSeq_min for LL with Fast: (64 * 9) >> 3 = 72
         let seqs = skewed_seqs(71);
         let mut out = Vec::new();
-        encode_sequences_section_with(&mut out, &seqs, &FseState::default(), Strategy::Fast)
-            .unwrap();
+        encode_sequences_section_with(
+            &mut out,
+            &seqs,
+            &FseState::default(),
+            &cparams(Strategy::Fast),
+        )
+        .unwrap();
         assert_eq!(out[1] >> 6, 0);
         let seqs = skewed_seqs(72);
         let mut out = Vec::new();
-        encode_sequences_section_with(&mut out, &seqs, &FseState::default(), Strategy::Fast)
-            .unwrap();
+        encode_sequences_section_with(
+            &mut out,
+            &seqs,
+            &FseState::default(),
+            &cparams(Strategy::Fast),
+        )
+        .unwrap();
         assert_eq!(out[1] >> 6, 2);
     }
 
@@ -1300,7 +1382,7 @@ mod tests {
                 &mut out,
                 &seqs,
                 &FseState::default(),
-                Strategy::Lazy,
+                &cparams(Strategy::Lazy),
             )
             .unwrap();
             assert_eq!(out[1] >> 6, expected, "nb_seq {nb_seq}");
