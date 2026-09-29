@@ -8,21 +8,78 @@ pub const HASH_READ_SIZE: usize = 8;
 pub const K_SEARCH_STRENGTH: u32 = 8;
 
 /// `MEM_read16`.
+///
+/// # Safety
+/// `pos + 2 <= src.len()`.
 #[inline(always)]
-pub fn read16(src: &[u8], pos: usize) -> u16 {
-    u16::from_le_bytes(src[pos..pos + 2].try_into().unwrap())
+pub unsafe fn read16(src: &[u8], pos: usize) -> u16 {
+    debug_assert!(pos + 2 <= src.len());
+    u16::from_le_bytes(*(src.as_ptr().add(pos) as *const [u8; 2]))
 }
 
 /// `MEM_read32` / `MEM_readLE32`.
+///
+/// # Safety
+/// `pos + 4 <= src.len()`.
 #[inline(always)]
-pub fn read32(src: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes(src[pos..pos + 4].try_into().unwrap())
+pub unsafe fn read32(src: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= src.len());
+    u32::from_le_bytes(*(src.as_ptr().add(pos) as *const [u8; 4]))
 }
 
 /// `MEM_read64` / `MEM_readLE64`.
+///
+/// # Safety
+/// `pos + 8 <= src.len()`.
 #[inline(always)]
-pub fn read64(src: &[u8], pos: usize) -> u64 {
-    u64::from_le_bytes(src[pos..pos + 8].try_into().unwrap())
+pub unsafe fn read64(src: &[u8], pos: usize) -> u64 {
+    debug_assert!(pos + 8 <= src.len());
+    u64::from_le_bytes(*(src.as_ptr().add(pos) as *const [u8; 8]))
+}
+
+/// `src[pos]`.
+///
+/// # Safety
+/// `pos < src.len()`.
+#[inline(always)]
+pub unsafe fn byte(src: &[u8], pos: usize) -> u8 {
+    debug_assert!(pos < src.len());
+    *src.get_unchecked(pos)
+}
+
+/// `table[h]`.
+///
+/// # Safety
+/// `h < table.len()`.
+#[inline(always)]
+pub unsafe fn tget(table: &[u32], h: usize) -> usize {
+    debug_assert!(h < table.len());
+    *table.get_unchecked(h) as usize
+}
+
+/// `table[h] = v`.
+///
+/// # Safety
+/// `h < table.len()`.
+#[inline(always)]
+pub unsafe fn tset(table: &mut [u32], h: usize, v: usize) {
+    debug_assert!(h < table.len());
+    *table.get_unchecked_mut(h) = v as u32;
+}
+
+/// Is the table entry `idx` a usable candidate for position `cur`, i.e.
+/// `low <= idx < cur`? `low` is the lowest valid index (`low <= cur`).
+///
+/// The upper bound is always true for a table filled by this module and
+/// only makes a stale entry of a misused `MatchState` a miss instead of an
+/// out-of-bounds read. It is folded into one unsigned compare on purpose:
+/// with two compares LLVM turns the branch-free candidate select of the
+/// callers (the C `ZSTD_selectAddr` idiom) into a branch, which costs the
+/// double-fast finder 18% throughput.
+#[inline(always)]
+pub fn candidate_valid(idx: usize, low: usize, cur: usize) -> bool {
+    debug_assert!(low <= cur);
+    idx.wrapping_sub(low) < cur - low
 }
 
 /// `PREFETCH_L1(src + pos)`: a cache hint, no-op when `pos` is outside
@@ -55,10 +112,14 @@ const PRIME8: u64 = 0xCF1BBCDCB7A56463;
 
 /// `ZSTD_hashPtr(p, hBits, mls)`: hash of the `MLS` bytes at `src[pos]`,
 /// `MLS` in `4..=8`; any other value hashes 4 bytes like libzstd's
-/// `default` arm. `MLS >= 5` reads 8 bytes, so `pos + 8 <= src.len()` is
-/// required. The result is `< 1 << hbits` by construction.
+/// `default` arm. The result is `< 1 << hbits` by construction
+/// (`1 <= hbits <= 32`).
+///
+/// # Safety
+/// `pos + HASH_READ_SIZE <= src.len()` (`MLS >= 5` reads 8 bytes).
 #[inline(always)]
-pub fn hash_ptr<const MLS: u32>(src: &[u8], pos: usize, hbits: u32) -> usize {
+pub unsafe fn hash_ptr<const MLS: u32>(src: &[u8], pos: usize, hbits: u32) -> usize {
+    debug_assert!((1..=32).contains(&hbits));
     match MLS {
         5 => (((read64(src, pos) << (64 - 40)).wrapping_mul(PRIME5)) >> (64 - hbits)) as usize,
         6 => (((read64(src, pos) << (64 - 48)).wrapping_mul(PRIME6)) >> (64 - hbits)) as usize,
@@ -69,9 +130,12 @@ pub fn hash_ptr<const MLS: u32>(src: &[u8], pos: usize, hbits: u32) -> usize {
 }
 
 /// `ZSTD_count(pIn, pMatch, pInLimit)`: length of the common prefix of
-/// `src[a..limit]` and `src[b..]`, `b < a <= limit`.
+/// `src[a..limit]` and `src[b..]`.
+///
+/// # Safety
+/// `b < a <= limit <= src.len()`.
 #[inline]
-pub fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+pub unsafe fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
     debug_assert!(b < a && a <= limit && limit <= src.len());
     let start = a;
     let (mut a, mut b) = (a, b);
@@ -102,7 +166,7 @@ pub fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
         a += 2;
         b += 2;
     }
-    if a < limit && src[b] == src[a] {
+    if a < limit && byte(src, b) == byte(src, a) {
         a += 1;
     }
     a - start
@@ -343,28 +407,33 @@ mod tests {
         let src: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
         let v32 = u32::from_le_bytes(src[3..7].try_into().unwrap());
         let v64 = u64::from_le_bytes(src[3..11].try_into().unwrap());
+        // SAFETY: 3 + 8 <= 32.
+        let (h3, h4, h5, h6, h7, h8) = unsafe {
+            (
+                hash_ptr::<3>(&src, 3, 14),
+                hash_ptr::<4>(&src, 3, 14),
+                hash_ptr::<5>(&src, 3, 17),
+                hash_ptr::<6>(&src, 3, 16),
+                hash_ptr::<7>(&src, 3, 14),
+                hash_ptr::<8>(&src, 3, 17),
+            )
+        };
+        assert_eq!(h4, (v32.wrapping_mul(2654435761) >> 18) as usize);
         assert_eq!(
-            hash_ptr::<4>(&src, 3, 14),
-            (v32.wrapping_mul(2654435761) >> 18) as usize
-        );
-        assert_eq!(
-            hash_ptr::<5>(&src, 3, 17),
+            h5,
             (((v64 << 24).wrapping_mul(889523592379)) >> 47) as usize
         );
         assert_eq!(
-            hash_ptr::<6>(&src, 3, 16),
+            h6,
             (((v64 << 16).wrapping_mul(227718039650203)) >> 48) as usize
         );
         assert_eq!(
-            hash_ptr::<7>(&src, 3, 14),
+            h7,
             (((v64 << 8).wrapping_mul(58295818150454627)) >> 50) as usize
         );
-        assert_eq!(
-            hash_ptr::<8>(&src, 3, 17),
-            ((v64.wrapping_mul(0xCF1BBCDCB7A56463)) >> 47) as usize
-        );
+        assert_eq!(h8, ((v64.wrapping_mul(0xCF1BBCDCB7A56463)) >> 47) as usize);
         // mls 3 falls into the 4-byte arm
-        assert_eq!(hash_ptr::<3>(&src, 3, 14), hash_ptr::<4>(&src, 3, 14));
+        assert_eq!(h3, h4);
     }
 
     #[test]
@@ -379,14 +448,17 @@ mod tests {
                 src[100 + i] = src[i];
             }
             src[100 + n] = src[n].wrapping_add(1);
-            assert_eq!(count(&src, 100, 0, 200), n, "n={n}");
-            // limit cuts the match short at every tail size
-            for limit in 100..=100 + n {
-                assert_eq!(
-                    count(&src, 100, 0, limit),
-                    limit - 100,
-                    "n={n} limit={limit}"
-                );
+            // SAFETY: 0 < 100 <= limit <= 200 == src.len().
+            unsafe {
+                assert_eq!(count(&src, 100, 0, 200), n, "n={n}");
+                // limit cuts the match short at every tail size
+                for limit in 100..=100 + n {
+                    assert_eq!(
+                        count(&src, 100, 0, limit),
+                        limit - 100,
+                        "n={n} limit={limit}"
+                    );
+                }
             }
         }
     }

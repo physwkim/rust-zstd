@@ -6,6 +6,10 @@
 //! puts the first input byte at index `ZSTD_WINDOW_START_INDEX == 1`; here
 //! `src[0]` sits at index 0, the empty-entry sentinel, so block 0 of a job
 //! starts one byte later than libzstd does. Everything else is index-exact.
+//!
+//! The search loop reads `src` and the hash table without bounds checks
+//! (the checks cost 10-16% of the throughput). Every read is covered by
+//! one of the invariants stated in [`compress_block_generic`].
 
 // Shared helpers live in common.rs; it is declared here so that the module
 // list in mod.rs stays untouched. `super::fast::common` is its path.
@@ -14,31 +18,38 @@ pub mod common;
 
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
-use common::{count, hash_ptr, prefetch, read32, HASH_READ_SIZE, K_SEARCH_STRENGTH};
+use common::{
+    byte, candidate_valid, count, hash_ptr, prefetch, read32, tget, tset, HASH_READ_SIZE,
+    K_SEARCH_STRENGTH,
+};
 use std::ops::Range;
 
 /// `kStepIncr` of the fast strategy.
 const K_STEP_INCR: usize = 1 << (K_SEARCH_STRENGTH - 1);
 
 /// `ZSTD_match4Found_cmov` / `ZSTD_match4Found_branch`: does the 4-byte
-/// candidate at `match_idx` (valid iff `>= idx_low_limit`) equal `src[cur..]`?
+/// candidate at `match_idx` equal `src[cur..]`? A candidate is valid iff
+/// `idx_low_limit <= match_idx < cur` (see [`candidate_valid`]).
+///
+/// # Safety
+/// `cur + 4 <= src.len()`.
 #[inline(always)]
-fn match4_found<const CMOV: bool>(
+unsafe fn match4_found<const CMOV: bool>(
     src: &[u8],
     cur: usize,
     match_idx: usize,
     idx_low_limit: usize,
 ) -> bool {
+    let valid = candidate_valid(match_idx, idx_low_limit, cur);
     if CMOV {
         // The C version loads from a dummy array when the index is out of
         // range so that the range test compiles to a conditional move.
         // Loading `cur` and flipping a bit guarantees the same mismatch.
-        let valid = match_idx >= idx_low_limit;
         let pos = if valid { match_idx } else { cur };
         let mval = read32(src, pos) ^ (!valid as u32);
         read32(src, cur) == mval
     } else {
-        let mval = if match_idx >= idx_low_limit {
+        let mval = if valid {
             read32(src, match_idx)
         } else {
             read32(src, cur) ^ 1 // guaranteed to not match
@@ -59,6 +70,24 @@ enum Found {
 
 /// `ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, srcSize,
 /// mls, useCmov)`, monomorphized over `MLS` and `CMOV`.
+///
+/// Bounds invariants covering every unchecked read below:
+///
+/// * (I1) ip-derived positions: inside the search loop
+///   `ip0 < ip1 < ip2 < ip3 < ilimit = iend - 8`, so 8-byte reads at
+///   `ip0..=ip2` end before `iend <= src.len()`; after a match the reads at
+///   `current0 + 2`, `ip0 - 2` and `ip0` are guarded by `ip0 <= ilimit`
+///   (`current0 + 4 <= ip0`). `ip0 - 1 >= prefix_start >= window_low >= 1`.
+/// * (I2) candidates: a table entry is used only after [`match4_found`]
+///   established `prefix_start <= match_idx < ip0`, so `match_idx + 4 <=
+///   ip0 + 4 <= iend` and `ip0 - match_idx >= 1`.
+/// * (I3) repcodes: on entry `rep_offset1/2 <= ip0 - window_low(ip0)`;
+///   afterwards `rep_offset1 = ip0 - match_idx` with (I2), and
+///   `rep_offset2` is a former `rep_offset1`. A repcode is only applied at
+///   positions `p >= ` the `ip0` it was derived at, hence
+///   `1 <= p - rep < p` and `p - rep >= window_low >= 1` (`rep == 0` means
+///   disabled and reads `p` itself).
+/// * (I4) `hash_ptr` returns `< 1 << hlog == hash_table.len()`.
 fn compress_block_generic<const MLS: u32, const CMOV: bool>(
     ms: &mut MatchState,
     src: &[u8],
@@ -72,6 +101,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
     let istart = block.start;
     let iend = block.end;
     assert!(istart <= iend && iend <= src.len());
+    assert!((1..=32).contains(&hlog));
     let prefix_start = ms.lowest_prefix_index(iend);
     // C: ilimit = iend - HASH_READ_SIZE, possibly below istart; every
     // comparison against it then sends the loop to _cleanup.
@@ -101,7 +131,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
     }
 
     let hash_table = &mut ms.hash_table[..];
-    assert_eq!(hash_table.len(), 1usize << hlog);
+    assert_eq!(hash_table.len(), 1usize << hlog); // (I4)
 
     // _start: requires ip0
     'start: loop {
@@ -117,94 +147,105 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
             break 'start; // _cleanup
         }
 
-        let mut hash0 = hash_ptr::<MLS>(src, ip0, hlog);
-        let mut hash1 = hash_ptr::<MLS>(src, ip1, hlog);
-        let mut match_idx = hash_table[hash0] as usize;
+        // SAFETY: (I1) for ip0, ip1; (I4) for the table.
+        let (mut hash0, mut hash1, mut match_idx) = unsafe {
+            let hash0 = hash_ptr::<MLS>(src, ip0, hlog);
+            (
+                hash0,
+                hash_ptr::<MLS>(src, ip1, hlog),
+                tget(hash_table, hash0),
+            )
+        };
         let mut current0;
 
-        let found = loop {
-            // load repcode match for ip[2]
-            let rval = read32(src, ip2 - rep_offset1 as usize);
+        // SAFETY: (I1) for every ip-derived read, (I2) for the candidate
+        // reads inside match4_found, (I3) for `ip2 - rep_offset1` and the
+        // bytes before it, (I4) for every table access.
+        let found = unsafe {
+            loop {
+                // load repcode match for ip[2]
+                let rval = read32(src, ip2 - rep_offset1 as usize);
 
-            // write back hash table entry
-            current0 = ip0;
-            hash_table[hash0] = current0 as u32;
+                // write back hash table entry
+                current0 = ip0;
+                tset(hash_table, hash0, current0);
 
-            // check repcode at ip[2]
-            if (read32(src, ip2) == rval) & (rep_offset1 > 0) {
-                ip0 = ip2;
-                let mut match0 = ip0 - rep_offset1 as usize;
-                let m_length = (src[ip0 - 1] == src[match0 - 1]) as usize;
-                ip0 -= m_length;
-                match0 -= m_length;
-                // Write next hash table entry: it's already calculated. This
-                // write is known to be safe because ip1 is before the
-                // repcode (ip2).
-                hash_table[hash1] = ip1 as u32;
-                break Found::Rep {
-                    match0,
-                    m_length: m_length + 4,
-                };
-            }
-
-            if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
-                // Write next hash table entry (it's already calculated). This
-                // write is known to be safe because the ip1 == ip0 + 1, so
-                // searching will resume after ip1.
-                hash_table[hash1] = ip1 as u32;
-                break Found::Offset;
-            }
-
-            // lookup ip[1]
-            match_idx = hash_table[hash1] as usize;
-
-            // hash ip[2]
-            hash0 = hash1;
-            hash1 = hash_ptr::<MLS>(src, ip2, hlog);
-
-            // advance to next positions
-            ip0 = ip1;
-            ip1 = ip2;
-            ip2 = ip3;
-
-            // write back hash table entry
-            current0 = ip0;
-            hash_table[hash0] = current0 as u32;
-
-            if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
-                // Write next hash table entry, since it's already calculated
-                if step <= 4 {
-                    // Avoid writing an index if it's >= position where search
-                    // will resume. The minimum possible match has length 4,
-                    // so search can resume at ip0 + 4.
-                    hash_table[hash1] = ip1 as u32;
+                // check repcode at ip[2]
+                if (read32(src, ip2) == rval) & (rep_offset1 > 0) {
+                    ip0 = ip2;
+                    let mut match0 = ip0 - rep_offset1 as usize;
+                    let m_length = (byte(src, ip0 - 1) == byte(src, match0 - 1)) as usize;
+                    ip0 -= m_length;
+                    match0 -= m_length;
+                    // Write next hash table entry: it's already calculated.
+                    // This write is known to be safe because ip1 is before
+                    // the repcode (ip2).
+                    tset(hash_table, hash1, ip1);
+                    break Found::Rep {
+                        match0,
+                        m_length: m_length + 4,
+                    };
                 }
-                break Found::Offset;
-            }
 
-            // lookup ip[1]
-            match_idx = hash_table[hash1] as usize;
+                if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
+                    // Write next hash table entry (it's already calculated).
+                    // This write is known to be safe because the ip1 == ip0
+                    // + 1, so searching will resume after ip1.
+                    tset(hash_table, hash1, ip1);
+                    break Found::Offset;
+                }
 
-            // hash ip[2]
-            hash0 = hash1;
-            hash1 = hash_ptr::<MLS>(src, ip2, hlog);
+                // lookup ip[1]
+                match_idx = tget(hash_table, hash1);
 
-            // advance to next positions
-            ip0 = ip1;
-            ip1 = ip2;
-            ip2 = ip0 + step;
-            ip3 = ip1 + step;
+                // hash ip[2]
+                hash0 = hash1;
+                hash1 = hash_ptr::<MLS>(src, ip2, hlog);
 
-            // calculate step
-            if ip2 >= next_step {
-                step += 1;
-                prefetch(src, ip1 + 64);
-                prefetch(src, ip1 + 128);
-                next_step += K_STEP_INCR;
-            }
+                // advance to next positions
+                ip0 = ip1;
+                ip1 = ip2;
+                ip2 = ip3;
 
-            if ip3 >= ilimit {
-                break Found::Cleanup;
+                // write back hash table entry
+                current0 = ip0;
+                tset(hash_table, hash0, current0);
+
+                if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
+                    // Write next hash table entry, since it's already calculated
+                    if step <= 4 {
+                        // Avoid writing an index if it's >= position where
+                        // search will resume. The minimum possible match has
+                        // length 4, so search can resume at ip0 + 4.
+                        tset(hash_table, hash1, ip1);
+                    }
+                    break Found::Offset;
+                }
+
+                // lookup ip[1]
+                match_idx = tget(hash_table, hash1);
+
+                // hash ip[2]
+                hash0 = hash1;
+                hash1 = hash_ptr::<MLS>(src, ip2, hlog);
+
+                // advance to next positions
+                ip0 = ip1;
+                ip1 = ip2;
+                ip2 = ip0 + step;
+                ip3 = ip1 + step;
+
+                // calculate step
+                if ip2 >= next_step {
+                    step += 1;
+                    prefetch(src, ip1 + 64);
+                    prefetch(src, ip1 + 128);
+                    next_step += K_STEP_INCR;
+                }
+
+                if ip3 >= ilimit {
+                    break Found::Cleanup;
+                }
             }
         };
 
@@ -219,18 +260,24 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
                 let offcode = offset_to_offbase(rep_offset1);
                 let mut m_length = 4;
                 // Count the backwards match length.
-                while ((ip0 > anchor) & (match0 > prefix_start)) && src[ip0 - 1] == src[match0 - 1]
-                {
-                    ip0 -= 1;
-                    match0 -= 1;
-                    m_length += 1;
+                // SAFETY: ip0 > anchor >= istart and match0 > prefix_start
+                // keep both indices >= 1 and below ip0 < iend.
+                unsafe {
+                    while ((ip0 > anchor) & (match0 > prefix_start))
+                        && byte(src, ip0 - 1) == byte(src, match0 - 1)
+                    {
+                        ip0 -= 1;
+                        match0 -= 1;
+                        m_length += 1;
+                    }
                 }
                 (match0, offcode, m_length)
             }
         };
 
         // _match: requires ip0, match0, offcode. Count the forward length.
-        m_length += count(src, ip0 + m_length, match0 + m_length, iend);
+        // SAFETY: match0 < ip0 (I2/I3) and ip0 + m_length <= ip2 + 4 < iend.
+        m_length += unsafe { count(src, ip0 + m_length, match0 + m_length, iend) };
 
         out.store_seq(src, anchor, ip0 - anchor, offcode, m_length);
 
@@ -239,20 +286,31 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
 
         // Fill table and check for immediate repcode.
         if ip0 <= ilimit {
-            // Fill Table: here because current+2 could be > iend-8
-            hash_table[hash_ptr::<MLS>(src, current0 + 2, hlog)] = (current0 + 2) as u32;
-            hash_table[hash_ptr::<MLS>(src, ip0 - 2, hlog)] = (ip0 - 2) as u32;
+            // SAFETY: (I1) with ip0 <= ilimit; (I3) for ip0 - rep_offset2;
+            // (I4) for the table.
+            unsafe {
+                // Fill Table: here because current+2 could be > iend-8
+                tset(
+                    hash_table,
+                    hash_ptr::<MLS>(src, current0 + 2, hlog),
+                    current0 + 2,
+                );
+                tset(hash_table, hash_ptr::<MLS>(src, ip0 - 2, hlog), ip0 - 2);
 
-            // rep_offset2 == 0 means rep_offset2 is invalidated
-            if rep_offset2 > 0 {
-                while ip0 <= ilimit && read32(src, ip0) == read32(src, ip0 - rep_offset2 as usize) {
-                    // store sequence
-                    let r_length = count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
-                    std::mem::swap(&mut rep_offset1, &mut rep_offset2);
-                    hash_table[hash_ptr::<MLS>(src, ip0, hlog)] = ip0 as u32;
-                    ip0 += r_length;
-                    out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
-                    anchor = ip0;
+                // rep_offset2 == 0 means rep_offset2 is invalidated
+                if rep_offset2 > 0 {
+                    while ip0 <= ilimit
+                        && read32(src, ip0) == read32(src, ip0 - rep_offset2 as usize)
+                    {
+                        // store sequence
+                        let r_length =
+                            count(src, ip0 + 4, ip0 + 4 - rep_offset2 as usize, iend) + 4;
+                        std::mem::swap(&mut rep_offset1, &mut rep_offset2);
+                        tset(hash_table, hash_ptr::<MLS>(src, ip0, hlog), ip0);
+                        ip0 += r_length;
+                        out.store_seq(src, anchor, 0, REPCODE1_TO_OFFBASE, r_length);
+                        anchor = ip0;
+                    }
                 }
             }
         }
@@ -317,6 +375,8 @@ pub fn compress_block(
 fn fill_hash_table<const MLS: u32>(ms: &mut MatchState, src: &[u8], start: usize, end: usize) {
     const FAST_HASH_FILL_STEP: usize = 3;
     let hbits = ms.cparams.hash_log;
+    assert!((1..=32).contains(&hbits));
+    assert!(end <= src.len());
     let hash_table = &mut ms.hash_table[..];
     assert_eq!(hash_table.len(), 1usize << hbits);
     let mut ip = start;
@@ -324,7 +384,8 @@ fn fill_hash_table<const MLS: u32>(ms: &mut MatchState, src: &[u8], start: usize
     // with iend = end - HASH_READ_SIZE. Always insert every
     // fastHashFillStep position into the hash table.
     while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
-        hash_table[hash_ptr::<MLS>(src, ip, hbits)] = ip as u32;
+        // SAFETY: ip + 10 <= end <= src.len(); hash < 1 << hbits == len.
+        unsafe { tset(hash_table, hash_ptr::<MLS>(src, ip, hbits), ip) };
         ip += FAST_HASH_FILL_STEP;
     }
 }
@@ -488,5 +549,23 @@ mod tests {
         assert_eq!(store.reconstruct(&[], [100, 4, 8]), src);
         assert_eq!(rep[1], 100);
         assert_eq!(rep[2], 8);
+    }
+
+    /// A table entry pointing past the current position (a MatchState
+    /// reused on a shorter input) must be a miss, never a read past `src`.
+    #[test]
+    fn stale_table_entries_beyond_the_input_are_ignored() {
+        let long = synthetic_text(300_000, 9);
+        let cp = CParams::for_level(1, long.len());
+        let mut ms = MatchState::new(cp, 1);
+        let mut store = SeqStore::new();
+        let mut rep = [1u32, 4, 8];
+        compress_block(&mut ms, &long, 0..long.len(), &mut rep, &mut store);
+        let short = &long[..20_000];
+        store.clear();
+        let mut rep = [1u32, 4, 8];
+        let anchor = compress_block(&mut ms, short, 0..short.len(), &mut rep, &mut store);
+        store.lits.extend_from_slice(&short[anchor..]);
+        assert_eq!(store.reconstruct(&[], [1, 4, 8]), short);
     }
 }
