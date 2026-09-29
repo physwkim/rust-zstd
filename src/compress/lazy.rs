@@ -526,6 +526,10 @@ struct RowSearch<M: TagMask, const MLS: u32, const ROW_LOG: u32> {
     /// block prologue (`ZSTD_row_fillHashCache`) and after lazy skipping, so
     /// it never carries information across blocks and lives here.
     hash_cache: [u32; ROW_HASH_CACHE_SIZE],
+    /// `matchBuffer` of `ZSTD_RowFindBestMatch`: an uninitialised local in
+    /// C. Kept here so that it is not zeroed again on every search; only
+    /// `..num_matches` is ever read.
+    match_buffer: [u32; ROW_HASH_MAX_ENTRIES],
 }
 
 impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> {
@@ -536,6 +540,7 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
         Self {
             mask,
             hash_cache: [0; ROW_HASH_CACHE_SIZE],
+            match_buffer: [0; ROW_HASH_MAX_ENTRIES],
         }
     }
 
@@ -685,7 +690,6 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
         let tag = (hash & ROW_HASH_TAG_MASK) as u8;
         let head_grouped = ((ms.tag_table[rel_row] as u32) & Self::ROW_MASK) * group_width;
-        let mut match_buffer = [0u32; ROW_HASH_MAX_ENTRIES];
         let mut num_matches = 0usize;
         let mut matches = self.mask.match_mask::<ROW_LOG>(
             &ms.tag_table[rel_row..rel_row + Self::ROW_ENTRIES],
@@ -706,7 +710,7 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
                 break;
             }
             prefetch_l1(src, match_index as usize);
-            match_buffer[num_matches] = match_index;
+            self.match_buffer[num_matches] = match_index;
             num_matches += 1;
             nb_attempts -= 1;
         }
@@ -722,7 +726,7 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         }
 
         // Return the longest match
-        for &match_index in &match_buffer[..num_matches] {
+        for &match_index in &self.match_buffer[..num_matches] {
             let match_index = match_index as usize;
             debug_assert!(match_index < curr && match_index >= low_limit);
             // read 4B starting from (match + ml + 1 - sizeof(U32))
