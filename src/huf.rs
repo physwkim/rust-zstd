@@ -612,19 +612,23 @@ pub fn write_ctable(
 /// in the output least-significant first, i.e. a backward bitstream.
 struct HufCStream<'a> {
     bit_container: [u64; 2],
-    bit_pos: [u32; 2],
+    /// Only the low 8 bits count: the fast add accumulates whole elements,
+    /// as the C does, so the upper bits are noise.
+    bit_pos: [u64; 2],
     buf: &'a mut [u8],
     ptr: usize,
 }
 
 impl HufCStream<'_> {
-    /// `HUF_addBits` with the C `kFast == 0` masking (`HUF_getValue`).
+    /// `HUF_addBits`. With `FAST` (`HUF_getValueFast`) the element's
+    /// length field is or-ed in as noise below the payload; the flush
+    /// never emits it, and the group sizes (`kUnroll`, `kLastFast`) keep it
+    /// below the live bits.
     #[inline(always)]
-    fn add_bits(&mut self, elt: u64, idx: usize) {
-        let nb_bits = (elt & 0xFF) as u32;
-        self.bit_container[idx] >>= nb_bits;
-        self.bit_container[idx] |= elt & !0xFF;
-        self.bit_pos[idx] += nb_bits;
+    fn add_bits<const FAST: bool>(&mut self, elt: u64, idx: usize) {
+        self.bit_container[idx] >>= elt & 0xFF;
+        self.bit_container[idx] |= if FAST { elt } else { elt & !0xFF };
+        self.bit_pos[idx] = self.bit_pos[idx].wrapping_add(if FAST { elt } else { elt & 0xFF });
     }
 
     /// `HUF_zeroIndex1`.
@@ -637,73 +641,102 @@ impl HufCStream<'_> {
     /// `HUF_mergeIndex1`.
     #[inline(always)]
     fn merge_index1(&mut self) {
-        debug_assert!(self.bit_pos[1] < 64);
-        self.bit_container[0] >>= self.bit_pos[1];
+        debug_assert!(self.bit_pos[1] & 0xFF < 64);
+        self.bit_container[0] >>= self.bit_pos[1] & 0xFF;
         self.bit_container[0] |= self.bit_container[1];
-        self.bit_pos[0] += self.bit_pos[1];
+        self.bit_pos[0] = self.bit_pos[0].wrapping_add(self.bit_pos[1]);
     }
 
-    /// `HUF_flushBits`: store the container's top `bit_pos` bits as one
-    /// little-endian word and advance by the whole bytes among them.
+    /// `HUF_flushBits` with `kFast`: store the container's top `bit_pos`
+    /// bits as one little-endian word and advance by the whole bytes among
+    /// them.
     #[inline(always)]
     fn flush_bits(&mut self) {
-        let nb_bits = self.bit_pos[0];
+        let nb_bits = (self.bit_pos[0] & 0xFF) as u32;
         debug_assert!(nb_bits > 0 && nb_bits <= 64);
         let nb_bytes = (nb_bits >> 3) as usize;
         let word = self.bit_container[0] >> (64 - nb_bits);
         self.bit_pos[0] &= 7;
-        self.buf[self.ptr..self.ptr + 8].copy_from_slice(&word.to_le_bytes());
+        debug_assert!(self.ptr + 8 <= self.buf.len());
+        // SAFETY: `buf` holds `tight_compress_bound(n, table_log)` =
+        // `((n * table_log) >> 3) + 8` bytes and every symbol takes at most
+        // `table_log` bits, so the bytes flushed before this store number
+        // at most `(n * table_log) >> 3` and the 8-byte store ends inside
+        // `buf` (the C `kFastFlush` relies on the same bound).
+        unsafe {
+            self.buf
+                .as_mut_ptr()
+                .add(self.ptr)
+                .cast::<u64>()
+                .write_unaligned(word.to_le());
+        }
         self.ptr += nb_bytes;
     }
 
     /// `HUF_closeCStream`: end mark, final flush, byte size.
     fn close(mut self) -> usize {
         const END_MARK: u64 = (1 << 63) | 1; // HUF_endMark: value 1, 1 bit
-        self.add_bits(END_MARK, 0);
+        self.add_bits::<false>(END_MARK, 0);
         self.flush_bits();
-        self.ptr + (self.bit_pos[0] > 0) as usize
+        self.ptr + (self.bit_pos[0] & 0xFF > 0) as usize
     }
 }
 
-/// `HUF_compress1X_usingCTable_internal_body_loop`: `K_UNROLL` symbols per
-/// container, two containers per outer iteration.
+/// `kUnroll` symbols of one group, highest address first, the last one
+/// masked unless `LAST_FAST` (`kLastFast`).
 #[inline(always)]
-fn compress_1x_loop<const K_UNROLL: usize>(bit_c: &mut HufCStream, ip: &[u8], ct: &[u64; 256]) {
+fn encode_group<const K: usize, const LAST_FAST: bool>(
+    bit_c: &mut HufCStream,
+    group: &[u8; K],
+    ct: &[u64; 256],
+    idx: usize,
+) {
+    for u in 1..K {
+        bit_c.add_bits::<true>(ct[group[K - u] as usize], idx);
+    }
+    if LAST_FAST {
+        bit_c.add_bits::<true>(ct[group[0] as usize], idx);
+    } else {
+        bit_c.add_bits::<false>(ct[group[0] as usize], idx);
+    }
+}
+
+/// `HUF_compress1X_usingCTable_internal_body_loop`: `K` symbols per
+/// container, two containers per outer iteration, walking `ip` backwards.
+#[inline(always)]
+fn compress_1x_loop<const K: usize, const LAST_FAST: bool>(
+    bit_c: &mut HufCStream,
+    ip: &[u8],
+    ct: &[u64; 256],
+) {
     let mut n = ip.len();
-    let rem = n % K_UNROLL;
+    // Join to K
+    let rem = n % K;
     if rem > 0 {
-        for _ in 0..rem {
-            n -= 1;
-            bit_c.add_bits(ct[ip[n] as usize], 0);
+        for &sym in ip[n - rem..].iter().rev() {
+            bit_c.add_bits::<false>(ct[sym as usize], 0);
         }
         bit_c.flush_bits();
+        n -= rem;
     }
-    debug_assert_eq!(n % K_UNROLL, 0);
-    if !n.is_multiple_of(2 * K_UNROLL) {
-        for u in 1..K_UNROLL {
-            bit_c.add_bits(ct[ip[n - u] as usize], 0);
-        }
-        bit_c.add_bits(ct[ip[n - K_UNROLL] as usize], 0);
+    // Join to 2K
+    if !n.is_multiple_of(2 * K) {
+        encode_group::<K, LAST_FAST>(bit_c, ip[n - K..n].try_into().unwrap(), ct, 0);
         bit_c.flush_bits();
-        n -= K_UNROLL;
+        n -= K;
     }
-    debug_assert_eq!(n % (2 * K_UNROLL), 0);
-    while n > 0 {
-        for u in 1..K_UNROLL {
-            bit_c.add_bits(ct[ip[n - u] as usize], 0);
-        }
-        bit_c.add_bits(ct[ip[n - K_UNROLL] as usize], 0);
+    for pair in ip[..n].rchunks_exact(2 * K) {
+        let (lo, hi) = pair.split_at(K);
+        // Encode K symbols into the bitstream @ index 0.
+        encode_group::<K, LAST_FAST>(bit_c, hi.try_into().unwrap(), ct, 0);
         bit_c.flush_bits();
+        // Encode K symbols into the bitstream @ index 1, without a data
+        // dependency on the first container, then merge.
         bit_c.zero_index1();
-        for u in 1..K_UNROLL {
-            bit_c.add_bits(ct[ip[n - K_UNROLL - u] as usize], 1);
-        }
-        bit_c.add_bits(ct[ip[n - 2 * K_UNROLL] as usize], 1);
+        encode_group::<K, LAST_FAST>(bit_c, lo.try_into().unwrap(), ct, 1);
         bit_c.merge_index1();
         bit_c.flush_bits();
-        n -= 2 * K_UNROLL;
     }
-    debug_assert_eq!(n, 0);
 }
 
 /// `HUF_tightCompressBound`: every symbol takes at most `table_log` bits;
@@ -725,14 +758,14 @@ pub fn compress_1x_using_ctable(out: &mut Vec<u8>, src: &[u8], table: &HufTable)
         buf: &mut out[start..],
         ptr: 0,
     };
-    // kUnroll / kLastFast per tableLog as in the 64-bit C switch; every
-    // add here uses the masked (non-fast) form, which yields the same bits.
+    // kUnroll / kLastFast per tableLog as in the 64-bit C switch.
     match table_log {
-        11 | 10 => compress_1x_loop::<5>(&mut bit_c, src, &table.elts),
-        9 => compress_1x_loop::<6>(&mut bit_c, src, &table.elts),
-        8 => compress_1x_loop::<7>(&mut bit_c, src, &table.elts),
-        7 => compress_1x_loop::<8>(&mut bit_c, src, &table.elts),
-        _ => compress_1x_loop::<9>(&mut bit_c, src, &table.elts),
+        11 => compress_1x_loop::<5, false>(&mut bit_c, src, &table.elts),
+        10 => compress_1x_loop::<5, true>(&mut bit_c, src, &table.elts),
+        9 => compress_1x_loop::<6, false>(&mut bit_c, src, &table.elts),
+        8 => compress_1x_loop::<7, false>(&mut bit_c, src, &table.elts),
+        7 => compress_1x_loop::<8, false>(&mut bit_c, src, &table.elts),
+        _ => compress_1x_loop::<9, true>(&mut bit_c, src, &table.elts),
     }
     let size = bit_c.close();
     out.truncate(start + size);
