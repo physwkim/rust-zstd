@@ -275,8 +275,13 @@ fn huf_build_tree(nodes: &mut [NodeElt; HUFF_NODE_TABLE_SIZE], max_symbol: usize
     hn!(low_s - 1).parent = node_nb as u16;
     node_nb += 1;
     low_s -= 2;
-    for n in node_nb..=node_root {
-        hn!(n).count = 1 << 30;
+    // `for (n=nodeNb; n<=nodeRoot; n++)`: empty when `nodeRoot < nodeNb`.
+    for node in nodes
+        .iter_mut()
+        .take((node_root + 2) as usize)
+        .skip((node_nb + 1) as usize)
+    {
+        node.count = 1 << 30;
     }
     hn!(-1).count = 1 << 31; // fake entry, strong barrier
     while node_nb <= node_root {
@@ -309,7 +314,7 @@ fn huf_build_tree(nodes: &mut [NodeElt; HUFF_NODE_TABLE_SIZE], max_symbol: usize
         let p = hn!(n).parent as isize;
         hn!(n).nb_bits = hn!(p).nb_bits + 1;
     }
-    for n in 0..=non_null_rank {
+    for n in 0..non_null_rank + 1 {
         let p = hn!(n).parent as isize;
         hn!(n).nb_bits = hn!(p).nb_bits + 1;
     }
