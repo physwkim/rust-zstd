@@ -10,7 +10,8 @@
 //! taskset -c 3 cargo test --release --offline --test stage_bench -- --ignored --nocapture
 //! ```
 //!
-//! `ZSTD_CORPUS_DIR` overrides the corpus directory.
+//! `ZSTD_CORPUS_DIR` overrides the corpus directory, `ZSTD_BENCH_ITERS` the
+//! number of iterations per cell (default 5, odd values keep the median exact).
 
 use rust_zstd::compress::block::{
     self, BlockScratch, BlockState, MIN_CBLOCK_SIZE, RLE_MAX_LENGTH, ZSTD_BLOCKHEADERSIZE,
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_CORPUS: &str = "/tmp/claude-1000/-home-stevek-work-rust-zstd/d30c8856-c9ae-4039-8110-94096bb23bce/scratchpad/corpus";
 const FILES: [&str; 3] = ["elf_8M.bin", "rssrc_8M.txt", "words_1M.txt"];
 const LEVELS: [i32; 4] = [1, 3, 5, 11];
-const ITERS: usize = 5;
+const DEFAULT_ITERS: usize = 5;
 
 #[derive(Clone, Copy, Default)]
 struct Stages {
@@ -142,6 +143,10 @@ fn stage_split() {
     let dir = std::env::var_os("ZSTD_CORPUS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CORPUS));
+    let iters: usize = std::env::var("ZSTD_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ITERS);
     eprintln!(
         "\n{:<13} {:>3} {:>4} {:>6} {:>9} {:>8} {:>7} {:>8} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5} | {:>8} {:>5}",
         "dataset", "L", "jobs", "blocks", "size", "e2e ms", "MB/s", "pass ms",
@@ -163,11 +168,11 @@ fn stage_split() {
             };
             let cparams = CParams::for_level(level, data.len());
             let mut frame = Vec::new();
-            let mut e2e = Vec::with_capacity(ITERS);
-            let mut runs = Vec::with_capacity(ITERS);
+            let mut e2e = Vec::with_capacity(iters);
+            let mut runs = Vec::with_capacity(iters);
             let mut layout = Layout::default();
             // Interleaved so that clock drift hits both sides alike.
-            for _ in 0..ITERS {
+            for _ in 0..iters {
                 let t = Instant::now();
                 frame = compress_with(&data, &opts);
                 e2e.push(t.elapsed());
