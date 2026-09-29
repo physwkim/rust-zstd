@@ -15,7 +15,7 @@ bytemuck = "1"
 rayon = { version = "1", optional = true }
 
 [dev-dependencies]
-zstd = "0.13.3"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [features]
 default = ["parallel"]
