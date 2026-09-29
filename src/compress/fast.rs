@@ -125,7 +125,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool>(
         }
     }
 
-    let hash_table = &mut ms.hash_table[..];
+    let (hash_table, _, _) = ms.ws.tables_mut();
     assert_eq!(hash_table.len(), 1usize << hlog); // (I4)
 
     // _start: requires ip0
@@ -379,7 +379,7 @@ fn fill_hash_table<const MLS: u32>(ms: &mut MatchState, src: &[u8], start: usize
     let hbits = ms.cparams.hash_log;
     assert!((1..=32).contains(&hbits));
     assert!(end <= src.len());
-    let hash_table = &mut ms.hash_table[..];
+    let (hash_table, _, _) = ms.ws.tables_mut();
     assert_eq!(hash_table.len(), 1usize << hbits);
     let mut ip = start;
     // C: for (; ip + fastHashFillStep < iend + 2; ip += fastHashFillStep)

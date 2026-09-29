@@ -11,20 +11,19 @@
 //! A candidate index `c` is usable at position `cur` only if
 //! `c >= window_low` and `cur - c <= (1 << window_log)`; see
 //! [`MatchState::lowest_prefix_index`].
+//!
+//! The tables share one allocation ([`Workspace`], the table area of
+//! `ZSTD_cwksp`), so the allocator sees one request per context rather
+//! than three that straddle glibc's dynamic mmap threshold.
 
 use super::params::{CParams, Strategy};
 
 pub struct MatchState {
     pub cparams: CParams,
-    /// `hashTable`: `1 << hash_log` entries. Every strategy.
-    pub hash_table: Vec<u32>,
-    /// `chainTable`: `1 << chain_log` entries. Empty for `Fast`. For `DFast`
-    /// zstd_double_fast.c uses `hash_table` as `hashLong` and this table as
-    /// `hashSmall`. For the lazy strategies it is the hash-chain table.
-    pub chain_table: Vec<u32>,
-    /// `tagTable`: `1 << hash_log` bytes, for the row-based lazy match finder.
-    /// Empty unless the strategy is `Greedy`/`Lazy`/`Lazy2`.
-    pub tag_table: Vec<u8>,
+    /// `hashTable`, `chainTable` and `tagTable`, see [`Workspace::tables_mut`].
+    /// Strategies borrow them as `ms.ws.tables_mut()`, which leaves the
+    /// other fields accessible while the slices are live.
+    pub ws: Workspace,
     /// `nextToUpdate`: index from which table insertion resumes.
     pub next_to_update: usize,
     /// `window.dictLimit` / `window.lowLimit`: lowest valid index (`>= 1`).
@@ -40,15 +39,85 @@ pub struct MatchState {
     pub hash_salt_entropy: u32,
 }
 
+/// The table area of `ZSTD_cwksp`: one zeroed allocation holding
+/// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
+/// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
+/// the hash-chain table for the lazy strategies) and `tagTable`
+/// (`1 << hash_log` bytes, row-based lazy finder only, else empty).
+#[derive(Default)]
+pub struct Workspace {
+    words: Vec<u32>,
+    hash_len: usize,
+    chain_len: usize,
+    tag_len: usize,
+}
+
+impl Workspace {
+    /// `(hash, chain, tag)` lengths for `cparams.strategy`.
+    fn lens(cparams: &CParams) -> (usize, usize, usize) {
+        let hash = 1usize << cparams.hash_log;
+        let chain = 1usize << cparams.chain_log;
+        match cparams.strategy {
+            Strategy::Fast => (hash, 0, 0),
+            Strategy::DFast => (hash, chain, 0),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, hash),
+        }
+    }
+
+    /// Size for `cparams`: an allocation that is large enough is kept and
+    /// exactly its used range zeroed (`ZSTD_cwksp_clean_tables`), else it
+    /// is freed and a zeroed one allocated.
+    fn reset(&mut self, cparams: &CParams) {
+        let (hash_len, chain_len, tag_len) = Self::lens(cparams);
+        let words = hash_len + chain_len + tag_len.div_ceil(4);
+        if self.words.capacity() < words {
+            // ZSTD_cwksp_free before ZSTD_cwksp_create: never both at once.
+            drop(std::mem::take(&mut self.words));
+            self.words = vec![0; words];
+        } else {
+            self.words.clear();
+            self.words.resize(words, 0);
+        }
+        self.hash_len = hash_len;
+        self.chain_len = chain_len;
+        self.tag_len = tag_len;
+    }
+
+    /// `(hashTable, chainTable, tagTable)`. Unchecked splits: the bounds
+    /// checks of `split_at_mut` at a strategy's entry re-allocate the
+    /// registers of its whole hot loop (fast L1 measured 7% slower).
+    #[inline]
+    pub fn tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u8]) {
+        // SAFETY: `reset` is the only writer of the lengths and sizes `words`
+        // to exactly `hash_len + chain_len + tag_len.div_ceil(4)`.
+        unsafe {
+            let (hash, rest) = self.words.split_at_mut_unchecked(self.hash_len);
+            let (chain, tag) = rest.split_at_mut_unchecked(self.chain_len);
+            let tag: &mut [u8] = bytemuck::cast_slice_mut(tag);
+            (hash, chain, tag.get_unchecked_mut(..self.tag_len))
+        }
+    }
+
+    /// `(hashTable, chainTable, tagTable)`, see [`Workspace::tables_mut`].
+    #[inline]
+    pub fn tables(&self) -> (&[u32], &[u32], &[u8]) {
+        // SAFETY: as in `tables_mut`.
+        unsafe {
+            let (hash, rest) = self.words.split_at_unchecked(self.hash_len);
+            let (chain, tag) = rest.split_at_unchecked(self.chain_len);
+            let tag: &[u8] = bytemuck::cast_slice(tag);
+            (hash, chain, tag.get_unchecked(..self.tag_len))
+        }
+    }
+}
+
 impl MatchState {
     /// Allocate zeroed tables for `cparams.strategy`; positions below
     /// `window_low` (which must be `>= 1`) are never referenced.
     pub fn new(cparams: CParams, window_low: usize) -> Self {
         let mut ms = Self {
             cparams,
-            hash_table: Vec::new(),
-            chain_table: Vec::new(),
-            tag_table: Vec::new(),
+            ws: Workspace::default(),
             next_to_update: 0,
             window_low: 0,
             hash_salt: 0,
@@ -74,21 +143,25 @@ impl MatchState {
             window_low >= 1,
             "window_low must be >= 1 (0 marks an empty table entry)"
         );
-        let hash_size = 1usize << cparams.hash_log;
-        let chain_size = 1usize << cparams.chain_log;
-        let (chain_size, tag_size) = match cparams.strategy {
-            Strategy::Fast => (0, 0),
-            Strategy::DFast => (chain_size, 0),
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (chain_size, hash_size),
-        };
-        zeroed(&mut self.hash_table, hash_size);
-        zeroed(&mut self.chain_table, chain_size);
-        zeroed(&mut self.tag_table, tag_size);
+        self.ws.reset(&cparams);
         self.cparams = cparams;
         self.next_to_update = window_low;
         self.window_low = window_low;
         self.hash_salt = super::lazy::initial_hash_salt();
         self.hash_salt_entropy = 0;
+    }
+
+    /// `(hashTable, chainTable, tagTable)`; borrows the whole state, use
+    /// `self.ws.tables_mut()` where the other fields must stay accessible.
+    #[inline]
+    pub fn tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u8]) {
+        self.ws.tables_mut()
+    }
+
+    /// `(hashTable, chainTable, tagTable)`.
+    #[inline]
+    pub fn tables(&self) -> (&[u32], &[u32], &[u8]) {
+        self.ws.tables()
     }
 
     /// `ZSTD_getLowestPrefixIndex(ms, cur, windowLog)` without a dictionary:
@@ -103,17 +176,5 @@ impl MatchState {
         } else {
             self.window_low
         }
-    }
-}
-
-/// Leave `table` with exactly `len` zero entries: the existing allocation
-/// memset when it is large enough, else a fresh zeroed one (untouched pages
-/// cost nothing until used).
-fn zeroed<T: Copy + Default>(table: &mut Vec<T>, len: usize) {
-    if table.capacity() < len {
-        *table = vec![T::default(); len];
-    } else {
-        table.clear();
-        table.resize(len, T::default());
     }
 }

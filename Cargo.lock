@@ -135,6 +135,7 @@ dependencies = [
 name = "rust-zstd"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fearless_simd",
  "rayon",
  "zstd",

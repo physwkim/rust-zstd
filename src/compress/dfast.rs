@@ -3,8 +3,8 @@
 //! `ZSTD_compressBlock_doubleFast` and `ZSTD_fillDoubleHashTable`
 //! (zstd_double_fast.c, libzstd 1.5.7), no-dictionary case.
 //!
-//! `ms.hash_table` is `hashLong` (`hBitsL = hash_log`, 8-byte hash) and
-//! `ms.chain_table` is `hashSmall` (`hBitsS = chain_log`, `mls`-byte hash).
+//! The hash table is `hashLong` (`hBitsL = hash_log`, 8-byte hash) and the
+//! chain table is `hashSmall` (`hBitsS = chain_log`, `mls`-byte hash).
 //! Position conventions and the unchecked-read policy are those of
 //! [`super::fast`].
 
@@ -88,8 +88,7 @@ fn compress_block_generic<const MLS: u32>(
         }
     }
 
-    let hash_long = &mut ms.hash_table[..];
-    let hash_small = &mut ms.chain_table[..];
+    let (hash_long, hash_small, _) = ms.ws.tables_mut();
     assert_eq!(hash_long.len(), 1usize << hbits_l); // (I4)
     assert_eq!(hash_small.len(), 1usize << hbits_s); // (I4)
 
@@ -346,8 +345,7 @@ fn fill_double_hash_table<const MLS: u32>(
     let hbits_s = ms.cparams.chain_log;
     assert!((1..=32).contains(&hbits_l) && (1..=32).contains(&hbits_s));
     assert!(end <= src.len());
-    let hash_long = &mut ms.hash_table[..];
-    let hash_small = &mut ms.chain_table[..];
+    let (hash_long, hash_small, _) = ms.ws.tables_mut();
     assert_eq!(hash_long.len(), 1usize << hbits_l);
     assert_eq!(hash_small.len(), 1usize << hbits_s);
     let mut ip = start;

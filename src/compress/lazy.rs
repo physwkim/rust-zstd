@@ -168,8 +168,8 @@ trait Search {
     ) -> usize;
 }
 
-/// `search_hashChain`: `ZSTD_HcFindBestMatch` over `ms.hash_table` heads and
-/// `ms.chain_table` links.
+/// `search_hashChain`: `ZSTD_HcFindBestMatch` over the hash table heads and
+/// the chain table links.
 struct HcSearch<const MLS: u32>;
 
 impl<const MLS: u32> HcSearch<MLS> {
@@ -189,18 +189,15 @@ impl<const MLS: u32> HcSearch<MLS> {
     ) -> u32 {
         let hash_log = ms.cparams.hash_log;
         let chain_mask = (1usize << ms.cparams.chain_log) - 1;
+        let (hash_table, chain_table, _) = ms.ws.tables_mut();
         let target = ip;
         let mut idx = ms.next_to_update;
         // Every hashed position is `<= ip`; `h < 1 << hash_log` and
         // `idx & chain_mask < 1 << chain_log`.
         while idx < target {
             let h = hash_salted::<MLS>(src, idx, hash_log, 0) as usize;
-            tset(
-                &mut ms.chain_table,
-                idx & chain_mask,
-                tget(&ms.hash_table, h),
-            );
-            tset(&mut ms.hash_table, h, idx);
+            tset(chain_table, idx & chain_mask, tget(hash_table, h));
+            tset(hash_table, h, idx);
             idx += 1;
             if lazy_skipping {
                 break;
@@ -208,7 +205,7 @@ impl<const MLS: u32> HcSearch<MLS> {
         }
         ms.next_to_update = target;
         tget(
-            &ms.hash_table,
+            hash_table,
             hash_salted::<MLS>(src, ip, hash_log, 0) as usize,
         ) as u32
     }
@@ -244,6 +241,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
         // asserted per block ([`assert_block_bounds`]).
         let mut match_index =
             unsafe { Self::insert_and_find_first_index(ms, src, ip, lazy_skipping) } as usize;
+        let (_, chain_table, _) = ms.ws.tables();
         // C only tests `matchIndex >= lowLimit`; the upper bound is folded
         // into the same compare so that a stale table entry is a miss, not
         // an out-of-bounds read.
@@ -269,7 +267,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
             }
             // SAFETY: `match_index & chain_mask < 1 << chain_log ==
             // chain_table.len()`.
-            match_index = unsafe { tget(&ms.chain_table, match_index & chain_mask) };
+            match_index = unsafe { tget(chain_table, match_index & chain_mask) };
             nb_attempts -= 1;
         }
         ml
@@ -554,9 +552,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// # Safety
     /// `pos + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
-    unsafe fn hash(ms: &MatchState, src: &[u8], pos: usize) -> u32 {
-        let hbits = ms.cparams.hash_log - ROW_LOG + ROW_HASH_TAG_BITS;
-        hash_salted::<MLS>(src, pos, hbits, ms.hash_salt)
+    unsafe fn hash(hash_log: u32, hash_salt: u64, src: &[u8], pos: usize) -> u32 {
+        let hbits = hash_log - ROW_LOG + ROW_HASH_TAG_BITS;
+        hash_salted::<MLS>(src, pos, hbits, hash_salt)
     }
 
     /// `&tag_table[rel_row]` (the head byte) for a row index of [`Self::hash`].
@@ -565,9 +563,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// `rel_row` came from [`Self::hash`] on a state whose tables are
     /// `1 << hash_log` long (asserted per block).
     #[inline(always)]
-    unsafe fn head(ms: &mut MatchState, rel_row: usize) -> &mut u8 {
-        debug_assert!(rel_row + Self::ROW_ENTRIES <= ms.tag_table.len());
-        ms.tag_table.get_unchecked_mut(rel_row)
+    unsafe fn head(tag_table: &mut [u8], rel_row: usize) -> &mut u8 {
+        debug_assert!(rel_row + Self::ROW_ENTRIES <= tag_table.len());
+        tag_table.get_unchecked_mut(rel_row)
     }
 
     /// `ZSTD_row_nextIndex`: cycle the head backwards through `1..entries`
@@ -584,14 +582,14 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
 
     /// `ZSTD_row_prefetch`.
     #[inline(always)]
-    fn prefetch_row(ms: &MatchState, rel_row: usize) {
-        prefetch_l1(&ms.hash_table, rel_row);
+    fn prefetch_row(hash_table: &[u32], tag_table: &[u8], rel_row: usize) {
+        prefetch_l1(hash_table, rel_row);
         if ROW_LOG >= 5 {
-            prefetch_l1(&ms.hash_table, rel_row + 16);
+            prefetch_l1(hash_table, rel_row + 16);
         }
-        prefetch_l1(&ms.tag_table, rel_row);
+        prefetch_l1(tag_table, rel_row);
         if ROW_LOG == 6 {
-            prefetch_l1(&ms.tag_table, rel_row + 32);
+            prefetch_l1(tag_table, rel_row + 32);
         }
     }
 
@@ -602,12 +600,17 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// `i_limit + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
     unsafe fn fill_hash_cache(&mut self, ms: &MatchState, src: &[u8], idx: usize, i_limit: usize) {
+        let (hash_table, _, tag_table) = ms.ws.tables();
         let max_elems = if idx > i_limit { 0 } else { i_limit - idx + 1 };
         let lim = idx + ROW_HASH_CACHE_SIZE.min(max_elems);
         for i in idx..lim {
             // `i <= i_limit`.
-            let hash = Self::hash(ms, src, i);
-            Self::prefetch_row(ms, ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize);
+            let hash = Self::hash(ms.cparams.hash_log, ms.hash_salt, src, i);
+            Self::prefetch_row(
+                hash_table,
+                tag_table,
+                ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize,
+            );
             self.hash_cache[i & ROW_HASH_CACHE_MASK] = hash;
         }
     }
@@ -618,9 +621,21 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// # Safety
     /// `idx + ROW_HASH_CACHE_SIZE + HASH_READ_SIZE <= src.len()`.
     #[inline(always)]
-    unsafe fn next_cached_hash(&mut self, ms: &MatchState, src: &[u8], idx: usize) -> u32 {
-        let new_hash = Self::hash(ms, src, idx + ROW_HASH_CACHE_SIZE);
-        Self::prefetch_row(ms, ((new_hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize);
+    unsafe fn next_cached_hash(
+        &mut self,
+        hash_table: &[u32],
+        tag_table: &[u8],
+        hash_log: u32,
+        hash_salt: u64,
+        src: &[u8],
+        idx: usize,
+    ) -> u32 {
+        let new_hash = Self::hash(hash_log, hash_salt, src, idx + ROW_HASH_CACHE_SIZE);
+        Self::prefetch_row(
+            hash_table,
+            tag_table,
+            ((new_hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize,
+        );
         let hash = self.hash_cache[idx & ROW_HASH_CACHE_MASK];
         self.hash_cache[idx & ROW_HASH_CACHE_MASK] = new_hash;
         hash
@@ -640,17 +655,25 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
         end: usize,
         use_cache: bool,
     ) {
+        let (hash_table, _, tag_table) = ms.ws.tables_mut();
         for idx in start..end {
             let hash = if use_cache {
-                self.next_cached_hash(ms, src, idx)
+                self.next_cached_hash(
+                    hash_table,
+                    tag_table,
+                    ms.cparams.hash_log,
+                    ms.hash_salt,
+                    src,
+                    idx,
+                )
             } else {
-                Self::hash(ms, src, idx)
+                Self::hash(ms.cparams.hash_log, ms.hash_salt, src, idx)
             };
             let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
             // `rel_row + pos < rel_row + ROW_ENTRIES <= table len`, see `hash`.
-            let pos = Self::next_index(Self::head(ms, rel_row));
-            *ms.tag_table.get_unchecked_mut(rel_row + pos) = (hash & ROW_HASH_TAG_MASK) as u8;
-            tset(&mut ms.hash_table, rel_row + pos, idx);
+            let pos = Self::next_index(Self::head(tag_table, rel_row));
+            *tag_table.get_unchecked_mut(rel_row + pos) = (hash & ROW_HASH_TAG_MASK) as u8;
+            tset(hash_table, rel_row + pos, idx);
         }
     }
 
@@ -725,23 +748,29 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         let hash = unsafe {
             if !lazy_skipping {
                 self.update_internal(ms, src, ip, true);
-                self.next_cached_hash(ms, src, curr)
+                let (hash_table, _, tag_table) = ms.ws.tables();
+                self.next_cached_hash(
+                    hash_table,
+                    tag_table,
+                    ms.cparams.hash_log,
+                    ms.hash_salt,
+                    src,
+                    curr,
+                )
             } else {
                 // Stop inserting every position when in the lazy skipping mode.
                 // The hash cache is also not kept up to date in this mode.
                 ms.next_to_update = curr;
-                Self::hash(ms, src, ip)
+                Self::hash(ms.cparams.hash_log, ms.hash_salt, src, ip)
             }
         };
         ms.hash_salt_entropy = ms.hash_salt_entropy.wrapping_add(hash); // collect salt entropy
 
         let rel_row = ((hash >> ROW_HASH_TAG_BITS) << ROW_LOG) as usize;
         let tag = (hash & ROW_HASH_TAG_MASK) as u8;
+        let (hash_table, _, tag_table) = ms.ws.tables_mut();
         // SAFETY: `rel_row + ROW_ENTRIES <= tag_table.len()`, see `hash`.
-        let tag_row = unsafe {
-            ms.tag_table
-                .get_unchecked(rel_row..rel_row + Self::ROW_ENTRIES)
-        };
+        let tag_row = unsafe { tag_table.get_unchecked(rel_row..rel_row + Self::ROW_ENTRIES) };
         let head_grouped = ((tag_row[0] as u32) & Self::ROW_MASK) * group_width;
         let mut num_matches = 0usize;
         let mut matches = self.mask.match_mask::<ROW_LOG>(tag_row, tag, head_grouped);
@@ -753,7 +782,7 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
             matches &= matches - 1;
             // SAFETY: `match_pos < ROW_ENTRIES`, so `rel_row + match_pos <
             // hash_table.len()`.
-            let match_index = unsafe { tget(&ms.hash_table, rel_row + match_pos as usize) };
+            let match_index = unsafe { tget(hash_table, rel_row + match_pos as usize) };
             if match_pos == 0 {
                 continue;
             }
@@ -776,9 +805,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
         // search.
         // SAFETY: `rel_row + pos < rel_row + ROW_ENTRIES <= table len`.
         unsafe {
-            let pos = Self::next_index(Self::head(ms, rel_row));
-            *ms.tag_table.get_unchecked_mut(rel_row + pos) = tag;
-            tset(&mut ms.hash_table, rel_row + pos, ms.next_to_update);
+            let pos = Self::next_index(Self::head(tag_table, rel_row));
+            *tag_table.get_unchecked_mut(rel_row + pos) = tag;
+            tset(hash_table, rel_row + pos, ms.next_to_update);
             ms.next_to_update += 1;
         }
 
@@ -1222,26 +1251,23 @@ pub fn compress_block(
 /// (`ZSTD_adjustCParams_internal` caps `hashLog` at `rowLog + 24`).
 fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMethod) {
     let cp = &ms.cparams;
+    let (hash_table, chain_table, tag_table) = ms.tables();
     assert!(
         end <= src.len(),
         "block end {end} past src.len() {}",
         src.len()
     );
-    assert_eq!(
-        ms.hash_table.len(),
-        1usize << cp.hash_log,
-        "hash_table size"
-    );
+    assert_eq!(hash_table.len(), 1usize << cp.hash_log, "hash_table size");
     match method {
         SearchMethod::HashChain => {
             assert_eq!(
-                ms.chain_table.len(),
+                chain_table.len(),
                 1usize << cp.chain_log,
                 "chain_table size"
             );
         }
         SearchMethod::RowHash => {
-            assert_eq!(ms.tag_table.len(), 1usize << cp.hash_log, "tag_table size");
+            assert_eq!(tag_table.len(), 1usize << cp.hash_log, "tag_table size");
             let row_log = row_log_of(cp);
             assert!(
                 cp.hash_log >= row_log && cp.hash_log - row_log + ROW_HASH_TAG_BITS <= 32,
@@ -1626,12 +1652,10 @@ mod tests {
             {
                 let mut reused = MatchState::new(cp_first, 1);
                 collect_on(&mut reused, first, 40_000, m, level);
-                assert!(reused.hash_table.iter().any(|&e| e != 0));
+                assert!(reused.tables().0.iter().any(|&e| e != 0));
                 reused.reset(cp_second, 1);
                 let mut fresh = MatchState::new(cp_second, 1);
-                assert_eq!(reused.hash_table, fresh.hash_table);
-                assert_eq!(reused.chain_table, fresh.chain_table);
-                assert_eq!(reused.tag_table, fresh.tag_table);
+                assert!(reused.tables() == fresh.tables());
                 assert_eq!(reused.next_to_update, fresh.next_to_update);
                 assert_eq!(reused.window_low, fresh.window_low);
                 assert_eq!(reused.hash_salt, fresh.hash_salt);
