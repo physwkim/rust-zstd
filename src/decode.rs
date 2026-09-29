@@ -2895,96 +2895,34 @@ fn run_sequences(
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
-    let mut ll_state = br.read_bits(ll_log);
+    let ll_state = br.read_bits(ll_log);
     br.reload();
-    let mut of_state = br.read_bits(of_log);
+    let of_state = br.read_bits(of_log);
     br.reload();
-    let mut ml_state = br.read_bits(ml_log);
+    let ml_state = br.read_bits(ml_log);
     br.reload();
 
-    let mut hist = [
-        offset_hist[0] as usize,
-        offset_hist[1] as usize,
-        offset_hist[2] as usize,
-    ];
+    let mut st = SeqState {
+        ll: ll_state,
+        ml: ml_state,
+        of: of_state,
+        hist: [
+            offset_hist[0] as usize,
+            offset_hist[1] as usize,
+            offset_hist[2] as usize,
+        ],
+    };
     let mut lit_pos = 0usize;
 
-    for remaining in (1..=num_sequences).rev() {
-        // SAFETY: each state is below its table's length (see above).
-        let (ll_e, ml_e, of_e) = unsafe {
-            (
-                table_entry(ll_dt, ll_state),
-                table_entry(ml_dt, ml_state),
-                table_entry(of_dt, of_state),
-            )
-        };
-
-        let mut ll = ll_e.base_value as usize;
-        let mut ml = ml_e.base_value as usize;
-        let ll_bits = u32::from(ll_e.extra_bits);
-        let ml_bits = u32::from(ml_e.extra_bits);
-        let of_bits = u32::from(of_e.extra_bits);
-        let total_bits = ll_bits + ml_bits + of_bits;
-
-        // Offset and repeat-offset history (ZSTD_decodeSequence).
-        let offset = if of_bits > 1 {
-            let o = of_e.base_value as usize + br.read_bits_fast(of_bits);
-            hist[2] = hist[1];
-            hist[1] = hist[0];
-            hist[0] = o;
-            o
-        } else {
-            let ll0 = usize::from(ll == 0);
-            if of_bits == 0 {
-                let o = hist[ll0];
-                hist[1] = hist[1 - ll0];
-                hist[0] = o;
-                o
-            } else {
-                // Offset code 1: base value 1 plus one extra bit selects a
-                // repeat offset 1..=3.
-                let o = 1 + ll0 + br.read_bits_fast(1);
-                let mut temp = if o == 3 {
-                    hist[0].wrapping_sub(1)
-                } else {
-                    hist[o]
-                };
-                if temp == 0 {
-                    // Corrupt input: force an offset that execution rejects.
-                    temp = usize::MAX;
-                }
-                if o != 1 {
-                    hist[2] = hist[1];
-                }
-                hist[1] = hist[0];
-                hist[0] = temp;
-                temp
-            }
-        };
-
-        if ml_bits > 0 {
-            ml += br.read_bits_fast(ml_bits);
-        }
-        // A reload guarantees 57 bits; the three state updates below need
-        // up to 26 more, so reload now if this sequence's extra bits could
-        // leave fewer than that.
-        if total_bits >= 57 - 26 {
-            br.reload();
-        }
-        if ll_bits > 0 {
-            ll += br.read_bits_fast(ll_bits);
-        }
-
-        if remaining > 1 {
-            ll_state = usize::from(ll_e.next_state) + br.read_bits(u32::from(ll_e.num_bits));
-            ml_state = usize::from(ml_e.next_state) + br.read_bits(u32::from(ml_e.num_bits));
-            of_state = usize::from(of_e.next_state) + br.read_bits(u32::from(of_e.num_bits));
-            br.reload();
-        }
-
+    for _ in 1..num_sequences {
+        let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
         op = exec_sequence(buf, op, literals, &mut lit_pos, ll, ml, offset)
             .map_err(seq_error_message)?;
     }
+    let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
+    op = exec_sequence(buf, op, literals, &mut lit_pos, ll, ml, offset)
+        .map_err(seq_error_message)?;
+    let hist = st.hist;
 
     if !br.is_finished() {
         return Err("Sequence bitstream not fully consumed".to_string());
@@ -3000,6 +2938,101 @@ fn run_sequences(
 
     *offset_hist = [hist[0] as u32, hist[1] as u32, hist[2] as u32];
     Ok(op)
+}
+
+/// FSE states and repeat offsets of the sequences decoder (seqState_t).
+struct SeqState {
+    ll: usize,
+    ml: usize,
+    of: usize,
+    hist: [usize; 3],
+}
+
+/// Decode one sequence (ZSTD_decodeSequence): literal length, match
+/// length, offset. `is_last` skips the state update, which would read
+/// past the end of the stream.
+#[inline(always)]
+fn decode_sequence(
+    br: &mut BitDStream<'_>,
+    st: &mut SeqState,
+    ll_dt: &[FSEEntry],
+    ml_dt: &[FSEEntry],
+    of_dt: &[FSEEntry],
+    is_last: bool,
+) -> (usize, usize, usize) {
+    // SAFETY: each state is below its table's length (see `run_sequences`).
+    let (ll_e, ml_e, of_e) = unsafe {
+        (
+            table_entry(ll_dt, st.ll),
+            table_entry(ml_dt, st.ml),
+            table_entry(of_dt, st.of),
+        )
+    };
+
+    let mut ll = ll_e.base_value as usize;
+    let mut ml = ml_e.base_value as usize;
+    let ll_bits = u32::from(ll_e.extra_bits);
+    let ml_bits = u32::from(ml_e.extra_bits);
+    let of_bits = u32::from(of_e.extra_bits);
+    let total_bits = ll_bits + ml_bits + of_bits;
+    let hist = &mut st.hist;
+
+    // Offset and repeat-offset history.
+    let offset = if of_bits > 1 {
+        let o = of_e.base_value as usize + br.read_bits_fast(of_bits);
+        hist[2] = hist[1];
+        hist[1] = hist[0];
+        hist[0] = o;
+        o
+    } else {
+        let ll0 = usize::from(ll == 0);
+        if of_bits == 0 {
+            let o = hist[ll0];
+            hist[1] = hist[1 - ll0];
+            hist[0] = o;
+            o
+        } else {
+            // Offset code 1: base value 1 plus one extra bit selects a
+            // repeat offset 1..=3.
+            let o = 1 + ll0 + br.read_bits_fast(1);
+            let mut temp = if o == 3 {
+                hist[0].wrapping_sub(1)
+            } else {
+                hist[o]
+            };
+            if temp == 0 {
+                // Corrupt input: force an offset that execution rejects.
+                temp = usize::MAX;
+            }
+            if o != 1 {
+                hist[2] = hist[1];
+            }
+            hist[1] = hist[0];
+            hist[0] = temp;
+            temp
+        }
+    };
+
+    if ml_bits > 0 {
+        ml += br.read_bits_fast(ml_bits);
+    }
+    // A reload guarantees 57 bits; the three state updates below need
+    // up to 26 more, so reload now if this sequence's extra bits could
+    // leave fewer than that.
+    if total_bits >= 57 - 26 {
+        br.reload();
+    }
+    if ll_bits > 0 {
+        ll += br.read_bits_fast(ll_bits);
+    }
+
+    if !is_last {
+        st.ll = usize::from(ll_e.next_state) + br.read_bits(u32::from(ll_e.num_bits));
+        st.ml = usize::from(ml_e.next_state) + br.read_bits(u32::from(ml_e.num_bits));
+        st.of = usize::from(of_e.next_state) + br.read_bits(u32::from(of_e.num_bits));
+        br.reload();
+    }
+    (ll, ml, offset)
 }
 
 /// Copy `ll` literals then `ml` match bytes from `offset` back
