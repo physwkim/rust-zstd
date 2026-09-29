@@ -4,7 +4,6 @@
 //! `HUF_compress1X_repeat` / `HUF_compress4X_repeat` path) and
 //! `lib/compress/zstd_compress_literals.c` (`ZSTD_compressLiterals`).
 
-use super::bitstream::BackwardBitWriter;
 use super::fse;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -587,22 +586,137 @@ pub fn write_ctable(
 // HUF_compress1X_usingCTable / HUF_compress4X_usingCTable
 // =========================================================================
 
+/// `HUF_CStream_t`: two 64-bit containers so that the encoder can fill
+/// them independently (`idx` 0 and 1) and merge, writing whole 8-byte words
+/// into `buf` at `ptr`. Bits are packed at the top of a container and land
+/// in the output least-significant first, i.e. a backward bitstream.
+struct HufCStream<'a> {
+    bit_container: [u64; 2],
+    bit_pos: [u32; 2],
+    buf: &'a mut [u8],
+    ptr: usize,
+}
+
+impl HufCStream<'_> {
+    /// `HUF_addBits` with the C `kFast == 0` masking (`HUF_getValue`).
+    #[inline(always)]
+    fn add_bits(&mut self, elt: u64, idx: usize) {
+        let nb_bits = (elt & 0xFF) as u32;
+        self.bit_container[idx] >>= nb_bits;
+        self.bit_container[idx] |= elt & !0xFF;
+        self.bit_pos[idx] += nb_bits;
+    }
+
+    /// `HUF_zeroIndex1`.
+    #[inline(always)]
+    fn zero_index1(&mut self) {
+        self.bit_container[1] = 0;
+        self.bit_pos[1] = 0;
+    }
+
+    /// `HUF_mergeIndex1`.
+    #[inline(always)]
+    fn merge_index1(&mut self) {
+        debug_assert!(self.bit_pos[1] < 64);
+        self.bit_container[0] >>= self.bit_pos[1];
+        self.bit_container[0] |= self.bit_container[1];
+        self.bit_pos[0] += self.bit_pos[1];
+    }
+
+    /// `HUF_flushBits`: store the container's top `bit_pos` bits as one
+    /// little-endian word and advance by the whole bytes among them.
+    #[inline(always)]
+    fn flush_bits(&mut self) {
+        let nb_bits = self.bit_pos[0];
+        debug_assert!(nb_bits > 0 && nb_bits <= 64);
+        let nb_bytes = (nb_bits >> 3) as usize;
+        let word = self.bit_container[0] >> (64 - nb_bits);
+        self.bit_pos[0] &= 7;
+        self.buf[self.ptr..self.ptr + 8].copy_from_slice(&word.to_le_bytes());
+        self.ptr += nb_bytes;
+    }
+
+    /// `HUF_closeCStream`: end mark, final flush, byte size.
+    fn close(mut self) -> usize {
+        const END_MARK: u64 = (1 << 63) | 1; // HUF_endMark: value 1, 1 bit
+        self.add_bits(END_MARK, 0);
+        self.flush_bits();
+        self.ptr + (self.bit_pos[0] > 0) as usize
+    }
+}
+
+/// `HUF_compress1X_usingCTable_internal_body_loop`: `K_UNROLL` symbols per
+/// container, two containers per outer iteration.
+#[inline(always)]
+fn compress_1x_loop<const K_UNROLL: usize>(bit_c: &mut HufCStream, ip: &[u8], ct: &[u64; 256]) {
+    let mut n = ip.len();
+    let rem = n % K_UNROLL;
+    if rem > 0 {
+        for _ in 0..rem {
+            n -= 1;
+            bit_c.add_bits(ct[ip[n] as usize], 0);
+        }
+        bit_c.flush_bits();
+    }
+    debug_assert_eq!(n % K_UNROLL, 0);
+    if !n.is_multiple_of(2 * K_UNROLL) {
+        for u in 1..K_UNROLL {
+            bit_c.add_bits(ct[ip[n - u] as usize], 0);
+        }
+        bit_c.add_bits(ct[ip[n - K_UNROLL] as usize], 0);
+        bit_c.flush_bits();
+        n -= K_UNROLL;
+    }
+    debug_assert_eq!(n % (2 * K_UNROLL), 0);
+    while n > 0 {
+        for u in 1..K_UNROLL {
+            bit_c.add_bits(ct[ip[n - u] as usize], 0);
+        }
+        bit_c.add_bits(ct[ip[n - K_UNROLL] as usize], 0);
+        bit_c.flush_bits();
+        bit_c.zero_index1();
+        for u in 1..K_UNROLL {
+            bit_c.add_bits(ct[ip[n - K_UNROLL - u] as usize], 1);
+        }
+        bit_c.add_bits(ct[ip[n - 2 * K_UNROLL] as usize], 1);
+        bit_c.merge_index1();
+        bit_c.flush_bits();
+        n -= 2 * K_UNROLL;
+    }
+    debug_assert_eq!(n, 0);
+}
+
+/// `HUF_tightCompressBound`: every symbol takes at most `table_log` bits;
+/// the 8 spare bytes absorb the last whole-word store.
+fn tight_compress_bound(src_size: usize, table_log: usize) -> usize {
+    ((src_size * table_log) >> 3) + 8
+}
+
 /// `HUF_compress1X_usingCTable_internal`: one backward Huffman bitstream for
 /// `src`, appended to `out`. Returns its byte size (never 0 here: the C
 /// early-outs are all output-capacity checks and `out` is unbounded).
 pub fn compress_1x_using_ctable(out: &mut Vec<u8>, src: &[u8], table: &HufTable) -> usize {
-    let mut bw = BackwardBitWriter::new();
-    for &sym in src.iter().rev() {
-        let elt = table.elts[sym as usize];
-        let nb = (elt & 0xFF) as u32;
-        if nb != 0 {
-            bw.add_bits(elt >> (64 - nb), nb);
-            bw.flush_bits();
-        }
+    let table_log = table.table_log as usize;
+    let start = out.len();
+    out.resize(start + tight_compress_bound(src.len(), table_log), 0);
+    let mut bit_c = HufCStream {
+        bit_container: [0; 2],
+        bit_pos: [0; 2],
+        buf: &mut out[start..],
+        ptr: 0,
+    };
+    // kUnroll / kLastFast per tableLog as in the 64-bit C switch; every
+    // add here uses the masked (non-fast) form, which yields the same bits.
+    match table_log {
+        11 | 10 => compress_1x_loop::<5>(&mut bit_c, src, &table.elts),
+        9 => compress_1x_loop::<6>(&mut bit_c, src, &table.elts),
+        8 => compress_1x_loop::<7>(&mut bit_c, src, &table.elts),
+        7 => compress_1x_loop::<8>(&mut bit_c, src, &table.elts),
+        _ => compress_1x_loop::<9>(&mut bit_c, src, &table.elts),
     }
-    let stream = bw.finish();
-    out.extend_from_slice(&stream);
-    stream.len()
+    let size = bit_c.close();
+    out.truncate(start + size);
+    size
 }
 
 /// `HUF_compress4X_usingCTable_internal`: jump table plus four streams.
