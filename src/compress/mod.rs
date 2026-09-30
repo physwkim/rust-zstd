@@ -1178,10 +1178,22 @@ mod tests {
         );
     }
 
+    /// `overlap_size` accepts exactly the overlap logs within
+    /// `ZSTD_c_overlapLog`'s bounds, and panics one past them.
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn overlap_log_above_nine_panics() {
-        overlap_size(&CParams::for_level(1, 1 << 20), 10, false);
+    fn overlap_log_bounds_match_libzstd() {
+        use crate::compress::common::testutil::c_bounds;
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::ZSTD_c_overlapLog;
+
+        let (lo, hi) = c_bounds(ZSTD_c_overlapLog);
+        assert_eq!(lo, 0);
+        let cp = CParams::for_level(1, 1 << 20);
+        for v in 0..=hi + 1 {
+            for ldm in [false, true] {
+                let ours = std::panic::catch_unwind(|| overlap_size(&cp, v as u8, ldm)).is_ok();
+                assert_eq!(ours, v <= hi, "{v} ldm {ldm}");
+            }
+        }
     }
 
     /// The preset runs three jobs on 4.25 MiB, counted as the job contexts

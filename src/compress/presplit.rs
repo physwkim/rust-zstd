@@ -249,10 +249,22 @@ mod tests {
         assert_eq!(split_level(6, Fast), Some(4));
     }
 
+    /// `split_level` accepts a level from 0 to one past libzstd's upper
+    /// bound exactly where `ZSTD_CCtx_setParameter` accepts
+    /// `ZSTD_c_blockSplitterLevel`, and panics where that returns
+    /// `parameter_outOfBound`.
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn split_level_above_six_panics() {
-        split_level(7, Strategy::Fast);
+    fn split_level_bounds_match_libzstd() {
+        use crate::compress::common::testutil::{c_accepts, c_bounds};
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter;
+
+        // ZSTD_c_blockSplitterLevel
+        let param = ZSTD_cParameter::ZSTD_c_experimentalParam20;
+        let (_, hi) = c_bounds(param);
+        for v in 0..=hi + 1 {
+            let ours = std::panic::catch_unwind(|| split_level(v as u8, Strategy::Fast)).is_ok();
+            assert_eq!(ours, c_accepts(param, v), "{v}");
+        }
     }
 
     fn text(len: usize) -> Vec<u8> {
