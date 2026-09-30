@@ -669,6 +669,14 @@ fn fse_cell_state(symbol_next: &mut [u16; 256], symbol: usize, table_log: u32) -
     )
 }
 
+/// Size in u32 words of FSE_decompress_wksp's workspace for a table of
+/// `table_log` over symbols `0..=max_symbol` (FSE_DECOMPRESS_WKSP_SIZE_U32).
+const fn fse_decompress_wksp_u32(table_log: usize, max_symbol: usize) -> usize {
+    let dtable = 1 + (1 << table_log);
+    let build = (2 * (max_symbol + 1) + (1 << table_log) + 8).div_ceil(4);
+    dtable + 1 + build + 256 / 2 + 1
+}
+
 /// Decode the weights of a Huffman tree description from an FSE bitstream
 /// with two interleaved states (FSE_decompress_usingDTable_generic): four
 /// symbols per reload while the stream lasts, then one at a time until it
@@ -894,6 +902,17 @@ impl HuffmanTable {
                 ));
             };
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
+            // FSE_decompress_wksp's table must fit HUF_readStats's workspace,
+            // sized for 6-bit tables over weights 0..=11.
+            let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
+            let log = usize::from(self.fse_table.accuracy_log);
+            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
+                return Err(format!(
+                    "Huffman weights table of log {} over {} symbols is too large",
+                    log,
+                    max_symbol + 1
+                ));
+            }
             let out = self.weights.first_chunk_mut::<255>().unwrap();
             let nb_weights = fse_decompress_weights(&self.fse_table, &src[ncount..], out)?;
             Ok((1 + header, nb_weights))
@@ -4521,6 +4540,178 @@ mod tests {
                 }
             }
         }
+    }
+
+    extern "C" {
+        // lib/common/huf.h; linked from zstd-sys's static libzstd.
+        fn HUF_readStats(
+            huff_weight: *mut u8,
+            hw_size: usize,
+            rank_stats: *mut u32,
+            nb_symbols: *mut u32,
+            table_log: *mut u32,
+            src: *const u8,
+            src_size: usize,
+        ) -> usize;
+        fn HUF_buildCTable_wksp(
+            tree: *mut usize,
+            count: *const u32,
+            max_symbol_value: u32,
+            max_nb_bits: u32,
+            workspace: *mut u64,
+            wksp_size: usize,
+        ) -> usize;
+        fn HUF_writeCTable_wksp(
+            dst: *mut u8,
+            max_dst_size: usize,
+            ctable: *const usize,
+            max_symbol_value: u32,
+            huff_log: u32,
+            workspace: *mut u64,
+            wksp_size: usize,
+        ) -> usize;
+    }
+
+    /// (description length, weights with the implied last one, rank
+    /// statistics up to weight 11, table log) of a tree description.
+    type HufStats = (usize, Vec<u8>, Vec<u32>, u32);
+
+    fn huf_stats_c(src: &[u8]) -> Option<HufStats> {
+        let mut weights = [0u8; 256];
+        let mut rank_stats = [0u32; 13];
+        let (mut nb_symbols, mut table_log) = (0u32, 0u32);
+        // SAFETY: the buffers have the sizes HUF_readStats is given (rankStats
+        // takes HUF_TABLELOG_MAX + 1 = 13 entries).
+        let (r, error) = unsafe {
+            let r = HUF_readStats(
+                weights.as_mut_ptr(),
+                weights.len(),
+                rank_stats.as_mut_ptr(),
+                &mut nb_symbols,
+                &mut table_log,
+                src.as_ptr(),
+                src.len(),
+            );
+            (r, zstd::zstd_safe::zstd_sys::ZSTD_isError(r) != 0)
+        };
+        if error {
+            return None;
+        }
+        let n = nb_symbols as usize;
+        Some((
+            r,
+            weights[..n].to_vec(),
+            rank_stats[..12].to_vec(),
+            table_log,
+        ))
+    }
+
+    fn huf_stats_ours(src: &[u8]) -> Option<HufStats> {
+        let mut t = HuffmanTable::new();
+        let (used, nb_weights) = t.read_weights(src).ok()?;
+        t.weight_stats(nb_weights).ok()?;
+        let n = t.nb_symbols;
+        Some((
+            used,
+            t.weights[..n].to_vec(),
+            t.rank_stats[..12].to_vec(),
+            u32::from(t.max_num_bits),
+        ))
+    }
+
+    /// libzstd's tree description of a code for `counts` of at most
+    /// `max_bits` bits; `None` when HUF_writeCTable cannot write it (more
+    /// than 128 symbols whose weights FSE does not compress).
+    fn huf_description_c(counts: &[u32], max_bits: u32) -> Option<Vec<u8>> {
+        let max_sv = counts.len() as u32 - 1;
+        let mut ctable = [0usize; 258];
+        let mut wksp = [0u64; 2048];
+        let mut out = [0u8; 256];
+        // SAFETY: `ctable` holds HUF_CTABLE_SIZE_ST(255) entries and `wksp`
+        // exceeds HUF_WORKSPACE_SIZE.
+        unsafe {
+            let bits = HUF_buildCTable_wksp(
+                ctable.as_mut_ptr(),
+                counts.as_ptr(),
+                max_sv,
+                max_bits,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            assert_eq!(zstd::zstd_safe::zstd_sys::ZSTD_isError(bits), 0);
+            let n = HUF_writeCTable_wksp(
+                out.as_mut_ptr(),
+                out.len(),
+                ctable.as_ptr(),
+                max_sv,
+                bits as u32,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            (zstd::zstd_safe::zstd_sys::ZSTD_isError(n) == 0).then(|| out[..n].to_vec())
+        }
+    }
+
+    /// `read_weights` + `weight_stats` against HUF_readStats on libzstd's
+    /// descriptions of random codes (raw and FSE-compressed, 2 to 256
+    /// symbols, 6- to 11-bit), every truncation of them, single-byte
+    /// corruptions and random bytes: the same outcome, and on success the
+    /// same length, weights, statistics and table log, except that 12-bit
+    /// codes are errors. Hundreds of the corrupted and random inputs are
+    /// valid descriptions.
+    #[test]
+    fn huf_stats_match_libzstd() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let check = |src: &[u8]| {
+            let theirs = huf_stats_c(src);
+            // libzstd takes weights and table logs up to HUF_TABLELOG_MAX = 12;
+            // the format caps the table log at 11 (MAX_MAX_NUM_BITS).
+            let want = theirs.filter(|&(.., log)| log <= u32::from(MAX_MAX_NUM_BITS));
+            let ours = huf_stats_ours(src);
+            assert_eq!(ours, want, "input {src:02x?}");
+            usize::from(ours.is_some())
+        };
+        let (mut raw, mut written, mut bad_ok, mut random_ok) = (0, 0, 0, 0);
+        for case in 0..3000 {
+            let nb = 2 + rand() as usize % 255;
+            let skew = rand() % 20;
+            let counts: Vec<u32> = (0..nb)
+                .map(|_| 1 + (rand() >> (31 - skew % 31)) % 5000)
+                .collect();
+            // HUF_minTableLog: at least enough bits for `nb` leaves.
+            let max_bits = (6 + case % 6).max(highest_bit_set(nb as u32) + 1);
+            let Some(desc) = huf_description_c(&counts, max_bits) else {
+                continue;
+            };
+            written += 1;
+            raw += usize::from(desc[0] >= 128);
+            for len in 0..=desc.len() {
+                check(&desc[..len]);
+            }
+            let mut bad = desc.clone();
+            let pos = rand() as usize % desc.len();
+            bad[pos] ^= 1 << (rand() % 8);
+            bad_ok += check(&bad);
+            bad[pos] = rand() as u8;
+            bad_ok += check(&bad);
+        }
+        assert!(raw > 100 && written - raw > 1000, "{raw} raw of {written}");
+        for _ in 0..200_000 {
+            let len = 1 + rand() as usize % 40;
+            let mut src: Vec<u8> = (0..len).map(|_| rand() as u8).collect();
+            src[0] %= 1 + len as u8;
+            random_ok += check(&src);
+        }
+        assert!(
+            bad_ok > 500 && random_ok > 1000,
+            "{bad_ok} {random_ok} accepted"
+        );
     }
 
     /// Raw 4-bit weights (an odd number of them) through the statistics and
