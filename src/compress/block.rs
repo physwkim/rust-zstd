@@ -10,7 +10,9 @@
 //! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
 //! discard the candidate, including its repeat offsets.
 
-use super::matchstate::MatchState;
+use super::common::Src;
+use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
+use super::matchstate::{Block, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -168,12 +170,55 @@ pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
     }
 }
 
+/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, ZSTD_noDict)`
+/// run on `block`: store its sequences into `out` and return the anchor of
+/// the trailing literals.
+pub fn run_block_compressor(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::Fast => fast::compress_block(ms, src, block, rep, out),
+        Strategy::DFast => dfast::compress_block(ms, src, block, rep, out),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            lazy::compress_block(ms, src, block, rep, out)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block(ms, src, block, rep, out, RawSeqView::default())
+        }
+    }
+}
+
+/// Where a block's long distance matches come from: the branches of
+/// `ZSTD_buildSeqStore`.
+///
+/// A block too small to compress ([`attempts_compression`]) is the last
+/// one of its job, so the sequences libzstd skips over for it
+/// (`ZSTD_ldm_skipSequences`, or `ZSTD_ldm_skipRawSeqStoreBytes` from
+/// btopt on) are never read again and are left alone.
+pub enum BlockLdm<'a> {
+    /// Long distance matching is off.
+    Off,
+    /// `ldmParams.enableLdm` on a single-threaded context: generate the
+    /// block's sequences from the frame's persistent state, then
+    /// `ZSTD_ldm_blockCompress`.
+    Internal(&'a mut LdmState),
+    /// `externSeqStore`: the job's sequences, generated ahead of it in job
+    /// order (ZSTDMT). `ZSTD_ldm_blockCompress` while some remain, the
+    /// plain block compressor once they are used up.
+    External(&'a mut RawSeqStore),
+}
+
 /// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, set
 /// up positions `block` of `data` ([`MatchState::start_block`], which
 /// applies the nextToUpdate clamp), run the strategy's block compressor on
-/// it, and store the trailing literals
-/// (`ZSTD_storeLastLiterals`). `rep` holds the committed repeat offsets on
-/// entry and the block's candidates on return.
+/// it (through `ZSTD_ldm_blockCompress` when `ldm` provides long matches)
+/// and store the trailing literals (`ZSTD_storeLastLiterals`). `rep` holds
+/// the committed repeat offsets on entry and the block's candidates on
+/// return.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
@@ -184,19 +229,21 @@ pub fn build_seq_store(
     block: Range<usize>,
     rep: &mut [u32; 3],
     store: &mut SeqStore,
+    ldm: &mut BlockLdm,
 ) {
     store.clear();
     let (block_len, block_end) = (block.len(), block.end);
+    let positions = block.clone();
     let (src, block) = ms.start_block(data, block);
-    let anchor = match ms.cparams.strategy {
-        Strategy::Fast => fast::compress_block(ms, src, block, rep, store),
-        Strategy::DFast => dfast::compress_block(ms, src, block, rep, store),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::compress_block(ms, src, block, rep, store)
+    let anchor = match ldm {
+        BlockLdm::External(seqs) if !seqs.is_exhausted() => {
+            ldm::block_compress(seqs, ms, src, block, rep, store)
         }
-        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            opt::compress_block(ms, src, block, rep, store)
+        BlockLdm::Internal(state) => {
+            let seqs = state.generate_block_sequences(data, positions);
+            ldm::block_compress(seqs, ms, src, block, rep, store)
         }
+        BlockLdm::Off | BlockLdm::External(_) => run_block_compressor(ms, src, block, rep, store),
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
     // (`ZSTD_initStats_ultra`), so the anchor is read back through `ms`.
@@ -455,6 +502,7 @@ pub fn compress_block(
     split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
+    ldm: &mut BlockLdm,
     out: &mut Vec<u8>,
 ) {
     let cparams = ms.cparams;
@@ -466,7 +514,7 @@ pub fn compress_block(
     } = scratch;
     let built = attempts_compression(block.len()).then(|| {
         let mut rep = state.prev().rep;
-        build_seq_store(ms, src, block.clone(), &mut rep, store);
+        build_seq_store(ms, src, block.clone(), &mut rep, store, ldm);
         rep
     });
     let parts = split.then(|| match built {
@@ -602,7 +650,7 @@ impl JobBlocks {
 
 /// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks sized by
 /// `sizing`, appended to `out`, each through the post-sequence splitter
-/// when `split`. With `pipelined` (parallel feature only) block N+1's match
+/// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N+1's match
 /// finding runs on rayon next to block N's entropy stage and emission
 /// whenever every block N is written as is [proven](proven_rep_after) to
 /// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
@@ -620,6 +668,7 @@ pub fn compress_blocks(
     split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
+    ldm: &mut BlockLdm,
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
@@ -631,7 +680,17 @@ pub fn compress_blocks(
     };
     #[cfg(feature = "parallel")]
     if pipelined {
-        compress_blocks_pipelined(ms, src, &mut blocks, last_job, split, state, scratch, out);
+        compress_blocks_pipelined(
+            ms,
+            src,
+            &mut blocks,
+            last_job,
+            split,
+            state,
+            scratch,
+            ldm,
+            out,
+        );
         return;
     }
     let _ = pipelined;
@@ -648,6 +707,7 @@ pub fn compress_blocks(
             split,
             state,
             scratch,
+            ldm,
             out,
         );
         blocks.wrote(&block, out.len() - written);
@@ -689,6 +749,7 @@ fn compress_blocks_pipelined(
     split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
+    ldm: &mut BlockLdm,
     out: &mut Vec<u8>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -710,7 +771,7 @@ fn compress_blocks_pipelined(
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
     let mut built = attempts_compression(block.len()).then(|| {
         let mut rep = state.prev().rep;
-        build_seq_store(ms, src, block.clone(), &mut rep, cur);
+        build_seq_store(ms, src, block.clone(), &mut rep, cur, ldm);
         rep
     });
     loop {
@@ -771,7 +832,7 @@ fn compress_blocks_pipelined(
                         out,
                     )
                 },
-                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt),
+                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
             );
             // The proof is what made block N+1 start from the decoder's
             // offsets, with the size the written block N gives it.
@@ -804,7 +865,7 @@ fn compress_blocks_pipelined(
             block = blocks.next(src, block.end, presplit);
             built = attempts_compression(block.len()).then(|| {
                 let mut rep = state.prev().rep;
-                build_seq_store(ms, src, block.clone(), &mut rep, nxt);
+                build_seq_store(ms, src, block.clone(), &mut rep, nxt, ldm);
                 rep
             });
         }

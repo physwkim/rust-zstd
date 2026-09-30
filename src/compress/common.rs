@@ -183,6 +183,28 @@ pub fn prefetch(src: Src, pos: usize) {
     }
 }
 
+/// `PREFETCH_L1(&slice[idx])`. `idx` may point past the end: C prefetches
+/// `base + matchIndex` and table rows the same way, and the hint never
+/// faults.
+#[inline(always)]
+pub fn prefetch_l1<T>(slice: &[T], idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "sse")]
+        #[inline]
+        fn prefetch(p: *const i8) {
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p)
+        }
+        // SAFETY: SSE is part of the x86_64 baseline, so the target feature
+        // the callee asks for is always present.
+        unsafe { prefetch(slice.as_ptr().wrapping_add(idx) as *const i8) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (slice, idx);
+    }
+}
+
 const PRIME4: u32 = 2654435761;
 const PRIME5: u64 = 889523592379;
 const PRIME6: u64 = 227718039650203;

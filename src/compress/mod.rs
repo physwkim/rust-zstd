@@ -17,6 +17,7 @@ pub mod common;
 pub mod dfast;
 pub mod fast;
 pub mod lazy;
+pub mod ldm;
 pub mod matchstate;
 pub mod opt;
 pub mod params;
@@ -26,9 +27,10 @@ pub mod split;
 
 use crate::constants::*;
 use block::{
-    write_raw_block, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
+    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
+use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
 use matchstate::MatchState;
 pub use params::{CParams, ParamSwitch, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
@@ -39,6 +41,9 @@ use std::ops::Range;
 pub const JOBSIZE_MIN: usize = 512 << 10;
 /// `ZSTDMT_JOBSIZE_MAX` (64-bit): upper bound of an explicit job size.
 pub const JOBSIZE_MAX: usize = 1 << 30;
+/// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the job size log that
+/// sizes the overlap under long distance matching.
+const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`Compressor`] and [`compress_with`].
 ///
@@ -75,8 +80,35 @@ pub struct CompressOptions {
     /// `BtLazy2`, 8 for `BtOpt` and `BtUltra`, 9 for `BtUltra2`), `1` means
     /// no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
-    /// them with `parameter_outOfBound`).
+    /// them with `parameter_outOfBound`). With long distance matching the
+    /// fraction is of `min(window, 1 << (job_log - 2))` instead, with
+    /// `job_log = min(max(21, cycleLog + 3), 30)`, and `1` no longer means
+    /// no overlap (`ZSTDMT_computeOverlapSize`).
     pub overlap_log: u8,
+    /// `ZSTD_c_enableLongDistanceMatching`: find matches up to a window
+    /// back with a rolling hash over the whole window (see [`ldm`]).
+    /// `Auto` enables it for the `btopt` strategies and up with a window
+    /// log of 27 or more (level 22 on inputs above 64 MiB). `Enable`
+    /// raises the window log to 27 (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before
+    /// the size adjustment. Without an explicit `job_size` each block's
+    /// matches are generated as the block is compressed; with one, each
+    /// job's are generated in job order before the job, and the job
+    /// overlap changes (see `overlap_log`).
+    pub ldm: ParamSwitch,
+    /// `ZSTD_c_ldmHashLog`: `0` derives it (window log minus hash rate
+    /// log, within `6..=30`), else `6..=30`.
+    pub ldm_hash_log: u32,
+    /// `ZSTD_c_ldmMinMatch`: `0` derives it (64, 32 for `btultra` and up),
+    /// else `4..=4096`.
+    pub ldm_min_match: u32,
+    /// `ZSTD_c_ldmBucketSizeLog`: `0` derives it (the strategy number
+    /// within `4..=8`), else `1..=8`; never above the hash log.
+    pub ldm_bucket_size_log: u32,
+    /// `ZSTD_c_ldmHashRateLog`: `0` derives it (window log minus an
+    /// explicit hash log, else `7 - strategy / 3`), else `1..=25`.
+    ///
+    /// Out-of-range LDM values panic, as `overlap_log` does.
+    pub ldm_hash_rate_log: u32,
     /// `ZSTD_c_splitAfterSequences`: after the match finder, cut a block
     /// into several where separate entropy tables are estimated to pay for
     /// the extra block headers. `Auto` (the default) enables it for
@@ -102,6 +134,11 @@ impl Default for CompressOptions {
             level: ZSTD_CLEVEL_DEFAULT,
             job_size: None,
             overlap_log: 0,
+            ldm: ParamSwitch::Auto,
+            ldm_hash_log: 0,
+            ldm_min_match: 0,
+            ldm_bucket_size_log: 0,
+            ldm_hash_rate_log: 0,
             split_after_sequences: ParamSwitch::Auto,
             block_splitter_level: 0,
         }
@@ -136,6 +173,31 @@ impl CompressOptions {
             overlap_log: 8,
             ..Self::default()
         }
+    }
+
+    /// `ZSTD_getCParamsFromCCtxParams` and `ZSTD_resolveEnableLdm` for an
+    /// input of `src_size` bytes: the frame's compression parameters and,
+    /// when long distance matching resolves to enabled, its parameters
+    /// (`ZSTD_ldm_adjustParameters`).
+    fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
+        let requested = LdmParams::requested(
+            self.ldm_hash_log,
+            self.ldm_min_match,
+            self.ldm_bucket_size_log,
+            self.ldm_hash_rate_log,
+        );
+        let mut cparams = CParams::for_level(self.level, src_size);
+        if self.ldm == ParamSwitch::Enable {
+            cparams.window_log = LDM_DEFAULT_WINDOW_LOG;
+            cparams = cparams.adjust(src_size);
+        }
+        let enabled = match self.ldm {
+            // wlog >= 27, strategy >= btopt
+            ParamSwitch::Auto => cparams.strategy >= Strategy::BtOpt && cparams.window_log >= 27,
+            ParamSwitch::Enable => true,
+            ParamSwitch::Disable => false,
+        };
+        (cparams, enabled.then(|| requested.adjusted(&cparams)))
     }
 }
 
@@ -172,14 +234,21 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 pub struct Compressor {
     opts: CompressOptions,
     jobs: Vec<JobContext>,
+    /// ZSTDMT's long distance matching state (`serialState.ldmState`),
+    /// once a multithreaded frame has used it.
+    serial_ldm: Option<LdmState>,
 }
 
-/// One job's reusable state: its match state once a job has run, and its
-/// block buffers.
+/// One job's reusable state: its match state once a job has run, its
+/// block buffers, the long distance matching state a single-threaded frame
+/// generates each block's matches from (the context's `ldmState`), and the
+/// long distance matches ZSTDMT generated for the job (`rawSeqStore`).
 #[derive(Default)]
 struct JobContext {
     ms: Option<MatchState>,
     scratch: BlockScratch,
+    ldm_state: Option<LdmState>,
+    ldm_seqs: RawSeqStore,
 }
 
 impl Compressor {
@@ -187,6 +256,7 @@ impl Compressor {
         Self {
             opts,
             jobs: Vec::new(),
+            serial_ldm: None,
         }
     }
 
@@ -196,7 +266,7 @@ impl Compressor {
             src.len() < u32::MAX as usize,
             "inputs of 4 GiB or more are not supported (match indices are u32)"
         );
-        let cparams = CParams::for_level(self.opts.level, src.len());
+        let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();
         write_frame_header(out, src.len() as u64, cparams.window_log);
@@ -207,7 +277,8 @@ impl Compressor {
             return;
         }
 
-        let overlap = overlap_size(&cparams, self.opts.overlap_log);
+        let ldm_on = ldm_params.is_some();
+        let overlap = overlap_size(&cparams, self.opts.overlap_log, ldm_on);
         let job_size = job_size_for(self.opts.job_size, overlap);
         let split = split::block_splitter_enabled(self.opts.split_after_sequences, &cparams);
         let jobs = job_ranges(src.len(), job_size);
@@ -217,11 +288,42 @@ impl Compressor {
         if self.jobs.len() < n_jobs {
             self.jobs.resize_with(n_jobs, JobContext::default);
         }
+        let pipelined = cfg!(feature = "parallel");
+        // ZSTDMT_serialState: every job's long distance matches from the one
+        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
+        // single-threaded frame generates each block's as it compresses the
+        // block (ZSTD_buildSeqStore), from its context's state.
+        let mut serial_ldm = ldm_params
+            .filter(|_| mt)
+            .map(|params| reset_ldm_state(&mut self.serial_ldm, params));
+        let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
+        // A job spawned only once its sequences are generated would be taken
+        // by a thread waiting in an earlier job's block join, holding that job
+        // back by a whole job; such jobs compress their blocks serially, as
+        // ZSTDMT's workers do.
+        let blocks_pipelined = pipelined && (n_jobs == 1 || serial_ldm.is_none());
         run_jobs(
             &jobs,
             &mut self.jobs[..n_jobs],
-            cfg!(feature = "parallel"),
+            pipelined,
+            // ZSTDMT_serialState_update
+            |job, ctx| {
+                if let Some(state) = &mut serial_ldm {
+                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                }
+            },
             |k, job, ctx, out| {
+                let JobContext {
+                    ms,
+                    scratch,
+                    ldm_state,
+                    ldm_seqs,
+                } = ctx;
+                let mut ldm = match ldm_params {
+                    None => BlockLdm::Off,
+                    Some(_) if mt => BlockLdm::External(ldm_seqs),
+                    Some(params) => BlockLdm::Internal(reset_ldm_state(ldm_state, params)),
+                };
                 compress_job(
                     src,
                     cparams,
@@ -231,8 +333,10 @@ impl Compressor {
                     k == 0,
                     k + 1 == n_jobs,
                     split,
-                    cfg!(feature = "parallel"),
-                    ctx,
+                    blocks_pipelined,
+                    ms,
+                    scratch,
+                    &mut ldm,
                     out,
                 )
             },
@@ -245,6 +349,18 @@ impl Compressor {
         let mut out = Vec::new();
         self.compress(src, &mut out);
         out
+    }
+}
+
+/// The long distance matching state in `slot` reset for a frame with
+/// `params`, allocated on first use.
+fn reset_ldm_state(slot: &mut Option<LdmState>, params: LdmParams) -> &mut LdmState {
+    match slot.take() {
+        Some(mut state) => {
+            state.reset(params, 0);
+            slot.insert(state)
+        }
+        None => slot.insert(LdmState::new(params, 0)),
     }
 }
 
@@ -284,10 +400,12 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 }
 
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
-/// appended to `out`, on `ctx`'s state reset for this job. Job 0 starts
-/// from `repStartValue` with its first byte as the window start; a later
-/// job's window starts `overlap` bytes before it, and the job indexes that
-/// prefix (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with invalidated repeat offsets and no
+/// appended to `out`, on the match state in `ms_slot` reset for this job
+/// (allocated on first use) with `scratch`'s buffers and the long distance
+/// matches of `ldm`. Job 0 starts from `repStartValue` with its first byte
+/// as the window start; a later job's window starts `overlap` bytes before
+/// it, and the job indexes that prefix (`ZSTD_loadDictionaryContent` on the
+/// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
 /// obtained from the previous job. `sizing` cuts the job into blocks;
 /// `split` runs every block through the post-sequence splitter.
@@ -302,7 +420,9 @@ fn compress_job(
     last_job: bool,
     split: bool,
     pipelined: bool,
-    ctx: &mut JobContext,
+    ms_slot: &mut Option<MatchState>,
+    scratch: &mut BlockScratch,
+    ldm: &mut BlockLdm,
     out: &mut Vec<u8>,
 ) {
     // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
@@ -311,7 +431,7 @@ fn compress_job(
     } else {
         job.start.saturating_sub(overlap)
     };
-    let mut ms = match ctx.ms.take() {
+    let mut ms = match ms_slot.take() {
         Some(mut ms) => {
             ms.reset(cparams, origin);
             ms
@@ -324,62 +444,46 @@ fn compress_job(
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
-    ctx.scratch.reserve(sizing.block_size_max);
+    scratch.reserve(sizing.block_size_max);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
-        &mut ms,
-        data,
-        job,
-        sizing,
-        first_job,
-        last_job,
-        split,
-        &mut state,
-        &mut ctx.scratch,
-        out,
+        &mut ms, data, job, sizing, first_job, last_job, split, &mut state, scratch, ldm, out,
         pipelined,
     );
-    ctx.ms = Some(ms);
+    *ms_slot = Some(ms);
 }
 
 /// Run `f` over every job, in job order, appending to `out`; `ctxs[k]` is
-/// job `k`'s context. Job 0 always writes straight into `out`. With the
-/// feature enabled and `parallel`, the remaining jobs run on rayon into
-/// buffers of their own while job 0 runs, and are appended afterwards; the
-/// serial loop hands every job `out`. The job function is the same either
-/// way, so the frame is identical.
-fn run_jobs<F>(
+/// job `k`'s context. `prepare` runs on each job's context, in job order and
+/// one at a time, before the job starts: with the feature enabled and
+/// `parallel`, on the calling task while the earlier jobs run on rayon, as
+/// ZSTDMT serializes its long distance matching across jobs. Job 0 writes
+/// straight into `out`, the others into buffers of their own that are
+/// appended afterwards; the serial loop hands every job `out`. The job
+/// function is the same either way, so the frame is identical.
+fn run_jobs<P, F>(
     jobs: &[Range<usize>],
     ctxs: &mut [JobContext],
     parallel: bool,
+    mut prepare: P,
     f: F,
     out: &mut Vec<u8>,
 ) where
+    P: FnMut(&Range<usize>, &mut JobContext) + Send,
     F: Fn(usize, Range<usize>, &mut JobContext, &mut Vec<u8>) + Sync,
 {
     debug_assert_eq!(jobs.len(), ctxs.len());
     #[cfg(feature = "parallel")]
     if parallel {
-        use rayon::prelude::*;
-        let (Some((first, rest)), Some((first_ctx, rest_ctxs))) =
-            (jobs.split_first(), ctxs.split_first_mut())
-        else {
-            return;
-        };
-        let ((), rest_out) = rayon::join(
-            || f(0, first.clone(), first_ctx, out),
-            || {
-                rest.par_iter()
-                    .zip(rest_ctxs.par_iter_mut())
-                    .enumerate()
-                    .map(|(i, (job, ctx))| {
-                        let mut o = Vec::new();
-                        f(i + 1, job.clone(), ctx, &mut o);
-                        o
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
+        let mut rest_out = vec![Vec::new(); jobs.len().saturating_sub(1)];
+        let outs = std::iter::once(&mut *out).chain(&mut rest_out);
+        let f = &f;
+        rayon::scope(|s| {
+            for (k, ((job, ctx), o)) in jobs.iter().zip(ctxs).zip(outs).enumerate() {
+                prepare(job, ctx);
+                s.spawn(move |_| f(k, job.clone(), ctx, o));
+            }
+        });
         for o in &rest_out {
             out.extend_from_slice(o);
         }
@@ -387,6 +491,7 @@ fn run_jobs<F>(
     }
     let _ = parallel;
     for (k, (job, ctx)) in jobs.iter().zip(ctxs.iter_mut()).enumerate() {
+        prepare(job, ctx);
         f(k, job.clone(), ctx, out);
     }
 }
@@ -412,10 +517,11 @@ pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// `ZSTDMT_computeOverlapSize` without long-distance matching: `overlap_log`
-/// as `ZSTD_c_overlapLog` (see [`CompressOptions::overlap_log`]); the result
-/// is `0` or `1 << (window_log - (9 - overlap_log))`.
-pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
+/// `ZSTDMT_computeOverlapSize`: `overlap_log` as `ZSTD_c_overlapLog` (see
+/// [`CompressOptions::overlap_log`]); without long distance matching the
+/// result is `0` or `1 << (window_log - (9 - overlap_log))`, with it
+/// `1 << (min(window_log, job_log - 2) - (9 - overlap_log))`.
+pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     assert!(
         overlap_log <= 9,
         "overlap_log {overlap_log} out of range 0..=9"
@@ -432,10 +538,22 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
         n => n as u32,
     };
     let overlap_rlog = 9 - overlap_log;
-    if overlap_rlog >= 8 {
+    let ov_log = if ldm {
+        // In Long Range Mode, the windowLog is typically oversized: ovLog
+        // becomes a fraction of the jobSize, rather than windowSize.
+        // ZSTDMT_computeTargetJobLog, from ZSTD_cycleLog(chainLog, strategy):
+        let cycle_log = cparams.chain_log - cparams.strategy.bt_scale();
+        let job_log = 21.max(cycle_log + 3).min(JOBLOG_MAX);
+        cparams.window_log.min(job_log - 2) - overlap_rlog
+    } else if overlap_rlog >= 8 {
         0
     } else {
-        1usize << (cparams.window_log - overlap_rlog)
+        cparams.window_log - overlap_rlog
+    };
+    if ov_log == 0 {
+        0
+    } else {
+        1usize << ov_log
     }
 }
 
@@ -584,6 +702,14 @@ mod tests {
         v
     }
 
+    /// Level 1's parameters with `window_log` and `chain_log` replaced.
+    fn logs(window_log: u32, chain_log: u32) -> CParams {
+        let mut cp = CParams::for_level(1, 8 << 20);
+        cp.window_log = window_log;
+        cp.chain_log = chain_log;
+        cp
+    }
+
     #[test]
     fn job_sizing() {
         // explicit: clamped to [JOBSIZE_MIN, JOBSIZE_MAX], otherwise used as is
@@ -607,16 +733,16 @@ mod tests {
             vec![0..1 << 17, 1 << 17..1 << 18, 1 << 18..(1 << 18) + 5]
         );
         let fast = CParams::for_level(1, 8 << 20);
-        assert_eq!(overlap_size(&fast, 0), 1 << (fast.window_log - 3));
+        assert_eq!(overlap_size(&fast, 0, false), 1 << (fast.window_log - 3));
         let lazy2 = CParams::for_level(11, 8 << 20);
         assert_eq!(lazy2.strategy, Strategy::Lazy2);
-        assert_eq!(overlap_size(&lazy2, 0), 1 << (lazy2.window_log - 2));
+        assert_eq!(overlap_size(&lazy2, 0, false), 1 << (lazy2.window_log - 2));
         // ZSTD_c_overlapLog: 1 = none, n = window >> (9 - n), 9 = window.
         for cp in [fast, lazy2] {
-            assert_eq!(overlap_size(&cp, 1), 0);
-            assert_eq!(overlap_size(&cp, 2), 1 << (cp.window_log - 7));
-            assert_eq!(overlap_size(&cp, 6), 1 << (cp.window_log - 3));
-            assert_eq!(overlap_size(&cp, 9), 1 << cp.window_log);
+            assert_eq!(overlap_size(&cp, 1, false), 0);
+            assert_eq!(overlap_size(&cp, 2, false), 1 << (cp.window_log - 7));
+            assert_eq!(overlap_size(&cp, 6, false), 1 << (cp.window_log - 3));
+            assert_eq!(overlap_size(&cp, 9, false), 1 << cp.window_log);
         }
         // A job is at least the overlap; JOBSIZE_MIN applies to explicit sizes.
         assert_eq!(job_size_for(Some(1), 1 << 22), 1 << 22);
@@ -624,10 +750,245 @@ mod tests {
         assert_eq!(job_size_for(Some(JOBSIZE_MIN), 1 << 23), 1 << 23);
     }
 
+    /// With long distance matching the overlap of explicit jobs is
+    /// `1 << (min(window_log, job_log - 2) - (9 - overlap_log))`, nonzero
+    /// even for overlap_log 1, with `job_log = min(max(21, cycleLog + 3),
+    /// 30)` whatever the window (`ZSTDMT_computeOverlapSize`,
+    /// `ZSTDMT_computeTargetJobLog`).
+    #[test]
+    fn overlap_with_ldm() {
+        // Job log 21: the overlap is a fraction of 1 << 19, not of the
+        // window.
+        let cp = logs(27, 13);
+        assert_eq!(overlap_size(&cp, 9, true), 1 << 19);
+        assert_eq!(overlap_size(&cp, 6, true), 1 << 16);
+        assert_eq!(overlap_size(&cp, 0, true), 1 << 16);
+        assert_eq!(overlap_size(&cp, 1, true), 1 << 11);
+        // cycleLog 18 + 3 is still 21; then 22, 27, and 31 capped to 30.
+        assert_eq!(overlap_size(&logs(27, 18), 9, true), 1 << 19);
+        assert_eq!(overlap_size(&logs(27, 19), 9, true), 1 << 20);
+        assert_eq!(overlap_size(&logs(27, 24), 9, true), 1 << 25);
+        assert_eq!(overlap_size(&logs(31, 28), 9, true), 1 << 28);
+        // A window below job_log - 2 is the base.
+        let small = logs(17, 13);
+        assert_eq!(overlap_size(&small, 9, true), 1 << 17);
+        assert_eq!(overlap_size(&small, 2, true), 1 << 10);
+        // Job log 27 (chain log 24), Lazy2's default overlap log 7.
+        let mut lazy2 = logs(27, 24);
+        lazy2.strategy = Strategy::Lazy2;
+        assert_eq!(overlap_size(&lazy2, 0, true), 1 << 23);
+        // The binary-tree strategies halve the cycle: level 22's chain log
+        // 27 gives job log 26 + 3, and btultra2's overlap log 9 the whole
+        // job log - 2 window.
+        let l22 = CParams::for_level(22, 1 << 30);
+        assert_eq!(overlap_size(&l22, 0, true), 1 << 27);
+        // An explicit job is at least that overlap.
+        assert_eq!(
+            job_size_for(Some(1), overlap_size(&logs(27, 24), 9, true)),
+            1 << 25
+        );
+    }
+
+    /// `len + gap` noise bytes, then the first `len` of them again: a
+    /// repeat `len + gap` bytes back, beyond the window of levels 1-11
+    /// without long distance matching once that exceeds 4 MiB.
+    fn far_repeat(len: usize, gap: usize) -> Vec<u8> {
+        let mut v = noise(len + gap, 11);
+        v.extend_from_within(..len);
+        v
+    }
+
+    fn ldm_opts(level: i32, ldm: ParamSwitch, job_size: Option<usize>) -> CompressOptions {
+        CompressOptions {
+            level,
+            job_size,
+            ldm,
+            ..Default::default()
+        }
+    }
+
+    /// One `Compressor` for `opts` writes, for each of `inputs` in turn,
+    /// what a fresh one does, and the frames decode through both decoders.
+    fn check_ldm_frames(opts: &CompressOptions, inputs: &[&Vec<u8>]) {
+        let mut cx = Compressor::new(opts.clone());
+        for &data in inputs {
+            let frame = cx.compress_to_vec(data);
+            let name = format!(
+                "L{} job {:?} {} bytes",
+                opts.level,
+                opts.job_size,
+                data.len()
+            );
+            assert!(frame == compress_with(data, opts), "{name}: reuse");
+            assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name}");
+            let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+            assert_eq!(&theirs, data, "{name}");
+        }
+    }
+
+    /// Long distance matching frames decode through both decoders on the
+    /// single-threaded path (the default, and explicit jobs up to
+    /// `JOBSIZE_MIN`) and over several jobs (the last block 3 bytes, too
+    /// small to compress), find the repeat that the frame without it stores
+    /// as literals, and a reused `Compressor` writes what fresh ones do.
+    #[test]
+    fn ldm_frames_roundtrip_and_find_far_repeats() {
+        let single = far_repeat(160 << 10, 160 << 10);
+        let jobs = far_repeat(1 << 20, (4 << 20) + 3);
+        let empty = Vec::new();
+        for level in [1, 3, 7, 11] {
+            for job_size in [None, Some(JOBSIZE_MIN)] {
+                let opts = ldm_opts(level, ParamSwitch::Enable, job_size);
+                check_ldm_frames(&opts, &[&jobs, &single, &empty, &jobs]);
+                let off = compress_with(&jobs, &ldm_opts(level, ParamSwitch::Disable, job_size));
+                let on = compress_with(&jobs, &opts);
+                assert!(
+                    on.len() + (900 << 10) < off.len(),
+                    "L{level} job {job_size:?}: {} with LDM, {} without",
+                    on.len(),
+                    off.len()
+                );
+            }
+        }
+    }
+
+    /// From btopt on the long distance matches are candidates of the
+    /// optimal parser: the frames decode through both decoders on the
+    /// single-threaded path and over explicit jobs, whose overlap with long
+    /// distance matching is half the window at level 16 (two jobs here) and
+    /// all of it at level 19 (one job, still fed from the job-order
+    /// sequences).
+    #[test]
+    fn ldm_opt_frames_roundtrip() {
+        let single = far_repeat(160 << 10, 160 << 10);
+        let jobs = far_repeat(256 << 10, 1 << 20);
+        for level in [16, 19] {
+            for job_size in [None, Some(JOBSIZE_MIN)] {
+                let opts = ldm_opts(level, ParamSwitch::Enable, job_size);
+                check_ldm_frames(&opts, &[&jobs, &single, &jobs]);
+            }
+        }
+    }
+
+    /// With long distance matching over several jobs, the parallel job loop
+    /// (generating each job's sequences while the earlier jobs run) and the
+    /// serial one write the same bytes, and those are the frame's.
+    #[test]
+    fn ldm_parallel_and_serial_job_loops_agree() {
+        let big = far_repeat(1 << 20, 4 << 20);
+        let small = far_repeat(256 << 10, 1 << 20);
+        for (level, data, min_jobs) in [
+            (1, &big, 6),
+            (3, &big, 6),
+            (7, &big, 6),
+            (11, &big, 6),
+            (16, &small, 2),
+            (18, &small, 2),
+        ] {
+            let src = data.as_slice();
+            let opts = ldm_opts(level, ParamSwitch::Enable, Some(JOBSIZE_MIN));
+            let (cparams, ldm) = opts.frame_params(src.len());
+            let ldm = ldm.expect("enabled");
+            let overlap = overlap_size(&cparams, opts.overlap_log, true);
+            let job_size = job_size_for(opts.job_size, overlap);
+            let mt = multithreaded(&opts, src.len());
+            let sizing = block_sizing(&opts, &cparams, mt, header_len(src, &cparams));
+            let split = split::block_splitter_enabled(opts.split_after_sequences, &cparams);
+            let jobs = job_ranges(src.len(), job_size);
+            let n = jobs.len();
+            assert!(n >= min_jobs, "L{level}: {n} jobs");
+            let max_seqs = job_size / ldm.min_match_length as usize;
+            let generate = || {
+                let mut state = LdmState::new(ldm, 0);
+                move |job: &Range<usize>, ctx: &mut JobContext| {
+                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                }
+            };
+            let f = |pipelined: bool| {
+                move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
+                    let JobContext {
+                        ms,
+                        scratch,
+                        ldm_seqs,
+                        ..
+                    } = ctx;
+                    compress_job(
+                        src,
+                        cparams,
+                        sizing,
+                        overlap,
+                        job,
+                        k == 0,
+                        k + 1 == n,
+                        split,
+                        pipelined,
+                        ms,
+                        scratch,
+                        &mut BlockLdm::External(ldm_seqs),
+                        out,
+                    )
+                }
+            };
+            let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
+            let mut par = Vec::new();
+            run_jobs(&jobs, &mut ctxs, true, generate(), f(true), &mut par);
+            let mut seq = Vec::new();
+            run_jobs(&jobs, &mut ctxs, false, generate(), f(false), &mut seq);
+            assert!(par == seq, "L{level}: job outputs differ");
+            assert!(compress_with(src, &opts).ends_with(&seq), "L{level}");
+        }
+    }
+
+    /// `Enable` selects window log 27 before the size adjustment; `Auto`
+    /// turns on for btopt and above at window log 27 (`ZSTD_resolveEnableLdm`),
+    /// which only level 22 reaches, above 64 MiB, and otherwise leaves the
+    /// parameters and frames `Disable`'s.
+    #[test]
+    fn ldm_switch_resolution() {
+        let data = far_repeat(300 << 10, 400 << 10);
+        for level in 1..=22 {
+            let (cp, ldm) = ldm_opts(level, ParamSwitch::Enable, None).frame_params(3 << 20);
+            assert_eq!(cp.window_log, 22, "L{level}: 3 MiB adjusts 27 to 22");
+            assert!(ldm.is_some_and(|p| p.window_log == 22));
+            let big = ldm_opts(level, ParamSwitch::Enable, None).frame_params(1 << 30);
+            assert_eq!(big.0.window_log, 27, "L{level}");
+            for size in [3 << 20, 64 << 20, (64 << 20) + 1, 1 << 30] {
+                let auto = ldm_opts(level, ParamSwitch::Auto, None).frame_params(size);
+                if level == 22 && size > 64 << 20 {
+                    let on = ldm_opts(level, ParamSwitch::Enable, None).frame_params(size);
+                    assert_eq!(auto, on, "L{level} {size}");
+                    assert!(auto.1.is_some(), "L{level} {size}");
+                } else {
+                    assert!(auto.1.is_none(), "L{level} {size}");
+                    assert_eq!(auto.0, CParams::for_level(level, size), "L{level} {size}");
+                    let off = ldm_opts(level, ParamSwitch::Disable, None).frame_params(size);
+                    assert_eq!(off, auto, "L{level} {size}");
+                }
+            }
+            let auto = compress_with(&data, &ldm_opts(level, ParamSwitch::Auto, None));
+            let off = compress_with(&data, &ldm_opts(level, ParamSwitch::Disable, None));
+            assert!(auto == off, "L{level}");
+        }
+    }
+
+    /// Out-of-range long distance matching parameters panic, as libzstd
+    /// refuses them with `parameter_outOfBound`.
+    #[test]
+    #[should_panic(expected = "ldm_bucket_size_log 9 out of range")]
+    fn ldm_parameter_out_of_range_panics() {
+        compress_with(
+            b"abc",
+            &CompressOptions {
+                ldm_bucket_size_log: 9,
+                ..Default::default()
+            },
+        );
+    }
+
     #[test]
     #[should_panic(expected = "out of range")]
     fn overlap_log_above_nine_panics() {
-        overlap_size(&CParams::for_level(1, 1 << 20), 10);
+        overlap_size(&CParams::for_level(1, 1 << 20), 10, false);
     }
 
     /// The preset runs three jobs on 4.25 MiB, counted as the job contexts
@@ -705,7 +1066,7 @@ mod tests {
                 ..Default::default()
             };
             let cparams = CParams::for_level(level, data.len());
-            let overlap = overlap_size(&cparams, opts.overlap_log);
+            let overlap = overlap_size(&cparams, opts.overlap_log, false);
             let job_size = job_size_for(opts.job_size, overlap);
             let jobs = job_ranges(data.len(), job_size);
             assert!(jobs.len() >= 5, "level {level}: {} jobs", jobs.len());
@@ -725,7 +1086,9 @@ mod tests {
                         k + 1 == n,
                         false,
                         pipelined,
-                        ctx,
+                        &mut ctx.ms,
+                        &mut ctx.scratch,
+                        &mut BlockLdm::Off,
                         out,
                     )
                 }
@@ -734,9 +1097,9 @@ mod tests {
             // covers the reset of used contexts.
             let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, f(true), &mut par);
+            run_jobs(&jobs, &mut ctxs, true, |_, _| {}, f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, f(false), &mut seq);
+            run_jobs(&jobs, &mut ctxs, false, |_, _| {}, f(false), &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
             assert!(
@@ -765,12 +1128,24 @@ mod tests {
         };
         let cparams = CParams::for_level(level, data.len());
         let sizing = block_sizing(&opts, &cparams, mt, header_len(data, &cparams));
-        let overlap = overlap_size(&cparams, 0);
+        let overlap = overlap_size(&cparams, 0, false);
         let mut ctx = JobContext::default();
         let mut out = Vec::new();
         let job = 0..data.len();
         compress_job(
-            data, cparams, sizing, overlap, job, true, true, split, pipelined, &mut ctx, &mut out,
+            data,
+            cparams,
+            sizing,
+            overlap,
+            job,
+            true,
+            true,
+            split,
+            pipelined,
+            &mut ctx.ms,
+            &mut ctx.scratch,
+            &mut BlockLdm::Off,
+            &mut out,
         );
         out
     }
@@ -1045,7 +1420,7 @@ mod tests {
             ..Default::default()
         };
         let cparams = CParams::for_level(1, data.len());
-        assert!(overlap_size(&cparams, 0) >= copy);
+        assert!(overlap_size(&cparams, 0, false) >= copy);
         let frame = compress_with(&data, &opts);
         assert!(
             frame.len() < job + copy / 4,

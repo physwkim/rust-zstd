@@ -272,6 +272,23 @@ impl MatchState {
         (src, Block { start, end })
     }
 
+    /// The literal run `range` of `block` (indices) that
+    /// `ZSTD_ldm_blockCompress` hands to the block compressor, after
+    /// `ZSTD_ldm_limitTableUpdate`: when more than 1024 positions before it
+    /// are uninserted, insert at most the last 512 of them (fewer while the
+    /// backlog is under 1536).
+    pub fn ldm_sub_block(&mut self, block: Block, range: Range<usize>) -> Block {
+        assert!(block.start <= range.start && range.start <= range.end && range.end <= block.end);
+        let start = range.start;
+        if start > self.next_to_update + 1024 {
+            self.next_to_update = start - 512.min(start - self.next_to_update - 1024);
+        }
+        Block {
+            start,
+            end: range.end,
+        }
+    }
+
     /// Move the window past the `len` bytes that begin it, as
     /// `ZSTD_initStats_ultra` forgets its first pass: `base -= len`,
     /// `dictLimit` and `lowLimit` up by `len`, `nextToUpdate = dictLimit`.

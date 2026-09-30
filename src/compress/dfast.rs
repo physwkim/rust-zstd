@@ -412,6 +412,16 @@ fn fill_double_hash_table<const MLS: u32>(ms: &mut MatchState, src: Src, start: 
     }
 }
 
+/// [`fill_double_hash_table`] for `ms.cparams.min_match`.
+fn fill_double_hash_table_from(ms: &mut MatchState, src: Src, start: usize, end: usize) {
+    match ms.cparams.min_match {
+        5 => fill_double_hash_table::<5>(ms, src, start, end),
+        6 => fill_double_hash_table::<6>(ms, src, start, end),
+        7 => fill_double_hash_table::<7>(ms, src, start, end),
+        _ => fill_double_hash_table::<4>(ms, src, start, end),
+    }
+}
+
 /// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`:
 /// insert every third position of `src[range]` from `ms.next_to_update`
 /// into both tables, then set `next_to_update = range.end`.
@@ -419,13 +429,16 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     let end = range.end;
     assert!(end <= src.end());
     let start = ms.next_to_update.max(range.start);
-    match ms.cparams.min_match {
-        5 => fill_double_hash_table::<5>(ms, src, start, end),
-        6 => fill_double_hash_table::<6>(ms, src, start, end),
-        7 => fill_double_hash_table::<7>(ms, src, start, end),
-        _ => fill_double_hash_table::<4>(ms, src, start, end),
-    }
+    fill_double_hash_table_from(ms, src, start, end);
     ms.next_to_update = end;
+}
+
+/// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)` as
+/// `ZSTD_ldm_fillFastTables` calls it before each block compressor run:
+/// insert every third position from `ms.next_to_update` up to `end` into
+/// both tables, leaving `next_to_update` where it is.
+pub fn fill_double_hash_table_to(ms: &mut MatchState, src: Src, end: usize) {
+    fill_double_hash_table_from(ms, src, ms.next_to_update, end);
 }
 
 #[cfg(test)]
