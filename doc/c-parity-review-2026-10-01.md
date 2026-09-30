@@ -262,7 +262,7 @@ Severity: High
 
 Class: libzstd bug
 
-Rust: `src/compress/ldm.rs:338-339` — `self.hash_table.resize(1 << params.hash_log, LdmEntry::default())`. On i686, hash log 28, 29 and 30 (explicit, or derived as in R1-16) end in a `capacity overflow` panic from `raw_vec/mod.rs:28`. The port does not corrupt memory. At 28 it panics where libzstd returns `memory_allocation`.
+Rust: `src/compress/ldm.rs:338-339` — `self.hash_table.resize(1 << params.hash_log, LdmEntry::default())`. On i686, explicit hash logs 28, 29 and 30 end in a `capacity overflow` panic from `raw_vec/mod.rs:28`. The port does not corrupt memory. At 28 it panics where libzstd returns `memory_allocation`.
 
 C reference: `lib/zstd.h:1263,1267,1296` — under MEM_32bits, `ZSTD_LDM_HASHLOG_MAX = ZSTD_HASHLOG_MAX = 30`, so ZSTD_c_ldmHashLog 29 and 30 pass the bounds check. `lib/compress/zstd_ldm.c:171-175` computes `ldmHSize * sizeof(ldmEntry_t)`, which is 2^32 or 2^33 and wraps to 0 in a 32-bit size_t. The workspace estimate therefore reserves nothing for the table. `lib/compress/zstd_compress.c:2224-2226` then reserves and memsets a 0-byte `hashTable`, and ZSTD_ldm_insertEntry indexes up to 2^hashLog entries into it.
 
@@ -272,7 +272,7 @@ Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
 - `ldmHashRateLog=24` on a 1 KiB input (derived hashLog 30) returns a 1034-byte frame after unchecked writes outside the workspace.
 - `ldmHashLog=28` returns error −64 (memory_allocation).
 
-The port panics in all four cases. At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
+The port panics in the three explicit cases; in the rate case it derives hash log 6 (see Accepted divergences). At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
 
 ### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state (port copied the bug)
 
