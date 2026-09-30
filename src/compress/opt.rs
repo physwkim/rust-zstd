@@ -364,7 +364,7 @@ type GetAllMatches = unsafe fn(
     &mut [Match; ZSTD_OPT_SIZE],
     &mut MatchState,
     &mut usize,
-    Src,
+    &Src,
     usize,
     usize,
     &[u32; 3],
@@ -381,7 +381,7 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: Src,
+    src: &Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -393,7 +393,7 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
         matches,
         ms,
         next_to_update3,
-        src,
+        *src,
         ip,
         i_high_limit,
         rep,
@@ -414,7 +414,7 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: Src,
+    src: &Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -426,7 +426,7 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
         matches,
         ms,
         next_to_update3,
-        src,
+        *src,
         ip,
         i_high_limit,
         rep,
@@ -668,6 +668,7 @@ impl<'a> OptLdm<'a> {
     /// `ZSTD_optLdm_processMatchCandidate`: move to the next long match once
     /// the parser is past the current one, then offer it at
     /// `curr_pos_in_block`.
+    #[inline(always)]
     fn process_match_candidate(
         &mut self,
         matches: &mut [Match; ZSTD_OPT_SIZE],
@@ -716,6 +717,8 @@ fn opt_generic<const OPT_LEVEL: u32>(
         matches,
         opt,
     } = state;
+    let matches: &mut [Match; ZSTD_OPT_SIZE] = matches;
+    let opt: &mut [Optimal; ZSTD_OPT_SIZE] = opt;
     let istart = block.start;
     let iend = block.end;
     let mut anchor = istart;
@@ -753,7 +756,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     matches,
                     ms,
                     &mut next_to_update3,
-                    src,
+                    &src,
                     ip,
                     iend,
                     rep,
@@ -921,7 +924,6 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     let ll0 = (opt[c].litlen == 0) as u32;
                     let previous_price = opt[c].price;
                     let base_price = previous_price + stats.ll_price::<OPT_LEVEL>(0);
-                    let cur_rep = opt[c].rep;
                     // SAFETY: `inr <= ilimit` so `inr + 8 <= iend`,
                     // `inr > ip >= window_low`.
                     let mut nb_matches = unsafe {
@@ -929,10 +931,10 @@ fn opt_generic<const OPT_LEVEL: u32>(
                             matches,
                             ms,
                             &mut next_to_update3,
-                            src,
+                            &src,
                             inr,
                             iend,
-                            &cur_rep,
+                            &opt[c].rep,
                             ll0,
                             min_match,
                         )
