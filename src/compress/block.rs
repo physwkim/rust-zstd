@@ -322,7 +322,7 @@ fn entropy_code(
 /// [`entropy_code`] `sections` into `cbuf`, then append one complete block
 /// to `out`. `state` is committed, with `sections.rep`, only when the block
 /// is written COMPRESSED. `is_first_block` disables RLE for the first block
-/// of a frame, as libzstd does for decoders <= 1.4.3.
+/// of a job, as libzstd does for decoders <= 1.4.3.
 #[allow(clippy::too_many_arguments)]
 fn entropy_and_emit(
     src: &[u8],
@@ -555,6 +555,14 @@ impl JobBlocks {
         start..start + size
     }
 
+    /// `isFirstBlock` at `block`: set by every job context's
+    /// `ZSTD_compressBegin` and cleared by its first block; a later ZSTDMT
+    /// job's header flush (`ZSTD_compressContinue` with no input) returns
+    /// before any block, so it holds for the first block of every job.
+    fn is_first(&self, block: &Range<usize>) -> bool {
+        block.start == self.job.start
+    }
+
     /// The block at `start`, from the blocks written so far.
     fn next(&self, src: &[u8], start: usize, presplit: &mut PreSplitter) -> Range<usize> {
         self.block(src, start, self.savings(start, self.gained), presplit)
@@ -631,7 +639,7 @@ pub fn compress_blocks(
             ms,
             src,
             block.clone(),
-            first_job && start == job.start,
+            blocks.is_first(&block),
             last_job && block.end == job.end,
             split,
             state,
@@ -702,7 +710,7 @@ fn compress_blocks_pipelined(
         rep
     });
     loop {
-        let is_first_block = blocks.first_job && block.start == job.start;
+        let is_first_block = blocks.is_first(&block);
         let is_last = last_job && block.end == job.end;
         // ZSTD_deriveBlockSplits runs against the state committed by the
         // previous block, before the next block's finder may start.
