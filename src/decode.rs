@@ -53,10 +53,6 @@ use std::ptr;
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
 const MAX_BLOCK_SIZE: u32 = 128 * 1024;
-/// `ZSTD_MAXWINDOWSIZE_DEFAULT`: libzstd's default decoder limit,
-/// `(1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`, which admits the window log
-/// 27 frames of level 22 and of long distance matching on large inputs.
-const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = (1 << 27) + 1;
 /// Largest Huffman table log, and so weight, the decoder takes (libzstd
 /// HUF_TABLELOG_MAX): the format caps the log at 11, libzstd's decoder at 12.
 const HUF_TABLELOG_MAX: u32 = 12;
@@ -3759,13 +3755,10 @@ fn decode_frame(
     min_parallel_blocks: usize,
     simd: Level,
 ) -> Result<(), String> {
+    // Any window the header takes: one-shot ZSTD_decompressDCtx checks
+    // `maxWindowSize` only when streaming, and this decoder keeps no window
+    // buffer, so the window's one use is to bound the blocks.
     let window_size = header.window_size()?;
-    if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-        return Err(format!(
-            "Window size {} exceeds maximum allowed {}",
-            window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
-        ));
-    }
     // Block_Maximum_Size (fParams.blockSizeMax), the bound `split_block`
     // puts on every compressed block and its literals, and
     // `execute_with_copies`, through `decoded_block_max`, on what the block
@@ -5154,13 +5147,28 @@ mod tests {
         frame
     }
 
-    /// libzstd's default limit: a 128 MiB window (exponent 17) decodes,
-    /// the next larger one (mantissa 1, 144 MiB) is refused.
+    /// One-shot libzstd refuses a window only above `ZSTD_WINDOWLOG_MAX`
+    /// (its default limit, window log 27, binds streaming alone): window
+    /// logs 27, 28, 31 and 32, at the smallest and largest mantissa, decode
+    /// exactly where `zstd::bulk` does.
     #[test]
-    fn test_window_limit_is_zstd_default() {
-        assert_eq!(decompress(&windowed_frame(17 << 3)).unwrap(), b"hi");
-        let err = decompress(&windowed_frame((17 << 3) | 1)).unwrap_err();
-        assert!(err.contains("exceeds maximum allowed"), "{err}");
+    fn test_window_limit_is_one_shot_zstd() {
+        for window_log in [27, 28, 31, 32] {
+            for mantissa in [0, 7] {
+                let frame = windowed_frame((window_log - 10) << 3 | mantissa);
+                let want = zstd::bulk::decompress(&frame, 16).ok();
+                assert_eq!(
+                    want.is_some(),
+                    u32::from(window_log) <= ZSTD_WINDOWLOG_MAX,
+                    "window log {window_log}"
+                );
+                assert_eq!(
+                    decompress(&frame).ok(),
+                    want,
+                    "window log {window_log} mantissa {mantissa}"
+                );
+            }
+        }
     }
 
     #[test]

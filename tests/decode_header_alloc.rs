@@ -1,8 +1,8 @@
-//! Frame headers that claim more than their blocks hold: the decoder's
-//! largest single allocation stays far below the claim, and the accept /
-//! reject outcome is libzstd 1.5.7's one-shot one (ZSTD_decompressDCtx),
-//! serial and MT at both SIMD levels. One test, so that nothing else
-//! allocates while it measures.
+//! Frame headers that claim more than their blocks hold, in window or in
+//! content size: the decoder's largest single allocation stays far below
+//! the claim, and the accept / reject outcome is libzstd 1.5.7's one-shot
+//! one (ZSTD_decompressDCtx), serial and MT at both SIMD levels. One test,
+//! so that nothing else allocates while it measures.
 
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -90,7 +90,8 @@ fn largest_allocation(name: &str, f: &[u8]) -> usize {
 
 #[test]
 fn claimed_sizes_allocate_what_the_blocks_hold() {
-    // Raw literals, then a compressed block of 5 raw literals.
+    // A raw block; an RLE and a raw one; a compressed block of 5 raw
+    // literals and an RLE one.
     let literals: &[u8] = &[5 << 3, b'h', b'e', b'l', b'l', b'o', 0];
     let blocks: [&[(u32, u32, &[u8])]; 3] = [
         &[(0, 16, &[b'r'; 16])],
@@ -98,12 +99,18 @@ fn claimed_sizes_allocate_what_the_blocks_hold() {
         &[(2, literals.len() as u32, literals), (1, 7, b"y")],
     ];
     let held = [16u64, 1003, 12];
-    for (blocks, held) in blocks.iter().zip(held) {
-        // Window log 20; the exact size, then ever larger claims.
-        for fcs in [held, u64::from(u32::MAX), 1 << 32, 1 << 40, 1 << 62] {
-            let name = format!("{} blocks holding {held}, content size {fcs}", blocks.len());
-            let largest = largest_allocation(&name, &frame(10 << 3, fcs, blocks));
-            assert!(largest < SMALL, "{name}: allocated {largest}");
+    // Window logs 20, 31 (2 GiB), 31 at mantissa 7 (3.75 GiB) and 32.
+    for wd in [10 << 3, 21 << 3, 21 << 3 | 7, 22 << 3] {
+        for (blocks, held) in blocks.iter().zip(held) {
+            // The exact size, then ever larger claims.
+            for fcs in [held, u64::from(u32::MAX), 1 << 32, 1 << 40, 1 << 62] {
+                let name = format!(
+                    "window descriptor {wd:#x}, {} blocks holding {held}, content size {fcs}",
+                    blocks.len()
+                );
+                let largest = largest_allocation(&name, &frame(wd, fcs, blocks));
+                assert!(largest < SMALL, "{name}: allocated {largest}");
+            }
         }
     }
 }
