@@ -2942,8 +2942,9 @@ fn build_sequence_tables(
 }
 
 /// Share of short offsets, out of 256, above which a block's sequences run
-/// with `Avx2ShortOffsets`. Below it the `offset >= 32` test of the match
-/// copy is predictable and cheaper than the shuffles that replace it.
+/// with `Avx2ShortOffsets` or `FallbackShortOffsets`. Below it the offset
+/// tests of the match copy are predictable and cheaper than the straight-line
+/// copies that replace them.
 const SHORT_OFFSET_SHARE_MIN: usize = 32;
 
 /// Cells of an offsets table with code 2..=4 (new offsets 1..=28), scaled
@@ -3085,6 +3086,18 @@ struct SeqInput<'a> {
 #[inline(never)]
 fn decode_and_execute_sequences(
     w: Fallback,
+    seqs: SeqInput<'_>,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
+}
+
+/// `decode_and_execute_sequences` for blocks with many short offsets.
+#[inline(never)]
+fn decode_and_execute_sequences_short(
+    w: FallbackShortOffsets,
     seqs: SeqInput<'_>,
     offset_hist: &mut [u32; 3],
     prefix_start: usize,
@@ -3481,6 +3494,68 @@ impl WildCopy for Fallback {
     #[inline(always)]
     unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize) {
         wildcopy(dst, src, len)
+    }
+
+    #[inline(always)]
+    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize) {
+        let _ = avail;
+        let src = dst.sub(offset) as *const u8;
+        if offset >= 16 {
+            // Two chunks before the first length test: `wildcopy`'s
+            // `len <= 16` exit and loop exit mispredict on source code's
+            // matches.
+            copy16(dst, src);
+            copy16(dst.add(16), src.add(16));
+            if ml > 32 {
+                wildcopy(dst.add(32), src.add(32), ml - 32);
+            }
+        } else {
+            let (dst, src) = overlap_copy8(dst, src, offset);
+            if ml > 8 {
+                wildcopy_overlap8(dst, src, ml - 8);
+            }
+        }
+    }
+}
+
+/// Portable copies for blocks with many short offsets
+/// (`FSEScratch::short_offsets`), whose `offset < 8` and `offset < 16`
+/// tests in `copy_match` are unpredictable: the first 16 bytes of a match
+/// take the same straight-line copy at every offset, continued in 8-byte
+/// chunks.
+#[derive(Clone, Copy)]
+struct FallbackShortOffsets(Fallback);
+
+impl WildCopy for FallbackShortOffsets {
+    const WIDTH: usize = 16;
+
+    #[inline(always)]
+    unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize) {
+        // SAFETY: the caller's.
+        unsafe { self.0.wildcopy(dst, src, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize) {
+        let _ = avail;
+        let src = dst.sub(offset) as *const u8;
+        // ZSTD_overlapCopy8, with row 8 for every `offset >= 8`: four single
+        // bytes, then 4 from `src + DEC32`; afterwards `dst - src` is a
+        // multiple of the offset of at least 8.
+        const DEC32: [usize; 9] = [0, 1, 2, 1, 4, 4, 4, 4, 4];
+        const DEC64: [usize; 9] = [8, 8, 8, 7, 8, 9, 10, 11, 4];
+        let o = offset.min(8);
+        *dst = *src;
+        *dst.add(1) = *src.add(1);
+        *dst.add(2) = *src.add(2);
+        *dst.add(3) = *src.add(3);
+        let s2 = src.add(DEC32[o]);
+        ptr::copy_nonoverlapping(s2, dst.add(4), 4);
+        let (dst, src) = (dst.add(8), s2.add(8).sub(DEC64[o]));
+        ptr::copy_nonoverlapping(src, dst, 8);
+        if ml > 16 {
+            wildcopy_overlap8(dst.add(8), src.add(8), ml - 16);
+        }
     }
 }
 
@@ -3900,6 +3975,13 @@ fn decompress_block(
                     )?
                 }
             },
+            _ if workspace.fse.short_offsets => decode_and_execute_sequences_short(
+                FallbackShortOffsets(Fallback::new()),
+                seqs,
+                &mut workspace.offset_hist,
+                frame_base,
+                output,
+            )?,
             _ => decode_and_execute_sequences(
                 Fallback::new(),
                 seqs,
@@ -4638,6 +4720,10 @@ mod tests {
     #[test]
     fn copy_match_is_bytewise_copy() {
         check_copy_match(Fallback::new(), "Fallback");
+        check_copy_match(
+            FallbackShortOffsets(Fallback::new()),
+            "FallbackShortOffsets",
+        );
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if let Level::Avx2(w) = Level::new() {
             check_copy_match(w, "Avx2");

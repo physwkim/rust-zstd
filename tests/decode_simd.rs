@@ -93,8 +93,8 @@ fn every_short_offset_decodes_at_both_levels() {
 /// Runs of random periods from 1 to 80, each opened by fresh bytes, so
 /// that most matches take a new offset rather than a repeat code and many
 /// blocks' offset tables are dominated by offsets below 29, which selects
-/// the shuffled match copy under AVX2 (from the first sequence of the
-/// frame on).
+/// the shuffled match copy under AVX2 and the straight-line one of the
+/// portable level (from the first sequence of the frame on).
 #[test]
 fn random_short_periods_decode_at_both_levels() {
     let noise = lcg_bytes(1 << 20, 33);
