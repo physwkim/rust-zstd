@@ -20,6 +20,13 @@ checked against RFC 8878 for reference-side bugs.
   every reset.
 - 32-bit limits follow `MEM_32bits()`.
 - Not ported, no output effect: the tiny-block LDM skip.
+- Huffman streams keep the strict end-mark and end-of-stream verdict of
+  libzstd without its BMI2 fast path (R1-4).
+- No legacy v0.1-v0.7 frame decoding (R1-7).
+- libzstd bugs that change frames or verdicts are copied for parity (R1-6,
+  R1-11, R1-17, R1-18, R1-22), except R1-16: an LDM hash rate log
+  above the adjusted window log derives ZSTD_HASHLOG_MIN, not libzstd's
+  wrapped 30.
 
 ## Open Findings
 
@@ -65,30 +72,6 @@ C reference: `decompress/zstd_decompress.c:717-718` — `RETURN_ERROR_IF(dctx->f
 
 Impact: A frame compressed with a dictionary is decoded without it. When it only uses raw blocks or its own tables and no dictionary offsets, Rust returns Ok instead of `dictionary_wrong`. By reading (not probed): a first sequence that uses a repcode set by the dictionary would run with the default repcodes 1/4/8 and silently produce wrong bytes whenever that offset lands inside the output. The caller gets no signal that a dictionary was needed.
 
-### R1-4: [libzstd] The 4-stream Huffman fast path skips the end-of-stream and end-mark checks, so the one-shot verdict depends on the host CPU (our port does not copy this)
-
-Severity: Medium
-
-Class: libzstd bug
-
-Rust: `src/decode.rs:1573-1576` and `src/decode.rs:1818-1823` (4X2: `2016-2021`) — the fast path rejects a stream whose last byte is 0 (`"Huffman stream has no end mark"`) and checks `br.is_finished()` on every stream (`"Huffman stream not fully consumed"`), the same as the body path (`:1872`, `:2076`).
-
-Probe P7/P8 on 4-stream literal sections, with three kinds of change:
-1. An extra byte inserted before stream 1 or stream 3.
-2. Stream 1's last byte set to 0.
-3. The regenerated size lowered by 1 so stream 4 holds one extra symbol.
-
-Verdicts:
-- Stock zstd-sys on this BMI2 host (one-shot and streaming): Ok for every case, same output.
-- libzstd with `CFLAGS=-DHUF_DISABLE_FAST_DECODE` (the body path, which is what a non-BMI2 CPU runs): `Data corruption detected` for every case.
-- Rust: Err for every case, except P8 seed 20 (that is R1-6).
-
-C reference: `decompress/huf_decompress.c:150-157` — `HUF_initFastDStream` treats `lastByte==0` as `bitsConsumed=0` instead of rejecting it. `:281-303` — `HUF_initRemainingDStream` sets `bit->start = args->ilowest`, so a stream's tail may read into the bytes before it. `:876-888` (4X2 `:1697-1712`) — `HUF_decodeStreamX1/X2` is not followed by `BIT_endOfDStream`, and `args.op[i] != segmentEnd` always holds. `:903-913` — with `DYNAMIC_BMI2`, a CPU without BMI2 goes straight to `fallbackFn`, whose body checks `BIT_endOfDStream` on all four streams (`:692-693`, `:1495`). The fast path also needs `dtLog == 11` and all streams at least 8 bytes.
-
-Impact: "One-shot libzstd" is not a single accept/reject function here: the same frame is accepted on BMI2 CPUs and rejected on CPUs without BMI2, with Huffman log 12, or with a stream under 8 bytes. Rust follows the non-BMI2 verdict, so on BMI2 hosts it rejects frames that libzstd accepts. Which verdict to follow is a user decision.
-
-Decision: follow the lax verdict of libzstd on BMI2 CPUs, or keep the strict verdict of libzstd without BMI2 (and of the RFC end-mark rule).
-
 ### R1-5: Must-be-zero reserved bits are not checked in the Frame_Header_Descriptor or in Symbol_Compression_Modes
 
 Severity: Low
@@ -107,37 +90,6 @@ C reference: `decompress/zstd_decompress.c:511-512` — `RETURN_ERROR_IF((fhdByt
 
 Impact: Frames that libzstd rejects as `frameParameter_unsupported` or `corruption_detected` decode to Ok in Rust. The data is the same as when the bits are clear, but the accept set is wider than the reference.
 
-### R1-6: [libzstd] X2's last-symbol step consumes both symbols' bits of a 2-symbol cell, so a stream carrying one extra symbol passes the end check that X1 fails (our port copied this)
-
-Severity: Low
-
-Class: libzstd bug
-
-Rust: `src/decode.rs:1897-1914` — `huf_decode_last_symbol_x2` writes one symbol but runs `br.skip_bits(entry.nb_bits)` for a `length == 2` cell and clamps `bits_consumed` to 64. X1 or X2 is picked by `huf_select_x2(dst_size, source.len())` (`:871`). Probe P8 lowers the regenerated size of a 4-stream section by 1, which leaves stream 4 with one encoded symbol that is never decoded:
-- Seed 20 (X2 selected, 8220→8219): libzstd body path `Ok(8219)`, Rust `Ok(8219)`.
-- All 10 X1-selected rows: both reject.
-- X2 seeds 3, 10 and 12, where the final two symbols do not fit one cell: both reject.
-
-C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` runs `BIT_skipBits(DStream, dt[val].nbBits)` for `length != 1`, and clamps to 64 with the comment "ugly hack; works only because it's the last symbol". `BIT_endOfDStream` then passes (`:1373`, `:1495`). X1's `HUF_decodeSymbolX1` consumes only the symbol's own bits, and the X1 body rejects the same shape (`:592`, `:692`). The choice between the two comes from the timing heuristic `HUF_selectDecoder` (`:1821-1843`, used at `:1930`).
-
-Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
-
-Decision: keep copying libzstd (accept-set parity) or diverge.
-
-### R1-7: Legacy v0.1-v0.7 frames decode in the reference but not in Rust
-
-Severity: Low
-
-Class: unimplemented feature
-
-Rust: `src/decode.rs:2546-2551` — any magic other than `ZSTD_MAGIC` or the skippable range fails with `"Bad magic number"`. Probe P9: a hand-built v0.7 frame (magic `0xFD2FB527`, one raw block "hello", then `bt_end`) gives Rust `Err(Frame header error: Bad magic number: 0xFD2FB527)`, while libzstd one-shot and streaming give `Ok(5 bytes)`.
-
-C reference: `decompress/zstd_decompress.c:1089-1117` — under `ZSTD_LEGACY_SUPPORT >= 1`, `ZSTD_isLegacy` frames go to `ZSTD_decompressLegacy` inside `ZSTD_decompressMultiFrame`. zstd-sys `build.rs:68-71` defines `ZSTD_LEGACY_SUPPORT=1` under the `legacy` feature, which the `zstd` crate enables by default.
-
-Impact: Pre-1.0 frames, and multi-frame inputs that mix legacy and current frames, are rejected where the reference decodes them. If legacy support is out of scope, this should be recorded as an accepted divergence.
-
-Decision: port the legacy decoders or record no legacy support as an accepted divergence.
-
 ### R1-8: [libzstd] Skippable Frame_Size values 0xFFFFFFF8..0xFFFFFFFF are rejected on 64-bit by a 32-bit wrap check (our port does not copy this)
 
 Severity: Low
@@ -150,7 +102,7 @@ C reference: `decompress/zstd_decompress.c:595-596` — `RETURN_ERROR_IF((U32)(s
 
 Impact: On 64-bit, libzstd rejects a complete skippable frame with User_Data of 4 GiB−8 or more; Rust skips it and continues. Under the one-shot-parity decision Rust should reject it too, while the Frame_Size field itself allows any 32-bit value.
 
-Decision: copy libzstd (reject) for one-shot parity, or keep accepting as the RFC allows.
+Decided 2026-10-01: copy libzstd, reject Frame_Size >= 0xFFFFFFF8 on every build.
 
 ### R1-9: `load_prefix` and blocks under 7 bytes skip the window update, so `next_src` lags the indexed bytes and a reused MT `Compressor` emits thread-count-dependent frames
 
@@ -173,20 +125,6 @@ Impact, probe-proven (scratchpad `probe/src/bin/reuse4.rs`, `reuse5.rs`; overflo
 
 This breaks the accepted contract "frames depend on job size, never on thread count".
 
-### R1-11: [libzstd] With minMatch 7, the hash-chain and binary-tree prefix loaders hash 7 bytes but the searches hash 6, so a loaded prefix is never matched
-
-Severity: Low
-
-Class: libzstd bug
-
-Rust: `src/compress/bt.rs:527` — `7 => update_tree_internal::<_, 7>(...)`: our btlazy2 and btopt+ prefix loader copies the bug. `src/compress/lazy.rs:1775-1787` (`HcSearch::<mls_of>` inside `load_prefix`) does not copy it: it hashes with `BOUNDED(4, minMatch, 6)`. That deviation is stated in the doc comment at `lazy.rs:1757-1759`.
-
-C reference: `zstd_lazy.c:661`: `ZSTD_insertAndFindFirstIndex` passes `ms->cParams.minMatch`, which is `ZSTD_hashPtr` case 7. `zstd_opt.c:584`: `ZSTD_updateTree` does the same. Both are called from `ZSTD_loadDictionaryContent` (`zstd_compress.c:5010`, `:5028`). The block searches use `mls = BOUNDED(4, minMatch, 6)` (`zstd_lazy.c:1531`, `:1955`), so they hash 6 bytes. The row loader is consistent: `ZSTD_row_update` uses `MIN(minMatch, 6)` (`zstd_lazy.c:952`).
-
-Impact: Proven with a probe against libzstd 1.5.7 (scratch `probe2`). The setup was a 100000-byte random prefix set with `ZSTD_CCtx_refPrefix`, the same bytes as input, `ZSTD_c_windowLog` 14 and hashLog/chainLog 16. With minMatch 5 or 6 the output is 83656 bytes; with minMatch 7 it is 100031 bytes (no match at all) for greedy, lazy and lazy2 on the hash chain, btlazy2 and btopt. The row finder is unaffected (34490 bytes at minMatch 5, 6 and 7). Every prefix or dictionary match is lost, which violates no RFC rule but is a pure ratio bug. Our port is unreachable today: there is no `min_match` option, and the greedy through btlazy2 rows of the level tables use minMatch 4 or 5 only.
-
-Decision: with R1-12, one policy for both loaders: copy libzstd (byte identity) or fix it in both.
-
 ### R1-12: The port handles libzstd's minMatch-7 loader bug two ways: the hash-chain loader fixes it, the binary-tree loader copies it
 
 Severity: Low
@@ -199,7 +137,7 @@ C reference: `zstd_compress.c:5010` / `:5028` — both loaders take `cParams.min
 
 Impact: At minMatch 7, greedy/lazy/lazy2 on the hash chain with a prefix (an MT job after the first) would emit different sequences from libzstd: we match into the prefix and libzstd does not. btlazy2 and btopt+ would stay byte-identical. One policy should apply to both loaders; the project's byte-identity rule points to copying C. Unreachable through the public API (see R1-11). Found by reading, not probed.
 
-Decision: see R1-11.
+Decided 2026-10-01: the hash-chain loader hashes minMatch like libzstd, as the binary-tree loader does.
 
 ### R1-13: A prefix of HASH_READ_SIZE bytes or less sets `next_to_update` to the prefix end; libzstd leaves it at the prefix start and skips the tag-table memset
 
@@ -237,39 +175,7 @@ Measured on a 1 KiB input, level 3, LDM enabled, rate 25 (rate 11 gives the same
 
 Both produce the same 1034-byte frame. At rate 10 both take 0.000 s and 2 MiB. On i686 the same wrap leads to R1-15. Proven by probe (scratch, not committed).
 
-Decision: keep copying libzstd (byte identity at these parameters) or derive ZSTD_HASHLOG_MIN (no 8 GiB table, frames differ from libzstd).
-
-### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state (port copied the bug)
-
-Severity: Low
-
-Class: libzstd bug
-
-Rust: `src/compress/ldm.rs:463-464` — "Initialize the rolling hash state with the first minMatchLength bytes (ZSTD_ldm_gear_reset leaves the state as it is)". Nothing is fed before `ip += min_match`. At `ldm.rs:542-548` the overlapping-match skip sets `ip = anchor - hashed` without re-hashing `[anchor - minMatch, anchor)`.
-
-C reference: `lib/compress/zstd_ldm.c:60-85` — the contract says it "feeds [data, data + minMatchLength) into the hash … effectively resets the hash state". The body computes a local `hash` from `state->rolling` but never writes `state->rolling = hash`. It is called at `:378` (after `gear_init` sets `rolling = ~0` at `:37`) and at `:501` (after a skip).
-
-Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chunk start and each skip, the stopMask bits depend on `~0` or on pre-skip bytes rather than on the preceding minMatch bytes. Split points, and so inserted entries and found LDM matches, differ from the documented design. Frames stay valid; only ratio is affected.
-
-The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
-
-Decision: keep copying libzstd (byte identity) or store the reset hash.
-
-### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again (port copied the bug)
-
-Severity: Low
-
-Class: libzstd bug
-
-Rust: `src/compress/opt.rs:1047-1057` — the `if last_stretch.litlen > 0 { … opt[store_end - 1] = last_stretch; }` block is followed unconditionally by `opt[store_end] = last_stretch; let mut store_start = store_end;`, with a comment saying libzstd 1.5.7 does the same. The `mlen == 0` branch at `opt.rs:1079-1085` (`ip = anchor + llen`) is unreachable.
-
-C reference: `lib/compress/zstd_opt.c:1385-1394` — `if (lastStretch.litlen > 0) { …storeStart = storeEnd-1; opt[storeStart] = lastStretch; } { opt[storeEnd] = lastStretch; storeStart = storeEnd; }`. This is a bare block where `else` was meant. It overwrites the literals-only entry, and the `mlen==0` store branch at `:1420-1424` becomes dead.
-
-Impact: when a series ends with trailing literals (`lastStretch.litlen > 0`), `ip` restarts at the end of the last match instead of after the literals. The next series re-runs match finding and pricing over those positions. The effect is CPU cost and a different parse at levels 16-22 (btopt/btultra/btultra2); frames stay valid.
-
-The bug was found by reading. That the port copied it is supported by the L19 byte-identical probe in R1-17.
-
-Decision: keep copying libzstd (byte identity) or add the `else`.
+Decided 2026-10-01: derive ZSTD_HASHLOG_MIN when the hash rate log is above the adjusted window log (diverges from libzstd, see Accepted divergences).
 
 ### R1-20: No content checksum (`ZSTD_c_checksumFlag`) on the compression side
 
@@ -288,25 +194,52 @@ C reference:
 
 Impact: A caller asking for libzstd's `-C` / `checksumFlag=1` output cannot get it. Every Rust frame lacks the 4-byte trailer and flag bit, so decoders cannot detect corruption, and the frames are not byte-identical to libzstd with checksums on (the zstd CLI default). Evidence: reading.
 
-Decision: add a checksum option (libzstd `ZSTD_c_checksumFlag`, default off as in `ZSTD_compress2`) or not.
+Decided 2026-10-01: add a checksum option, default off as in ZSTD_compress2.
 
-### R1-22: [libzstd] `addEvents_generic` counts fewer events than it samples
+## libzstd bugs
+
+Upstream reports. Where the port copies one, its row says so.
+
+### R1-4: [libzstd] The 4-stream Huffman fast path skips the end-of-stream and end-mark checks, so the one-shot verdict depends on the host CPU (our port does not copy this)
+
+Severity: Medium
+
+Class: libzstd bug
+
+Rust: `src/decode.rs:1573-1576` and `src/decode.rs:1818-1823` (4X2: `2016-2021`) — the fast path rejects a stream whose last byte is 0 (`"Huffman stream has no end mark"`) and checks `br.is_finished()` on every stream (`"Huffman stream not fully consumed"`), the same as the body path (`:1872`, `:2076`).
+
+Probe P7/P8 on 4-stream literal sections, with three kinds of change:
+1. An extra byte inserted before stream 1 or stream 3.
+2. Stream 1's last byte set to 0.
+3. The regenerated size lowered by 1 so stream 4 holds one extra symbol.
+
+Verdicts:
+- Stock zstd-sys on this BMI2 host (one-shot and streaming): Ok for every case, same output.
+- libzstd with `CFLAGS=-DHUF_DISABLE_FAST_DECODE` (the body path, which is what a non-BMI2 CPU runs): `Data corruption detected` for every case.
+- Rust: Err for every case, except P8 seed 20 (that is R1-6).
+
+C reference: `decompress/huf_decompress.c:150-157` — `HUF_initFastDStream` treats `lastByte==0` as `bitsConsumed=0` instead of rejecting it. `:281-303` — `HUF_initRemainingDStream` sets `bit->start = args->ilowest`, so a stream's tail may read into the bytes before it. `:876-888` (4X2 `:1697-1712`) — `HUF_decodeStreamX1/X2` is not followed by `BIT_endOfDStream`, and `args.op[i] != segmentEnd` always holds. `:903-913` — with `DYNAMIC_BMI2`, a CPU without BMI2 goes straight to `fallbackFn`, whose body checks `BIT_endOfDStream` on all four streams (`:692-693`, `:1495`). The fast path also needs `dtLog == 11` and all streams at least 8 bytes.
+
+Impact: "One-shot libzstd" is not a single accept/reject function here: the same frame is accepted on BMI2 CPUs and rejected on CPUs without BMI2, with Huffman log 12, or with a stream under 8 bytes. Rust follows the non-BMI2 verdict, so on BMI2 hosts it rejects frames that libzstd accepts. Which verdict to follow is a user decision.
+
+Decided 2026-10-01: the port keeps the strict verdict.
+
+### R1-6: [libzstd] X2's last-symbol step consumes both symbols' bits of a 2-symbol cell, so a stream carrying one extra symbol passes the end check that X1 fails (our port copied this)
 
 Severity: Low
 
 Class: libzstd bug
 
-Rust: `src/compress/presplit.rs:71` — `self.nb_events = (limit / RATE) as u64;` after sampling positions `0, RATE, 2·RATE, … < limit`. The test `record_counts_floor_of_limit_over_rate` (`presplit.rs:225`) pins nb_events = 190 against an event total of 191 at rate 43. The port copies the bug deliberately, for byte parity.
+Rust: `src/decode.rs:1897-1914` — `huf_decode_last_symbol_x2` writes one symbol but runs `br.skip_bits(entry.nb_bits)` for a `length == 2` cell and clamps `bits_consumed` to 64. X1 or X2 is picked by `huf_select_x2(dst_size, source.len())` (`:871`). Probe P8 lowers the regenerated size of a 4-stream section by 1, which leaves stream 4 with one encoded symbol that is never decoded:
+- Seed 20 (X2 selected, 8220→8219): libzstd body path `Ok(8219)`, Rust `Ok(8219)`.
+- All 10 X1-selected rows: both reject.
+- X2 seeds 3, 10 and 12, where the final two symbols do not fit one cell: both reject.
 
-C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
+C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` runs `BIT_skipBits(DStream, dt[val].nbBits)` for `length != 1`, and clamps to 64 with the comment "ugly hack; works only because it's the last symbol". `BIT_endOfDStream` then passes (`:1373`, `:1495`). X1's `HUF_decodeSymbolX1` consumes only the symbol's own bits, and the X1 body rejects the same shape (`:592`, `:692`). The choice between the two comes from the timing heuristic `HUF_selectDecoder` (`:1821-1843`, used at `:1930`).
 
-Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
+Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
 
-Decision: keep copying libzstd (byte identity) or count ceil(limit/rate).
-
-## libzstd bugs the port does not share
-
-Upstream reports; no change to rust-zstd is needed for these.
+Decided 2026-10-01: the port keeps copying libzstd.
 
 ### R1-10: [libzstd] `ZSTD_deriveSeqStoreChunk` keeps a long length that sits exactly at the chunk end
 
@@ -319,6 +252,20 @@ Rust: `src/compress/seqstore.rs` — `Seq` stores the full u32 literal and match
 C reference: `zstd_compress.c:4013` — the test is `if (originalSeqStore->longLengthPos < startIdx || originalSeqStore->longLengthPos > endIdx)`, but `endIdx` is exclusive, so it should read `>= endIdx`. When `longLengthPos == endIdx`, the chunk keeps `longLengthType` with `longLengthPos = nbSeq` of the chunk. `ZSTD_seqToCodes` (`zstd_compress.c:2715-2718`) then writes `llCodeTable[nbSeq]` / `mlCodeTable[nbSeq]`, one entry past the chunk.
 
 Impact: in libzstd itself this is harmless. The stray write lands inside the array, on the next chunk's first sequence, which is the long one, and it writes MaxLL/MaxML, that sequence's correct code. It is still out-of-contract indexing that a stricter port would reproduce as an out-of-bounds write. There is no effect on our frames.
+
+### R1-11: [libzstd] With minMatch 7, the hash-chain and binary-tree prefix loaders hash 7 bytes but the searches hash 6, so a loaded prefix is never matched
+
+Severity: Low
+
+Class: libzstd bug
+
+Rust: `src/compress/bt.rs:527` — `7 => update_tree_internal::<_, 7>(...)`: our btlazy2 and btopt+ prefix loader copies the bug. `src/compress/lazy.rs:1775-1787` (`HcSearch::<mls_of>` inside `load_prefix`) does not copy it: it hashes with `BOUNDED(4, minMatch, 6)`. That deviation is stated in the doc comment at `lazy.rs:1757-1759`.
+
+C reference: `zstd_lazy.c:661`: `ZSTD_insertAndFindFirstIndex` passes `ms->cParams.minMatch`, which is `ZSTD_hashPtr` case 7. `zstd_opt.c:584`: `ZSTD_updateTree` does the same. Both are called from `ZSTD_loadDictionaryContent` (`zstd_compress.c:5010`, `:5028`). The block searches use `mls = BOUNDED(4, minMatch, 6)` (`zstd_lazy.c:1531`, `:1955`), so they hash 6 bytes. The row loader is consistent: `ZSTD_row_update` uses `MIN(minMatch, 6)` (`zstd_lazy.c:952`).
+
+Impact: Proven with a probe against libzstd 1.5.7 (scratch `probe2`). The setup was a 100000-byte random prefix set with `ZSTD_CCtx_refPrefix`, the same bytes as input, `ZSTD_c_windowLog` 14 and hashLog/chainLog 16. With minMatch 5 or 6 the output is 83656 bytes; with minMatch 7 it is 100031 bytes (no match at all) for greedy, lazy and lazy2 on the hash chain, btlazy2 and btopt. The row finder is unaffected (34490 bytes at minMatch 5, 6 and 7). Every prefix or dictionary match is lost, which violates no RFC rule but is a pure ratio bug. Our port is unreachable today: there is no `min_match` option, and the greedy through btlazy2 rows of the level tables use minMatch 4 or 5 only.
+
+Decided 2026-10-01: the port copies libzstd in both loaders (R1-12).
 
 ### R1-14: [libzstd] The fast and row-lazy finders form pointers outside the input object (C11 6.5.6p8 undefined behaviour); the attribute on them only silences UBSan
 
@@ -353,6 +300,38 @@ Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
 
 The port panics in all four cases. At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
 
+### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state (port copied the bug)
+
+Severity: Low
+
+Class: libzstd bug
+
+Rust: `src/compress/ldm.rs:463-464` — "Initialize the rolling hash state with the first minMatchLength bytes (ZSTD_ldm_gear_reset leaves the state as it is)". Nothing is fed before `ip += min_match`. At `ldm.rs:542-548` the overlapping-match skip sets `ip = anchor - hashed` without re-hashing `[anchor - minMatch, anchor)`.
+
+C reference: `lib/compress/zstd_ldm.c:60-85` — the contract says it "feeds [data, data + minMatchLength) into the hash … effectively resets the hash state". The body computes a local `hash` from `state->rolling` but never writes `state->rolling = hash`. It is called at `:378` (after `gear_init` sets `rolling = ~0` at `:37`) and at `:501` (after a skip).
+
+Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chunk start and each skip, the stopMask bits depend on `~0` or on pre-skip bytes rather than on the preceding minMatch bytes. Split points, and so inserted entries and found LDM matches, differ from the documented design. Frames stay valid; only ratio is affected.
+
+The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
+
+Decided 2026-10-01: the port keeps copying libzstd.
+
+### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again (port copied the bug)
+
+Severity: Low
+
+Class: libzstd bug
+
+Rust: `src/compress/opt.rs:1047-1057` — the `if last_stretch.litlen > 0 { … opt[store_end - 1] = last_stretch; }` block is followed unconditionally by `opt[store_end] = last_stretch; let mut store_start = store_end;`, with a comment saying libzstd 1.5.7 does the same. The `mlen == 0` branch at `opt.rs:1079-1085` (`ip = anchor + llen`) is unreachable.
+
+C reference: `lib/compress/zstd_opt.c:1385-1394` — `if (lastStretch.litlen > 0) { …storeStart = storeEnd-1; opt[storeStart] = lastStretch; } { opt[storeEnd] = lastStretch; storeStart = storeEnd; }`. This is a bare block where `else` was meant. It overwrites the literals-only entry, and the `mlen==0` store branch at `:1420-1424` becomes dead.
+
+Impact: when a series ends with trailing literals (`lastStretch.litlen > 0`), `ip` restarts at the end of the last match instead of after the literals. The next series re-runs match finding and pricing over those positions. The effect is CPU cost and a different parse at levels 16-22 (btopt/btultra/btultra2); frames stay valid.
+
+The bug was found by reading. That the port copied it is supported by the L19 byte-identical probe in R1-17.
+
+Decided 2026-10-01: the port keeps copying libzstd.
+
 ### R1-19: [libzstd] `iend - 8` / `iend - HASH_READ_SIZE` form a pointer before `istart` for inputs under 8 bytes (undefined behaviour); port did not copy it
 
 Severity: Low
@@ -382,6 +361,20 @@ C reference:
 - Pointer arithmetic that leaves the array object is undefined behaviour under C11 6.5.6p8. libzstd acknowledges this by tagging both functions `ZSTD_ALLOW_POINTER_OVERFLOW_ATTR` (`zstd_compress_internal.h:1158`, `:1353`), which expands to `no_sanitize("pointer-overflow")` in `common/compiler.h:326-337`. That suppresses the sanitizer; it does not remove the UB.
 
 Impact: It works only on a flat address space where the compiler does not exploit the UB. A source buffer near the bottom of the address space, combined with a large continued index, makes `ip - distanceFromBase` wrap. Frames and state do not differ from the port; this is a note on reference soundness. Evidence: reading.
+
+### R1-22: [libzstd] `addEvents_generic` counts fewer events than it samples
+
+Severity: Low
+
+Class: libzstd bug
+
+Rust: `src/compress/presplit.rs:71` — `self.nb_events = (limit / RATE) as u64;` after sampling positions `0, RATE, 2·RATE, … < limit`. The test `record_counts_floor_of_limit_over_rate` (`presplit.rs:225`) pins nb_events = 190 against an event total of 191 at rate 43. The port copies the bug deliberately, for byte parity.
+
+C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
+
+Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
+
+Decided 2026-10-01: the port keeps copying libzstd.
 
 ## Review Log
 
