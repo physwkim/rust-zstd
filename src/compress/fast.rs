@@ -368,9 +368,11 @@ pub fn compress_block(
     let block = block.range();
     match simd_level() {
         // SAFETY: fearless_simd constructs the witness only after detecting
-        // AVX2 on this CPU.
+        // AVX2 on this CPU, and BMI2 is detected here.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        Level::Avx2(w) => unsafe { compress_block_avx2(w, ms, src, block, rep, out) },
+        Level::Avx2(w) if std::arch::is_x86_feature_detected!("bmi2") => unsafe {
+            compress_block_avx2(w, ms, src, block, rep, out)
+        },
         _ => compress_block_scalar(ms, src, block, rep, out),
     }
 }
@@ -387,14 +389,17 @@ fn compress_block_scalar(
     compress_block_level(Fallback::new(), ms, src, block, rep, out)
 }
 
-/// [`compress_block`] compiled with AVX2, counting 32 bytes per step.
+/// [`compress_block`] compiled with AVX2, counting 32 bytes per step, and
+/// BMI2, whose `shrx` takes the hash shift count in any register: with the
+/// `shr r, cl` form the loop spends `rcx` on it and reloads it from the
+/// stack.
 ///
 /// # Safety
 ///
-/// The CPU must support AVX2 (the witness proves it).
+/// The CPU must support AVX2 (the witness proves it) and BMI2.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(never)]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi2")]
 unsafe fn compress_block_avx2(
     mc: Avx2,
     ms: &mut MatchState,
