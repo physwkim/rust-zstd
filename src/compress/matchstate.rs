@@ -21,6 +21,7 @@
 use std::ops::Range;
 
 use super::common::Src;
+use super::lazy::{default_search_method, SearchMethod};
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
 
@@ -54,16 +55,23 @@ pub struct MatchState {
     /// `opt`: the optimal parser's statistics and work tables, allocated
     /// for the opt strategies and kept (not shrunk) across resets.
     pub opt: Option<Box<OptState>>,
+    /// The lazy match finder the tables are sized for (`useRowMatchFinder`
+    /// resolved): [`MatchState::new`] and [`MatchState::reset`] take
+    /// [`default_search_method`], [`MatchState::new_for`] and
+    /// [`MatchState::reset_for`] a given one. Meaningful for the lazy
+    /// strategies only.
+    pub search_method: SearchMethod,
 }
 
 /// The table area of `ZSTD_cwksp`: one zeroed allocation holding
 /// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
-/// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
-/// the hash-chain table for the lazy strategies; the binary tree, two
-/// entries per node, for `BtLazy2` and the opt strategies), `hashTable3`
-/// (`1 << hash_log3` entries, opt strategies with `min_match == 3` only)
-/// and `tagTable` (`1 << hash_log` bytes, row-based lazy finder only, else
-/// empty), in that order.
+/// (`1 << chain_log` entries; empty for `Fast` and the row-based lazy
+/// finder, as `ZSTD_allocateChainTable` allocates none there; `hashSmall`
+/// for `DFast`; the hash-chain table of the other lazy finders; the binary
+/// tree, two entries per node, for `BtLazy2` and the opt strategies),
+/// `hashTable3` (`1 << hash_log3` entries, opt strategies with
+/// `min_match == 3` only) and `tagTable` (`1 << hash_log` bytes, row-based
+/// lazy finder only, else empty), in that order.
 ///
 /// Every table starts on a 4 KiB page boundary: the allocation is of
 /// `Page`s and each table fills whole pages. A row of the row finder
@@ -125,15 +133,18 @@ impl Workspace {
         bytemuck::cast_slice(&self.pages)
     }
 
-    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy`: entries,
-    /// bytes for `tag`.
-    fn lens(cparams: &CParams) -> (usize, usize, usize, usize) {
+    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy` and, for
+    /// the lazy strategies, the finder `method`: entries, bytes for `tag`.
+    fn lens(cparams: &CParams, method: SearchMethod) -> (usize, usize, usize, usize) {
         let hash = 1usize << cparams.hash_log;
         let chain = 1usize << cparams.chain_log;
         match cparams.strategy {
             Strategy::Fast => (hash, 0, 0, 0),
             Strategy::DFast => (hash, chain, 0, 0),
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, 0, hash),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => match method {
+                SearchMethod::RowHash => (hash, 0, 0, hash),
+                SearchMethod::HashChain | SearchMethod::BinaryTree => (hash, chain, 0, 0),
+            },
             Strategy::BtLazy2 => (hash, chain, 0, 0),
             Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
                 let hash3 = match cparams.hash_log3() {
@@ -145,11 +156,11 @@ impl Workspace {
         }
     }
 
-    /// Size for `cparams`: an allocation that is large enough is kept and
-    /// exactly its used range zeroed (`ZSTD_cwksp_clean_tables`), else it
-    /// is freed and a zeroed one allocated.
-    fn reset(&mut self, cparams: &CParams) {
-        let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams);
+    /// Size for `cparams` and `method`: an allocation that is large enough
+    /// is kept and exactly its used range zeroed (`ZSTD_cwksp_clean_tables`),
+    /// else it is freed and a zeroed one allocated.
+    fn reset(&mut self, cparams: &CParams, method: SearchMethod) {
+        let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams, method);
         let whole = |words: usize| words.next_multiple_of(PAGE_WORDS);
         self.hash_len = hash_len;
         self.chain_off = whole(hash_len);
@@ -260,6 +271,11 @@ impl MatchState {
     /// Allocate zeroed tables for `cparams.strategy` and start a window at
     /// position `origin`, see [`MatchState::reset`].
     pub fn new(cparams: CParams, origin: usize) -> Self {
+        Self::new_for(cparams, origin, default_search_method(&cparams))
+    }
+
+    /// [`MatchState::new`] with tables for the lazy finder `method`.
+    pub fn new_for(cparams: CParams, origin: usize, method: SearchMethod) -> Self {
         let mut ms = Self {
             cparams,
             ws: Workspace::default(),
@@ -270,8 +286,9 @@ impl MatchState {
             hash_salt: 0,
             hash_salt_entropy: 0,
             opt: None,
+            search_method: method,
         };
-        ms.reset(cparams, origin);
+        ms.reset_for(cparams, origin, method);
         ms
     }
 
@@ -289,7 +306,13 @@ impl MatchState {
     /// on the context's history; the tag table is cleared here and the salt
     /// stays at its initial value.
     pub fn reset(&mut self, cparams: CParams, origin: usize) {
-        self.ws.reset(&cparams);
+        self.reset_for(cparams, origin, default_search_method(&cparams))
+    }
+
+    /// [`MatchState::reset`] with tables for the lazy finder `method`.
+    pub fn reset_for(&mut self, cparams: CParams, origin: usize, method: SearchMethod) {
+        self.ws.reset(&cparams, method);
+        self.search_method = method;
         self.cparams = cparams;
         self.origin = origin;
         self.base = origin.wrapping_sub(WINDOW_START_INDEX);
@@ -481,6 +504,41 @@ mod tests {
                 check(&MatchState::new(cp, 0), level);
                 reused.reset(cp, 0);
                 check(&reused, level);
+            }
+        }
+    }
+
+    /// `ZSTD_allocateChainTable`: the row finder gets a tag table and no
+    /// chain table, the hash chain a chain table and no tag table, whichever
+    /// finder the state held before.
+    #[test]
+    fn lazy_tables_follow_the_search_method() {
+        let lens = |ms: &MatchState| {
+            let (hash, chain, tag) = ms.tables();
+            (hash.len(), chain.len(), tag.len())
+        };
+        // 1 KiB inputs get windowLog <= 14, where the hash chain is the default.
+        for size in [1 << 10, 1 << 20] {
+            for level in 3..=15 {
+                let cp = CParams::for_level(level, size);
+                if !cp.row_match_finder_supported() {
+                    continue;
+                }
+                let (hash, chain) = (1 << cp.hash_log, 1 << cp.chain_log);
+                let row = (hash, 0, hash);
+                let hc = (hash, chain, 0);
+                let default = MatchState::new(cp, 0);
+                let expect = match default.search_method {
+                    SearchMethod::RowHash => row,
+                    _ => hc,
+                };
+                assert_eq!(lens(&default), expect, "level {level} size {size}");
+                let mut ms = MatchState::new_for(cp, 0, SearchMethod::RowHash);
+                assert_eq!(lens(&ms), row);
+                ms.reset_for(cp, 0, SearchMethod::HashChain);
+                assert_eq!(lens(&ms), hc);
+                ms.reset_for(cp, 0, SearchMethod::RowHash);
+                assert_eq!(lens(&ms), row);
             }
         }
     }
