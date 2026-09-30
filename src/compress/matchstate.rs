@@ -23,7 +23,7 @@
 //! `tableValidEnd` of `ZSTD_cwksp`).
 //!
 //! Indices are stored as `u32`: before a block would end above
-//! [`CURRENT_MAX`], [`MatchState::start_block`] moves the window's base
+//! [`CURRENT_MAX`], [`MatchState::enter_block`] moves the window's base
 //! forward and reduces every stored index by the same amount
 //! (`ZSTD_overflowCorrectIfNeeded`), so inputs of any size compress.
 //!
@@ -37,7 +37,7 @@
 
 use std::ops::Range;
 
-use super::common::Src;
+use super::common::{Src, HASH_READ_SIZE};
 use super::lazy::{default_search_method, SearchMethod, DUBT_UNSORTED_MARK};
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
@@ -571,6 +571,27 @@ impl Workspace {
     }
 }
 
+/// The positions of a block inside the window, its overflow check done.
+/// Only [`MatchState::enter_block`] makes one, and
+/// [`MatchState::start_block`] takes it, so no block reaches a finder
+/// without entering the window first.
+#[derive(Debug)]
+pub struct EnteredBlock(Range<usize>);
+
+impl EnteredBlock {
+    #[inline]
+    pub fn positions(&self) -> Range<usize> {
+        self.0.clone()
+    }
+}
+
+/// The indexed suffix of a raw-content prefix inside the window, its
+/// overflow check done. Only [`MatchState::enter_prefix`] makes one, and
+/// the strategies' `load_prefix` take it, so no prefix reaches the tables
+/// without entering the window first.
+#[derive(Debug)]
+pub struct EnteredPrefix(Range<usize>);
+
 /// The indices of one block about to be searched. Only
 /// [`MatchState::start_block`] makes one, after the block-start
 /// `nextToUpdate` clamp, so no finder can run without it.
@@ -706,13 +727,70 @@ impl MatchState {
         Src::new(data, self.window.pos(self.window.low), self.window.low)
     }
 
+    /// Positions `input`, the next of the input, enter the window: the
+    /// contiguous `ZSTD_window_update`, then `ZSTD_overflowCorrectIfNeeded`
+    /// over `indexed` if given.
+    ///
+    /// The window's invariant, kept here alone: every position a finder
+    /// indexes into the tables, or is handed as a block, lies in
+    /// `[low, next_src)` before any table write, and the overflow check
+    /// runs for every block whatever its size. `next_src` thus covers every
+    /// stored index, so the next reset's `ZSTD_window_clear` puts them all
+    /// below the new window and `ZSTD_indexTooCloseToMax` sees where the
+    /// input really ended. The only callers are [`MatchState::enter_block`]
+    /// and [`MatchState::enter_prefix`], whose [`EnteredBlock`] and
+    /// [`EnteredPrefix`] the finders and the strategies' `load_prefix`
+    /// require; outside a test, this is the only caller of the private
+    /// [`Window::extend_to`] and [`MatchState::correct_overflow_if_needed`].
+    fn enter(&mut self, input: Range<usize>, indexed: Option<Range<usize>>) {
+        assert!(
+            self.window.next_src <= input.start && input.start <= input.end,
+            "input {input:?} does not follow the window's end {}",
+            self.window.next_src
+        );
+        self.window.extend_to(input.end);
+        if let Some(indexed) = indexed {
+            self.correct_overflow_if_needed(indexed);
+        }
+    }
+
+    /// `ZSTD_compress_frameChunk`'s set-up of the block at `positions`, for
+    /// every block whatever its size: the window covers it
+    /// (`ZSTD_compressContinue_internal`'s `ZSTD_window_update`) and the
+    /// overflow check runs for it (see `MatchState::enter`).
+    pub fn enter_block(&mut self, positions: Range<usize>) -> EnteredBlock {
+        self.enter(positions.clone(), Some(positions.clone()));
+        EnteredBlock(positions)
+    }
+
+    /// `ZSTD_loadDictionaryContent`'s window step for the raw-content
+    /// prefix at `prefix`: the window covers all of it, see
+    /// `MatchState::enter`. Only the last
+    /// `1 << min(max(hashLog + 3, chainLog + 1), 31)` positions are to be
+    /// indexed ("larger than we can reasonably index in our tables"), and
+    /// they get the overflow check when more than [`HASH_READ_SIZE`].
+    /// Returns them.
+    pub fn enter_prefix(&mut self, prefix: Range<usize>) -> EnteredPrefix {
+        let cp = &self.cparams;
+        let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
+        let indexed = prefix.start.max(prefix.end.saturating_sub(max_dict_size))..prefix.end;
+        let checked = (indexed.len() > HASH_READ_SIZE).then(|| indexed.clone());
+        self.enter(prefix, checked);
+        EnteredPrefix(indexed)
+    }
+
+    /// The indices of an entered prefix's suffix to index.
+    pub fn prefix_indices(&self, prefix: EnteredPrefix) -> Range<usize> {
+        self.index(prefix.0.start)..self.index(prefix.0.end)
+    }
+
     /// `ZSTD_overflowCorrectIfNeeded` before the positions `range` (a block,
     /// or a loaded prefix) are indexed: when the window must be corrected
     /// ([`Window::need_overflow_correction`] with `ZSTD_cycleLog` and the
     /// window size), move it ([`Window::correct_overflow`]) and subtract the
     /// correction from every stored index (`ZSTD_reduceIndex`) and from
     /// `next_to_update`.
-    pub fn correct_overflow_if_needed(&mut self, range: Range<usize>) {
+    fn correct_overflow_if_needed(&mut self, range: Range<usize>) {
         let cycle_log = self.cparams.chain_log - self.cparams.strategy.bt_scale();
         let max_dist = 1u32 << self.cparams.window_log;
         if self
@@ -734,17 +812,15 @@ impl MatchState {
         self.ws.reduce(correction, preserve_mark);
     }
 
-    /// `ZSTD_compress_frameChunk` and `ZSTD_buildSeqStore`'s set-up of a
-    /// block: the overflow correction for `positions`
-    /// ([`MatchState::correct_overflow_if_needed`]), then `data[positions]`
-    /// as indices of this window, after the "limited update after a very
-    /// long match" clamp: when the previous block left more than 384
-    /// positions uninserted (its last match ran past the block end), insert
-    /// at most the 192 positions before the block (fewer while the backlog
-    /// is under 576) instead of the whole backlog.
-    pub fn start_block<'a>(&mut self, data: &'a [u8], positions: Range<usize>) -> (Src<'a>, Block) {
-        self.correct_overflow_if_needed(positions.clone());
-        self.window.extend_to(positions.end);
+    /// `ZSTD_buildSeqStore`'s set-up of a block that entered the window
+    /// ([`MatchState::enter_block`]): `data[block]` as indices of this
+    /// window, after the "limited update after a very long match" clamp:
+    /// when the previous block left more than 384 positions uninserted (its
+    /// last match ran past the block end), insert at most the 192 positions
+    /// before the block (fewer while the backlog is under 576) instead of
+    /// the whole backlog.
+    pub fn start_block<'a>(&mut self, data: &'a [u8], block: EnteredBlock) -> (Src<'a>, Block) {
+        let positions = block.0;
         let src = self.view(data);
         let (start, end) = (self.index(positions.start), self.index(positions.end));
         assert!(
@@ -839,7 +915,8 @@ mod tests {
                 ms.next_to_update = n;
             }
             let pos = idx - WINDOW_START_INDEX;
-            let (_, block) = ms.start_block(&data, pos..pos);
+            let entered = ms.enter_block(pos..pos);
+            let (_, block) = ms.start_block(&data, entered);
             assert_eq!(block.range(), idx..idx);
             ms.next_to_update
         };
@@ -944,10 +1021,9 @@ mod tests {
     #[test]
     fn reset_continues_indices_over_kept_tables() {
         let cp = table_params(Strategy::DFast, 10, 10);
-        let data = vec![0u8; 5000];
         let mut ms = MatchState::new(cp, 0);
-        ms.start_block(&data, 0..3000);
-        ms.start_block(&data, 3000..5000);
+        ms.enter_block(0..3000);
+        ms.enter_block(3000..5000);
         ms.ws.tables_mut().0.fill(77);
         ms.reset(cp, 100);
         assert_eq!(ms.window_low(), WINDOW_START_INDEX + 5000);
@@ -978,9 +1054,8 @@ mod tests {
     /// zeroed one and restart the indices.
     #[test]
     fn reset_restarts_indices_when_tables_outgrow() {
-        let data = vec![0u8; 5000];
         let mut ms = MatchState::new(table_params(Strategy::Fast, 10, 0), 0);
-        ms.start_block(&data, 0..5000);
+        ms.enter_block(0..5000);
         ms.ws.tables_mut().0.fill(77);
         ms.reset(table_params(Strategy::Fast, 11, 0), 0);
         assert_eq!(ms.window_low(), WINDOW_START_INDEX);

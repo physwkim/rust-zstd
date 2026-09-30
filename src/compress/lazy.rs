@@ -13,7 +13,7 @@ use super::common::{
     byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,
     Src, HASH_READ_SIZE,
 };
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::seqstore::{
     offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
@@ -1762,7 +1762,8 @@ pub fn compress_block_with(
 /// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
 /// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
 /// level table produces.
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
+    let range = ms.prefix_indices(prefix);
     let end = range.end;
     assert_block_bounds(ms, src, end);
     let start = ms.next_to_update.max(range.start).max(ms.window_low());
@@ -1846,10 +1847,10 @@ mod tests {
         method: SearchMethod,
     ) -> (usize, usize) {
         let mut ms = MatchState::new_for(cp, origin, method);
-        let view = ms.view(src);
         if job_start > origin {
-            let range = ms.index(origin)..ms.index(job_start);
-            load_prefix(&mut ms, view, range);
+            let prefix = ms.enter_prefix(origin..job_start);
+            let view = ms.view(src);
+            load_prefix(&mut ms, view, prefix);
             assert_eq!(ms.next_to_update, ms.index(job_start));
         }
         let mut rep = rep0;
@@ -1860,7 +1861,8 @@ mod tests {
             let end = (start + block_size).min(src.len());
             store.clear();
             let rep_in = rep;
-            let (view, block) = ms.start_block(src, start..end);
+            let entered = ms.enter_block(start..end);
+            let (view, block) = ms.start_block(src, entered);
             let anchor = compress_block_with(
                 &mut ms,
                 view,
@@ -2070,7 +2072,8 @@ mod tests {
         while start < src.len() {
             let end = (start + block_size).min(src.len());
             store.clear();
-            let (view, block) = ms.start_block(src, start..end);
+            let entered = ms.enter_block(start..end);
+            let (view, block) = ms.start_block(src, entered);
             let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, level);
             let anchor = ms.pos(anchor);
             all.seqs.extend_from_slice(&store.seqs);

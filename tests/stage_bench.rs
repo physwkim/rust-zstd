@@ -18,9 +18,7 @@
 //! The replica cuts 128 KiB blocks, so both compressors run with the
 //! pre-splitter off (`block_splitter_level` 1, `ZSTD_c_blockSplitterLevel` 1).
 
-use rust_zstd::compress::block::{
-    self, BlockScratch, BlockState, MIN_CBLOCK_SIZE, RLE_MAX_LENGTH, ZSTD_BLOCKHEADERSIZE,
-};
+use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{
     compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions, Compressor,
@@ -85,19 +83,19 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
             let is_last = last_job && end == job.end;
             layout.blocks += 1;
             let mut next = None;
-            // block.rs: `block_len < MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 + 1` -> RAW
-            if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
-                let mut rep = prev.rep;
-                let t = Instant::now();
-                block::build_seq_store(
-                    &mut ms,
-                    data,
-                    start..end,
-                    &mut rep,
-                    &mut scratch.store,
-                    &mut block::BlockLdm::Off,
-                );
-                st.block += t.elapsed();
+            let t = Instant::now();
+            let entered = ms.enter_block(start..end);
+            let built = block::build_seq_store(
+                &mut ms,
+                data,
+                entered,
+                prev.rep,
+                &mut scratch.store,
+                &mut block::BlockLdm::Off,
+            );
+            st.block += t.elapsed();
+            // None below 7 bytes (RAW)
+            if let Some(rep) = built {
                 let store = &scratch.store;
                 let cbuf = &mut scratch.cbuf;
                 cbuf.clear();

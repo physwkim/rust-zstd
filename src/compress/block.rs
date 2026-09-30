@@ -10,9 +10,9 @@
 //! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
 //! discard the candidate, including its repeat offsets.
 
-use super::common::{Src, HASH_READ_SIZE};
+use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, EnteredBlock, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -148,31 +148,24 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
     out.extend_from_slice(compressed);
 }
 
-/// `ZSTD_loadDictionaryContent` for a raw-content prefix: index
-/// `data[range]` into the strategy's tables before the first block of a job.
-/// Only the last `1 << min(max(hashLog + 3, chainLog + 1), 31)` bytes are
-/// indexed ("larger than we can reasonably index in our tables"); matches
-/// may still reach the whole prefix, which `window_low` keeps valid.
-/// `range` is in positions of `data`, starting at the window's origin.
-/// The indexed suffix gets the overflow correction a block gets
-/// ([`MatchState::correct_overflow_if_needed`]); a prefix, at most a
-/// window, never needs one.
+/// `ZSTD_loadDictionaryContent` for a raw-content prefix: `data[range]`
+/// enters the window ([`MatchState::enter_prefix`]) and its indexed suffix
+/// goes into the strategy's tables before the first block of a job;
+/// matches may still reach the whole prefix, which `window_low` keeps
+/// valid. `range` is in positions of `data`, starting at the window's
+/// origin.
 pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
-    let cp = &ms.cparams;
-    let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
-    let range = range.start.max(range.end.saturating_sub(max_dict_size))..range.end;
-    if range.len() > HASH_READ_SIZE {
-        ms.correct_overflow_if_needed(range.clone());
-    }
+    let prefix = ms.enter_prefix(range);
     let src = ms.view(data);
-    let range = ms.index(range.start)..ms.index(range.end);
     match ms.cparams.strategy {
-        Strategy::Fast => fast::load_prefix(ms, src, range),
-        Strategy::DFast => dfast::load_prefix(ms, src, range),
+        Strategy::Fast => fast::load_prefix(ms, src, prefix),
+        Strategy::DFast => dfast::load_prefix(ms, src, prefix),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::load_prefix(ms, src, range)
+            lazy::load_prefix(ms, src, prefix)
         }
-        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => bt::load_prefix(ms, src, range),
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            bt::load_prefix(ms, src, prefix)
+        }
     }
 }
 
@@ -201,8 +194,8 @@ pub fn run_block_compressor(
 /// Where a block's long distance matches come from: the branches of
 /// `ZSTD_buildSeqStore`.
 ///
-/// A block too small to compress ([`attempts_compression`]) is the last
-/// one of its job, so the sequences libzstd skips over for it
+/// A block too small to compress ([`build_seq_store`] returns `None`) is
+/// the last one of its job, so the sequences libzstd skips over for it
 /// (`ZSTD_ldm_skipSequences`, or `ZSTD_ldm_skipRawSeqStoreBytes` from
 /// btopt on) are never read again and are left alone.
 pub enum BlockLdm<'a> {
@@ -218,13 +211,14 @@ pub enum BlockLdm<'a> {
     External(&'a mut RawSeqStore),
 }
 
-/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, set
-/// up positions `block` of `data` ([`MatchState::start_block`], which
-/// applies the nextToUpdate clamp), run the strategy's block compressor on
-/// it (through `ZSTD_ldm_blockCompress` when `ldm` provides long matches)
-/// and store the trailing literals (`ZSTD_storeLastLiterals`). `rep` holds
-/// the committed repeat offsets on entry and the block's candidates on
-/// return.
+/// `ZSTD_buildSeqStore` for a block that entered the window
+/// ([`MatchState::enter_block`]): `None` for a block too small to attempt
+/// compression, else reset `store`, set up the block's positions of `data`
+/// ([`MatchState::start_block`], which applies the nextToUpdate clamp), run
+/// the strategy's block compressor on it (through `ZSTD_ldm_blockCompress`
+/// when `ldm` provides long matches) and store the trailing literals
+/// (`ZSTD_storeLastLiterals`). `rep` is the committed repeat offsets; the
+/// block's candidates are returned.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
@@ -232,24 +226,29 @@ pub enum BlockLdm<'a> {
 pub fn build_seq_store(
     ms: &mut MatchState,
     data: &[u8],
-    block: Range<usize>,
-    rep: &mut [u32; 3],
+    block: EnteredBlock,
+    mut rep: [u32; 3],
     store: &mut SeqStore,
     ldm: &mut BlockLdm,
-) {
+) -> Option<[u32; 3]> {
+    let positions = block.positions();
+    if !attempts_compression(positions.len()) {
+        return None;
+    }
     store.clear();
-    let (block_len, block_end) = (block.len(), block.end);
-    let positions = block.clone();
+    let (block_len, block_end) = (positions.len(), positions.end);
     let (src, block) = ms.start_block(data, block);
     let anchor = match ldm {
         BlockLdm::External(seqs) if !seqs.is_exhausted() => {
-            ldm::block_compress(seqs, ms, src, block, rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
         }
         BlockLdm::Internal(state) => {
             let seqs = state.generate_block_sequences(data, positions);
-            ldm::block_compress(seqs, ms, src, block, rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
         }
-        BlockLdm::Off | BlockLdm::External(_) => run_block_compressor(ms, src, block, rep, store),
+        BlockLdm::Off | BlockLdm::External(_) => {
+            run_block_compressor(ms, src, block, &mut rep, store)
+        }
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
     // (`ZSTD_initStats_ultra`), so the anchor is read back through `ms`.
@@ -265,12 +264,13 @@ pub fn build_seq_store(
                 .sum::<usize>(),
         block_len
     );
+    Some(rep)
 }
 
-/// `ZSTD_compressBlock_internal`: "don't even attempt compression below a
-/// certain srcSize"; smaller blocks skip both stages and go RAW.
+/// `ZSTD_buildSeqStore`: "don't even attempt compression below a certain
+/// srcSize"; smaller blocks skip both stages and go RAW.
 #[inline]
-pub fn attempts_compression(block_len: usize) -> bool {
+fn attempts_compression(block_len: usize) -> bool {
     block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1
 }
 
@@ -518,11 +518,8 @@ pub fn compress_block(
         splitter,
         ..
     } = scratch;
-    let built = attempts_compression(block.len()).then(|| {
-        let mut rep = state.prev().rep;
-        build_seq_store(ms, src, block.clone(), &mut rep, store, ldm);
-        rep
-    });
+    let entered = ms.enter_block(block.clone());
+    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm);
     let parts = split.then(|| match built {
         Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
         None => &[][..],
@@ -775,11 +772,8 @@ fn compress_blocks_pipelined(
     let (mut cur, mut nxt) = (store, next);
     let mut block = blocks.next(src, job.start, presplit);
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
-    let mut built = attempts_compression(block.len()).then(|| {
-        let mut rep = state.prev().rep;
-        build_seq_store(ms, src, block.clone(), &mut rep, cur, ldm);
-        rep
-    });
+    let entered = ms.enter_block(block.clone());
+    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm);
     loop {
         let is_first_block = blocks.is_first(&block);
         let is_last = last_job && block.end == job.end;
@@ -820,13 +814,13 @@ fn compress_blocks_pipelined(
         let written = out.len();
         if let Some((rep, rep_next, least_gained, following)) = overlap {
             PIPELINE_OVERLAPPED.fetch_add(1, Relaxed);
-            let mut rep_following = rep_next;
+            let entered = ms.enter_block(following.clone());
             let cur_store = &mut *cur;
             let state = &mut *state;
             // The match state stays on this thread, whose caches hold its
             // tables; block N's entropy stage is the part a thief takes.
-            let ((), compressed) = rayon::join(
-                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
+            let (built_following, compressed) = rayon::join(
+                || build_seq_store(ms, src, entered, rep_next, nxt, ldm),
                 || {
                     emit_block(
                         src,
@@ -848,7 +842,7 @@ fn compress_blocks_pipelined(
             assert_eq!(state.prev().rep, rep_next, "repeat offset proof failed");
             blocks.wrote(&block, out.len() - written);
             assert!(blocks.gained >= least_gained, "savings bound proof failed");
-            built = Some(rep_following);
+            built = built_following;
             block = following;
         } else {
             if following_builds {
@@ -871,11 +865,8 @@ fn compress_blocks_pipelined(
                 return;
             }
             block = blocks.next(src, block.end, presplit);
-            built = attempts_compression(block.len()).then(|| {
-                let mut rep = state.prev().rep;
-                build_seq_store(ms, src, block.clone(), &mut rep, nxt, ldm);
-                rep
-            });
+            let entered = ms.enter_block(block.clone());
+            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }

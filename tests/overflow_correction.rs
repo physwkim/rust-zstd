@@ -256,3 +256,35 @@ fn input_over_4_gib_matches_libzstd() {
         assert!(rust_zstd::decompress(&frame).unwrap() == data, "{name}");
     }
 }
+
+/// One reused context's window corrections after each of 40 frames equal
+/// libzstd's (`tests/data/overflow_frequent_reuse.c`): a 128 KiB block and
+/// a last one of 3 bytes, which is too small to compress but still gets
+/// its overflow check, or of 7.
+#[test]
+fn frequent_correction_counts_on_reused_context() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/overflow_frequent_reuse.txt");
+    let text = std::fs::read_to_string(&path).expect("tests/data/overflow_frequent_reuse.txt");
+    let mut rows = 0;
+    for line in text.lines() {
+        let (case, want) = line.split_once(": ").unwrap();
+        let (level, len) = case[1..].split_once(' ').unwrap();
+        let src = input(len.parse().unwrap());
+        let mut cx = Compressor::new(CompressOptions {
+            level: level.parse().unwrap(),
+            overflow_correct_frequently: true,
+            ..CompressOptions::default()
+        });
+        let got: Vec<String> = want
+            .split(' ')
+            .map(|_| {
+                cx.compress_to_vec(&src);
+                cx.overflow_corrections().0.to_string()
+            })
+            .collect();
+        assert_eq!(got.join(" "), want, "{case}");
+        rows += 1;
+    }
+    assert_eq!(rows, 4);
+}

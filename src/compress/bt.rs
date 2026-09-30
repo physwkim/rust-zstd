@@ -16,10 +16,9 @@
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
 use super::common::{byte, read32, tget, MatchCount, Src, HASH_READ_SIZE};
-use super::matchstate::MatchState;
+use super::matchstate::{EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, repcode_to_offbase, ZSTD_REP_NUM};
 use fearless_simd::Fallback;
-use std::ops::Range;
 
 /// `ZSTD_OPT_NUM`: positions of one optimal-parser series.
 pub const ZSTD_OPT_NUM: usize = 1 << 12;
@@ -490,7 +489,8 @@ pub(crate) fn assert_opt_bounds(ms: &MatchState, src: Src, end: usize) {
 /// the prefix start, then, unless the prefix is at most `HASH_READ_SIZE`
 /// bytes, `ZSTD_updateTree(ms, end - HASH_READ_SIZE, end)` and
 /// `nextToUpdate = end`.
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
+    let range = ms.prefix_indices(prefix);
     assert!(
         range.start >= ms.window_low(),
         "prefix start {} below window_low {}",

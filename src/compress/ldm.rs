@@ -1165,7 +1165,8 @@ mod tests {
             let mut blocks = vec![];
             for block in [1 + n..split, split..src.len()] {
                 let mut out = SeqStore::new();
-                let (view, b) = ms.start_block(&src, block.clone());
+                let entered = ms.enter_block(block.clone());
+                let (view, b) = ms.start_block(&src, entered);
                 let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out);
                 let anchor = ms.pos(anchor);
                 let found: Vec<_> = out
