@@ -44,6 +44,17 @@ impl<'a> Src<'a> {
         }
     }
 
+    /// The same bytes with every index `shift` higher (`base -= shift`).
+    #[inline]
+    pub(super) fn rebased(self, shift: usize) -> Self {
+        Src {
+            base: self.base.wrapping_sub(shift),
+            lo: self.lo + shift,
+            end: self.end + shift,
+            data: PhantomData,
+        }
+    }
+
     /// The lowest readable index.
     #[inline(always)]
     pub fn lo(self) -> usize {

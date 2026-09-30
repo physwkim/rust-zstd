@@ -18,6 +18,8 @@
 //! `ZSTD_cwksp`), so the allocator sees one request per context rather
 //! than three that straddle glibc's dynamic mmap threshold.
 
+use std::ops::Range;
+
 use super::common::Src;
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
@@ -237,6 +239,29 @@ impl MatchState {
             data.len() - self.origin
         );
         src
+    }
+
+    /// Move the window past the `len` bytes that begin it, as
+    /// `ZSTD_initStats_ultra` forgets its first pass: `base -= len`,
+    /// `dictLimit` and `lowLimit` up by `len`, `nextToUpdate = dictLimit`.
+    /// Every index already in the tables falls below the window, and every
+    /// byte's index grows by `len`; returns `src` and `block` re-addressed.
+    pub fn skip_window<'a>(
+        &mut self,
+        src: Src<'a>,
+        block: Range<usize>,
+        len: usize,
+    ) -> (Src<'a>, Range<usize>) {
+        debug_assert_eq!(block.start, self.window_low);
+        self.base = self.base.wrapping_sub(len);
+        self.window_low += len;
+        self.next_to_update = self.window_low;
+        let src = src.rebased(len);
+        assert!(
+            u32::try_from(src.end() - 1).is_ok(),
+            "window moved past the u32 index space"
+        );
+        (src, block.start + len..block.end + len)
     }
 
     /// `(hashTable, chainTable, tagTable)`; borrows the whole state, use

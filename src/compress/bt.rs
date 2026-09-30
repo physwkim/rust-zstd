@@ -479,47 +479,6 @@ pub(crate) fn assert_opt_bounds(ms: &MatchState, src: Src, end: usize) {
     assert_eq!(ms.ws.hash3().len(), want, "hash_table3 size");
 }
 
-/// Empty the `hashTable` bucket, and the `hashTable3` bucket when there is
-/// one, of every position in `range`, hashed as [`bt_get_all_matches`]
-/// hashes them (`mls = BOUNDED(3, minMatch, 6)`). Undoes the insertions of
-/// a parse over `range` into tables that were empty before it.
-pub(crate) fn clear_hash_buckets(ms: &mut MatchState, src: Src, range: Range<usize>) {
-    assert!(
-        range.is_empty() || range.end - 1 + HASH_READ_SIZE <= src.end(),
-        "range {range:?} too close to src end {}",
-        src.end()
-    );
-    assert_opt_bounds(ms, src, 0);
-    let cp = ms.cparams;
-    let hash_log3 = cp.hash_log3();
-    let (hash_table, _, hash_table3) = ms.ws.opt_tables_mut();
-    fn clear<const MLS: u32>(
-        hash_table: &mut [u32],
-        hash_log: u32,
-        hash_table3: &mut [u32],
-        hash_log3: u32,
-        src: Src,
-        range: Range<usize>,
-    ) {
-        for p in range {
-            // SAFETY: `p + HASH_READ_SIZE <= src.end()` (asserted above);
-            // the hashes are below the asserted table sizes.
-            unsafe {
-                *hash_table.get_unchecked_mut(super::common::hash_ptr::<MLS>(src, p, hash_log)) = 0;
-                if hash_log3 != 0 {
-                    *hash_table3.get_unchecked_mut(hash3_ptr(src, p, hash_log3)) = 0;
-                }
-            }
-        }
-    }
-    let (h, h3) = (cp.hash_log, hash_log3);
-    match cp.min_match.clamp(3, 6) {
-        5 => clear::<5>(hash_table, h, hash_table3, h3, src, range),
-        6 => clear::<6>(hash_table, h, hash_table3, h3, src, range),
-        _ => clear::<4>(hash_table, h, hash_table3, h3, src, range),
-    }
-}
-
 /// `ZSTD_loadDictionaryContent`, binary-tree arm, for a raw-content prefix
 /// `src[range]` (already cut to the table-sized suffix): `nextToUpdate` at
 /// the prefix start, then, unless the prefix is at most `HASH_READ_SIZE`

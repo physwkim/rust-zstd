@@ -197,7 +197,7 @@ pub fn build_seq_store(
 ) {
     store.clear();
     let src = ms.view(data);
-    let block_len = block.len();
+    let (block_len, block_end) = (block.len(), block.end);
     let block = ms.index(block.start)..ms.index(block.end);
     limit_update_after_long_match(ms, block.start);
     let anchor = match ms.cparams.strategy {
@@ -210,8 +210,11 @@ pub fn build_seq_store(
             opt::compress_block(ms, src, block.clone(), rep, store)
         }
     };
-    // ZSTD_storeLastLiterals
-    store.lits.extend_from_slice(src.slice(anchor, block.end));
+    // ZSTD_storeLastLiterals; btultra2 may have moved the window
+    // (`ZSTD_initStats_ultra`), so the anchor is read back through `ms`.
+    store
+        .lits
+        .extend_from_slice(&data[ms.pos(anchor)..block_end]);
     debug_assert_eq!(
         store.lits.len()
             + store
