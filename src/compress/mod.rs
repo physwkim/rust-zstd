@@ -914,7 +914,9 @@ mod tests {
                 let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
                 assert_eq!(&theirs, data, "{name} L{level}");
                 if name == "sources" {
-                    // The post-sequence splitter against 128 KiB blocks.
+                    // The post-sequence splitter against 128 KiB blocks. It
+                    // can cost a few bytes, as libzstd's does, so only the
+                    // split is asserted; tests/split_parity pins where.
                     let unsplit = |split_after_sequences| CompressOptions {
                         block_splitter_level: 1,
                         ..opts(split_after_sequences)
@@ -926,7 +928,6 @@ mod tests {
                         count_blocks(&split) > count_blocks(&whole),
                         "{name} L{level}: no block split"
                     );
-                    assert!(split.len() < whole.len(), "{name} L{level}");
                 }
             }
         }
