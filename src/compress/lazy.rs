@@ -88,10 +88,10 @@ const fn bitmix(mut val: u64, len: u64) -> u64 {
     val ^ (val >> 28)
 }
 
-/// The `hashSalt` of a freshly created `ZSTD_CCtx`: `ZSTD_advanceHashSalt`
-/// applied to `hashSalt == 0` and `hashSaltEntropy == 0`.
-pub(super) const fn initial_hash_salt() -> u64 {
-    bitmix(0, 8) ^ bitmix(0, 4)
+/// `ZSTD_advanceHashSalt`: the salt a context reset mixes from the previous
+/// salt and the entropy the row searches since collected.
+pub(super) const fn advance_hash_salt(salt: u64, entropy: u32) -> u64 {
+    bitmix(salt, 8) ^ bitmix(entropy as u64, 4)
 }
 
 /// `BOUNDED(4, minMatch, 6)`.
@@ -2123,8 +2123,8 @@ mod tests {
                     assert!(reused.tables() == fresh.tables());
                 }
                 assert_eq!(reused.next_to_update, reused.window_low());
-                assert_eq!(reused.hash_salt, fresh.hash_salt);
-                assert_eq!(reused.hash_salt_entropy, fresh.hash_salt_entropy);
+                // Only the reused context's second reset advanced its salt.
+                assert_ne!(reused.hash_salt, fresh.hash_salt);
                 assert_eq!(reused.cparams, fresh.cparams);
                 let (r_store, r_rep) = collect_on(&mut reused, second, 40_000, m, level);
                 let (f_store, f_rep) = collect_on(&mut fresh, second, 40_000, m, level);
@@ -2404,8 +2404,8 @@ mod tests {
     fn salt_and_hash_match_c_constants() {
         // ZSTD_bitmix(0, 8) ^ ZSTD_bitmix(0, 4), evaluated by hand from the
         // C definition: both terms are pure functions of `len`.
-        assert_eq!(initial_hash_salt(), bitmix(0, 8) ^ bitmix(0, 4));
-        assert_ne!(initial_hash_salt(), 0);
+        assert_eq!(advance_hash_salt(0, 0), bitmix(0, 8) ^ bitmix(0, 4));
+        assert_ne!(advance_hash_salt(0, 0), 0);
         let src = b"abcdefghijklmnop";
         // SAFETY: `0 + 8 <= src.len()`.
         let (h4, h5, h6) = unsafe {

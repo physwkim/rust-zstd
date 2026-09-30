@@ -283,14 +283,11 @@ pub struct MatchState {
     pub next_to_update: usize,
     /// `window`: the index space, see [`MatchState::window_low`].
     window: Window,
-    /// `hashSalt`: salt of the row-based finder's hash (`ZSTD_hashPtrSalted`).
-    /// Always the value a fresh `ZSTD_CCtx` has after its first
-    /// `ZSTD_advanceHashSalt` (both inputs zero), see
-    /// [`super::lazy::initial_hash_salt`]; libzstd advances it on every
-    /// reset, see [`MatchState::reset`].
+    /// `hashSalt`: salt of the row-based finder's hash (`ZSTD_hashPtrSalted`),
+    /// advanced on every reset, see [`MatchState::reset`].
     pub hash_salt: u64,
-    /// `hashSaltEntropy`: running sum of the row finder's search hashes,
-    /// which libzstd mixes into the next salt on a context reset.
+    /// `hashSaltEntropy`: running sum of the row finder's search hashes over
+    /// the context's life, mixed into the salt on every reset.
     pub hash_salt_entropy: u32,
     /// `opt`: the optimal parser's statistics and work tables, allocated
     /// for the opt strategies and kept (not shrunk) across resets.
@@ -505,12 +502,15 @@ impl MatchState {
     /// Every finder takes an entry below the window for a miss, as it takes
     /// `0`, so either way the frames equal those of [`MatchState::new`].
     ///
-    /// Deviation: libzstd advances the row finder's hash salt on every reset
-    /// (`ZSTD_advanceHashSalt`), which makes a frame depend on the context's
-    /// history; here the salt stays at its initial value. A stale tag in
-    /// the kept tag table can then only name an entry below the window,
-    /// older than every entry of the current input in its row, and the
-    /// search stops there as it would at an empty slot.
+    /// Every reset also advances the row finder's hash salt
+    /// (`ZSTD_advanceHashSalt`; libzstd only when that finder is in use, and
+    /// the salt is unused otherwise). The salt XORs the multiplied hash, so
+    /// it only permutes rows and tags, and frames do not depend on it. It
+    /// keeps the kept tags from matching the current input's: a stale entry
+    /// is older than every current one in its row, so a match on it ends
+    /// the search as an empty slot's would, but only after loading the
+    /// entry. With a constant salt, input repeating the previous one met
+    /// such a match in nearly every search (elf L11: 8% slower).
     ///
     /// The overflow correction knob ([`MatchState::set_correct_frequently`])
     /// is a property of the context and survives the reset.
@@ -525,8 +525,7 @@ impl MatchState {
         self.cparams = cparams;
         // ZSTD_invalidateMatchState: `nextToUpdate = dictLimit`.
         self.next_to_update = self.window.low;
-        self.hash_salt = super::lazy::initial_hash_salt();
-        self.hash_salt_entropy = 0;
+        self.hash_salt = super::lazy::advance_hash_salt(self.hash_salt, self.hash_salt_entropy);
         // ZSTD_invalidateMatchState: `opt.litLengthSum = 0` forces the next
         // opt block to initialize its statistics.
         if cparams.strategy.is_opt() {
