@@ -228,16 +228,20 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 pub struct Compressor {
     opts: CompressOptions,
     jobs: Vec<JobContext>,
-    /// The long distance matching state, once a frame has used it.
-    ldm: Option<LdmState>,
+    /// ZSTDMT's long distance matching state (`serialState.ldmState`),
+    /// once a multithreaded frame has used it.
+    serial_ldm: Option<LdmState>,
 }
 
 /// One job's reusable state: its match state once a job has run, its
-/// block buffers and its long distance matches (ZSTDMT's `rawSeqStore`).
+/// block buffers, the long distance matching state a single-threaded frame
+/// generates each block's matches from (the context's `ldmState`), and the
+/// long distance matches ZSTDMT generated for the job (`rawSeqStore`).
 #[derive(Default)]
 struct JobContext {
     ms: Option<MatchState>,
     scratch: BlockScratch,
+    ldm_state: Option<LdmState>,
     ldm_seqs: RawSeqStore,
 }
 
@@ -246,7 +250,7 @@ impl Compressor {
         Self {
             opts,
             jobs: Vec::new(),
-            ldm: None,
+            serial_ldm: None,
         }
     }
 
@@ -295,51 +299,26 @@ impl Compressor {
             self.jobs.resize_with(n_jobs, JobContext::default);
         }
         let pipelined = cfg!(feature = "parallel");
-        let mut ldm_state = ldm_params.map(|params| match self.ldm.take() {
-            Some(mut state) => {
-                state.reset(params, 0);
-                state
-            }
-            None => LdmState::new(params, 0),
-        });
-        if let (Some(state), true) = (&mut ldm_state, src.len() <= JOBSIZE_MIN) {
-            // ZSTD_CCtx_init_compressStream2: no ZSTDMT up to
-            // ZSTDMT_JOBSIZE_MIN; the single context generates each block's
-            // sequences as it goes.
-            debug_assert_eq!(n_jobs, 1);
-            let ctx = &mut self.jobs[0];
-            compress_job(
-                src,
-                cparams,
-                sizing,
-                overlap,
-                jobs[0].clone(),
-                true,
-                true,
-                split,
-                pipelined,
-                &mut ctx.ms,
-                &mut ctx.scratch,
-                &mut BlockLdm::Internal(state),
-                out,
-            );
-            self.ldm = ldm_state;
-            return;
-        }
+        // ZSTDMT_serialState: every job's long distance matches from the one
+        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
+        // single-threaded frame generates each block's as it compresses the
+        // block (ZSTD_buildSeqStore), from its context's state.
+        let mut serial_ldm = ldm_params
+            .filter(|_| mt)
+            .map(|params| reset_ldm_state(&mut self.serial_ldm, params));
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
         // A job spawned only once its sequences are generated would be taken
         // by a thread waiting in an earlier job's block join, holding that job
         // back by a whole job; such jobs compress their blocks serially, as
         // ZSTDMT's workers do.
-        let blocks_pipelined = pipelined && (n_jobs == 1 || ldm_state.is_none());
+        let blocks_pipelined = pipelined && (n_jobs == 1 || serial_ldm.is_none());
         run_jobs(
             &jobs,
             &mut self.jobs[..n_jobs],
             pipelined,
-            // ZSTDMT_serialState_update: every job's sequences from the one
-            // state, in job order.
+            // ZSTDMT_serialState_update
             |job, ctx| {
-                if let Some(state) = &mut ldm_state {
+                if let Some(state) = &mut serial_ldm {
                     state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
                 }
             },
@@ -347,12 +326,13 @@ impl Compressor {
                 let JobContext {
                     ms,
                     scratch,
+                    ldm_state,
                     ldm_seqs,
                 } = ctx;
-                let mut ldm = if ldm_on {
-                    BlockLdm::External(ldm_seqs)
-                } else {
-                    BlockLdm::Off
+                let mut ldm = match ldm_params {
+                    None => BlockLdm::Off,
+                    Some(_) if mt => BlockLdm::External(ldm_seqs),
+                    Some(params) => BlockLdm::Internal(reset_ldm_state(ldm_state, params)),
                 };
                 compress_job(
                     src,
@@ -372,7 +352,6 @@ impl Compressor {
             },
             out,
         );
-        self.ldm = ldm_state;
     }
 
     /// One frame holding `src`.
@@ -380,6 +359,18 @@ impl Compressor {
         let mut out = Vec::new();
         self.compress(src, &mut out);
         out
+    }
+}
+
+/// The long distance matching state in `slot` reset for a frame with
+/// `params`, allocated on first use.
+fn reset_ldm_state(slot: &mut Option<LdmState>, params: LdmParams) -> &mut LdmState {
+    match slot.take() {
+        Some(mut state) => {
+            state.reset(params, 0);
+            slot.insert(state)
+        }
+        None => slot.insert(LdmState::new(params, 0)),
     }
 }
 
@@ -855,10 +846,10 @@ mod tests {
     }
 
     /// Long distance matching frames decode through both decoders on the
-    /// single-context path (up to `JOBSIZE_MIN`) and over one or several
-    /// jobs (the last block 3 bytes, too small to compress), find the
-    /// repeat that the frame without it stores as literals, and a reused
-    /// `Compressor` writes what fresh ones do.
+    /// single-threaded path (the default, and explicit jobs up to
+    /// `JOBSIZE_MIN`) and over several jobs (the last block 3 bytes, too
+    /// small to compress), find the repeat that the frame without it stores
+    /// as literals, and a reused `Compressor` writes what fresh ones do.
     #[test]
     fn ldm_frames_roundtrip_and_find_far_repeats() {
         let single = far_repeat(160 << 10, 160 << 10);
@@ -882,9 +873,10 @@ mod tests {
 
     /// From btopt on the long distance matches are candidates of the
     /// optimal parser: the frames decode through both decoders on the
-    /// single-context path and over jobs. With long distance matching the
-    /// job overlap is half the window at level 16 (two jobs here) and all
-    /// of it at level 19 (one job, still fed from the job-order sequences).
+    /// single-threaded path and over explicit jobs, whose overlap with long
+    /// distance matching is half the window at level 16 (two jobs here) and
+    /// all of it at level 19 (one job, still fed from the job-order
+    /// sequences).
     #[test]
     fn ldm_opt_frames_roundtrip() {
         let single = far_repeat(160 << 10, 160 << 10);
@@ -937,6 +929,7 @@ mod tests {
                         ms,
                         scratch,
                         ldm_seqs,
+                        ..
                     } = ctx;
                     compress_job(
                         src,
