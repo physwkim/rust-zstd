@@ -80,6 +80,26 @@ impl Default for CompressOptions {
     }
 }
 
+impl CompressOptions {
+    /// Opt-in multi-job preset: 2 MiB jobs (`ZSTD_c_jobSize`) with
+    /// `ZSTD_c_overlapLog` 8 (half-window overlap). Inputs above 2 MiB split
+    /// into several jobs, so the `parallel` feature can compress them
+    /// concurrently; the frame still does not depend on the thread count.
+    ///
+    /// Measured on 8 threads against the default options (`tests/mt_grid.rs`
+    /// on the 8 MiB ELF and Rust-source corpus files) the size cost is at
+    /// most 0.17% at levels 1 to 7 and 0.55% at level 11 (ELF), and the
+    /// speedup (geometric mean over the ELF, source and 1 MiB words files)
+    /// is 1.06x at level 1, 2.3x at 3, 1.5x at 5, 1.7x at 7 and 1.2x at 11.
+    pub fn parallel(level: i32) -> Self {
+        Self {
+            level,
+            job_size: Some(2 << 20),
+            overlap_log: 8,
+        }
+    }
+}
+
 /// Compress `data` into a zstd frame at `level`.
 ///
 /// Returns a valid zstd frame decompressible by any conformant decoder.
@@ -546,6 +566,22 @@ mod tests {
     #[should_panic(expected = "out of range")]
     fn overlap_log_above_nine_panics() {
         overlap_size(&CParams::for_level(1, 1 << 20), 10);
+    }
+
+    /// A multi-job preset frame decodes through both decoders.
+    #[test]
+    fn parallel_preset_roundtrips() {
+        let mut data = text(2 << 20);
+        data.extend_from_slice(&noise(256 << 10, 7));
+        data.extend_from_slice(&text(2 << 20));
+        for level in [1, 3, 7, 11] {
+            let opts = CompressOptions::parallel(level);
+            assert_eq!((opts.job_size, opts.overlap_log), (Some(2 << 20), 8));
+            let frame = compress_with(&data, &opts);
+            assert_eq!(crate::decompress(&frame).unwrap(), data, "L{level}");
+            let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+            assert_eq!(theirs, data, "L{level}");
+        }
     }
 
     /// Every overlap boundary (none, smallest, default, full window) yields a
