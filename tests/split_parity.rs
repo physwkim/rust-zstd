@@ -15,6 +15,7 @@
 
 mod common;
 
+use common::{frame_blocks as blocks, Block};
 use rust_zstd::{compress_with, CompressOptions, ParamSwitch};
 use std::path::PathBuf;
 use zstd::zstd_safe::zstd_sys as sys;
@@ -23,110 +24,19 @@ const DEFAULT_CORPUS: &str = "/tmp/claude-1000/-home-stevek-work-rust-zstd/d30c8
 const FILES: [&str; 3] = ["elf_8M.bin", "rssrc_8M.txt", "words_1M.txt"];
 const LEVELS: [i32; 4] = [3, 5, 7, 11];
 
-extern "C" {
-    fn ZSTD_decompressBegin(dctx: *mut sys::ZSTD_DCtx) -> usize;
-    fn ZSTD_nextSrcSizeToDecompress(dctx: *mut sys::ZSTD_DCtx) -> usize;
-    fn ZSTD_nextInputType(dctx: *mut sys::ZSTD_DCtx) -> i32;
-    fn ZSTD_decompressContinue(
-        dctx: *mut sys::ZSTD_DCtx,
-        dst: *mut u8,
-        dst_capacity: usize,
-        src: *const u8,
-        src_size: usize,
-    ) -> usize;
-}
-
-/// One block: type (0 RAW, 1 RLE, 2 COMPRESSED), decompressed size and
-/// size in the frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Block {
-    ty: u32,
-    size: usize,
-    c_size: usize,
-}
-
-/// Decode a single-frame `frame` with libzstd's buffer-less decoder,
-/// returning its blocks and content.
-fn blocks(frame: &[u8], content_size: usize) -> (Vec<Block>, Vec<u8>) {
-    // ZSTD_nextInputType: ZSTDnit_blockHeader, ZSTDnit_block,
-    // ZSTDnit_lastBlock.
-    const BLOCK_HEADER: i32 = 1;
-    const BLOCK: i32 = 2;
-    const LAST_BLOCK: i32 = 3;
-    let mut out = vec![0u8; content_size];
-    let mut list = Vec::new();
-    let (mut ip, mut op) = (0usize, 0usize);
-    let mut header = None;
-    // SAFETY: every call gets the context it created and in-bounds buffers.
-    unsafe {
-        let dctx = sys::ZSTD_createDCtx();
-        assert_eq!(sys::ZSTD_isError(ZSTD_decompressBegin(dctx)), 0);
-        loop {
-            let n = ZSTD_nextSrcSizeToDecompress(dctx);
-            if n == 0 {
-                break;
-            }
-            let kind = ZSTD_nextInputType(dctx);
-            if kind == BLOCK_HEADER {
-                let h = u32::from_le_bytes([frame[ip], frame[ip + 1], frame[ip + 2], 0]);
-                let ty = (h >> 1) & 3;
-                header = Some((ty, 3 + if ty == 1 { 1 } else { (h >> 3) as usize }));
-            }
-            let r = ZSTD_decompressContinue(
-                dctx,
-                out.as_mut_ptr().add(op),
-                out.len() - op,
-                frame.as_ptr().add(ip),
-                n,
-            );
-            assert_eq!(sys::ZSTD_isError(r), 0, "libzstd rejects the block at {ip}");
-            if kind == BLOCK || kind == LAST_BLOCK {
-                let (ty, c_size) = header.take().expect("block without header");
-                list.push(Block {
-                    ty,
-                    size: r,
-                    c_size,
-                });
-            }
-            ip += n;
-            op += r;
-        }
-        sys::ZSTD_freeDCtx(dctx);
-    }
-    assert_eq!(ip, frame.len());
-    out.truncate(op);
-    (list, out)
-}
-
 /// libzstd's single-threaded frame with `ZSTD_c_splitAfterSequences` set to
 /// `split` (1 enable, 2 disable) and the pre-splitter off.
 fn c_frame(data: &[u8], level: i32, split: i32) -> Vec<u8> {
-    // SAFETY: the context is used only here; buffers are sized by
-    // ZSTD_compressBound.
-    unsafe {
-        let cctx = sys::ZSTD_createCCtx();
-        let set = |p, v| {
-            let r = sys::ZSTD_CCtx_setParameter(cctx, p, v);
-            assert_eq!(sys::ZSTD_isError(r), 0, "set parameter {p:?}");
-        };
-        set(sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level);
-        // ZSTD_c_splitAfterSequences.
-        set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam13, split);
-        // ZSTD_c_blockSplitterLevel 1: no pre-splitting.
-        set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam20, 1);
-        let mut out = vec![0u8; sys::ZSTD_compressBound(data.len())];
-        let n = sys::ZSTD_compress2(
-            cctx,
-            out.as_mut_ptr().cast(),
-            out.len(),
-            data.as_ptr().cast(),
-            data.len(),
-        );
-        assert_eq!(sys::ZSTD_isError(n), 0);
-        sys::ZSTD_freeCCtx(cctx);
-        out.truncate(n);
-        out
-    }
+    common::c_compress2(
+        data,
+        &[
+            (sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+            // ZSTD_c_splitAfterSequences.
+            (sys::ZSTD_cParameter::ZSTD_c_experimentalParam13, split),
+            // ZSTD_c_blockSplitterLevel 1: no pre-splitting.
+            (sys::ZSTD_cParameter::ZSTD_c_experimentalParam20, 1),
+        ],
+    )
 }
 
 /// Our frame as one job, with the pre-splitter off like [`c_frame`].
