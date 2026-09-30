@@ -20,6 +20,16 @@ pub enum Strategy {
     Lazy2 = 5,
 }
 
+/// `ZSTD_ParamSwitch_e`: a feature left to libzstd's default for the
+/// parameters (`Auto`), or forced on or off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamSwitch {
+    #[default]
+    Auto,
+    Enable,
+    Disable,
+}
+
 /// `ZSTD_compressionParameters`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CParams {

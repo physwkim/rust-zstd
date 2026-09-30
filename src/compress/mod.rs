@@ -19,6 +19,7 @@ pub mod lazy;
 pub mod matchstate;
 pub mod params;
 pub mod seqstore;
+pub mod split;
 
 use crate::constants::*;
 use block::{
@@ -26,7 +27,7 @@ use block::{
     ZSTD_BLOCKHEADERSIZE,
 };
 use matchstate::MatchState;
-pub use params::{CParams, Strategy};
+pub use params::{CParams, ParamSwitch, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
 use std::ops::Range;
