@@ -114,21 +114,20 @@ impl Fingerprint {
     }
 }
 
-/// `ZSTD_optimalBlockSize`'s `splitLevels[strat]` and `ZSTD_c_blockSplitterLevel`:
-/// the `ZSTD_splitBlock` level for `block_splitter_level` (0 auto by
-/// strategy, 1 off, 2..=6 fixed), `None` when off.
+/// `splitLevels` of `ZSTD_optimalBlockSize`, indexed by `ZSTD_strategy`
+/// (`ZSTD_fast` = 1 to `ZSTD_btultra2` = 9).
+const SPLIT_LEVELS: [u8; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
+
+/// `ZSTD_c_blockSplitterLevel` as `ZSTD_optimalBlockSize` applies it: the
+/// `ZSTD_splitBlock` level for `block_splitter_level` (0 auto by strategy,
+/// 1 off, 2..=6 fixed), `None` when off.
 pub fn split_level(block_splitter_level: u8, strategy: Strategy) -> Option<u8> {
     assert!(
         block_splitter_level <= 6,
         "block_splitter_level {block_splitter_level} out of range 0..=6"
     );
     match block_splitter_level {
-        0 => Some(match strategy {
-            Strategy::Fast => 0,
-            Strategy::DFast => 1,
-            Strategy::Greedy | Strategy::Lazy => 2,
-            Strategy::Lazy2 => 3,
-        }),
+        0 => Some(SPLIT_LEVELS[strategy as usize]),
         1 => None,
         n => Some(n - 2),
     }

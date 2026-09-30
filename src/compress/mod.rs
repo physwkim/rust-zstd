@@ -87,9 +87,10 @@ pub struct CompressOptions {
     /// `ZSTD_c_blockSplitterLevel`, `0..=6`: before match finding, end a
     /// full 128 KiB block early where its byte statistics change
     /// (`ZSTD_splitBlock`). `0` (the default) picks the heuristic by
-    /// strategy as libzstd does: `Fast` compares the block's borders,
-    /// `DFast`, `Greedy`/`Lazy` and `Lazy2` compare 8 KiB chunks sampled
-    /// every 43, 11 and 5 bytes. `1` disables it; `2` selects the borders
+    /// strategy from libzstd's `splitLevels`: `Fast` compares the block's
+    /// borders, the others compare 8 KiB chunks sampled every 43 bytes
+    /// (`DFast`), 11 (`Greedy`, `Lazy`), 5 (`Lazy2`, `btlazy2`) or 1
+    /// (`btopt` and above). `1` disables it; `2` selects the borders
     /// and `3..=6` chunks sampled every 43, 11, 5 and 1 bytes. A block is
     /// split only once its job has saved 3 bytes, so the first block of
     /// every job is whole. Values above 6 panic (libzstd rejects them
