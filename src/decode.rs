@@ -2579,14 +2579,22 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         pos += 1;
     }
 
-    // We don't support dictionaries, but we still need to skip these bytes
+    // ZSTD_decodeFrameHeader: no dictionary is loaded, so a frame naming one
+    // (any Dictionary_ID but 0) is dictionary_wrong.
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
-    if src.len() < pos + dict_id_len {
-        return Err(FrameDecoderError::new(
-            "Error reading dictionary id: truncated".into(),
-        ));
-    }
+    let dict_id = src
+        .get(pos..pos + dict_id_len)
+        .ok_or_else(|| FrameDecoderError::new("Error reading dictionary id: truncated".into()))?;
     pos += dict_id_len;
+    let dict_id = dict_id
+        .iter()
+        .rev()
+        .fold(0u32, |id, &b| id << 8 | u32::from(b));
+    if dict_id != 0 {
+        return Err(FrameDecoderError::new(format!(
+            "Frame needs dictionary {dict_id}, none is loaded"
+        )));
+    }
 
     let fcs_len = desc
         .frame_content_size_bytes()

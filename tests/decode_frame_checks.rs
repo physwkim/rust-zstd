@@ -260,3 +260,57 @@ fn every_input_byte_belongs_to_a_frame() {
     );
     assert_eq!(rust_zstd::decompress(&[]).unwrap(), Vec::<u8>::new());
 }
+
+/// Frame of one raw block holding `content`, whose header carries the
+/// Dictionary_ID `dict_id` in the `dict_id_flag` form (1, 2 or 4 bytes),
+/// single-segment or with a window descriptor.
+fn dict_id_frame(dict_id_flag: u8, dict_id: u32, single_segment: bool, content: &[u8]) -> Vec<u8> {
+    assert!(content.len() < 256);
+    let mut f = MAGIC.to_vec();
+    f.push(if single_segment { 0x20 } else { 0 } | dict_id_flag);
+    if !single_segment {
+        f.push(0);
+    }
+    let len = [0, 1, 2, 4][usize::from(dict_id_flag)];
+    f.extend_from_slice(&dict_id.to_le_bytes()[..len]);
+    if single_segment {
+        f.push(content.len() as u8);
+    }
+    f.extend_from_slice(&(1 | (content.len() as u32) << 3).to_le_bytes()[..3]);
+    f.extend_from_slice(content);
+    f
+}
+
+/// With no dictionary loaded, a frame naming a dictionary (any non-zero
+/// Dictionary_ID, in every field size) is ZSTD_decodeFrameHeader's
+/// dictionary_wrong; a Dictionary_ID field holding 0 names none.
+#[test]
+fn dictionary_id_needs_a_dictionary() {
+    let cases: [(u8, u32, bool); 12] = [
+        (1, 0, true),
+        (1, 1, false),
+        (1, 0xff, false),
+        (2, 0, true),
+        (2, 1, false),
+        (2, 0x100, false),
+        (2, 0xffff, false),
+        (3, 0, true),
+        (3, 1, false),
+        (3, 0x100, false),
+        (3, 0x0100_0000, false),
+        (3, 0xffff_ffff, false),
+    ];
+    let hello = raw_frame(b"hello");
+    for (flag, id, accept) in cases {
+        for single_segment in [true, false] {
+            let f = dict_id_frame(flag, id, single_segment, b"dict");
+            let name = format!("flag {flag} id {id:#x} single_segment {single_segment}");
+            check(&name, &f, accept);
+            check(
+                &format!("a frame then {name}"),
+                &[&hello[..], &f[..]].concat(),
+                accept,
+            );
+        }
+    }
+}
