@@ -3774,8 +3774,11 @@ fn decode_frame(
     if let Some(fcs) = header.frame_content_size() {
         // Room for the whole frame plus what a compressed block may write
         // past its start, so that no block has to grow the buffer (and
-        // move everything decoded).
-        let want = usize::try_from(fcs)
+        // move everything decoded). A content size past what the blocks
+        // can decode to fails the size check below, so it gets no room
+        // beyond that.
+        let content = fcs.min(blocks_decoded_bound(&data[*pos..], block_size_max));
+        let want = usize::try_from(content)
             .ok()
             .and_then(|n| n.checked_add(DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH))
             .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
@@ -3821,6 +3824,29 @@ fn decode_frame(
         }
     }
     Ok(())
+}
+
+/// The most the blocks at the start of `data` decode to: the sum of each
+/// raw block's content, RLE block's size and compressed block's
+/// `decoded_block_max`, up to the last block or up to the first one the
+/// input does not hold, where decoding fails.
+fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
+    let mut rest = data;
+    let mut bound = 0u64;
+    while let Ok((block, header_len)) = parse_block_header(rest) {
+        let Some(next) = rest.get(header_len + block.content_size as usize..) else {
+            break;
+        };
+        rest = next;
+        bound = bound.saturating_add(match block.block_type {
+            BlockType::Compressed => decoded_block_max(block_size_max) as u64,
+            _ => u64::from(block.decompressed_size),
+        });
+        if block.last_block {
+            break;
+        }
+    }
+    bound
 }
 
 /// The serial block loop of `decode_frame`: decode every block of the
