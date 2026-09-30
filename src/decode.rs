@@ -121,6 +121,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
 /// the same either way.
+///
+/// The output grows as needed, as one-shot `ZSTD_decompressDCtx` into an
+/// ample buffer does, so that is the reference for which frames decode:
+/// libzstd's verdict on some malformed blocks depends on its buffer size.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
