@@ -75,17 +75,15 @@ pub struct CompressOptions {
     /// `ZSTD_c_overlapLog`, `0..=9`: the history a job indexes from before
     /// its start, as a fraction of the window. `0` selects
     /// `ZSTDMT_overlapLog_default` (6 for `Fast`..`Lazy`, 7 for `Lazy2` and
-    /// `BtLazy2`),
-    /// `1` means no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
+    /// `BtLazy2`, 8 for `BtOpt` and `BtUltra`, 9 for `BtUltra2`), `1` means
+    /// no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
     /// them with `parameter_outOfBound`).
     pub overlap_log: u8,
     /// `ZSTD_c_splitAfterSequences`: after the match finder, cut a block
     /// into several where separate entropy tables are estimated to pay for
     /// the extra block headers. `Auto` (the default) enables it for
-    /// `strategy >= ZSTD_btopt` with `window_log >= 17`, as libzstd does;
-    /// no ported strategy reaches `btopt` yet, so `Auto` leaves blocks
-    /// whole.
+    /// `strategy >= ZSTD_btopt` with `window_log >= 17`, as libzstd does.
     pub split_after_sequences: ParamSwitch,
     /// `ZSTD_c_blockSplitterLevel`, `0..=6`: before match finding, end a
     /// full 128 KiB block early where its byte statistics change
