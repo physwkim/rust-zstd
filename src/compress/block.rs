@@ -168,20 +168,10 @@ pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
     }
 }
 
-/// `ZSTD_buildSeqStore`, "limited update after a very long match": when the
-/// previous block left more than 384 positions uninserted (its last match ran
-/// past the block end), insert at most the 192 positions before `curr` (fewer
-/// while the backlog is under 576) instead of the whole backlog.
-#[inline]
-fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
-    if curr > ms.next_to_update + 384 {
-        ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
-    }
-}
-
-/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, apply
-/// the nextToUpdate clamp, run the strategy's block compressor on the
-/// indices of positions `block` of `data`, and store the trailing literals
+/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, set
+/// up positions `block` of `data` ([`MatchState::start_block`], which
+/// applies the nextToUpdate clamp), run the strategy's block compressor on
+/// it, and store the trailing literals
 /// (`ZSTD_storeLastLiterals`). `rep` holds the committed repeat offsets on
 /// entry and the block's candidates on return.
 ///
@@ -196,18 +186,16 @@ pub fn build_seq_store(
     store: &mut SeqStore,
 ) {
     store.clear();
-    let src = ms.view(data);
     let (block_len, block_end) = (block.len(), block.end);
-    let block = ms.index(block.start)..ms.index(block.end);
-    limit_update_after_long_match(ms, block.start);
+    let (src, block) = ms.start_block(data, block);
     let anchor = match ms.cparams.strategy {
-        Strategy::Fast => fast::compress_block(ms, src, block.clone(), rep, store),
-        Strategy::DFast => dfast::compress_block(ms, src, block.clone(), rep, store),
+        Strategy::Fast => fast::compress_block(ms, src, block, rep, store),
+        Strategy::DFast => dfast::compress_block(ms, src, block, rep, store),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::compress_block(ms, src, block.clone(), rep, store)
+            lazy::compress_block(ms, src, block, rep, store)
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            opt::compress_block(ms, src, block.clone(), rep, store)
+            opt::compress_block(ms, src, block, rep, store)
         }
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
@@ -994,33 +982,6 @@ mod tests {
         frame.extend_from_slice(&blocks);
         assert_eq!(crate::decompress(&frame).unwrap(), b.src);
         assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), b.src);
-    }
-
-    #[test]
-    fn limit_update_after_long_match_boundaries() {
-        let cp = CParams::for_level(5, 1 << 20);
-        let mut ms = MatchState::new(cp, 0);
-        // Backlog of exactly 384: untouched.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1384);
-        assert_eq!(ms.next_to_update, 1000);
-        // Backlog 385..575: only the excess over 384 gets inserted.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1385);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1575);
-        assert_eq!(ms.next_to_update, 1384);
-        // Backlog >= 576: insert only the last 192 positions.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1576);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
-        // Idempotent.
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
     }
 
     /// 1 MiB of period-21 text with noise over `[40 KiB, 128 KiB)`: the

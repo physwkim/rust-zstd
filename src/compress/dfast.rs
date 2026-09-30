@@ -12,7 +12,7 @@ use super::common::{
     byte, candidate_valid, hash_ptr, prefetch, read32, read64, simd_level, tget, tset, MatchCount,
     Src, HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
-use super::matchstate::MatchState;
+use super::matchstate::{Block, MatchState};
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
@@ -326,10 +326,11 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
 pub fn compress_block(
     ms: &mut MatchState,
     src: Src,
-    block: Range<usize>,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    let block = block.range();
     match simd_level() {
         // SAFETY: fearless_simd constructs the witness only after detecting
         // AVX2 on this CPU.

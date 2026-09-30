@@ -371,13 +371,12 @@ pub unsafe fn count_with(level: Level, src: Src, a: usize, b: usize, limit: usiz
 #[cfg(test)]
 pub mod testutil {
     use super::Src;
-    use crate::compress::matchstate::MatchState;
+    use crate::compress::matchstate::{Block, MatchState};
     use crate::compress::params::CParams;
     use crate::compress::seqstore::{SeqStore, ZSTD_REP_NUM};
     use std::ops::Range;
 
-    pub type BlockFn =
-        fn(&mut MatchState, Src, Range<usize>, &mut [u32; 3], &mut SeqStore) -> usize;
+    pub type BlockFn = fn(&mut MatchState, Src, Block, &mut [u32; 3], &mut SeqStore) -> usize;
     pub type PrefixFn = fn(&mut MatchState, Src, Range<usize>);
 
     /// Run the finder `f` on positions `block` of `data`, returning the
@@ -390,8 +389,7 @@ pub mod testutil {
         rep: &mut [u32; 3],
         store: &mut SeqStore,
     ) -> usize {
-        let src = ms.view(data);
-        let block = ms.index(block.start)..ms.index(block.end);
+        let (src, block) = ms.start_block(data, block);
         let anchor = f(ms, src, block, rep, store);
         ms.pos(anchor)
     }

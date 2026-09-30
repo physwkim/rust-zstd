@@ -165,6 +165,22 @@ impl Workspace {
     }
 }
 
+/// The indices of one block about to be searched. Only
+/// [`MatchState::start_block`] makes one, after the block-start
+/// `nextToUpdate` clamp, so no finder can run without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    start: usize,
+    end: usize,
+}
+
+impl Block {
+    #[inline]
+    pub fn range(self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
 impl MatchState {
     /// Allocate zeroed tables for `cparams.strategy` and start a window at
     /// position `origin`, see [`MatchState::reset`].
@@ -241,6 +257,21 @@ impl MatchState {
         src
     }
 
+    /// `ZSTD_buildSeqStore`'s set-up of a block: `data[positions]` as
+    /// indices of this window, after the "limited update after a very long
+    /// match" clamp: when the previous block left more than 384 positions
+    /// uninserted (its last match ran past the block end), insert at most
+    /// the 192 positions before the block (fewer while the backlog is under
+    /// 576) instead of the whole backlog.
+    pub fn start_block<'a>(&mut self, data: &'a [u8], positions: Range<usize>) -> (Src<'a>, Block) {
+        let src = self.view(data);
+        let (start, end) = (self.index(positions.start), self.index(positions.end));
+        if start > self.next_to_update + 384 {
+            self.next_to_update = start - 192.min(start - self.next_to_update - 384);
+        }
+        (src, Block { start, end })
+    }
+
     /// Move the window past the `len` bytes that begin it, as
     /// `ZSTD_initStats_ultra` forgets its first pass: `base -= len`,
     /// `dictLimit` and `lowLimit` up by `len`, `nextToUpdate = dictLimit`.
@@ -289,5 +320,36 @@ impl MatchState {
         } else {
             self.window_low
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_block_limits_update_after_long_match() {
+        let data = vec![0u8; 500_000];
+        let mut ms = MatchState::new(CParams::for_level(5, 1 << 20), 0);
+        // The clamp for a block starting at index `idx`.
+        let mut clamp = |next_to_update: Option<usize>, idx: usize| {
+            if let Some(n) = next_to_update {
+                ms.next_to_update = n;
+            }
+            let pos = idx - WINDOW_START_INDEX;
+            let (_, block) = ms.start_block(&data, pos..pos);
+            assert_eq!(block.range(), idx..idx);
+            ms.next_to_update
+        };
+        // Backlog of exactly 384: untouched.
+        assert_eq!(clamp(Some(1000), 1384), 1000);
+        // Backlog 385..575: only the excess over 384 gets inserted.
+        assert_eq!(clamp(Some(1000), 1385), 1384);
+        assert_eq!(clamp(Some(1000), 1575), 1384);
+        // Backlog >= 576: insert only the last 192 positions.
+        assert_eq!(clamp(Some(1000), 1576), 1384);
+        assert_eq!(clamp(Some(1000), 500_000), 500_000 - 192);
+        // Idempotent.
+        assert_eq!(clamp(None, 500_000), 500_000 - 192);
     }
 }

@@ -23,7 +23,7 @@
 
 use super::bt::{assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
 use super::common::{simd_level, Src};
-use super::matchstate::MatchState;
+use super::matchstate::{Block, MatchState};
 use super::params::Strategy;
 use super::seqstore::{update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
@@ -465,10 +465,11 @@ fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
 pub fn compress_block(
     ms: &mut MatchState,
     src: Src,
-    block: Range<usize>,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    let block = block.range();
     assert_opt_bounds(ms, src, block.end);
     let get_all_matches = select_get_all_matches(ms.cparams.min_match, simd_level());
     let mut state = ms

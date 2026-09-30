@@ -13,7 +13,7 @@ use super::common::{
     byte, candidate_valid, count, prefetch, read32, read64, tget, tset, MatchCount, Src,
     HASH_READ_SIZE,
 };
-use super::matchstate::MatchState;
+use super::matchstate::{Block, MatchState};
 use super::params::{CParams, Strategy};
 use super::seqstore::{
     offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
@@ -1700,7 +1700,7 @@ unsafe fn bt_block_avx2(
 pub fn compress_block(
     ms: &mut MatchState,
     src: Src,
-    block: Range<usize>,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
@@ -1747,12 +1747,13 @@ fn assert_block_bounds(ms: &MatchState, src: Src, end: usize, method: SearchMeth
 pub fn compress_block_with(
     ms: &mut MatchState,
     src: Src,
-    block: Range<usize>,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
     method: SearchMethod,
     level: Level,
 ) -> usize {
+    let block = block.range();
     let depth = depth_of(ms.cparams.strategy);
     assert_block_bounds(ms, src, block.end, method);
     match method {
@@ -1887,7 +1888,7 @@ mod tests {
             let end = (start + block_size).min(src.len());
             store.clear();
             let rep_in = rep;
-            let block = ms.index(start)..ms.index(end);
+            let (view, block) = ms.start_block(src, start..end);
             let anchor = compress_block_with(
                 &mut ms,
                 view,
@@ -2095,12 +2096,11 @@ mod tests {
         let mut rep = [1u32, 4, 8];
         let mut all = SeqStore::new();
         let mut store = SeqStore::new();
-        let view = ms.view(src);
         let mut start = 0;
         while start < src.len() {
             let end = (start + block_size).min(src.len());
             store.clear();
-            let block = ms.index(start)..ms.index(end);
+            let (view, block) = ms.start_block(src, start..end);
             let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, method, level);
             let anchor = ms.pos(anchor);
             all.seqs.extend_from_slice(&store.seqs);
