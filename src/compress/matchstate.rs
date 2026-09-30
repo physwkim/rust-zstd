@@ -41,6 +41,7 @@ use super::common::Src;
 use super::lazy::DUBT_UNSORTED_MARK;
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
+use crate::constants::MEM_32BITS;
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
 pub const WINDOW_START_INDEX: usize = 2;
@@ -49,11 +50,12 @@ pub const WINDOW_START_INDEX: usize = 2;
 /// input ended less than this below [`CURRENT_MAX`].
 const INDEX_OVERFLOW_MARGIN: usize = 16 << 20;
 
-/// `ZSTD_CURRENT_MAX` (64-bit): the highest index a block, or a long
-/// distance matching chunk, may end at without its window being corrected
-/// first. The `ZSTD_CHUNKSIZE_MAX` (596 MiB) indices above it exceed any
-/// block or chunk.
-pub const CURRENT_MAX: usize = 3500 << 20;
+/// `ZSTD_CURRENT_MAX`: the highest index a block, or a long distance
+/// matching chunk, may end at without its window being corrected first;
+/// 3500 MiB, or 2000 MiB where `size_t` is 32 bits. The
+/// `ZSTD_CHUNKSIZE_MAX` (596 or 2096 MiB) indices above it exceed any block
+/// or chunk.
+pub const CURRENT_MAX: usize = if MEM_32BITS { 2000 << 20 } else { 3500 << 20 };
 
 /// `ZSTD_window_t` without a dictionary (`lowLimit == dictLimit`, no
 /// `dictBase`) over one contiguous input at a time: the position <-> index

@@ -132,7 +132,8 @@ pub struct CompressOptions {
     /// Test knob, libzstd's `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`:
     /// correct the match state's and the long distance matcher's windows
     /// whenever a correction keeps the whole window, not only before an
-    /// index would pass 3500 MiB, so that small inputs exercise the
+    /// index would pass `ZSTD_CURRENT_MAX` (3500 MiB, or 2000 MiB where
+    /// `usize` is 32 bits), so that small inputs exercise the
     /// correction. The frames then equal those of a libzstd built with
     /// that macro set to 1.
     #[doc(hidden)]
