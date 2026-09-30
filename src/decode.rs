@@ -647,12 +647,6 @@ impl FSETable {
     }
 }
 
-fn fse_next_position(mut p: usize, table_size: usize) -> usize {
-    p += (table_size >> 1) + (table_size >> 3) + 3;
-    p &= table_size - 1;
-    p
-}
-
 pub(crate) fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
