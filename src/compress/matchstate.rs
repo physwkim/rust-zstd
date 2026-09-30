@@ -42,7 +42,8 @@ pub struct MatchState {
 /// The table area of `ZSTD_cwksp`: one zeroed allocation holding
 /// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
 /// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
-/// the hash-chain table for the lazy strategies) and `tagTable`
+/// the hash-chain table for the lazy strategies; the binary tree for
+/// `BtLazy2`) and `tagTable`
 /// (`1 << hash_log` bytes, row-based lazy finder only, else empty).
 #[derive(Default)]
 pub struct Workspace {
@@ -61,6 +62,8 @@ impl Workspace {
             Strategy::Fast => (hash, 0, 0),
             Strategy::DFast => (hash, chain, 0),
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, hash),
+            // The chain table holds the binary tree, two entries per node.
+            Strategy::BtLazy2 => (hash, chain, 0),
         }
     }
 
