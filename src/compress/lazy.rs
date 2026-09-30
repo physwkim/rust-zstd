@@ -7,7 +7,7 @@
 //!
 //! Positions are the indices [`MatchState`](super::matchstate) assigns,
 //! libzstd's `window.base`-relative ones: table entry `0` means empty and
-//! `1` is [`DUBT_UNSORTED_MARK`], both below `window_low`.
+//! `1` is `DUBT_UNSORTED_MARK`, both below `window_low`.
 
 use super::common::{
     byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,

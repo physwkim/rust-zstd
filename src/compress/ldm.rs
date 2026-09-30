@@ -144,7 +144,7 @@ impl LdmParams {
 
 /// `rawSeq`: `lit_length` literals, then `match_length` bytes at `offset`
 /// back. `offset == 0` marks "the rest is literals" in
-/// [`RawSeqStore::maybe_split_sequence`]'s result.
+/// `RawSeqStore::maybe_split_sequence`'s result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RawSeq {
     pub offset: u32,

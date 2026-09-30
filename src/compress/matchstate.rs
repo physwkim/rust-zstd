@@ -46,7 +46,7 @@ pub struct MatchState {
     /// so that a reused tag table does not produce phantom matches. Starts
     /// at the value a fresh `ZSTD_CCtx` has after its first
     /// `ZSTD_advanceHashSalt` (both inputs zero), see
-    /// [`super::lazy::initial_hash_salt`].
+    /// `lazy::initial_hash_salt`.
     pub hash_salt: u64,
     /// `hashSaltEntropy`: running sum of the row finder's search hashes,
     /// mixed into the next salt by `ZSTD_advanceHashSalt` on a context reset.

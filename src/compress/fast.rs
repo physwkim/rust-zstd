@@ -8,7 +8,7 @@
 //!
 //! The search loop reads `src` and the hash table without bounds checks
 //! (the checks cost 10-16% of the throughput). Every read is covered by
-//! one of the invariants stated in [`compress_block_generic`].
+//! one of the invariants stated in `compress_block_generic`.
 
 use super::common::{
     byte, candidate_valid, hash_ptr, prefetch, read32, simd_level, tget, tset, MatchCount, Src,
