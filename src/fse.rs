@@ -1496,12 +1496,21 @@ mod tests {
         norm.iter().map(|&n| n.unsigned_abs() as u32).sum()
     }
 
+    /// The `total` of `counts`. `FSE_normalizeCount` casts it to `U32`, so a
+    /// total past `u32::MAX` is no histogram on any target; panic rather
+    /// than wrap in a 32-bit `usize`.
+    fn count_total(counts: &[u32]) -> usize {
+        let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
+        u32::try_from(total).unwrap_or_else(|_| panic!("count total {total} does not fit u32"))
+            as usize
+    }
+
     /// `normalize_count` on `counts` at every table log from
     /// `FSE_minTableLog` up to `max_log`: a success must sum to
     /// `1 << table_log`, and the `FSE_optimalTableLog` choice must succeed.
     fn check_normalize(counts: &[u32], max_log: u32) {
         let max_symbol = counts.len() - 1;
-        let total: usize = counts.iter().map(|&c| c as usize).sum();
+        let total = count_total(counts);
         let optimal = optimal_table_log(max_log, total, max_symbol);
         for use_low_prob in [false, true] {
             for table_log in FSE_MIN_TABLELOG..=max_log {
@@ -1556,9 +1565,13 @@ mod tests {
             check_normalize(&counts, 9);
             counts.reverse();
             check_normalize(&counts, 9);
-            // rare symbols with a geometric tail
+            // rare symbols with a geometric tail: rare_count doubling every 8
+            // symbols, shifted down as a whole (the low end saturating at 1)
+            // so that no tail symbol exceeds half the dominant
+            let levels = (rare_symbols as u32 - 1) / 8;
+            let top = (u64::from(rare_count) << levels).min(u64::from(dominant / 2)) as u32;
             let mut geometric: Vec<u32> = (0..rare_symbols as u32)
-                .map(|i| (rare_count << (i / 8)).max(1))
+                .map(|i| (top >> (levels - i / 8)).max(1))
                 .collect();
             geometric.insert(0, dominant);
             check_normalize(&geometric, 9);
@@ -1612,7 +1625,7 @@ mod tests {
             let fields: Vec<&str> = line.split(' ').collect();
             let recorded_log: u32 = fields[2].parse().unwrap();
             let counts: Vec<u32> = fields[5].split(',').map(|c| c.parse().unwrap()).collect();
-            let total: usize = counts.iter().map(|&c| c as usize).sum();
+            let total = count_total(&counts);
             assert_eq!(total, fields[3].parse::<usize>().unwrap());
             // The log the pre-port code chose must now either be exact or be
             // refused; the offset (8) and LL/ML (9) maxima must both work.
