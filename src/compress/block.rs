@@ -12,6 +12,7 @@
 
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
+use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
 use super::split::{resolve_off_codes, BlockSplitter, Partition};
 use super::{dfast, fast, lazy};
@@ -87,6 +88,8 @@ pub struct BlockScratch {
     pub cbuf: Vec<u8>,
     /// The post-sequence splitter's partitions and estimator buffers.
     pub splitter: BlockSplitter,
+    /// The pre-splitter's fingerprints.
+    pub presplit: PreSplitter,
 }
 
 impl BlockScratch {
@@ -486,20 +489,126 @@ pub fn compress_block(
     );
 }
 
-/// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks of
-/// `block_size`, appended to `out`, each through the post-sequence splitter
+/// How [`compress_blocks`] sizes blocks: `ZSTD_compress_frameChunk` with
+/// `ZSTD_optimalBlockSize`.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockSizing {
+    /// `blockSizeMax`: `min(ZSTD_BLOCKSIZE_MAX, 1 << window_log)`.
+    pub block_size_max: usize,
+    /// The `ZSTD_splitBlock` level, `None` with the pre-splitter off (see
+    /// [`split_level`](super::presplit::split_level)).
+    pub split_level: Option<u8>,
+    /// Source bytes per `ZSTD_compressContinue` call, from the job start;
+    /// no block crosses the end of one. ZSTDMT feeds a job in chunks of
+    /// `4 * ZSTD_BLOCKSIZE_MAX`; single-threaded `ZSTD_compress2` passes the
+    /// whole input in one call (`usize::MAX`).
+    pub chunk_size: usize,
+    /// Frame header length. `producedCSize` counts it only after the call
+    /// that wrote it, so job 0's `savings` owe it from its second chunk on.
+    pub header_len: usize,
+}
+
+/// [`BlockSizing`] over one job, with the job's `savings` so far.
+struct JobBlocks {
+    sizing: BlockSizing,
+    job: Range<usize>,
+    first_job: bool,
+    /// Source minus written bytes over the job's blocks so far.
+    gained: i64,
+}
+
+impl JobBlocks {
+    /// `min(remaining, blockSizeMax)` at `start`, with `remaining` the rest
+    /// of its chunk: the block's size unless pre-split.
+    fn unsplit_size(&self, start: usize) -> usize {
+        let chunk = self.sizing.chunk_size;
+        let offset = start - self.job.start;
+        let chunk_end = (offset / chunk + 1)
+            .saturating_mul(chunk)
+            .min(self.job.len());
+        (chunk_end - offset).min(self.sizing.block_size_max)
+    }
+
+    /// `savings` (`consumedSrcSize - producedCSize` plus the chunk's blocks
+    /// so far) at `start`, had the blocks before it gained `gained`.
+    fn savings(&self, start: usize, gained: i64) -> i64 {
+        let owes_header = self.first_job && start - self.job.start >= self.sizing.chunk_size;
+        let header = if owes_header {
+            self.sizing.header_len
+        } else {
+            0
+        };
+        gained - header as i64
+    }
+
+    /// `ZSTD_optimalBlockSize`: the block starting at `start` with
+    /// `savings`. Only a full 128 KiB block is split, and only once the
+    /// job has saved 3 bytes, so the first block of a job never is.
+    fn block(
+        &self,
+        src: &[u8],
+        start: usize,
+        savings: i64,
+        presplit: &mut PreSplitter,
+    ) -> Range<usize> {
+        let unsplit = self.unsplit_size(start);
+        let size = match self.sizing.split_level {
+            Some(level) if unsplit == SPLIT_BLOCK_SIZE && savings >= 3 => {
+                presplit.split_block(&src[start..start + unsplit], level)
+            }
+            _ => unsplit,
+        };
+        start..start + size
+    }
+
+    /// The block at `start`, from the blocks written so far.
+    fn next(&self, src: &[u8], start: usize, presplit: &mut PreSplitter) -> Range<usize> {
+        self.block(src, start, self.savings(start, self.gained), presplit)
+    }
+
+    /// The block at `start` while the blocks before it, not all written,
+    /// are known to gain at least `least_gained`. [`JobBlocks::block`]
+    /// depends on `savings` only through `savings >= 3` and only for a
+    /// block that may be pre-split, so the size is fixed unless that holds
+    /// and the least savings are under 3.
+    #[cfg(feature = "parallel")]
+    fn next_unwritten(
+        &self,
+        src: &[u8],
+        start: usize,
+        least_gained: i64,
+        presplit: &mut PreSplitter,
+    ) -> Option<Range<usize>> {
+        let least_savings = self.savings(start, least_gained);
+        let may_split =
+            self.sizing.split_level.is_some() && self.unsplit_size(start) == SPLIT_BLOCK_SIZE;
+        if may_split && least_savings < 3 {
+            return None;
+        }
+        Some(self.block(src, start, least_savings, presplit))
+    }
+
+    /// Account `block`, written as `written` bytes.
+    fn wrote(&mut self, block: &Range<usize>, written: usize) {
+        self.gained += block.len() as i64 - written as i64;
+    }
+}
+
+/// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks sized by
+/// `sizing`, appended to `out`, each through the post-sequence splitter
 /// when `split`. With `pipelined` (parallel feature only) block N+1's match
 /// finding runs on rayon next to block N's entropy stage and emission
 /// whenever every block N is written as is [proven](proven_rep_after) to
 /// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
-/// the decoder will hold; otherwise N's entropy stage runs first and N+1
-/// starts from the committed offsets. Output is identical either way.
+/// the decoder will hold, and N+1's size is fixed without N's compressed
+/// size; otherwise N's entropy stage runs first and N+1 starts from the
+/// committed offsets. Output is identical either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_blocks(
     ms: &mut MatchState,
     src: &[u8],
     job: Range<usize>,
-    block_size: usize,
+    sizing: BlockSizing,
     first_job: bool,
     last_job: bool,
     split: bool,
@@ -508,29 +617,35 @@ pub fn compress_blocks(
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
+    let mut blocks = JobBlocks {
+        sizing,
+        job: job.clone(),
+        first_job,
+        gained: 0,
+    };
     #[cfg(feature = "parallel")]
     if pipelined {
-        compress_blocks_pipelined(
-            ms, src, job, block_size, first_job, last_job, split, state, scratch, out,
-        );
+        compress_blocks_pipelined(ms, src, &mut blocks, last_job, split, state, scratch, out);
         return;
     }
     let _ = pipelined;
     let mut start = job.start;
     while start < job.end {
-        let end = (start + block_size).min(job.end);
+        let block = blocks.next(src, start, &mut scratch.presplit);
+        let written = out.len();
         compress_block(
             ms,
             src,
-            start..end,
+            block.clone(),
             first_job && start == job.start,
-            last_job && end == job.end,
+            last_job && block.end == job.end,
             split,
             state,
             scratch,
             out,
         );
-        start = end;
+        blocks.wrote(&block, out.len() - written);
+        start = block.end;
     }
 }
 
@@ -543,14 +658,27 @@ pub static PIPELINE_OVERLAPPED: std::sync::atomic::AtomicUsize =
 pub static PIPELINE_SERIALIZED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// The least `len - written` over the blocks [`emit_block`] writes for
+/// `block_len` bytes cut into `parts` when all are COMPRESSED:
+/// [`entropy_and_emit`] writes COMPRESSED only a payload under
+/// `len - ZSTD_minGain`, so with its header a block takes at most
+/// `len - min_gain + 2` bytes.
+#[cfg(feature = "parallel")]
+fn compressed_gain_bound(block_len: usize, parts: Option<&[Partition]>, strategy: Strategy) -> i64 {
+    let gain =
+        |len: usize| CParams::min_gain(len, strategy) as i64 + 1 - ZSTD_BLOCKHEADERSIZE as i64;
+    match parts {
+        None | Some([]) => gain(block_len),
+        Some(parts) => parts.iter().map(|p| gain(p.src_len)).sum(),
+    }
+}
+
 #[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 fn compress_blocks_pipelined(
     ms: &mut MatchState,
     src: &[u8],
-    job: Range<usize>,
-    block_size: usize,
-    first_job: bool,
+    blocks: &mut JobBlocks,
     last_job: bool,
     split: bool,
     state: &mut CommittedBlockState,
@@ -559,68 +687,65 @@ fn compress_blocks_pipelined(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let cparams = ms.cparams;
-    let blocks: Vec<Range<usize>> = (job.start..job.end)
-        .step_by(block_size)
-        .map(|start| start..(start + block_size).min(job.end))
-        .collect();
-    scratch.next.reserve(block_size);
+    let job = blocks.job.clone();
+    if job.is_empty() {
+        return;
+    }
+    scratch.next.reserve(blocks.sizing.block_size_max);
     let BlockScratch {
         store,
         next,
         cbuf,
         splitter,
+        presplit,
     } = scratch;
     let (mut cur, mut nxt) = (store, next);
-    // `built`: block i's store is in `cur`, with the finder's offsets after it.
-    let mut built = blocks.first().and_then(|b| {
-        attempts_compression(b.len()).then(|| {
-            let mut rep = state.prev().rep;
-            build_seq_store(ms, src, b.clone(), &mut rep, cur);
-            rep
-        })
+    let mut block = blocks.next(src, job.start, presplit);
+    // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
+    let mut built = attempts_compression(block.len()).then(|| {
+        let mut rep = state.prev().rep;
+        build_seq_store(ms, src, block.clone(), &mut rep, cur);
+        rep
     });
-    for (i, block) in blocks.iter().enumerate() {
-        let is_first_block = first_job && i == 0;
-        let is_last = last_job && i + 1 == blocks.len();
-        // ZSTD_deriveBlockSplits runs against the state committed by block
-        // i - 1, before block i + 1's finder may start.
+    loop {
+        let is_first_block = blocks.first_job && block.start == job.start;
+        let is_last = last_job && block.end == job.end;
+        // ZSTD_deriveBlockSplits runs against the state committed by the
+        // previous block, before the next block's finder may start.
         let parts = split.then(|| match built {
             Some(_) => splitter.derive(cur, state.prev(), &cparams, block.len()),
             None => &[][..],
         });
-        let following = blocks
-            .get(i + 1)
-            .filter(|b| attempts_compression(b.len()))
-            .cloned();
-        let Some(following) = following else {
-            emit_block(
-                src,
-                block.clone(),
-                built.map(|rep| (&mut *cur, rep)),
-                parts,
-                &cparams,
-                is_first_block,
-                is_last,
-                state,
-                cbuf,
-                out,
-            );
-            built = None;
-            continue;
-        };
-        let proven = built.and_then(|rep| {
-            proven_rep_after(
-                src,
-                block.clone(),
-                cur,
-                rep,
-                parts,
-                state.prev().rep,
-                cparams.strategy,
-            )
-            .map(|rep_next| (rep, rep_next))
-        });
-        if let Some((rep, rep_next)) = proven {
+        let following_start = block.end;
+        // A pre-split block is at least 8 KiB, so the unsplit size decides
+        // whether the next block attempts compression.
+        let following_builds =
+            following_start < job.end && attempts_compression(blocks.unsplit_size(following_start));
+        // Block N+1 may start before block N is written when N is proven
+        // COMPRESSED (the offsets N+1 starts from) and N+1's size does not
+        // depend on N's compressed size: it is not pre-split, or the least
+        // savings a COMPRESSED N leaves already allow the split.
+        let overlap = following_builds
+            .then(|| {
+                let rep = built?;
+                let rep_next = proven_rep_after(
+                    src,
+                    block.clone(),
+                    cur,
+                    rep,
+                    parts,
+                    state.prev().rep,
+                    cparams.strategy,
+                )?;
+                let least_gained =
+                    blocks.gained + compressed_gain_bound(block.len(), parts, cparams.strategy);
+                let following =
+                    blocks.next_unwritten(src, following_start, least_gained, presplit)?;
+                Some((rep, rep_next, least_gained, following))
+            })
+            .flatten();
+        let written = out.len();
+        if let Some((rep, rep_next, least_gained, following)) = overlap {
             PIPELINE_OVERLAPPED.fetch_add(1, Relaxed);
             let mut rep_following = rep_next;
             let cur_store = &mut *cur;
@@ -642,13 +767,18 @@ fn compress_blocks_pipelined(
                 },
                 || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt),
             );
-            // The proof is what made block i + 1 start from the decoder's
-            // offsets.
+            // The proof is what made block N+1 start from the decoder's
+            // offsets, with the size the written block N gives it.
             assert!(compressed, "section bound proof failed");
             assert_eq!(state.prev().rep, rep_next, "repeat offset proof failed");
+            blocks.wrote(&block, out.len() - written);
+            assert!(blocks.gained >= least_gained, "savings bound proof failed");
             built = Some(rep_following);
+            block = following;
         } else {
-            PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
+            if following_builds {
+                PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
+            }
             emit_block(
                 src,
                 block.clone(),
@@ -661,9 +791,16 @@ fn compress_blocks_pipelined(
                 cbuf,
                 out,
             );
-            let mut rep_following = state.prev().rep;
-            build_seq_store(ms, src, following, &mut rep_following, nxt);
-            built = Some(rep_following);
+            blocks.wrote(&block, out.len() - written);
+            if block.end == job.end {
+                return;
+            }
+            block = blocks.next(src, block.end, presplit);
+            built = attempts_compression(block.len()).then(|| {
+                let mut rep = state.prev().rep;
+                build_seq_store(ms, src, block.clone(), &mut rep, nxt);
+                rep
+            });
         }
         std::mem::swap(&mut cur, &mut nxt);
     }
@@ -865,5 +1002,119 @@ mod tests {
         // Idempotent.
         limit_update_after_long_match(&mut ms, 500_000);
         assert_eq!(ms.next_to_update, 500_000 - 192);
+    }
+
+    /// 1 MiB of period-21 text with noise over `[40 KiB, 128 KiB)`: the
+    /// chunked pre-splitter levels cut the block at 0 at 40 KiB and keep
+    /// every later one whole.
+    fn presplit_input() -> Vec<u8> {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut src: Vec<u8> = (0..1 << 20)
+            .map(|i| b"the quick brown foxes"[i % 21])
+            .collect();
+        for b in &mut src[40 << 10..SPLIT_BLOCK_SIZE] {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 56) as u8;
+        }
+        src
+    }
+
+    fn job_blocks(split_level: Option<u8>, chunk_size: usize, job: Range<usize>) -> JobBlocks {
+        JobBlocks {
+            sizing: BlockSizing {
+                block_size_max: ZSTD_BLOCKSIZE_MAX,
+                split_level,
+                chunk_size,
+                header_len: 10,
+            },
+            job,
+            first_job: true,
+            gained: 0,
+        }
+    }
+
+    /// `ZSTD_optimalBlockSize`: a full block splits at `savings` 3, not 2;
+    /// a block under 128 KiB (job end, a smaller `blockSizeMax`) or with
+    /// the pre-splitter off never does.
+    #[test]
+    fn block_splits_full_blocks_once_savings_reach_three() {
+        let src = presplit_input();
+        let mut ps = PreSplitter::default();
+        let on = job_blocks(Some(1), usize::MAX, 0..src.len());
+        assert_eq!(on.block(&src, 0, 2, &mut ps), 0..SPLIT_BLOCK_SIZE);
+        assert_eq!(on.block(&src, 0, 3, &mut ps), 0..40 << 10);
+        assert_eq!(
+            on.block(&src, 512 << 10, 3, &mut ps).len(),
+            SPLIT_BLOCK_SIZE
+        );
+        let tail = src.len() - 1000;
+        assert_eq!(on.block(&src, tail, 1 << 20, &mut ps), tail..src.len());
+        let off = job_blocks(None, usize::MAX, 0..src.len());
+        assert_eq!(off.block(&src, 0, 1 << 20, &mut ps), 0..SPLIT_BLOCK_SIZE);
+        let mut small = job_blocks(Some(1), usize::MAX, 0..src.len());
+        small.sizing.block_size_max = 64 << 10;
+        assert_eq!(small.block(&src, 0, 1 << 20, &mut ps), 0..64 << 10);
+    }
+
+    /// ZSTDMT chunks: no block crosses `job.start + k * 512 KiB`, and job 0
+    /// owes the frame header from its second chunk on; single-threaded,
+    /// the job is one chunk and the header is never owed.
+    #[test]
+    fn chunks_bound_blocks_and_owe_the_header_from_the_second() {
+        let chunk = 4 * ZSTD_BLOCKSIZE_MAX;
+        let job = 1000..1000 + (700 << 10);
+        let mt = job_blocks(Some(1), chunk, job.clone());
+        let second = job.start + chunk;
+        assert_eq!(mt.unsplit_size(job.start), SPLIT_BLOCK_SIZE);
+        assert_eq!(mt.unsplit_size(second - (8 << 10)), 8 << 10);
+        assert_eq!(mt.unsplit_size(second), SPLIT_BLOCK_SIZE);
+        assert_eq!(mt.unsplit_size(job.end - 100), 100);
+        assert_eq!(mt.savings(second - 1, 5), 5);
+        assert_eq!(mt.savings(second, 5), -5);
+        let later = JobBlocks {
+            first_job: false,
+            ..job_blocks(Some(1), chunk, job.clone())
+        };
+        assert_eq!(later.savings(second, 5), 5);
+        let st = job_blocks(Some(1), usize::MAX, job.clone());
+        assert_eq!(st.unsplit_size(second - (8 << 10)), SPLIT_BLOCK_SIZE);
+        assert_eq!(st.savings(job.end - 1, 5), 5);
+    }
+
+    /// The pipelined loop fixes the next block before the current one is
+    /// written only when the least savings decide it as the written block
+    /// will: a block that may split needs least savings of 3 (the header
+    /// debit included); any other block is fixed at any savings.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn next_unwritten_waits_only_when_least_savings_cannot_decide() {
+        let src = presplit_input();
+        let mut ps = PreSplitter::default();
+        let st = job_blocks(Some(1), usize::MAX, 0..src.len());
+        assert_eq!(st.next_unwritten(&src, 0, 2, &mut ps), None);
+        assert_eq!(st.next_unwritten(&src, 0, 3, &mut ps), Some(0..40 << 10));
+        let tail = src.len() - 1000;
+        assert_eq!(
+            st.next_unwritten(&src, tail, -100, &mut ps),
+            Some(tail..src.len())
+        );
+        let off = job_blocks(None, usize::MAX, 0..src.len());
+        assert_eq!(
+            off.next_unwritten(&src, 0, -100, &mut ps),
+            Some(0..SPLIT_BLOCK_SIZE)
+        );
+        let chunk = 4 * ZSTD_BLOCKSIZE_MAX;
+        let mt = job_blocks(Some(1), chunk, 0..src.len());
+        assert_eq!(mt.next_unwritten(&src, chunk, 12, &mut ps), None);
+        assert_eq!(
+            mt.next_unwritten(&src, chunk, 13, &mut ps).map(|b| b.len()),
+            Some(SPLIT_BLOCK_SIZE)
+        );
+        assert_eq!(
+            mt.next_unwritten(&src, chunk - (8 << 10), -100, &mut ps),
+            Some(chunk - (8 << 10)..chunk)
+        );
     }
 }
