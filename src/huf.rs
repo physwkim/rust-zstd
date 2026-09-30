@@ -1026,6 +1026,88 @@ pub fn literals_section_bound(lit_len: usize) -> usize {
     lit_len + raw_header
 }
 
+/// `COMPRESS_LITERALS_SIZE_MIN`: `ZSTD_buildBlockEntropyStats_literals`
+/// leaves literals up to this size raw unless the previous table is
+/// `HUF_repeat_valid`.
+const COMPRESS_LITERALS_SIZE_MIN: usize = 63;
+
+/// `ZSTD_buildBlockEntropyStats_literals` followed by
+/// `ZSTD_estimateBlockSize_literal` with `writeEntropy` set for a new
+/// table: the size the post-sequence block splitter estimates for the
+/// literals section of `literals` coded against `prev`, header included.
+/// `desc` is scratch for the tree description. `None` where the C
+/// returns an error.
+///
+/// The decision differs from [`compress_literals_with`]: no
+/// `ZSTD_minLiteralsToCompress`, no sampling of suspected incompressible
+/// input, no preference for the previous table, and a Raw or RLE section
+/// is costed without its header.
+pub fn estimate_literals_section(
+    literals: &[u8],
+    prev: &HufState,
+    cparams: &CParams,
+    desc: &mut Vec<u8>,
+) -> Option<usize> {
+    let src_size = literals.len();
+    if literals_compression_is_disabled(cparams) {
+        return Some(src_size); // set_basic
+    }
+    let min_lit_size = if prev.repeat() == HufRepeat::Valid {
+        6
+    } else {
+        COMPRESS_LITERALS_SIZE_MIN
+    };
+    if src_size <= min_lit_size {
+        return Some(src_size); // set_basic: too small
+    }
+    let mut count = [0u32; 256];
+    let (largest, max_symbol) = hist_count(&mut count, literals);
+    if largest as usize == src_size {
+        return Some(1); // set_rle
+    }
+    if largest as usize <= (src_size >> 7) + 4 {
+        return Some(src_size); // set_basic: likely not compressible
+    }
+    let mut repeat = prev.repeat();
+    if repeat == HufRepeat::Check
+        && !prev
+            .table()
+            .is_some_and(|t| validate_ctable(t, &count, max_symbol))
+    {
+        repeat = HufRepeat::None;
+    }
+    // HUF_optimalTableLog without HUF_flags_optimalDepth, as in
+    // `compress_internal`.
+    let huff_log = fse::optimal_table_log_internal(HUF_TABLELOG_DEFAULT, src_size, max_symbol, 1);
+    let table = build_ctable(&count, max_symbol, huff_log)?;
+    let new_c_size = estimate_compressed_size(&table, &count, max_symbol);
+    desc.clear();
+    // The C does not check HUF_writeCTable_wksp's result: an error is
+    // `(size_t)-1` in the comparisons below and fails the estimate only
+    // when the new table is selected.
+    let h_size =
+        write_ctable(desc, &table, max_symbol, table.table_log as u32).unwrap_or(usize::MAX);
+    let header = 3 + (src_size >= 1024) as usize + (src_size >= 16384) as usize;
+    // four streams need a 6-byte jump table
+    let jump_table = if src_size < 256 { 0 } else { 6 };
+    if repeat != HufRepeat::None {
+        let old_c_size = estimate_compressed_size(prev.table()?, &count, max_symbol);
+        if old_c_size < src_size
+            && (old_c_size <= h_size.wrapping_add(new_c_size)
+                || h_size.wrapping_add(12) >= src_size)
+        {
+            return Some(old_c_size + jump_table + header); // set_repeat
+        }
+    }
+    if new_c_size.wrapping_add(h_size) >= src_size {
+        return Some(src_size); // set_basic: no gain
+    }
+    if h_size == usize::MAX {
+        return None;
+    }
+    Some(new_c_size + h_size + jump_table + header) // set_compressed
+}
+
 /// `ZSTD_compressLiterals`: write the literals section for one block and
 /// return the Huffman state the decoder holds afterwards (`nextHuf`).
 /// `nb_seq` is the block's sequence count, from which the caller-side

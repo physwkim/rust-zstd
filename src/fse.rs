@@ -1194,6 +1194,30 @@ pub fn sequences_section_bound(seqs: &[Seq]) -> usize {
     bound
 }
 
+/// `ZSTD_seqToCodes`: the literal-length, offset and match-length codes of
+/// `sequences`, written to `codes` (`3 * sequences.len()` bytes) and
+/// returned as three slices.
+#[inline(always)]
+fn seq_to_codes<'a>(
+    sequences: &[Seq],
+    codes: &'a mut [u8],
+) -> (&'a mut [u8], &'a mut [u8], &'a mut [u8]) {
+    let nb_seq = sequences.len();
+    let (ll_codes, rest) = codes.split_at_mut(nb_seq);
+    let (of_codes, ml_codes) = rest.split_at_mut(nb_seq);
+    for (((seq, ll), of), ml) in sequences
+        .iter()
+        .zip(&mut *ll_codes)
+        .zip(&mut *of_codes)
+        .zip(&mut *ml_codes)
+    {
+        *ll = ll_code(seq.lit_len);
+        *of = off_code(seq.off_base);
+        *ml = ml_code(seq.ml_base);
+    }
+    (ll_codes, of_codes, &mut ml_codes[..nb_seq])
+}
+
 /// `None` means the block must be emitted uncompressed: libzstd returns 0
 /// for the 1.3.4 decoder workaround (the last table description plus the
 /// bitstream under 4 bytes) and fails the compression when a table cannot
@@ -1225,20 +1249,8 @@ pub fn encode_sequences_section_with(
     let seq_head = out.len();
     out.push(0);
 
-    // ZSTD_seqToCodes
     let mut codes = vec![0u8; 3 * nb_seq];
-    let (ll_codes, rest) = codes.split_at_mut(nb_seq);
-    let (of_codes, ml_codes) = rest.split_at_mut(nb_seq);
-    for (((seq, ll), of), ml) in sequences
-        .iter()
-        .zip(&mut *ll_codes)
-        .zip(&mut *of_codes)
-        .zip(&mut *ml_codes)
-    {
-        *ll = ll_code(seq.lit_len);
-        *of = off_code(seq.off_base);
-        *ml = ml_code(seq.ml_base);
-    }
+    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut codes);
 
     // The `HIST_countFast_wksp` of each `ZSTD_buildSequencesStatistics`
     // step, taken up front so the histograms also total the raw bits the
@@ -1328,6 +1340,138 @@ pub fn encode_sequences_section_with(
         of: of_next,
         ml: ml_next,
     })
+}
+
+/// Reusable buffers of [`estimate_sequences_section`].
+#[derive(Default)]
+pub struct EstimateScratch {
+    codes: Vec<u8>,
+    descriptions: Vec<u8>,
+}
+
+/// `ZSTD_buildBlockEntropyStats_sequences` followed by
+/// `ZSTD_estimateBlockSize_sequences` with `writeEntropy`: the size the
+/// post-sequence block splitter estimates for the sequences section of
+/// `sequences` coded against `prev`, header and table descriptions
+/// included. `None` where `ZSTD_buildSequencesStatistics` fails.
+///
+/// Per table the estimate is the bits `ZSTD_selectEncodingType` /
+/// `ZSTD_buildCTable` would spend on the codes (the default distribution's
+/// cross entropy for `Basic`, nothing for `Rle`, `ZSTD_fseBitCost` of the
+/// table for `Compressed` and `Repeat`, or a flat `10` bytes per sequence
+/// when that table cannot code a symbol) plus the codes' extra bits,
+/// rounded down to bytes table by table.
+pub fn estimate_sequences_section(
+    sequences: &[Seq],
+    prev: &FseState,
+    cparams: &CParams,
+    scratch: &mut EstimateScratch,
+) -> Option<usize> {
+    let nb_seq = sequences.len();
+    // seqHead + the smallest sequence count, whatever `nb_seq` is
+    let header = 1 + 1 + (nb_seq >= 128) as usize + (nb_seq >= LONGNBSEQ) as usize;
+    if nb_seq == 0 {
+        // ZSTD_buildDummySequencesStatistics: every table Basic, no codes
+        return Some(header);
+    }
+    scratch.codes.resize(3 * nb_seq, 0);
+    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut scratch.codes);
+    scratch.descriptions.clear();
+    let mut bytes = 0;
+    /// One code stream and the tables `build_seq_table` chooses between.
+    struct Stream<'a> {
+        codes: &'a [u8],
+        fse_log: u32,
+        prev: &'a FseTableState,
+        default_norm: &'a [i16],
+        default_norm_log: u32,
+        default_max: usize,
+        /// Extra bits per code; `None` for offsets, whose code is the count.
+        extra: Option<&'a [u8]>,
+    }
+    let streams = [
+        Stream {
+            codes: ll_codes,
+            fse_log: LL_FSE_LOG,
+            prev: &prev.ll,
+            default_norm: &LL_DEFAULT_NORM,
+            default_norm_log: LL_DEFAULT_NORM_LOG,
+            default_max: MAX_LL,
+            extra: Some(&LL_BITS),
+        },
+        Stream {
+            codes: of_codes,
+            fse_log: OFF_FSE_LOG,
+            prev: &prev.of,
+            default_norm: &OF_DEFAULT_NORM,
+            default_norm_log: OF_DEFAULT_NORM_LOG,
+            default_max: DEFAULT_MAX_OFF,
+            extra: None,
+        },
+        Stream {
+            codes: ml_codes,
+            fse_log: ML_FSE_LOG,
+            prev: &prev.ml,
+            default_norm: &ML_DEFAULT_NORM,
+            default_norm_log: ML_DEFAULT_NORM_LOG,
+            default_max: MAX_ML,
+            extra: Some(&ML_BITS),
+        },
+    ];
+    for Stream {
+        codes,
+        fse_log,
+        prev,
+        default_norm,
+        default_norm_log,
+        default_max,
+        extra,
+    } in streams
+    {
+        let mut counts = [0u32; 256];
+        let (most, max) = huf::hist_count(&mut counts, codes);
+        // `build_seq_table` lowers the last code's count for a new table.
+        let mut table_counts = counts;
+        let (table, _, ty, _) = build_seq_table(
+            &mut scratch.descriptions,
+            codes,
+            &mut table_counts,
+            max,
+            most as usize,
+            fse_log,
+            prev,
+            default_norm,
+            default_norm_log,
+            default_max,
+            cparams.strategy,
+        )?;
+        // ZSTD_estimateBlockSize_symbolType
+        let symbol_bits = match ty {
+            SymbolEncodingType::Basic => Some(cross_entropy_cost(
+                default_norm,
+                default_norm_log,
+                &counts,
+                max,
+            )),
+            SymbolEncodingType::Rle => Some(0),
+            SymbolEncodingType::Compressed | SymbolEncodingType::Repeat => {
+                table.bit_cost(&counts, max)
+            }
+        };
+        let Some(symbol_bits) = symbol_bits else {
+            bytes += nb_seq * 10;
+            continue;
+        };
+        // For offsets the code is also the number of extra bits.
+        let extra_bits: u64 = counts[..=max]
+            .iter()
+            .enumerate()
+            .map(|(c, &n)| n as u64 * extra.map_or(c as u64, |bits| bits[c] as u64))
+            .sum();
+        bytes += ((symbol_bits + extra_bits) >> 3) as usize;
+    }
+    // fseTablesSize: every description ZSTD_buildCTable wrote
+    Some(bytes + scratch.descriptions.len() + header)
 }
 
 #[cfg(test)]

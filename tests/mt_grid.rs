@@ -128,6 +128,7 @@ fn mt_grid() {
                     level,
                     job_size,
                     overlap_log,
+                    ..Default::default()
                 };
                 let mut cx = Compressor::new(opts);
                 let (rs_t, rs_frame) = pool.install(|| time(iters, || cx.compress_to_vec(&data)));
