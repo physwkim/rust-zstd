@@ -10,7 +10,7 @@
 //! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
 //! discard the candidate, including its repeat offsets.
 
-use super::ldm::{self, LdmState, RawSeqStore};
+use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
 use super::seqstore::SeqStore;
@@ -186,7 +186,7 @@ pub fn run_block_compressor(
             lazy::compress_block(ms, src, range, rep, out)
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            opt::compress_block(ms, src, range, rep, out)
+            opt::compress_block(ms, src, range, rep, out, RawSeqView::default())
         }
     }
 }
@@ -196,7 +196,8 @@ pub fn run_block_compressor(
 ///
 /// A block too small to compress ([`attempts_compression`]) is the last
 /// one of its job, so the sequences libzstd skips over for it
-/// (`ZSTD_ldm_skipSequences`) are never read again and are left alone.
+/// (`ZSTD_ldm_skipSequences`, or `ZSTD_ldm_skipRawSeqStoreBytes` from
+/// btopt on) are never read again and are left alone.
 pub enum BlockLdm<'a> {
     /// Long distance matching is off.
     Off,

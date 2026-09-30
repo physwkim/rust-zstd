@@ -19,6 +19,7 @@
 use super::block;
 use super::common::{count, HASH_READ_SIZE};
 use super::matchstate::MatchState;
+use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
 use std::ops::Range;
@@ -153,11 +154,19 @@ pub struct RawSeq {
 
 /// `RawSeqStore_t`: generated sequences and the read position of
 /// [`block_compress`], which consumes them across blocks.
+///
+/// The strategies below btopt consume a sequence by shortening it in place
+/// ([`RawSeqStore::skip_sequences`]); the optimal parser leaves the
+/// sequences intact and counts the bytes consumed of the current one in
+/// `pos_in_sequence` ([`RawSeqStore::skip_raw_seq_store_bytes`]). A store
+/// serves one frame or job, so one strategy, and never mixes the two.
 #[derive(Clone, Debug, Default)]
 pub struct RawSeqStore {
     pub seqs: Vec<RawSeq>,
     /// `pos`: the next sequence to consume.
     pub pos: usize,
+    /// `posInSequence`: bytes of `seqs[pos]` the optimal parser consumed.
+    pub pos_in_sequence: usize,
 }
 
 impl RawSeqStore {
@@ -166,9 +175,27 @@ impl RawSeqStore {
         self.pos >= self.seqs.len()
     }
 
+    /// The optimal parser's copy of the store (`ZSTD_optLdm_t::seqStore =
+    /// *ms->ldmSeqStore`).
+    pub fn view(&self) -> RawSeqView<'_> {
+        RawSeqView {
+            seqs: &self.seqs,
+            pos: self.pos,
+            pos_in_sequence: self.pos_in_sequence,
+        }
+    }
+
+    /// `ZSTD_ldm_skipRawSeqStoreBytes`: see [`RawSeqView::skip_bytes`].
+    pub fn skip_raw_seq_store_bytes(&mut self, nb_bytes: usize) {
+        let mut view = self.view();
+        view.skip_bytes(nb_bytes);
+        (self.pos, self.pos_in_sequence) = (view.pos, view.pos_in_sequence);
+    }
+
     /// `ZSTD_ldm_skipSequences`: consume `src_size` bytes of input; a
     /// match cut below `min_match` becomes literals of the next sequence.
     pub fn skip_sequences(&mut self, mut src_size: usize, min_match: u32) {
+        debug_assert_eq!(self.pos_in_sequence, 0, "consumed by the optimal parser");
         while src_size > 0 && self.pos < self.seqs.len() {
             let seq = &mut self.seqs[self.pos];
             if src_size <= seq.lit_length as usize {
@@ -222,6 +249,50 @@ impl RawSeqStore {
     }
 }
 
+/// A read position over borrowed sequences: the optimal parser's copy of a
+/// [`RawSeqStore`], which it moves through the block while the store
+/// itself is moved past the whole block afterwards. The default is
+/// `kNullRawSeqStore`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawSeqView<'a> {
+    seqs: &'a [RawSeq],
+    pos: usize,
+    pos_in_sequence: usize,
+}
+
+impl RawSeqView<'_> {
+    /// Whether every sequence has been consumed (`size == 0 || pos >=
+    /// size`).
+    pub fn is_exhausted(&self) -> bool {
+        self.pos >= self.seqs.len()
+    }
+
+    /// The sequence at the read position and the bytes of it consumed.
+    pub fn current(&self) -> (RawSeq, usize) {
+        (self.seqs[self.pos], self.pos_in_sequence)
+    }
+
+    /// `ZSTD_optLdm_skipRawSeqStoreBytes`: move forward by `nb_bytes`,
+    /// updating `pos` and `pos_in_sequence`.
+    pub fn skip_bytes(&mut self, nb_bytes: usize) {
+        let mut curr_pos = self.pos_in_sequence + nb_bytes;
+        while curr_pos != 0 && self.pos < self.seqs.len() {
+            let curr_seq = self.seqs[self.pos];
+            let seq_len = (curr_seq.lit_length + curr_seq.match_length) as usize;
+            if curr_pos >= seq_len {
+                curr_pos -= seq_len;
+                self.pos += 1;
+            } else {
+                self.pos_in_sequence = curr_pos;
+                break;
+            }
+        }
+        if curr_pos == 0 || self.pos == self.seqs.len() {
+            self.pos_in_sequence = 0;
+        }
+    }
+}
+
 /// `ldmEntry_t`: a split position and the high half of its hash.
 #[derive(Clone, Copy, Debug, Default)]
 struct LdmEntry {
@@ -272,7 +343,7 @@ impl LdmState {
         self.low = first;
         self.block_seqs = RawSeqStore {
             seqs: std::mem::take(&mut self.block_seqs.seqs),
-            pos: 0,
+            ..Default::default()
         };
     }
 
@@ -293,6 +364,7 @@ impl LdmState {
     ) {
         out.seqs.clear();
         out.pos = 0;
+        out.pos_in_sequence = 0;
         let max_dist = 1usize << self.params.window_log;
         let mut leftover = 0usize;
         let mut chunk_start = range.start;
@@ -500,10 +572,12 @@ fn fill_fast_tables(ms: &mut MatchState, src: &[u8], end: usize) {
     }
 }
 
-/// `ZSTD_ldm_blockCompress` for the strategies below `btopt`: store the
-/// long matches of `seqs` that fall in `src[block]` (cut at the block end)
-/// and run the strategy's block compressor on the literals between them.
-/// Returns the anchor of the block's trailing literals.
+/// `ZSTD_ldm_blockCompress`: from btopt on, run the optimal parser on
+/// `src[block]` with the long matches of `seqs` as extra candidates; below
+/// it, store the long matches that fall in the block (cut at the block
+/// end) and run the strategy's block compressor on the literals between
+/// them. Either way `seqs` moves past the block. Returns the anchor of the
+/// block's trailing literals.
 pub fn block_compress(
     seqs: &mut RawSeqStore,
     ms: &mut MatchState,
@@ -512,6 +586,15 @@ pub fn block_compress(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    // If using opt parser, use LDMs only as candidates rather than always
+    // accepting them
+    if ms.cparams.strategy >= Strategy::BtOpt {
+        let block_len = block.len();
+        let anchor = opt::compress_block(ms, src, block, rep, out, seqs.view());
+        seqs.skip_raw_seq_store_bytes(block_len);
+        return anchor;
+    }
+
     let min_match = ms.cparams.min_match;
     let iend = block.end;
     let mut ip = block.start;
@@ -946,7 +1029,7 @@ mod tests {
                     match_length,
                 })
                 .collect(),
-            pos: 0,
+            ..Default::default()
         }
     }
 
@@ -986,6 +1069,92 @@ mod tests {
             }
             assert_eq!(s.pos, pos, "{remaining}");
             assert_eq!(s.seqs[pos], after, "{remaining}");
+        }
+    }
+
+    /// `ZSTD_ldm_skipRawSeqStoreBytes` at each boundary: inside a sequence,
+    /// at its end, past the last one, and with nothing to skip.
+    #[test]
+    fn skip_raw_seq_store_bytes_boundaries() {
+        // lengths 80 and 85
+        let seqs = [(100, 10, 70), (200, 5, 80)];
+        for (from, nb_bytes, to) in [
+            ((0, 0), 0, (0, 0)),
+            ((0, 10), 0, (0, 10)),
+            ((0, 0), 30, (0, 30)),
+            ((0, 30), 50, (1, 0)),
+            ((0, 30), 51, (1, 1)),
+            ((1, 84), 1, (2, 0)),
+            ((1, 84), 7, (2, 0)),
+            ((0, 0), 1000, (2, 0)),
+            ((2, 0), 5, (2, 0)),
+        ] {
+            let mut s = store(&seqs);
+            (s.pos, s.pos_in_sequence) = from;
+            s.skip_raw_seq_store_bytes(nb_bytes);
+            assert_eq!((s.pos, s.pos_in_sequence), to, "{from:?} + {nb_bytes}");
+        }
+    }
+
+    /// From btopt on, [`block_compress`] offers the sequences to the
+    /// optimal parser as candidates (`ZSTD_optLdm_*`): a repeat whose source
+    /// the binary tree never indexed is found through them alone, cut at
+    /// the block end, and resumed by the next block from `pos_in_sequence`.
+    /// The parser's lookahead moves its copy past the sequence it loads, so
+    /// (as in libzstd) a store's last sequence is offered only where it
+    /// covers the block start: without the trailing sequence the second
+    /// block gets no candidate at its start and reaches the repeat one byte
+    /// later as repcode 1 (rep[0] is the offset since the first block).
+    #[test]
+    fn opt_parser_takes_ldm_candidates() {
+        let n = 96 << 10;
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut src = vec![0u8]; // the window starts at 1
+        src.extend((0..n).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 56) as u8
+        }));
+        src.extend_from_within(1..1 + n);
+        let split = 1 + n + (64 << 10);
+        let run = |seqs: &[(u32, u32, u32)]| {
+            let cp = CParams::for_level(16, src.len());
+            assert!(cp.strategy >= Strategy::BtOpt);
+            let mut ms = MatchState::new(cp, 1);
+            // The first copy is never inserted into the binary tree.
+            ms.next_to_update = 1 + n;
+            let mut seqs = store(seqs);
+            let mut rep = [1, 4, 8];
+            let mut blocks = vec![];
+            for block in [1 + n..split, split..src.len()] {
+                let mut out = SeqStore::new();
+                let anchor =
+                    block_compress(&mut seqs, &mut ms, &src, block.clone(), &mut rep, &mut out);
+                let found: Vec<_> = out
+                    .seqs
+                    .iter()
+                    .map(|s| (s.lit_len, s.match_len(), s.off_base))
+                    .collect();
+                blocks.push((found, block.end - anchor, seqs.pos, seqs.pos_in_sequence));
+            }
+            blocks
+        };
+        let n32 = n as u32;
+        let off_base = offset_to_offbase(n32);
+        let first = (vec![(0, 64 << 10, off_base)], 0, 0, 64 << 10);
+        let trailer = (1, 1 << 20, 4);
+        assert_eq!(
+            run(&[(n32, 0, n32), trailer]),
+            [first.clone(), (vec![(0, 32 << 10, off_base)], 0, 1, 0)]
+        );
+        assert_eq!(
+            run(&[(n32, 0, n32)]),
+            [first, (vec![(1, (32 << 10) - 1, 1)], 0, 1, 0)]
+        );
+        // Without candidates only short chance matches are found.
+        for (found, ..) in run(&[]) {
+            assert!(found.iter().all(|&(_, ml, _)| ml < 16), "{found:?}");
         }
     }
 

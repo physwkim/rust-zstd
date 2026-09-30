@@ -787,6 +787,25 @@ mod tests {
         }
     }
 
+    /// One `Compressor` for `opts` writes, for each of `inputs` in turn,
+    /// what a fresh one does, and the frames decode through both decoders.
+    fn check_ldm_frames(opts: &CompressOptions, inputs: &[&Vec<u8>]) {
+        let mut cx = Compressor::new(opts.clone());
+        for &data in inputs {
+            let frame = cx.compress_to_vec(data);
+            let name = format!(
+                "L{} job {:?} {} bytes",
+                opts.level,
+                opts.job_size,
+                data.len()
+            );
+            assert!(frame == compress_with(data, opts), "{name}: reuse");
+            assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name}");
+            let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+            assert_eq!(&theirs, data, "{name}");
+        }
+    }
+
     /// Long distance matching frames decode through both decoders on the
     /// single-context path (up to `JOBSIZE_MIN`) and over one or several
     /// jobs (the last block 3 bytes, too small to compress), find the
@@ -800,15 +819,7 @@ mod tests {
         for level in [1, 3, 7, 11] {
             for job_size in [None, Some(JOBSIZE_MIN)] {
                 let opts = ldm_opts(level, ParamSwitch::Enable, job_size);
-                let mut cx = Compressor::new(opts.clone());
-                for data in [&jobs, &single, &empty, &jobs] {
-                    let frame = cx.compress_to_vec(data);
-                    let name = format!("L{level} job {job_size:?} {} bytes", data.len());
-                    assert!(frame == compress_with(data, &opts), "{name}: reuse");
-                    assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name}");
-                    let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
-                    assert_eq!(&theirs, data, "{name}");
-                }
+                check_ldm_frames(&opts, &[&jobs, &single, &empty, &jobs]);
                 let off = compress_with(&jobs, &ldm_opts(level, ParamSwitch::Disable, job_size));
                 let on = compress_with(&jobs, &opts);
                 assert!(
@@ -821,14 +832,39 @@ mod tests {
         }
     }
 
+    /// From btopt on the long distance matches are candidates of the
+    /// optimal parser: the frames decode through both decoders on the
+    /// single-context path and over jobs. With long distance matching the
+    /// job overlap is half the window at level 16 (two jobs here) and all
+    /// of it at level 19 (one job, still fed from the job-order sequences).
+    #[test]
+    fn ldm_opt_frames_roundtrip() {
+        let single = far_repeat(160 << 10, 160 << 10);
+        let jobs = far_repeat(256 << 10, 1 << 20);
+        for level in [16, 19] {
+            for job_size in [None, Some(JOBSIZE_MIN)] {
+                let opts = ldm_opts(level, ParamSwitch::Enable, job_size);
+                check_ldm_frames(&opts, &[&jobs, &single, &jobs]);
+            }
+        }
+    }
+
     /// With long distance matching over several jobs, the parallel and the
     /// serial job loop write the same bytes from the sequences generated in
     /// job order, and those are the frame's.
     #[test]
     fn ldm_parallel_and_serial_job_loops_agree() {
-        let data = far_repeat(1 << 20, 4 << 20);
-        let src = data.as_slice();
-        for level in [1, 3, 7, 11] {
+        let big = far_repeat(1 << 20, 4 << 20);
+        let small = far_repeat(256 << 10, 1 << 20);
+        for (level, data, min_jobs) in [
+            (1, &big, 6),
+            (3, &big, 6),
+            (7, &big, 6),
+            (11, &big, 6),
+            (16, &small, 2),
+            (18, &small, 2),
+        ] {
+            let src = data.as_slice();
             let opts = ldm_opts(level, ParamSwitch::Enable, Some(JOBSIZE_MIN));
             let (cparams, ldm) = opts.frame_params(src.len());
             let ldm = ldm.expect("enabled");
@@ -837,7 +873,7 @@ mod tests {
             let job_size = job_size_for(opts.job_size, &cparams, true, overlap);
             let jobs = job_ranges(src.len(), job_size);
             let n = jobs.len();
-            assert!(n >= 6, "L{level}: {n} jobs");
+            assert!(n >= min_jobs, "L{level}: {n} jobs");
             let generate = |ctxs: &mut [JobContext]| {
                 let mut state = LdmState::new(ldm, 0);
                 let max_seqs = job_size / ldm.min_match_length as usize;
@@ -881,8 +917,9 @@ mod tests {
     }
 
     /// `Enable` selects window log 27 before the size adjustment; `Auto`
-    /// stays off for the ported strategies (all below `btopt`), so its
-    /// frames are `Disable`'s.
+    /// turns on for btopt and above at window log 27 (`ZSTD_resolveEnableLdm`),
+    /// which only level 22 reaches, above 64 MiB, and otherwise leaves the
+    /// parameters and frames `Disable`'s.
     #[test]
     fn ldm_switch_resolution() {
         let data = far_repeat(300 << 10, 400 << 10);
@@ -892,13 +929,18 @@ mod tests {
             assert!(ldm.is_some_and(|p| p.window_log == 22));
             let big = ldm_opts(level, ParamSwitch::Enable, None).frame_params(1 << 30);
             assert_eq!(big.0.window_log, 27, "L{level}");
-            for size in [3 << 20, 1 << 30] {
-                let (auto_cp, auto_ldm) =
-                    ldm_opts(level, ParamSwitch::Auto, None).frame_params(size);
-                assert!(auto_ldm.is_none(), "L{level} {size}");
-                assert_eq!(auto_cp, CParams::for_level(level, size), "L{level} {size}");
-                let off = ldm_opts(level, ParamSwitch::Disable, None).frame_params(size);
-                assert_eq!(off, (auto_cp, None), "L{level} {size}");
+            for size in [3 << 20, 64 << 20, (64 << 20) + 1, 1 << 30] {
+                let auto = ldm_opts(level, ParamSwitch::Auto, None).frame_params(size);
+                if level == 22 && size > 64 << 20 {
+                    let on = ldm_opts(level, ParamSwitch::Enable, None).frame_params(size);
+                    assert_eq!(auto, on, "L{level} {size}");
+                    assert!(auto.1.is_some(), "L{level} {size}");
+                } else {
+                    assert!(auto.1.is_none(), "L{level} {size}");
+                    assert_eq!(auto.0, CParams::for_level(level, size), "L{level} {size}");
+                    let off = ldm_opts(level, ParamSwitch::Disable, None).frame_params(size);
+                    assert_eq!(off, auto, "L{level} {size}");
+                }
             }
             let auto = compress_with(&data, &ldm_opts(level, ParamSwitch::Auto, None));
             let off = compress_with(&data, &ldm_opts(level, ParamSwitch::Disable, None));

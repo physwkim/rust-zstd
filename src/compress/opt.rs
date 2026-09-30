@@ -24,9 +24,10 @@
 
 use super::bt::{self, assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
 use super::common::{simd_level, HASH_READ_SIZE};
+use super::ldm::RawSeqView;
 use super::matchstate::MatchState;
 use super::params::Strategy;
-use super::seqstore::{update_rep, SeqStore};
+use super::seqstore::{offset_to_offbase, update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
 use crate::constants::{ZSTD_BLOCKSIZE_MAX, ZSTD_MINMATCH};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -435,6 +436,15 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
     )
 }
 
+/// Where `ZSTD_compressBlock_opt_generic` takes its match candidates from:
+/// the binary tree (`ZSTD_selectBtGetAllMatches`) and the block's long
+/// distance matches (`ms->ldmSeqStore`, empty without LDM).
+#[derive(Clone, Copy)]
+struct Finders<'a> {
+    get_all_matches: GetAllMatches,
+    ldm: RawSeqView<'a>,
+}
+
 /// `ZSTD_selectBtGetAllMatches(ms, ZSTD_noDict)`: the finder for
 /// `mls = BOUNDED(3, minMatch, 6)` and this CPU's SIMD level.
 fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
@@ -460,25 +470,29 @@ fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
 /// sequences of `src[block]` with the optimal parser and store them into
 /// `out`. Returns the anchor: the start of the trailing literals, which the
 /// caller appends to `out.lits` (`ZSTD_storeLastLiterals`). `rep` is the
-/// repeat-offset history on entry and is updated on exit.
+/// repeat-offset history on entry and is updated on exit. `ldm` holds the
+/// long distance matches from the block start on (`ms->ldmSeqStore`); the
+/// caller moves its store past the block.
 pub fn compress_block(
     ms: &mut MatchState,
     src: &[u8],
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    ldm: RawSeqView,
 ) -> usize {
     assert_opt_bounds(ms, src, block.end);
-    let get_all_matches = select_get_all_matches(ms.cparams.min_match, simd_level());
+    let finders = Finders {
+        get_all_matches: select_get_all_matches(ms.cparams.min_match, simd_level()),
+        ldm,
+    };
     let mut state = ms
         .opt
         .take()
         .expect("MatchState::reset allocates OptState for the opt strategies");
     let anchor = match ms.cparams.strategy {
-        Strategy::BtOpt => opt_generic::<0>(ms, &mut state, src, block, rep, out, get_all_matches),
-        Strategy::BtUltra => {
-            opt_generic::<2>(ms, &mut state, src, block, rep, out, get_all_matches)
-        }
+        Strategy::BtOpt => opt_generic::<0>(ms, &mut state, src, block, rep, out, finders),
+        Strategy::BtUltra => opt_generic::<2>(ms, &mut state, src, block, rep, out, finders),
         Strategy::BtUltra2 => {
             // 2-passes strategy: this strategy makes a first pass over
             // first block to collect statistics in order to seed next
@@ -490,17 +504,9 @@ pub fn compress_block(
                 && block.start <= ms.window_low // start of frame, nothing loaded nor skipped
                 && block.len() > ZSTD_PREDEF_THRESHOLD
             {
-                init_stats_ultra(
-                    ms,
-                    &mut state,
-                    src,
-                    block.clone(),
-                    rep,
-                    out,
-                    get_all_matches,
-                );
+                init_stats_ultra(ms, &mut state, src, block.clone(), rep, out, finders);
             }
-            opt_generic::<2>(ms, &mut state, src, block, rep, out, get_all_matches)
+            opt_generic::<2>(ms, &mut state, src, block, rep, out, finders)
         }
         s => unreachable!("opt::compress_block called for {s:?}"),
     };
@@ -527,7 +533,7 @@ fn init_stats_ultra(
     block: Range<usize>,
     rep: &[u32; 3],
     out: &mut SeqStore,
-    get_all_matches: GetAllMatches,
+    finders: Finders,
 ) {
     let mut tmp_rep = *rep; // updated rep codes will sink here
     debug_assert!(state.stats.lit_length_sum == 0); // first block
@@ -536,15 +542,7 @@ fn init_stats_ultra(
     let first_update = ms.next_to_update;
 
     // generate stats into ms.opt
-    opt_generic::<2>(
-        ms,
-        state,
-        src,
-        block.clone(),
-        &mut tmp_rep,
-        out,
-        get_all_matches,
-    );
+    opt_generic::<2>(ms, state, src, block.clone(), &mut tmp_rep, out, finders);
 
     // invalidate first scan from history, only keep entropy stats
     out.clear();
@@ -556,8 +554,158 @@ fn init_stats_ultra(
     ms.next_to_update = first_update;
 }
 
+/// `ZSTD_optLdm_t`: the long distance match the parser may use around its
+/// position, read from its own copy of the block's LDM sequences. Positions
+/// are relative to the block start; `u32::MAX` marks "none in this block".
+struct OptLdm<'a> {
+    seq_store: RawSeqView<'a>,
+    /// Start position of the current match candidate.
+    start_pos_in_block: u32,
+    /// End position of the current match candidate.
+    end_pos_in_block: u32,
+    /// Offset of the match candidate.
+    offset: u32,
+}
+
+impl<'a> OptLdm<'a> {
+    /// The initialization at the top of `ZSTD_compressBlock_opt_generic`,
+    /// at block position 0 of a `block_len`-byte block.
+    fn new(seq_store: RawSeqView<'a>, block_len: u32) -> Self {
+        let mut opt_ldm = Self {
+            seq_store,
+            start_pos_in_block: 0,
+            end_pos_in_block: 0,
+            offset: 0,
+        };
+        opt_ldm.get_next_match_and_update_seq_store(0, block_len);
+        opt_ldm
+    }
+
+    /// `ZSTD_opt_getNextMatchAndUpdateSeqStore`: calculate the beginning
+    /// and end of the next match in the current block, and move the copy
+    /// past it.
+    fn get_next_match_and_update_seq_store(
+        &mut self,
+        curr_pos_in_block: u32,
+        block_bytes_remaining: u32,
+    ) {
+        // Setting match end position to MAX to ensure we never use an LDM
+        // during this block
+        if self.seq_store.is_exhausted() {
+            self.start_pos_in_block = u32::MAX;
+            self.end_pos_in_block = u32::MAX;
+            return;
+        }
+        // Calculate appropriate bytes left in matchLength and litLength
+        // after adjusting based on posInSequence
+        let (curr_seq, pos_in_sequence) = self.seq_store.current();
+        let pos_in_sequence = pos_in_sequence as u32;
+        debug_assert!(pos_in_sequence <= curr_seq.lit_length + curr_seq.match_length);
+        let curr_block_end_pos = curr_pos_in_block + block_bytes_remaining;
+        let literals_bytes_remaining = curr_seq.lit_length.saturating_sub(pos_in_sequence);
+        let match_bytes_remaining = if literals_bytes_remaining == 0 {
+            curr_seq.match_length - (pos_in_sequence - curr_seq.lit_length)
+        } else {
+            curr_seq.match_length
+        };
+
+        // If there are more literal bytes than bytes remaining in block, no
+        // ldm is possible
+        if literals_bytes_remaining >= block_bytes_remaining {
+            self.start_pos_in_block = u32::MAX;
+            self.end_pos_in_block = u32::MAX;
+            self.seq_store.skip_bytes(block_bytes_remaining as usize);
+            return;
+        }
+
+        // Matches may be < minMatch by this process. In that case, we will
+        // reject them when we are deciding whether or not to add the ldm
+        self.start_pos_in_block = curr_pos_in_block + literals_bytes_remaining;
+        self.end_pos_in_block = self.start_pos_in_block + match_bytes_remaining;
+        self.offset = curr_seq.offset;
+
+        if self.end_pos_in_block > curr_block_end_pos {
+            // Match ends after the block ends, we can't use the whole match
+            self.end_pos_in_block = curr_block_end_pos;
+            self.seq_store
+                .skip_bytes((curr_block_end_pos - curr_pos_in_block) as usize);
+        } else {
+            // Consume nb of bytes equal to size of sequence left
+            self.seq_store
+                .skip_bytes((literals_bytes_remaining + match_bytes_remaining) as usize);
+        }
+    }
+
+    /// `ZSTD_optLdm_maybeAddMatch`: append the candidate to `matches` if
+    /// it covers `curr_pos_in_block` with at least `min_match` bytes and is
+    /// longer than every match found there, keeping `matches` sorted.
+    fn maybe_add_match(
+        &self,
+        matches: &mut [Match; ZSTD_OPT_SIZE],
+        nb_matches: &mut usize,
+        curr_pos_in_block: u32,
+        min_match: u32,
+    ) {
+        let pos_diff = curr_pos_in_block.wrapping_sub(self.start_pos_in_block);
+        // Note: Match actually contains offBase and matchLength (before
+        // subtracting MINMATCH)
+        let candidate_match_length = self
+            .end_pos_in_block
+            .wrapping_sub(self.start_pos_in_block)
+            .wrapping_sub(pos_diff);
+
+        // Ensure that current block position is not outside of the match
+        if curr_pos_in_block < self.start_pos_in_block
+            || curr_pos_in_block >= self.end_pos_in_block
+            || candidate_match_length < min_match
+        {
+            return;
+        }
+
+        if *nb_matches == 0
+            || (candidate_match_length > matches[*nb_matches - 1].len && *nb_matches < ZSTD_OPT_NUM)
+        {
+            matches[*nb_matches] = Match {
+                off: offset_to_offbase(self.offset),
+                len: candidate_match_length,
+            };
+            *nb_matches += 1;
+        }
+    }
+
+    /// `ZSTD_optLdm_processMatchCandidate`: move to the next long match once
+    /// the parser is past the current one, then offer it at
+    /// `curr_pos_in_block`.
+    fn process_match_candidate(
+        &mut self,
+        matches: &mut [Match; ZSTD_OPT_SIZE],
+        nb_matches: &mut usize,
+        curr_pos_in_block: u32,
+        remaining_bytes: u32,
+        min_match: u32,
+    ) {
+        if self.seq_store.is_exhausted() {
+            return;
+        }
+
+        if curr_pos_in_block >= self.end_pos_in_block {
+            if curr_pos_in_block > self.end_pos_in_block {
+                // The position at which process_match_candidate() is called
+                // is not necessarily at the end of a match from the ldm seq
+                // store, and will often be some bytes over beyond
+                // matchEndPosInBlock. As such, we need to correct for these
+                // "overshoots"
+                let pos_overshoot = curr_pos_in_block - self.end_pos_in_block;
+                self.seq_store.skip_bytes(pos_overshoot as usize);
+            }
+            self.get_next_match_and_update_seq_store(curr_pos_in_block, remaining_bytes);
+        }
+        self.maybe_add_match(matches, nb_matches, curr_pos_in_block, min_match);
+    }
+}
+
 /// `ZSTD_compressBlock_opt_generic(ms, seqStore, rep, src, srcSize,
-/// optLevel, ZSTD_noDict)` without LDM candidates.
+/// optLevel, ZSTD_noDict)`.
 fn opt_generic<const OPT_LEVEL: u32>(
     ms: &mut MatchState,
     state: &mut OptState,
@@ -565,8 +713,12 @@ fn opt_generic<const OPT_LEVEL: u32>(
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
-    get_all_matches: GetAllMatches,
+    finders: Finders,
 ) -> usize {
+    let Finders {
+        get_all_matches,
+        ldm,
+    } = finders;
     let OptState {
         stats,
         matches,
@@ -584,6 +736,8 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let mut next_to_update3 = ms.next_to_update;
 
     let mut last_stretch = Optimal::default();
+
+    let mut opt_ldm = OptLdm::new(ldm, (iend - istart) as u32);
 
     // init
     stats.rescale_freqs::<OPT_LEVEL>(&src[block.clone()]);
@@ -603,7 +757,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             let ll0 = (litlen == 0) as u32;
             // SAFETY: `ip + 8 < iend <= src.len()`, `ip >= window_low`, the
             // tables passed `assert_opt_bounds` in `compress_block`.
-            let nb_matches = unsafe {
+            let mut nb_matches = unsafe {
                 get_all_matches(
                     matches,
                     ms,
@@ -616,6 +770,13 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     min_match,
                 )
             } as usize;
+            opt_ldm.process_match_candidate(
+                matches,
+                &mut nb_matches,
+                (ip - istart) as u32,
+                (iend - ip) as u32,
+                min_match,
+            );
             if nb_matches == 0 {
                 ip += 1;
                 continue 'series;
@@ -772,7 +933,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     let cur_rep = opt[c].rep;
                     // SAFETY: `inr <= ilimit` so `inr + 8 <= iend`,
                     // `inr > ip >= window_low`.
-                    let nb_matches = unsafe {
+                    let mut nb_matches = unsafe {
                         get_all_matches(
                             matches,
                             ms,
@@ -785,6 +946,14 @@ fn opt_generic<const OPT_LEVEL: u32>(
                             min_match,
                         )
                     } as usize;
+
+                    opt_ldm.process_match_candidate(
+                        matches,
+                        &mut nb_matches,
+                        (inr - istart) as u32,
+                        (iend - inr) as u32,
+                        min_match,
+                    );
 
                     if nb_matches == 0 {
                         break 'position;
@@ -945,7 +1114,9 @@ mod tests {
     use crate::compress::{compress_with, CompressOptions, JOBSIZE_MIN};
 
     const OPT: Finder = Finder {
-        compress_block,
+        compress_block: |ms, src, block, rep, out| {
+            compress_block(ms, src, block, rep, out, RawSeqView::default())
+        },
         load_prefix: bt::load_prefix,
     };
 
@@ -1047,7 +1218,10 @@ mod tests {
             let mut ms = MatchState::new(cp, 1);
             let mut state = ms.opt.take().unwrap();
             let mut out = SeqStore::new();
-            let get_all_matches = select_get_all_matches(cp.min_match, simd_level());
+            let finders = Finders {
+                get_all_matches: select_get_all_matches(cp.min_match, simd_level()),
+                ldm: RawSeqView::default(),
+            };
             init_stats_ultra(
                 &mut ms,
                 &mut state,
@@ -1055,7 +1229,7 @@ mod tests {
                 0..data.len(),
                 &[1, 4, 8],
                 &mut out,
-                get_all_matches,
+                finders,
             );
             assert!(out.seqs.is_empty() && out.lits.is_empty());
             assert_eq!(ms.next_to_update, 1, "mm{min_match}");
