@@ -171,10 +171,9 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
         let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
             Ok(parsed) => parsed,
             Err(e) => match e.skip_frame_length() {
-                Some(skip_len) => {
+                Some(frame_len) => {
                     let end = pos
-                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
-                        .and_then(|p| p.checked_add(skip_len as usize))
+                        .checked_add(frame_len as usize)
                         .filter(|&end| end <= data.len())
                         .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
                     pos = end;
@@ -2507,6 +2506,7 @@ impl FrameHeader {
 
 struct FrameDecoderError {
     msg: String,
+    /// A skippable frame's length, header included.
     skip_length: Option<u32>,
 }
 
@@ -2562,7 +2562,16 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
             .ok_or_else(|| {
                 FrameDecoderError::new("Error reading skip frame size: truncated".into())
             })?;
-        return Err(FrameDecoderError::skip(skip_size));
+        // readSkippableFrameSize: the length, header included, must fit in
+        // 32 bits (frameParameter_unsupported), whatever the input size.
+        let frame_len = skip_size
+            .checked_add(SKIPPABLE_FRAME_HEADER_LEN as u32)
+            .ok_or_else(|| {
+                FrameDecoderError::new(format!(
+                    "Skippable frame size {skip_size:#x} unsupported: with its header it overflows 32 bits"
+                ))
+            })?;
+        return Err(FrameDecoderError::skip(frame_len));
     }
 
     if magic_num != ZSTD_MAGIC {

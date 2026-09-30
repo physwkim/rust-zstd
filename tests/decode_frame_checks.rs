@@ -422,3 +422,36 @@ fn reserved_bits_must_be_zero() {
         "Number_of_Sequences lengths {count_lengths:?}"
     );
 }
+
+/// A skippable Frame_Size of 0xFFFFFFF8 or more overflows 32 bits with the
+/// 8-byte header, which ZSTD_readSkippableFrameSize refuses as
+/// frameParameter_unsupported on every build, before it compares the length
+/// with the input: a header alone gets that error, not srcSize_wrong.
+#[test]
+fn skippable_frame_length_fits_32_bits() {
+    let hello = raw_frame(b"hello");
+    for (size, unsupported) in [
+        (0xFFFF_FFF7, false),
+        (0xFFFF_FFF8, true),
+        (0xFFFF_FFFF, true),
+    ] {
+        for (lead_name, lead) in [("", &[][..]), ("a frame then ", &hello[..])] {
+            let f = [lead, &skippable(size, &[1, 2, 3])].concat();
+            let name = format!("{lead_name}a skippable frame of size {size:#x}");
+            check(&name, &f, false);
+            let theirs = zstd::bulk::decompress(&f, CAPACITY).unwrap_err();
+            let want = if unsupported {
+                "Unsupported frame parameter"
+            } else {
+                "Src size is incorrect"
+            };
+            assert_eq!(theirs.to_string(), want, "{name}");
+            let ours = rust_zstd::decompress(&f).unwrap_err();
+            assert_eq!(
+                ours.contains("overflows 32 bits"),
+                unsupported,
+                "{name}: {ours}"
+            );
+        }
+    }
+}
