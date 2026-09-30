@@ -69,6 +69,13 @@ pub struct CompressOptions {
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
     /// them with `parameter_outOfBound`).
     pub overlap_log: u8,
+    /// `ZSTD_c_splitAfterSequences`: after the match finder, cut a block
+    /// into several where separate entropy tables are estimated to pay for
+    /// the extra block headers. `Auto` (the default) enables it for
+    /// `strategy >= ZSTD_btopt` with `window_log >= 17`, as libzstd does;
+    /// no ported strategy reaches `btopt` yet, so `Auto` leaves blocks
+    /// whole.
+    pub split_after_sequences: ParamSwitch,
 }
 
 impl Default for CompressOptions {
@@ -77,6 +84,7 @@ impl Default for CompressOptions {
             level: ZSTD_CLEVEL_DEFAULT,
             job_size: None,
             overlap_log: 0,
+            split_after_sequences: ParamSwitch::Auto,
         }
     }
 }
@@ -97,6 +105,7 @@ impl CompressOptions {
             level,
             job_size: Some(2 << 20),
             overlap_log: 8,
+            ..Self::default()
         }
     }
 }
@@ -185,6 +194,7 @@ impl Compressor {
 
         let overlap = overlap_size(&cparams, self.opts.overlap_log);
         let job_size = job_size_for(self.opts.job_size, cparams.window_log, overlap);
+        let split = split::block_splitter_enabled(self.opts.split_after_sequences, &cparams);
         let jobs = job_ranges(src.len(), job_size);
         let n_jobs = jobs.len();
         if self.jobs.len() < n_jobs {
@@ -203,6 +213,7 @@ impl Compressor {
                     job,
                     k == 0,
                     k + 1 == n_jobs,
+                    split,
                     cfg!(feature = "parallel"),
                     ctx,
                     out,
@@ -232,7 +243,8 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 /// `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on the
 /// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
-/// obtained from the previous job.
+/// obtained from the previous job. `split` runs every block through the
+/// post-sequence splitter.
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
@@ -242,6 +254,7 @@ fn compress_job(
     job: Range<usize>,
     first_job: bool,
     last_job: bool,
+    split: bool,
     pipelined: bool,
     ctx: &mut JobContext,
     out: &mut Vec<u8>,
@@ -273,6 +286,7 @@ fn compress_job(
         block_size,
         first_job,
         last_job,
+        split,
         &mut state,
         &mut ctx.scratch,
         out,
@@ -606,6 +620,7 @@ mod tests {
                         level,
                         job_size: Some(JOBSIZE_MIN),
                         overlap_log,
+                        ..Default::default()
                     },
                 )
             };
@@ -634,6 +649,7 @@ mod tests {
                 level,
                 job_size: Some(512 << 10),
                 overlap_log: 0,
+                ..Default::default()
             };
             let cparams = CParams::for_level(level, data.len());
             let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
@@ -653,6 +669,7 @@ mod tests {
                         job,
                         k == 0,
                         k + 1 == n,
+                        false,
                         pipelined,
                         ctx,
                         out,
@@ -676,9 +693,10 @@ mod tests {
         }
     }
 
-    /// One job through `compress_job`, pipelined or serial.
+    /// One job through `compress_job`, pipelined or serial, with the block
+    /// splitter on or off.
     #[cfg(feature = "parallel")]
-    fn one_job(data: &[u8], level: i32, pipelined: bool) -> Vec<u8> {
+    fn one_job(data: &[u8], level: i32, split: bool, pipelined: bool) -> Vec<u8> {
         let cparams = CParams::for_level(level, data.len());
         let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
         let overlap = overlap_size(&cparams, 0);
@@ -686,7 +704,8 @@ mod tests {
         let mut out = Vec::new();
         let job = 0..data.len();
         compress_job(
-            data, cparams, block_size, overlap, job, true, true, pipelined, &mut ctx, &mut out,
+            data, cparams, block_size, overlap, job, true, true, split, pipelined, &mut ctx,
+            &mut out,
         );
         out
     }
@@ -713,8 +732,8 @@ mod tests {
                 ("mixed", &mixed),
             ] {
                 let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
-                let serial = one_job(data, level, false);
-                let piped = one_job(data, level, true);
+                let serial = one_job(data, level, false, false);
+                let piped = one_job(data, level, false, true);
                 assert!(piped == serial, "{name} L{level}: pipelined != serial");
                 let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
                 if name != "random" {
@@ -749,6 +768,7 @@ mod tests {
                     level,
                     job_size,
                     overlap_log: 0,
+                    ..Default::default()
                 };
                 let mut cx = Compressor::new(opts.clone());
                 for input in [&a, &b, &c, &a, &empty] {
@@ -784,6 +804,7 @@ mod tests {
                     level,
                     job_size: None,
                     overlap_log: 0,
+                    ..Default::default()
                 },
             );
             for js in [300 << 10, 512 << 10, 1 << 20] {
@@ -793,6 +814,7 @@ mod tests {
                         level,
                         job_size: Some(js),
                         overlap_log: 0,
+                        ..Default::default()
                     },
                 );
                 assert!(auto == explicit, "level {level} job_size {js}");
@@ -815,6 +837,7 @@ mod tests {
                     level,
                     job_size: Some(JOBSIZE_MIN),
                     overlap_log: 0,
+                    ..Default::default()
                 },
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data, "level {level}");
@@ -836,6 +859,7 @@ mod tests {
             level: 1,
             job_size: Some(job),
             overlap_log: 0,
+            ..Default::default()
         };
         let cparams = CParams::for_level(1, data.len());
         assert!(overlap_size(&cparams, 0) >= copy);

@@ -12,7 +12,8 @@
 
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
-use super::seqstore::SeqStore;
+use super::seqstore::{Seq, SeqStore};
+use super::split::{resolve_off_codes, BlockSplitter, Partition};
 use super::{dfast, fast, lazy};
 use crate::constants::*;
 use crate::fse::{self, FseState};
@@ -84,6 +85,8 @@ pub struct BlockScratch {
     /// sized on first use.
     pub next: SeqStore,
     pub cbuf: Vec<u8>,
+    /// The post-sequence splitter's partitions and estimator buffers.
+    pub splitter: BlockSplitter,
 }
 
 impl BlockScratch {
@@ -211,34 +214,55 @@ pub fn attempts_compression(block_len: usize) -> bool {
     block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1
 }
 
+/// The sections of one block about to be entropy coded: its literals and
+/// sequences, and the repeat offsets the decoder holds after them, which
+/// the commit installs if the block is written COMPRESSED.
+#[derive(Clone, Copy)]
+struct Sections<'a> {
+    lits: &'a [u8],
+    seqs: &'a [Seq],
+    rep: [u32; 3],
+}
+
+impl<'a> Sections<'a> {
+    fn whole(store: &'a SeqStore, rep: [u32; 3]) -> Self {
+        Sections {
+            lits: &store.lits,
+            seqs: &store.seqs,
+            rep,
+        }
+    }
+}
+
 /// Proof, before entropy coding, that [`entropy_and_emit`] will write
-/// `src[block]` COMPRESSED from `store`: the block is not RLE and the
-/// section bounds already beat `block_len - ZSTD_minGain`.
+/// `src[block]` COMPRESSED from `lits` and `seqs`: the block is not RLE and
+/// the section bounds already beat `block_len - ZSTD_minGain`.
 #[cfg(feature = "parallel")]
 fn proven_compressed(
     src: &[u8],
     block: Range<usize>,
-    store: &SeqStore,
+    lits: &[u8],
+    seqs: &[Seq],
     strategy: Strategy,
 ) -> bool {
     let block_len = block.len();
     !is_rle(&src[block])
-        && huf::literals_section_bound(store.lits.len()) + fse::sequences_section_bound(&store.seqs)
+        && huf::literals_section_bound(lits.len()) + fse::sequences_section_bound(seqs)
             < block_len - CParams::min_gain(block_len, strategy)
 }
 
 /// `ZSTD_entropyCompressSeqStore` and the block-type decision of
-/// `ZSTD_compressBlock_internal`: from `built` (the block's sequence store
-/// and the finder's repeat offsets after it, `None` when compression was
-/// not attempted) write the payload into `cbuf`, then append one complete
-/// block to `out`. `state` is committed only when the block is written
-/// COMPRESSED. `is_first_block` disables RLE for the first block of a
-/// frame, as libzstd does for decoders <= 1.4.3.
+/// `ZSTD_compressBlock_internal` / `ZSTD_compressSeqStore_singleBlock`:
+/// from `built` (`None` when compression was not attempted) write the
+/// payload into `cbuf`, then append one complete block to `out`. `state` is
+/// committed, with `built.rep`, only when the block is written COMPRESSED.
+/// `is_first_block` disables RLE for the first block of a frame, as
+/// libzstd does for decoders <= 1.4.3.
 #[allow(clippy::too_many_arguments)]
 fn entropy_and_emit(
     src: &[u8],
     block: Range<usize>,
-    built: Option<(&SeqStore, [u32; 3])>,
+    built: Option<Sections>,
     cparams: &CParams,
     is_first_block: bool,
     is_last: bool,
@@ -249,12 +273,11 @@ fn entropy_and_emit(
     debug_assert!(block.len() <= ZSTD_BLOCKSIZE_MAX);
     let block_len = block.len();
     let data = &src[block];
-    let next = built.and_then(|(store, rep)| {
+    let next = built.and_then(|Sections { lits, seqs, rep }| {
         let prev = state.prev();
         cbuf.clear();
-        let huf =
-            huf::compress_literals_with(cbuf, &store.lits, store.seqs.len(), &prev.huf, cparams);
-        let fse = fse::encode_sequences_section_with(cbuf, &store.seqs, &prev.fse, cparams)?;
+        let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), &prev.huf, cparams);
+        let fse = fse::encode_sequences_section_with(cbuf, seqs, &prev.fse, cparams)?;
         let max_c_size = block_len - CParams::min_gain(block_len, cparams.strategy);
         if cbuf.len() >= max_c_size {
             return None;
@@ -281,9 +304,104 @@ fn entropy_and_emit(
     }
 }
 
-/// Compress `src[block]` (at most `ZSTD_BLOCKSIZE_MAX` bytes) and append one
-/// complete block, header included, to `out`: [`build_seq_store`] from the
-/// committed repeat offsets, then [`entropy_and_emit`].
+/// Append `src[block]` to `out` from `built` (the block's sequence store
+/// and the finder's repeat offsets after it, `None` when compression was
+/// not attempted). With the splitter off (`parts` is `None`) this is
+/// `ZSTD_compressBlock_internal`'s entropy stage, one block. With it on,
+/// `ZSTD_compressBlock_splitBlock` after `ZSTD_buildSeqStore`: `parts`
+/// from [`BlockSplitter::derive`], one block when empty, else one per
+/// partition (`ZSTD_compressBlock_splitBlock_internal`), each coded with
+/// the repcodes [`resolve_off_codes`] made valid for the decoder and
+/// committing those repcodes. Returns whether every block written is
+/// COMPRESSED.
+#[allow(clippy::too_many_arguments)]
+fn emit_block(
+    src: &[u8],
+    block: Range<usize>,
+    built: Option<(&mut SeqStore, [u32; 3])>,
+    parts: Option<&[Partition]>,
+    cparams: &CParams,
+    is_first_block: bool,
+    is_last: bool,
+    state: &mut CommittedBlockState,
+    cbuf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let (built, parts) = match (built, parts) {
+        (built, None) => {
+            let built = built.map(|(store, rep)| Sections::whole(store, rep));
+            return entropy_and_emit(
+                src,
+                block,
+                built,
+                cparams,
+                is_first_block,
+                is_last,
+                state,
+                cbuf,
+                out,
+            ) == BlockKind::Compressed;
+        }
+        // ZSTDbss_noCompress: RAW, without the RLE check.
+        (None, Some(_)) => {
+            write_raw_block(out, &src[block], is_last);
+            return false;
+        }
+        (Some((store, rep)), Some([])) => {
+            return entropy_and_emit(
+                src,
+                block,
+                Some(Sections::whole(store, rep)),
+                cparams,
+                is_first_block,
+                is_last,
+                state,
+                cbuf,
+                out,
+            ) == BlockKind::Compressed;
+        }
+        (Some((store, _)), Some(parts)) => (store, parts),
+    };
+    let store = built;
+    let mut d_rep = state.prev().rep;
+    let mut c_rep = d_rep;
+    let mut start = block.start;
+    let mut all_compressed = true;
+    for (i, part) in parts.iter().enumerate() {
+        let d_rep_original = d_rep;
+        resolve_off_codes(&mut d_rep, &mut c_rep, &mut store.seqs[part.seqs.clone()]);
+        let kind = entropy_and_emit(
+            src,
+            start..start + part.src_len,
+            Some(Sections {
+                lits: &store.lits[part.lits.clone()],
+                seqs: &store.seqs[part.seqs.clone()],
+                rep: d_rep,
+            }),
+            cparams,
+            is_first_block,
+            is_last && i + 1 == parts.len(),
+            state,
+            cbuf,
+            out,
+        );
+        if kind != BlockKind::Compressed {
+            // The decoder's history is untouched by a RAW or RLE block.
+            d_rep = d_rep_original;
+            all_compressed = false;
+        }
+        start += part.src_len;
+    }
+    debug_assert_eq!(start, block.end);
+    // `prevCBlock->rep = dRep`: the last COMPRESSED partition committed it.
+    debug_assert_eq!(state.prev().rep, d_rep);
+    all_compressed
+}
+
+/// Compress `src[block]` (at most `ZSTD_BLOCKSIZE_MAX` bytes) and append it,
+/// as one block or, with `split`, as the blocks the post-sequence splitter
+/// cuts it into, to `out`: [`build_seq_store`] from the committed repeat
+/// offsets, then [`emit_block`].
 #[allow(clippy::too_many_arguments)]
 pub fn compress_block(
     ms: &mut MatchState,
@@ -291,36 +409,50 @@ pub fn compress_block(
     block: Range<usize>,
     is_first_block: bool,
     is_last: bool,
+    split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     out: &mut Vec<u8>,
-) -> BlockKind {
+) {
+    let cparams = ms.cparams;
+    let BlockScratch {
+        store,
+        cbuf,
+        splitter,
+        ..
+    } = scratch;
     let built = attempts_compression(block.len()).then(|| {
         let mut rep = state.prev().rep;
-        build_seq_store(ms, src, block.clone(), &mut rep, &mut scratch.store);
+        build_seq_store(ms, src, block.clone(), &mut rep, store);
         rep
     });
-    let cparams = ms.cparams;
-    entropy_and_emit(
+    let parts = split.then(|| match built {
+        Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
+        None => &[][..],
+    });
+    emit_block(
         src,
         block,
-        built.map(|rep| (&scratch.store, rep)),
+        built.map(|rep| (store, rep)),
+        parts,
         &cparams,
         is_first_block,
         is_last,
         state,
-        &mut scratch.cbuf,
+        cbuf,
         out,
-    )
+    );
 }
 
 /// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks of
-/// `block_size`, appended to `out`. With `pipelined` (parallel feature
-/// only) block N+1's match finding runs on rayon next to block N's entropy
-/// stage and emission whenever block N is [proven](proven_compressed) to be
-/// written COMPRESSED, so that the finder's repeat offsets after N are the
-/// ones the decoder will hold; otherwise N's entropy stage runs first and
-/// N+1 starts from the committed offsets. Output is identical either way.
+/// `block_size`, appended to `out`, each through the post-sequence splitter
+/// when `split`. With `pipelined` (parallel feature only) and without
+/// `split`, block N+1's match finding runs on rayon next to block N's
+/// entropy stage and emission whenever N is
+/// [proven](proven_compressed) to be written COMPRESSED, so that the repeat
+/// offsets N+1 starts from are the ones the decoder will hold; otherwise
+/// N's entropy stage runs first and N+1 starts from the committed offsets.
+/// Output is identical either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_blocks(
     ms: &mut MatchState,
@@ -329,13 +461,14 @@ pub fn compress_blocks(
     block_size: usize,
     first_job: bool,
     last_job: bool,
+    split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
     #[cfg(feature = "parallel")]
-    if pipelined {
+    if pipelined && !split {
         compress_blocks_pipelined(
             ms, src, job, block_size, first_job, last_job, state, scratch, out,
         );
@@ -351,6 +484,7 @@ pub fn compress_blocks(
             start..end,
             first_job && start == job.start,
             last_job && end == job.end,
+            split,
             state,
             scratch,
             out,
@@ -388,7 +522,9 @@ fn compress_blocks_pipelined(
         .map(|start| start..(start + block_size).min(job.end))
         .collect();
     scratch.next.reserve(block_size);
-    let BlockScratch { store, next, cbuf } = scratch;
+    let BlockScratch {
+        store, next, cbuf, ..
+    } = scratch;
     let (mut cur, mut nxt) = (store, next);
     // `built`: block i's store is in `cur`, with the finder's offsets after it.
     let mut built = blocks.first().and_then(|b| {
@@ -406,11 +542,11 @@ fn compress_blocks_pipelined(
             .filter(|b| attempts_compression(b.len()))
             .cloned();
         let Some(following) = following else {
-            let built_cur = built.map(|rep| (&*cur, rep));
-            entropy_and_emit(
+            emit_block(
                 src,
                 block.clone(),
-                built_cur,
+                built.map(|rep| (&mut *cur, rep)),
+                None,
                 &cparams,
                 is_first_block,
                 is_last,
@@ -421,17 +557,20 @@ fn compress_blocks_pipelined(
             built = None;
             continue;
         };
-        let proven = built.filter(|_| proven_compressed(src, block.clone(), cur, cparams.strategy));
+        let proven = built.filter(|_| {
+            proven_compressed(src, block.clone(), &cur.lits, &cur.seqs, cparams.strategy)
+        });
         if let Some(rep) = proven {
             PIPELINE_OVERLAPPED.fetch_add(1, Relaxed);
             let mut rep_next = rep;
-            let cur_store = &*cur;
-            let (kind, ()) = rayon::join(
+            let cur_store = &mut *cur;
+            let (compressed, ()) = rayon::join(
                 || {
-                    entropy_and_emit(
+                    emit_block(
                         src,
                         block.clone(),
                         Some((cur_store, rep)),
+                        None,
                         &cparams,
                         is_first_block,
                         is_last,
@@ -443,15 +582,15 @@ fn compress_blocks_pipelined(
                 || build_seq_store(ms, src, following.clone(), &mut rep_next, nxt),
             );
             // The proof is what made `rep_next` the decoder's offsets.
-            assert_eq!(kind, BlockKind::Compressed, "section bound proof failed");
+            assert!(compressed, "section bound proof failed");
             built = Some(rep_next);
         } else {
             PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
-            let built_cur = built.map(|rep| (&*cur, rep));
-            entropy_and_emit(
+            emit_block(
                 src,
                 block.clone(),
-                built_cur,
+                built.map(|rep| (&mut *cur, rep)),
+                None,
                 &cparams,
                 is_first_block,
                 is_last,
@@ -496,6 +635,146 @@ mod tests {
         assert!(lowest(cap) >= src.len() - cap);
         assert!(lowest(cap - 1) > src.len() - cap);
         assert!(lowest(cap + 1000) < src.len() - cap + 64);
+    }
+
+    /// Builds a block and its sequence store one partition at a time,
+    /// executing each sequence against the finder's repeat offsets.
+    struct Builder {
+        src: Vec<u8>,
+        store: SeqStore,
+        c_rep: [u32; 3],
+        parts: Vec<Partition>,
+        part_start: (usize, usize, usize),
+    }
+
+    impl Builder {
+        fn seq(&mut self, lits: &[u8], off_base: u32, match_len: usize) {
+            use super::super::seqstore::{offbase_is_repcode, offbase_to_offset, update_rep};
+            let ll0 = lits.is_empty();
+            let offset = if offbase_is_repcode(off_base) {
+                match off_base - 1 + ll0 as u32 {
+                    3 => self.c_rep[0] - 1,
+                    i => self.c_rep[i as usize],
+                }
+            } else {
+                offbase_to_offset(off_base)
+            } as usize;
+            self.src.extend_from_slice(lits);
+            self.store.lits.extend_from_slice(lits);
+            for _ in 0..match_len {
+                self.src.push(self.src[self.src.len() - offset]);
+            }
+            self.store.seqs.push(Seq {
+                lit_len: lits.len() as u32,
+                off_base,
+                ml_base: match_len as u32 - 3,
+            });
+            update_rep(&mut self.c_rep, off_base, ll0);
+        }
+
+        fn end_partition(&mut self) {
+            let (seq, lit, src) = self.part_start;
+            let end = (self.store.seqs.len(), self.store.lits.len(), self.src.len());
+            self.parts.push(Partition {
+                seqs: seq..end.0,
+                lits: lit..end.1,
+                src_len: end.2 - src,
+            });
+            self.part_start = end;
+        }
+    }
+
+    /// A split block with an RLE and a RAW partition between COMPRESSED
+    /// ones: the decoder's repeat offsets skip the RLE and RAW partitions'
+    /// sequences, so the repcodes after each are rewritten to the finder's
+    /// raw offsets, the frame decodes, and the committed offsets are the
+    /// decoder's.
+    #[test]
+    fn split_block_resolves_repcodes_across_rle_and_raw_partitions() {
+        use super::super::seqstore::{offset_to_offbase, repcode_to_offbase};
+        let mut b = Builder {
+            src: Vec::new(),
+            store: SeqStore::new(),
+            c_rep: BlockState::initial().rep,
+            parts: Vec::new(),
+            part_start: (0, 0, 0),
+        };
+        // COMPRESSED: offset 16 everywhere; both histories end [16, 16, 16].
+        b.seq(
+            b"the quick brown fox jumps over t",
+            offset_to_offbase(16),
+            12,
+        );
+        for _ in 0..399 {
+            b.seq(b"abcd", offset_to_offbase(16), 12);
+        }
+        b.end_partition();
+        // RLE: zeros, with a new offset 7 the decoder never sees.
+        b.seq(&[0; 64], offset_to_offbase(7), 100);
+        b.end_partition();
+        // COMPRESSED: repcode 1 is 7 for the finder, 16 for the decoder.
+        let c_first = b.store.seqs.len();
+        for _ in 0..50 {
+            b.seq(b"wxyz", repcode_to_offbase(1), 12);
+        }
+        b.end_partition();
+        // RAW: incompressible, with a new offset 33 the decoder never sees.
+        let mut x = 0x9e37_79b9u32;
+        let noise: Vec<u8> = (0..60)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        b.seq(&noise, offset_to_offbase(33), 3);
+        b.end_partition();
+        // COMPRESSED: repcode 2 is 7 for the finder, 16 for the decoder.
+        let e_first = b.store.seqs.len();
+        b.seq(b"klmn", repcode_to_offbase(2), 12);
+        for _ in 0..49 {
+            b.seq(b"klmn", repcode_to_offbase(1), 12);
+        }
+        b.end_partition();
+
+        let cparams = CParams::for_level(3, b.src.len());
+        let mut state = CommittedBlockState::new(BlockState::initial());
+        let (mut cbuf, mut blocks) = (Vec::new(), Vec::new());
+        let all_compressed = emit_block(
+            &b.src,
+            0..b.src.len(),
+            Some((&mut b.store, b.c_rep)),
+            Some(&b.parts),
+            &cparams,
+            false,
+            true,
+            &mut state,
+            &mut cbuf,
+            &mut blocks,
+        );
+        assert!(!all_compressed);
+
+        let mut kinds = Vec::new();
+        let mut pos = 0;
+        while pos < blocks.len() {
+            let h = u32::from_le_bytes([blocks[pos], blocks[pos + 1], blocks[pos + 2], 0]);
+            let ty = (h >> 1) & 3;
+            kinds.push(ty);
+            pos += 3 + if ty == 1 { 1 } else { (h >> 3) as usize };
+        }
+        // 0 RAW, 1 RLE, 2 COMPRESSED.
+        assert_eq!(kinds, [2, 1, 2, 0, 2]);
+        assert_eq!(b.store.seqs[c_first].off_base, offset_to_offbase(7));
+        assert_eq!(b.store.seqs[c_first + 1].off_base, repcode_to_offbase(1));
+        assert_eq!(b.store.seqs[e_first].off_base, offset_to_offbase(7));
+        assert_eq!(state.prev().rep, [7, 7, 16]);
+
+        let mut frame = Vec::new();
+        super::super::write_frame_header(&mut frame, b.src.len() as u64, cparams.window_log);
+        frame.extend_from_slice(&blocks);
+        assert_eq!(crate::decompress(&frame).unwrap(), b.src);
+        assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), b.src);
     }
 
     #[test]
