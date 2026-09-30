@@ -119,9 +119,12 @@ fn literals_only(literals: Vec<u8>) -> Block {
     Block::Compressed(v)
 }
 
-/// Compressed block decoding to `1 + ml` bytes: one RLE literal and one
-/// sequence (RLE-mode tables) matching `ml` bytes at repeat offset 1.
-fn one_sequence_block(ml: u32) -> Block {
+/// Compressed block of `lits` RLE literals and one sequence per entry of
+/// `mls` (RLE-mode tables, so all of one match length code), each taking
+/// one literal and matching `ml` bytes at repeat offset 1. It decodes to
+/// `lits` plus the match lengths, the last `lits - mls.len()` literals
+/// after the last sequence.
+fn sequences_block(lits: usize, mls: &[u32]) -> Block {
     const ML_BASE: [u32; 21] = [
         35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387,
         32771, 65539,
@@ -129,18 +132,26 @@ fn one_sequence_block(ml: u32) -> Block {
     const ML_BITS: [u32; 21] = [
         1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
     ];
-    let (code, extra, bits) = match ML_BASE.iter().rposition(|&b| b <= ml) {
+    let code = |ml: u32| match ML_BASE.iter().rposition(|&b| b <= ml) {
         Some(i) => (32 + i as u8, ml - ML_BASE[i], ML_BITS[i]),
         None => (ml as u8 - 3, 0, 0),
     };
-    assert!(extra < 1 << bits || bits == 0 && extra == 0);
-    let mut v = rle_literals(1, b'q');
-    // One sequence; LL, OF and ML in RLE mode: LL code 1, OF code 0
-    // (repeat offset 1 after a literal), ML `code`.
-    v.extend_from_slice(&[1, 0x54, 1, 0, code]);
-    // Only the match length has extra bits; then the end marker.
-    let stream = u64::from(extra) | 1 << bits;
-    v.extend_from_slice(&stream.to_le_bytes()[..bits as usize / 8 + 1]);
+    let (ml_code, _, bits) = code(mls[0]);
+    assert!(lits >= mls.len() && mls.iter().all(|&ml| code(ml).0 == ml_code));
+    let mut v = rle_literals(lits, b'q');
+    // LL, OF and ML in RLE mode: LL code 1, OF code 0 (repeat offset 1
+    // after a literal), ML `ml_code`.
+    v.extend_from_slice(&[mls.len() as u8, 0x54, 1, 0, ml_code]);
+    // Only the match lengths have extra bits, read from below the end
+    // marker down: the first sequence's first.
+    let mut stream = 1u128;
+    for &ml in mls {
+        let extra = code(ml).1;
+        assert!(extra < 1 << bits);
+        stream = stream << bits | u128::from(extra);
+    }
+    let len = mls.len() * bits as usize / 8 + 1;
+    v.extend_from_slice(&stream.to_le_bytes()[..len]);
     Block::Compressed(v)
 }
 
@@ -234,15 +245,31 @@ fn literals_size_is_at_most_block_maximum_size() {
     }
 }
 
-/// Block_Maximum_Size does not bound the decoded size of a compressed
-/// block in ZSTD_decompressFrame (only ZSTD_decompressStream checks it):
-/// below 128 KiB, both decoders take it past the window.
+/// ZSTD_decompressFrame bounds what a compressed block decodes to by where
+/// it keeps the block's literals, Block_Maximum_Size + WILDCOPY_OVERLENGTH
+/// (32) past the block's start when the output has room: a block decoding
+/// to that many bytes is accepted and to one more rejected, whether the
+/// last sequence or the literals after it cross the bound (only
+/// ZSTD_decompressStream bounds it by Block_Maximum_Size).
 #[test]
-fn decoded_size_past_the_window_decodes_like_libzstd() {
-    for (wd, max) in WINDOWS.into_iter().filter(|&(_, max)| max < 128 << 10) {
-        for n in [max, max + 1] {
-            let f = around(wd, one_sequence_block(n as u32 - 1));
-            check(&format!("max {max}: block decoding to {n}"), &f, true);
+fn decoded_size_is_at_most_block_maximum_size_plus_wildcopy_overlength() {
+    for (wd, max) in WINDOWS {
+        for (n, accept) in [
+            (max, true),
+            (max + 1, true),
+            (max + 32, true),
+            (max + 33, false),
+        ] {
+            let ml = (n - 2) as u32;
+            let f = around(wd, sequences_block(2, &[ml / 2, ml - ml / 2]));
+            check(&format!("max {max}: sequences decoding to {n}"), &f, accept);
+            let lits = n / 2;
+            let f = around(wd, sequences_block(lits, &[(n - lits) as u32]));
+            check(
+                &format!("max {max}: sequence then literals decoding to {n}"),
+                &f,
+                accept,
+            );
         }
     }
 }
