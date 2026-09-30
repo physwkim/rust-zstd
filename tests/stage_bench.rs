@@ -55,7 +55,7 @@ struct Layout {
 fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layout) -> Vec<u8> {
     let t_pass = Instant::now();
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-    let overlap = overlap_size(&cparams, 0);
+    let overlap = overlap_size(&cparams, 0, false);
     let jobs = job_ranges(data.len(), job_size_for(None, overlap));
     layout.jobs = jobs.len();
     layout.blocks = 0;
@@ -89,7 +89,14 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
             if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
                 let mut rep = prev.rep;
                 let t = Instant::now();
-                block::build_seq_store(&mut ms, data, start..end, &mut rep, &mut scratch.store);
+                block::build_seq_store(
+                    &mut ms,
+                    data,
+                    start..end,
+                    &mut rep,
+                    &mut scratch.store,
+                    &mut block::BlockLdm::Off,
+                );
                 st.block += t.elapsed();
                 let store = &scratch.store;
                 let cbuf = &mut scratch.cbuf;

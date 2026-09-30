@@ -80,7 +80,7 @@ fn stages(
 fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     let cparams = CParams::for_level(level, data.len());
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-    let overlap = overlap_size(&cparams, 0);
+    let overlap = overlap_size(&cparams, 0, false);
     let jobs = job_ranges(data.len(), job_size_for(None, overlap));
     let fresh = BlockState::initial();
     let mut out = Vec::new();
@@ -111,7 +111,14 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
             if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
                 tally.blocks += 1;
                 let mut rep = prev.rep;
-                block::build_seq_store(&mut ms, data, start..end, &mut rep, &mut scratch.store);
+                block::build_seq_store(
+                    &mut ms,
+                    data,
+                    start..end,
+                    &mut rep,
+                    &mut scratch.store,
+                    &mut block::BlockLdm::Off,
+                );
                 let store = &scratch.store;
                 let proven = literals_section_bound(store.lits.len())
                     + sequences_section_bound(&store.seqs)
