@@ -4,6 +4,8 @@
 //! and `ZSTD_adjustCParams_internal` (zstd_compress.c) for the
 //! no-dictionary case (`dictSize == 0`, `ZSTD_cpm_noAttachDict`).
 
+use crate::constants::{ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX};
+
 /// Match-finder strategy. Numeric values follow `ZSTD_strategy`.
 ///
 /// Every `ZSTD_strategy` is ported; a level's table row selects the
@@ -75,11 +77,8 @@ pub struct CParams {
 pub const ZSTD_MAX_CLEVEL: i32 = 22;
 /// `ZSTD_CLEVEL_DEFAULT`: level 0 selects this row.
 pub const ZSTD_CLEVEL_DEFAULT: i32 = 3;
-/// `ZSTD_WINDOWLOG_MAX` on 64-bit hosts.
-pub const ZSTD_WINDOWLOG_MAX: u32 = 31;
 /// `ZSTD_WINDOWLOG_ABSOLUTEMIN`.
 pub const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
-const ZSTD_HASHLOG_MIN: u32 = 6;
 const ZSTD_TARGETLENGTH_MAX: i32 = 1 << 17;
 const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 
@@ -352,6 +351,76 @@ impl CParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window and hash log limits are libzstd's for this target, a
+    /// level clamps at `ZSTD_c_compressionLevel`'s bounds (as
+    /// `ZSTD_CCtx_setParameter` clamps it), and every level's parameters lie
+    /// within `ZSTD_cParam_getBounds` for any input size.
+    #[test]
+    fn cparam_bounds_match_libzstd() {
+        use crate::compress::common::testutil::c_bounds;
+        use crate::constants::ZSTD_HASHLOG_MAX;
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::*;
+
+        assert_eq!(c_bounds(ZSTD_c_windowLog).1, ZSTD_WINDOWLOG_MAX as i32);
+        assert_eq!(
+            c_bounds(ZSTD_c_hashLog),
+            (ZSTD_HASHLOG_MIN as i32, ZSTD_HASHLOG_MAX as i32)
+        );
+        let sizes = [
+            0,
+            1000,
+            16 << 10,
+            (128 << 10) + 1,
+            (256 << 10) + 1,
+            1 << 20,
+            1 << 29,
+            (1 << 29) + 1,
+            usize::MAX,
+        ];
+        let (lo, hi) = c_bounds(ZSTD_c_compressionLevel);
+        for size in sizes {
+            let cp = |level| CParams::for_level(level, size);
+            for (level, bound) in [(i32::MIN, lo), (lo - 1, lo), (hi + 1, hi), (i32::MAX, hi)] {
+                assert_eq!(cp(level), cp(bound), "level {level} size {size}");
+            }
+            assert_ne!(cp(lo), cp(lo + 1), "size {size}");
+        }
+        assert_ne!(
+            CParams::for_level(hi, 1 << 20),
+            CParams::for_level(hi - 1, 1 << 20)
+        );
+        let bounds = [
+            ZSTD_c_windowLog,
+            ZSTD_c_chainLog,
+            ZSTD_c_hashLog,
+            ZSTD_c_searchLog,
+            ZSTD_c_minMatch,
+            ZSTD_c_targetLength,
+            ZSTD_c_strategy,
+        ]
+        .map(|param| (param, c_bounds(param)));
+        for level in lo..=hi {
+            for size in sizes {
+                let cp = CParams::for_level(level, size);
+                let values = [
+                    cp.window_log,
+                    cp.chain_log,
+                    cp.hash_log,
+                    cp.search_log,
+                    cp.min_match,
+                    cp.target_length,
+                    cp.strategy as u32,
+                ];
+                for ((param, (min, max)), v) in bounds.into_iter().zip(values) {
+                    assert!(
+                        (min..=max).contains(&(v as i32)),
+                        "level {level} size {size}: {param:?} {v}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn level1_large_input_matches_c_table_row() {

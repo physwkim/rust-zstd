@@ -7,7 +7,21 @@
 pub const ZSTD_MAGIC: u32 = 0xFD2FB528;
 pub const ZSTD_BLOCKSIZELOG_MAX: u32 = 17;
 pub const ZSTD_BLOCKSIZE_MAX: usize = 1 << ZSTD_BLOCKSIZELOG_MAX; // 128 KiB
-pub const ZSTD_WINDOWLOG_MAX: u32 = 31;
+/// `MEM_32bits()`: `size_t` is 32 bits wide. libzstd lowers its window
+/// log, index and job size limits there, and ours follow it so that frames
+/// match the libzstd built for the same target.
+pub const MEM_32BITS: bool = usize::BITS == 32;
+/// `ZSTD_WINDOWLOG_MAX`: `ZSTD_WINDOWLOG_MAX_32` (30) where `size_t` is 32
+/// bits, else `ZSTD_WINDOWLOG_MAX_64` (31).
+pub const ZSTD_WINDOWLOG_MAX: u32 = if MEM_32BITS { 30 } else { 31 };
+/// `ZSTD_HASHLOG_MIN`.
+pub const ZSTD_HASHLOG_MIN: u32 = 6;
+/// `ZSTD_HASHLOG_MAX`: [`ZSTD_WINDOWLOG_MAX`], at most 30.
+pub const ZSTD_HASHLOG_MAX: u32 = if ZSTD_WINDOWLOG_MAX < 30 {
+    ZSTD_WINDOWLOG_MAX
+} else {
+    30
+};
 pub const ZSTD_MINMATCH: usize = 3;
 
 // Block types

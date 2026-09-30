@@ -23,6 +23,7 @@ use super::matchstate::{Block, MatchState, Window};
 use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
+use crate::constants::{ZSTD_HASHLOG_MAX, ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX};
 use std::ops::Range;
 
 /// `ZSTD_LDM_DEFAULT_WINDOW_LOG` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`): the
@@ -36,9 +37,6 @@ const LDM_MIN_MATCH_LENGTH: u32 = 64;
 const LDM_BATCH_SIZE: usize = 64;
 /// `kMaxChunkSize` of `ZSTD_ldm_generateSequences`.
 const MAX_CHUNK_SIZE: usize = 1 << 20;
-/// `ZSTD_HASHLOG_MIN` / `ZSTD_HASHLOG_MAX` (64-bit).
-const HASHLOG_MIN: u32 = 6;
-const HASHLOG_MAX: u32 = 30;
 /// `ZSTD_LDM_MINMATCH_MIN` / `ZSTD_LDM_MINMATCH_MAX`.
 const MINMATCH_MIN: u32 = 4;
 const MINMATCH_MAX: u32 = 4096;
@@ -46,7 +44,7 @@ const MINMATCH_MAX: u32 = 4096;
 const BUCKETSIZELOG_MIN: u32 = 1;
 const BUCKETSIZELOG_MAX: u32 = 8;
 /// `ZSTD_LDM_HASHRATELOG_MAX`: `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`.
-const HASHRATELOG_MAX: u32 = 31 - HASHLOG_MIN;
+const HASHRATELOG_MAX: u32 = ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN;
 
 /// `ldmParams_t` without `enableLdm`. A field left at `0` is derived from
 /// the compression parameters by [`LdmParams::adjusted`].
@@ -82,7 +80,7 @@ impl LdmParams {
                 "{name} {v} out of range {lo}..={hi} (0 derives it)"
             );
         };
-        check("ldm_hash_log", hash_log, HASHLOG_MIN, HASHLOG_MAX);
+        check("ldm_hash_log", hash_log, ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
         check(
             "ldm_min_match",
             min_match_length,
@@ -127,7 +125,7 @@ impl LdmParams {
             self.hash_log = self
                 .window_log
                 .wrapping_sub(self.hash_rate_log)
-                .clamp(HASHLOG_MIN, HASHLOG_MAX);
+                .clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
         }
         if self.min_match_length == 0 {
             self.min_match_length = LDM_MIN_MATCH_LENGTH;
@@ -1010,15 +1008,15 @@ mod tests {
         );
         // a rate above the window log wraps in U32 and clamps to the max
         assert_eq!(
-            LdmParams::requested(0, 0, 0, 25)
+            LdmParams::requested(0, 0, 0, HASHRATELOG_MAX)
                 .adjusted(&cparams(Strategy::Fast, 20))
                 .hash_log,
-            HASHLOG_MAX
+            ZSTD_HASHLOG_MAX
         );
         // a small difference clamps to the min
         assert_eq!(
             LdmParams::requested(0, 0, 0, 24).adjusted(&fast27).hash_log,
-            HASHLOG_MIN
+            ZSTD_HASHLOG_MIN
         );
         // the bucket size log never exceeds the hash log
         assert_eq!(
@@ -1030,21 +1028,30 @@ mod tests {
         assert_eq!((explicit.min_match_length, explicit.hash_rate_log), (32, 4));
     }
 
-    /// Each parameter at both bounds is accepted, one past either panics.
+    /// Each parameter is accepted from 0 to one past libzstd's upper bound
+    /// exactly where `ZSTD_CCtx_setParameter` accepts it, and panics where
+    /// that returns `parameter_outOfBound`.
     #[test]
-    fn requested_enforces_zstd_bounds() {
-        LdmParams::requested(6, 4, 1, 1);
-        LdmParams::requested(30, 4096, 8, 25);
-        for (h, m, b, r) in [
-            (5, 0, 0, 0),
-            (31, 0, 0, 0),
-            (0, 3, 0, 0),
-            (0, 4097, 0, 0),
-            (0, 0, 9, 0),
-            (0, 0, 0, 26),
-        ] {
-            let caught = std::panic::catch_unwind(|| LdmParams::requested(h, m, b, r));
-            assert!(caught.is_err(), "({h}, {m}, {b}, {r}) accepted");
+    fn requested_bounds_match_libzstd() {
+        use crate::compress::common::testutil::{c_accepts, c_bounds};
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::*;
+
+        // in the order of `requested`'s arguments
+        let params = [
+            ZSTD_c_ldmHashLog,
+            ZSTD_c_ldmMinMatch,
+            ZSTD_c_ldmBucketSizeLog,
+            ZSTD_c_ldmHashRateLog,
+        ];
+        for (i, param) in params.into_iter().enumerate() {
+            let (_, hi) = c_bounds(param);
+            for v in 0..=hi + 1 {
+                let mut args = [0; 4];
+                args[i] = v as u32;
+                let [h, m, b, r] = args;
+                let ours = std::panic::catch_unwind(|| LdmParams::requested(h, m, b, r)).is_ok();
+                assert_eq!(ours, c_accepts(param, v), "{param:?} {v}");
+            }
         }
     }
 

@@ -107,7 +107,8 @@ pub struct CompressOptions {
     /// within `4..=8`), else `1..=8`; never above the hash log.
     pub ldm_bucket_size_log: u32,
     /// `ZSTD_c_ldmHashRateLog`: `0` derives it (window log minus an
-    /// explicit hash log, else `7 - strategy / 3`), else `1..=25`.
+    /// explicit hash log, else `7 - strategy / 3`), else `1..=25`
+    /// (`1..=24` where `usize` is 32 bits).
     ///
     /// Out-of-range LDM values panic, as `overlap_log` does.
     pub ldm_hash_rate_log: u32,
