@@ -668,6 +668,7 @@ impl<'a> OptLdm<'a> {
     /// `ZSTD_optLdm_processMatchCandidate`: move to the next long match once
     /// the parser is past the current one, then offer it at
     /// `curr_pos_in_block`.
+    #[inline(always)]
     fn process_match_candidate(
         &mut self,
         matches: &mut [Match; ZSTD_OPT_SIZE],
