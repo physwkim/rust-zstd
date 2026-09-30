@@ -765,6 +765,157 @@ mod tests {
         assert_eq!(overlap_size(&lazy2, 0, true), 1 << 23);
     }
 
+    /// `len + gap` noise bytes, then the first `len` of them again: a
+    /// repeat `len + gap` bytes back, beyond the window of levels 1-11
+    /// without long distance matching once that exceeds 4 MiB.
+    fn far_repeat(len: usize, gap: usize) -> Vec<u8> {
+        let mut v = noise(len + gap, 11);
+        v.extend_from_within(..len);
+        v
+    }
+
+    fn ldm_opts(level: i32, ldm: ParamSwitch, job_size: Option<usize>) -> CompressOptions {
+        CompressOptions {
+            level,
+            job_size,
+            ldm,
+            ..Default::default()
+        }
+    }
+
+    /// Long distance matching frames decode through both decoders on the
+    /// single-context path (up to `JOBSIZE_MIN`) and over one or several
+    /// jobs (the last block 3 bytes, too small to compress), find the
+    /// repeat that the frame without it stores as literals, and a reused
+    /// `Compressor` writes what fresh ones do.
+    #[test]
+    fn ldm_frames_roundtrip_and_find_far_repeats() {
+        let single = far_repeat(160 << 10, 160 << 10);
+        let jobs = far_repeat(1 << 20, (4 << 20) + 3);
+        let empty = Vec::new();
+        for level in [1, 3, 7, 11] {
+            for job_size in [None, Some(JOBSIZE_MIN)] {
+                let opts = ldm_opts(level, ParamSwitch::Enable, job_size);
+                let mut cx = Compressor::new(opts.clone());
+                for data in [&jobs, &single, &empty, &jobs] {
+                    let frame = cx.compress_to_vec(data);
+                    let name = format!("L{level} job {job_size:?} {} bytes", data.len());
+                    assert!(frame == compress_with(data, &opts), "{name}: reuse");
+                    assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name}");
+                    let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+                    assert_eq!(&theirs, data, "{name}");
+                }
+                let off = compress_with(&jobs, &ldm_opts(level, ParamSwitch::Disable, job_size));
+                let on = compress_with(&jobs, &opts);
+                assert!(
+                    on.len() + (900 << 10) < off.len(),
+                    "L{level} job {job_size:?}: {} with LDM, {} without",
+                    on.len(),
+                    off.len()
+                );
+            }
+        }
+    }
+
+    /// With long distance matching over several jobs, the parallel and the
+    /// serial job loop write the same bytes from the sequences generated in
+    /// job order, and those are the frame's.
+    #[test]
+    fn ldm_parallel_and_serial_job_loops_agree() {
+        let data = far_repeat(1 << 20, 4 << 20);
+        let src = data.as_slice();
+        for level in [1, 3, 7, 11] {
+            let opts = ldm_opts(level, ParamSwitch::Enable, Some(JOBSIZE_MIN));
+            let (cparams, ldm) = opts.frame_params(src.len());
+            let ldm = ldm.expect("enabled");
+            let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
+            let overlap = overlap_size(&cparams, opts.overlap_log, true);
+            let job_size = job_size_for(opts.job_size, &cparams, true, overlap);
+            let jobs = job_ranges(src.len(), job_size);
+            let n = jobs.len();
+            assert!(n >= 6, "L{level}: {n} jobs");
+            let generate = |ctxs: &mut [JobContext]| {
+                let mut state = LdmState::new(ldm, 0);
+                let max_seqs = job_size / ldm.min_match_length as usize;
+                for (job, ctx) in jobs.iter().zip(ctxs) {
+                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                }
+            };
+            let f = |pipelined: bool| {
+                move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
+                    let JobContext {
+                        ms,
+                        scratch,
+                        ldm_seqs,
+                    } = ctx;
+                    compress_job(
+                        src,
+                        cparams,
+                        block_size,
+                        overlap,
+                        job,
+                        k == 0,
+                        k + 1 == n,
+                        pipelined,
+                        ms,
+                        scratch,
+                        &mut BlockLdm::External(ldm_seqs),
+                        out,
+                    )
+                }
+            };
+            let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
+            generate(&mut ctxs);
+            let mut par = Vec::new();
+            run_jobs(&jobs, &mut ctxs, true, f(true), &mut par);
+            generate(&mut ctxs);
+            let mut seq = Vec::new();
+            run_jobs(&jobs, &mut ctxs, false, f(false), &mut seq);
+            assert!(par == seq, "L{level}: job outputs differ");
+            assert!(compress_with(src, &opts).ends_with(&seq), "L{level}");
+        }
+    }
+
+    /// `Enable` selects window log 27 before the size adjustment; `Auto`
+    /// stays off for the ported strategies (all below `btopt`), so its
+    /// frames are `Disable`'s.
+    #[test]
+    fn ldm_switch_resolution() {
+        let data = far_repeat(300 << 10, 400 << 10);
+        for level in 1..=22 {
+            let (cp, ldm) = ldm_opts(level, ParamSwitch::Enable, None).frame_params(3 << 20);
+            assert_eq!(cp.window_log, 22, "L{level}: 3 MiB adjusts 27 to 22");
+            assert!(ldm.is_some_and(|p| p.window_log == 22));
+            let big = ldm_opts(level, ParamSwitch::Enable, None).frame_params(1 << 30);
+            assert_eq!(big.0.window_log, 27, "L{level}");
+            for size in [3 << 20, 1 << 30] {
+                let (auto_cp, auto_ldm) =
+                    ldm_opts(level, ParamSwitch::Auto, None).frame_params(size);
+                assert!(auto_ldm.is_none(), "L{level} {size}");
+                assert_eq!(auto_cp, CParams::for_level(level, size), "L{level} {size}");
+                let off = ldm_opts(level, ParamSwitch::Disable, None).frame_params(size);
+                assert_eq!(off, (auto_cp, None), "L{level} {size}");
+            }
+            let auto = compress_with(&data, &ldm_opts(level, ParamSwitch::Auto, None));
+            let off = compress_with(&data, &ldm_opts(level, ParamSwitch::Disable, None));
+            assert!(auto == off, "L{level}");
+        }
+    }
+
+    /// Out-of-range long distance matching parameters panic, as libzstd
+    /// refuses them with `parameter_outOfBound`.
+    #[test]
+    #[should_panic(expected = "ldm_bucket_size_log 9 out of range")]
+    fn ldm_parameter_out_of_range_panics() {
+        compress_with(
+            b"abc",
+            &CompressOptions {
+                ldm_bucket_size_log: 9,
+                ..Default::default()
+            },
+        );
+    }
+
     #[test]
     #[should_panic(expected = "out of range")]
     fn overlap_log_above_nine_panics() {

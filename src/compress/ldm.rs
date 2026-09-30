@@ -799,4 +799,180 @@ mod tests {
             0xFBCE_A83C_8A37_8BF1
         );
     }
+
+    fn cparams(strategy: Strategy, window_log: u32) -> CParams {
+        let mut cp = CParams::for_level(1, 1 << 20);
+        cp.strategy = strategy;
+        cp.window_log = window_log;
+        cp
+    }
+
+    fn params(hash_log: u32, bucket_size_log: u32, hash_rate_log: u32) -> LdmParams {
+        LdmParams {
+            hash_log,
+            bucket_size_log,
+            min_match_length: 64,
+            hash_rate_log,
+            window_log: 27,
+        }
+    }
+
+    /// Every branch of `ZSTD_ldm_adjustParameters`.
+    #[test]
+    fn adjusted_derives_like_zstd() {
+        let derive = LdmParams::requested(0, 0, 0, 0);
+        // fast: rate 7 - 1/3, hash log 27 - 7, bucket size log 1 raised to 4
+        assert_eq!(
+            derive.adjusted(&cparams(Strategy::Fast, 27)),
+            params(20, 4, 7)
+        );
+        // lazy2 (5): rate 7 - 5/3, bucket size log 5
+        assert_eq!(
+            derive.adjusted(&cparams(Strategy::Lazy2, 27)),
+            params(21, 5, 6)
+        );
+        // an explicit hash log sets the rate to the window log above it...
+        let fast27 = cparams(Strategy::Fast, 27);
+        assert_eq!(
+            LdmParams::requested(16, 0, 0, 0).adjusted(&fast27),
+            params(16, 4, 11)
+        );
+        // ... and leaves it 0 when the window log is not above it
+        assert_eq!(
+            LdmParams::requested(27, 0, 0, 0).adjusted(&fast27),
+            params(27, 4, 0)
+        );
+        // a rate above the window log wraps in U32 and clamps to the max
+        assert_eq!(
+            LdmParams::requested(0, 0, 0, 25)
+                .adjusted(&cparams(Strategy::Fast, 20))
+                .hash_log,
+            HASHLOG_MAX
+        );
+        // a small difference clamps to the min
+        assert_eq!(
+            LdmParams::requested(0, 0, 0, 24).adjusted(&fast27).hash_log,
+            HASHLOG_MIN
+        );
+        // the bucket size log never exceeds the hash log
+        assert_eq!(
+            LdmParams::requested(6, 0, 8, 0).adjusted(&fast27),
+            params(6, 6, 21)
+        );
+        // explicit values stay
+        let explicit = LdmParams::requested(20, 32, 3, 4).adjusted(&fast27);
+        assert_eq!((explicit.min_match_length, explicit.hash_rate_log), (32, 4));
+    }
+
+    /// Each parameter at both bounds is accepted, one past either panics.
+    #[test]
+    fn requested_enforces_zstd_bounds() {
+        LdmParams::requested(6, 4, 1, 1);
+        LdmParams::requested(30, 4096, 8, 25);
+        for (h, m, b, r) in [
+            (5, 0, 0, 0),
+            (31, 0, 0, 0),
+            (0, 3, 0, 0),
+            (0, 4097, 0, 0),
+            (0, 0, 9, 0),
+            (0, 0, 0, 26),
+        ] {
+            let caught = std::panic::catch_unwind(|| LdmParams::requested(h, m, b, r));
+            assert!(caught.is_err(), "({h}, {m}, {b}, {r}) accepted");
+        }
+    }
+
+    fn store(seqs: &[(u32, u32, u32)]) -> RawSeqStore {
+        RawSeqStore {
+            seqs: seqs
+                .iter()
+                .map(|&(offset, lit_length, match_length)| RawSeq {
+                    offset,
+                    lit_length,
+                    match_length,
+                })
+                .collect(),
+            pos: 0,
+        }
+    }
+
+    /// `maybeSplitSequence` at every boundary of a 10-literal, 70-byte
+    /// match followed by one more sequence, with `min_match` 4.
+    #[test]
+    fn maybe_split_sequence_boundaries() {
+        let seqs = [(100, 10, 70), (200, 5, 80)];
+        let seq = |offset, lit_length, match_length| RawSeq {
+            offset,
+            lit_length,
+            match_length,
+        };
+        // (remaining, returned, store afterwards, pos afterwards)
+        let cases = [
+            // the whole sequence fits
+            (80, seq(100, 10, 70), seq(200, 5, 80), 1),
+            // the block ends in the literals: rest is literals
+            (6, seq(0, 6, 70), seq(100, 4, 70), 0),
+            // ... or right after them
+            (10, seq(0, 10, 70), seq(100, 0, 70), 0),
+            // a cut match under min_match is dropped
+            (13, seq(0, 10, 3), seq(100, 0, 67), 0),
+            // a cut match of min_match is kept
+            (14, seq(100, 10, 4), seq(100, 0, 66), 0),
+            // a remainder under min_match becomes the next literals
+            (77, seq(100, 10, 67), seq(200, 8, 80), 1),
+        ];
+        for (remaining, returned, after, pos) in cases {
+            let mut s = store(&seqs);
+            let got = s.maybe_split_sequence(remaining, 4);
+            assert_eq!(got.offset == 0, returned.offset == 0, "{remaining}");
+            if got.offset != 0 {
+                assert_eq!(got, returned, "{remaining}");
+            } else {
+                assert_eq!(got.lit_length, 10, "{remaining}");
+            }
+            assert_eq!(s.pos, pos, "{remaining}");
+            assert_eq!(s.seqs[pos], after, "{remaining}");
+        }
+    }
+
+    /// Positions far enough back are rejected once the window moves past
+    /// them, per chunk (`ZSTD_window_enforceMaxDist`); matches inside the
+    /// window extend backwards to `low` but not below.
+    #[test]
+    fn generate_sequences_respects_window_and_low() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 56) as u8
+                })
+                .collect()
+        };
+        let a = noise(64 << 10);
+        let mut src = a.clone();
+        src.extend_from_slice(&noise(200 << 10));
+        src.extend_from_slice(&a);
+        let p = LdmParams::requested(0, 0, 0, 0).adjusted(&cparams(Strategy::Fast, 27));
+        let run = |window_log: u32, first: usize| {
+            let mut state = LdmState::new(LdmParams { window_log, ..p }, first);
+            let mut out = RawSeqStore::default();
+            state.generate_sequences(&src, first..src.len(), usize::MAX, &mut out);
+            out.seqs
+        };
+        let repeat = (264 << 10) as u32;
+        // window 1 MiB: `a` repeats as matches at offset 264 KiB covering
+        // it all but the first split's backward reach is capped at `low`
+        let seqs = run(20, 0);
+        assert!(!seqs.is_empty());
+        assert!(seqs.iter().all(|s| s.offset == repeat));
+        let matched: u32 = seqs.iter().map(|s| s.match_length).sum();
+        assert!(matched > (60 << 10), "{matched}");
+        // window 256 KiB: the repeat is beyond it
+        assert!(run(18, 0).is_empty());
+        // starting at 1 (the harness convention) changes only `low`
+        assert_eq!(run(20, 1).len(), seqs.len());
+    }
 }
