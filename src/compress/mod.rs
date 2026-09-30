@@ -41,7 +41,8 @@ use std::ops::Range;
 pub const JOBSIZE_MIN: usize = 512 << 10;
 /// `ZSTDMT_JOBSIZE_MAX` (64-bit): upper bound of an explicit job size.
 pub const JOBSIZE_MAX: usize = 1 << 30;
-/// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the job size log.
+/// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the job size log that
+/// sizes the overlap under long distance matching.
 const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`Compressor`] and [`compress_with`].
@@ -78,16 +79,19 @@ pub struct CompressOptions {
     /// no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
     /// them with `parameter_outOfBound`). With long distance matching the
-    /// fraction is of `min(window, job size of the LDM formula / 4)`
-    /// instead, and `1` no longer means no overlap
-    /// (`ZSTDMT_computeOverlapSize`).
+    /// fraction is of `min(window, 1 << (job_log - 2))` instead, with
+    /// `job_log = min(max(21, cycleLog + 3), 30)`, and `1` no longer means
+    /// no overlap (`ZSTDMT_computeOverlapSize`).
     pub overlap_log: u8,
     /// `ZSTD_c_enableLongDistanceMatching`: find matches up to a window
     /// back with a rolling hash over the whole window (see [`ldm`]).
     /// `Auto` enables it for the `btopt` strategies and up with a window
-    /// log of 27 or more (level 22 on inputs above 64 MiB). `Enable` raises the window log to 27
-    /// (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before the size adjustment, and
-    /// with it the job size and overlap (see `job_size`, `overlap_log`).
+    /// log of 27 or more (level 22 on inputs above 64 MiB). `Enable`
+    /// raises the window log to 27 (`ZSTD_LDM_DEFAULT_WINDOW_LOG`) before
+    /// the size adjustment. Without an explicit `job_size` each block's
+    /// matches are generated as the block is compressed; with one, each
+    /// job's are generated in job order before the job, and the job
+    /// overlap changes (see `overlap_log`).
     pub ldm: ParamSwitch,
     /// `ZSTD_c_ldmHashLog`: `0` derives it (window log minus hash rate
     /// log, within `6..=30`), else `6..=30`.
@@ -517,19 +521,6 @@ pub fn job_size_for(requested: Option<usize>, overlap: usize) -> usize {
     }
 }
 
-/// `ZSTDMT_computeTargetJobLog`: from the window log, or with long distance
-/// matching (whose window is typically oversized) from the cycle log.
-fn target_job_log(cparams: &CParams, ldm: bool) -> u32 {
-    let job_log = if ldm {
-        // ZSTD_cycleLog(chainLog, strategy)
-        let cycle_log = cparams.chain_log - cparams.strategy.bt_scale();
-        21.max(cycle_log + 3)
-    } else {
-        20.max(cparams.window_log + 2)
-    };
-    job_log.min(JOBLOG_MAX)
-}
-
 /// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
 /// last job truncated to `len`.
 pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
@@ -542,7 +533,7 @@ pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
 /// `ZSTDMT_computeOverlapSize`: `overlap_log` as `ZSTD_c_overlapLog` (see
 /// [`CompressOptions::overlap_log`]); without long distance matching the
 /// result is `0` or `1 << (window_log - (9 - overlap_log))`, with it
-/// `1 << (min(window_log, target_job_log - 2) - (9 - overlap_log))`.
+/// `1 << (min(window_log, job_log - 2) - (9 - overlap_log))`.
 pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     assert!(
         overlap_log <= 9,
@@ -563,7 +554,10 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     let ov_log = if ldm {
         // In Long Range Mode, the windowLog is typically oversized: ovLog
         // becomes a fraction of the jobSize, rather than windowSize.
-        cparams.window_log.min(target_job_log(cparams, true) - 2) - overlap_rlog
+        // ZSTDMT_computeTargetJobLog, from ZSTD_cycleLog(chainLog, strategy):
+        let cycle_log = cparams.chain_log - cparams.strategy.bt_scale();
+        let job_log = 21.max(cycle_log + 3).min(JOBLOG_MAX);
+        cparams.window_log.min(job_log - 2) - overlap_rlog
     } else if overlap_rlog >= 8 {
         0
     } else {
