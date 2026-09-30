@@ -568,7 +568,9 @@ mod tests {
         overlap_size(&CParams::for_level(1, 1 << 20), 10);
     }
 
-    /// A multi-job preset frame decodes through both decoders.
+    /// The preset runs three jobs on 4.25 MiB, counted as the job contexts
+    /// a fresh `Compressor` leaves holding a match state, and its frame
+    /// decodes through both decoders.
     #[test]
     fn parallel_preset_roundtrips() {
         let mut data = text(2 << 20);
@@ -577,7 +579,11 @@ mod tests {
         for level in [1, 3, 7, 11] {
             let opts = CompressOptions::parallel(level);
             assert_eq!((opts.job_size, opts.overlap_log), (Some(2 << 20), 8));
-            let frame = compress_with(&data, &opts);
+            let mut cx = Compressor::new(opts.clone());
+            let frame = cx.compress_to_vec(&data);
+            let ran = cx.jobs.iter().filter(|j| j.ms.is_some()).count();
+            assert_eq!(ran, 3, "L{level}: jobs run");
+            assert!(frame == compress_with(&data, &opts), "L{level}");
             assert_eq!(crate::decompress(&frame).unwrap(), data, "L{level}");
             let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
             assert_eq!(theirs, data, "L{level}");
