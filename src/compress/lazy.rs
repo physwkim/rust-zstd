@@ -1764,12 +1764,11 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
 /// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms: insert every
 /// position of `range` up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
-/// at `iend - HASH_READ_SIZE`) and set `next_to_update =
-/// end`. Expects the tables of a fresh [`MatchState`] (C zeroes the tag table
-/// here; `MatchState::new` already did). The hash width is `BOUNDED(4,
-/// minMatch, 6)` as in the block loop, where C's chain loader passes
-/// `minMatch` itself; they differ only for `minMatch == 7`, which no level
-/// table produces.
+/// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
+/// finder's tag table is zeroed first, as C does here. The hash width is
+/// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
+/// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
+/// level table produces.
 pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, method: SearchMethod) {
     let end = range.end;
     assert_block_bounds(ms, src, end, method);
@@ -1794,6 +1793,7 @@ pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, meth
                 };
             }
             SearchMethod::RowHash => {
+                ms.ws.tables_mut().2.fill(0);
                 macro_rules! go {
                     ($mls:literal, $row_log:literal) => {
                         unsafe {
@@ -1829,6 +1829,7 @@ pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, meth
 mod tests {
     use super::super::common::testutil::run_block;
     use super::*;
+    use crate::compress::matchstate::WINDOW_START_INDEX;
     use crate::compress::params::CParams;
     use crate::constants::ZSTD_BLOCKSIZE_MAX;
 
@@ -2090,15 +2091,15 @@ mod tests {
     }
 
     /// `MatchState::reset` on a context that compressed something else, with
-    /// other table sizes, leaves exactly `MatchState::new`'s state (tables,
-    /// update pointer, salt) and therefore the same sequences from both
-    /// finders, in either direction of table growth.
+    /// other table sizes, gives the sequences of `MatchState::new` from both
+    /// finders: smaller tables continue the indices over the first input's
+    /// entries, larger ones outgrow the allocation and restart them.
     #[test]
     fn reset_context_matches_fresh_context() {
         let a = crate_sources();
         let b = current_exe(300_000);
         // Explicit table sizes: the level tables give both inputs the same
-        // hash_log, and the reset must shrink and grow the allocations.
+        // hash_log, and the reset must shrink and grow the tables.
         let mut cp_a = lazy_params(11, a.len(), Strategy::Lazy2, 5);
         cp_a.hash_log = 20;
         cp_a.chain_log = 20;
@@ -2107,16 +2108,21 @@ mod tests {
         cp_b.chain_log = 16;
         let level = Level::new();
         for m in METHODS {
-            for (first, cp_first, second, cp_second) in [(&a, cp_a, &b, cp_b), (&b, cp_b, &a, cp_a)]
+            for (first, cp_first, second, cp_second, continues) in
+                [(&a, cp_a, &b, cp_b, true), (&b, cp_b, &a, cp_a, false)]
             {
                 let mut reused = MatchState::new(cp_first, 0);
                 collect_on(&mut reused, first, 40_000, m, level);
-                assert!(reused.tables().0.iter().any(|&e| e != 0));
                 reused.reset(cp_second, 0);
                 let mut fresh = MatchState::new(cp_second, 0);
-                assert!(reused.tables() == fresh.tables());
-                assert_eq!(reused.next_to_update, fresh.next_to_update);
-                assert_eq!(reused.window_low(), fresh.window_low());
+                if continues {
+                    assert_eq!(reused.window_low(), WINDOW_START_INDEX + first.len());
+                    assert!(reused.tables().0.iter().any(|&e| e != 0));
+                } else {
+                    assert_eq!(reused.window_low(), WINDOW_START_INDEX);
+                    assert!(reused.tables() == fresh.tables());
+                }
+                assert_eq!(reused.next_to_update, reused.window_low());
                 assert_eq!(reused.hash_salt, fresh.hash_salt);
                 assert_eq!(reused.hash_salt_entropy, fresh.hash_salt_entropy);
                 assert_eq!(reused.cparams, fresh.cparams);
