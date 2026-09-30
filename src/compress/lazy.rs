@@ -270,7 +270,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
 /// `ZSTD_DUBT_UNSORTED_MARK`: the second slot of a node that was inserted
 /// by [`BtSearch::update_dubt`] but not yet sorted into the tree. No real
 /// candidate is ever `1`: candidates are `> window_low >= WINDOW_START_INDEX`.
-const DUBT_UNSORTED_MARK: usize = 1;
+pub(super) const DUBT_UNSORTED_MARK: usize = 1;
 
 /// `search_binaryTree`: a "delayed update binary tree" in the chain table,
 /// two entries per position (`bt[2 * (idx & btMask)]` the smaller child,
@@ -292,7 +292,7 @@ const BT_DUMMY: usize = usize::MAX;
 struct BtParams {
     /// `btMask = (1 << (chainLog - 1)) - 1`.
     bt_mask: usize,
-    /// `window.lowLimit` (`ms.window_low`).
+    /// `window.lowLimit` (`ms.window_low()`).
     window_valid: usize,
     /// `1 << windowLog`.
     max_distance: usize,
@@ -302,7 +302,7 @@ impl BtParams {
     fn of(ms: &MatchState) -> Self {
         BtParams {
             bt_mask: (1usize << (ms.cparams.chain_log - 1)) - 1,
-            window_valid: ms.window_low,
+            window_valid: ms.window_low(),
             max_distance: 1usize << ms.cparams.window_log,
         }
     }
@@ -1216,7 +1216,7 @@ fn lazy_generic<S: Search>(
     let mut anchor = istart;
     // Below `istart + 1` the loop conditions are false anyway.
     let ilimit = iend.saturating_sub(S::ILIMIT_MARGIN);
-    let prefix_lowest = ms.window_low;
+    let prefix_lowest = ms.window_low();
 
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
@@ -1773,7 +1773,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
 pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, method: SearchMethod) {
     let end = range.end;
     assert_block_bounds(ms, src, end, method);
-    let start = ms.next_to_update.max(range.start).max(ms.window_low);
+    let start = ms.next_to_update.max(range.start).max(ms.window_low());
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
@@ -2116,7 +2116,7 @@ mod tests {
                 let mut fresh = MatchState::new(cp_second, 0);
                 assert!(reused.tables() == fresh.tables());
                 assert_eq!(reused.next_to_update, fresh.next_to_update);
-                assert_eq!(reused.window_low, fresh.window_low);
+                assert_eq!(reused.window_low(), fresh.window_low());
                 assert_eq!(reused.hash_salt, fresh.hash_salt);
                 assert_eq!(reused.hash_salt_entropy, fresh.hash_salt_entropy);
                 assert_eq!(reused.cparams, fresh.cparams);

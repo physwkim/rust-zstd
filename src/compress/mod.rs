@@ -46,9 +46,6 @@ pub const JOBSIZE_MAX: usize = 1 << 30;
 const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`Compressor`] and [`compress_with`].
-///
-/// Inputs must be smaller than 4 GiB: match positions are `u32` indices into
-/// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
     /// Compression level, `ZSTD_c_compressionLevel`, as libzstd reads it:
@@ -126,6 +123,14 @@ pub struct CompressOptions {
     /// every job is whole. Values above 6 panic (libzstd rejects them
     /// with `parameter_outOfBound`).
     pub block_splitter_level: u8,
+    /// Test knob, libzstd's `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`:
+    /// correct the match state's and the long distance matcher's windows
+    /// whenever a correction keeps the whole window, not only before an
+    /// index would pass 3500 MiB, so that small inputs exercise the
+    /// correction. The frames then equal those of a libzstd built with
+    /// that macro set to 1.
+    #[doc(hidden)]
+    pub overflow_correct_frequently: bool,
 }
 
 impl Default for CompressOptions {
@@ -141,6 +146,7 @@ impl Default for CompressOptions {
             ldm_hash_rate_log: 0,
             split_after_sequences: ParamSwitch::Auto,
             block_splitter_level: 0,
+            overflow_correct_frequently: false,
         }
     }
 }
@@ -260,12 +266,23 @@ impl Compressor {
         }
     }
 
+    /// Test hook for `CompressOptions::overflow_correct_frequently`: the
+    /// window overflow corrections of the match states and of the long
+    /// distance matchers since each was last reset, which for a fresh
+    /// `Compressor` are those of its one frame.
+    #[doc(hidden)]
+    pub fn overflow_corrections(&self) -> (u32, u32) {
+        let ms = self.jobs.iter().filter_map(|ctx| ctx.ms.as_ref());
+        let ldm = self.jobs.iter().filter_map(|ctx| ctx.ldm_state.as_ref());
+        let ldm = ldm.chain(self.serial_ldm.as_ref());
+        (
+            ms.map(|ms| ms.window().nb_overflow_corrections()).sum(),
+            ldm.map(|ldm| ldm.window().nb_overflow_corrections()).sum(),
+        )
+    }
+
     /// Append one frame holding `src` to `out`.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        assert!(
-            src.len() < u32::MAX as usize,
-            "inputs of 4 GiB or more are not supported (match indices are u32)"
-        );
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();
@@ -293,9 +310,10 @@ impl Compressor {
         // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
         // single-threaded frame generates each block's as it compresses the
         // block (ZSTD_buildSeqStore), from its context's state.
+        let frequently = self.opts.overflow_correct_frequently;
         let mut serial_ldm = ldm_params
             .filter(|_| mt)
-            .map(|params| reset_ldm_state(&mut self.serial_ldm, params));
+            .map(|params| reset_ldm_state(&mut self.serial_ldm, params, frequently));
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
         // A job spawned only once its sequences are generated would be taken
         // by a thread waiting in an earlier job's block join, holding that job
@@ -322,11 +340,14 @@ impl Compressor {
                 let mut ldm = match ldm_params {
                     None => BlockLdm::Off,
                     Some(_) if mt => BlockLdm::External(ldm_seqs),
-                    Some(params) => BlockLdm::Internal(reset_ldm_state(ldm_state, params)),
+                    Some(params) => {
+                        BlockLdm::Internal(reset_ldm_state(ldm_state, params, frequently))
+                    }
                 };
                 compress_job(
                     src,
                     cparams,
+                    frequently,
                     sizing,
                     overlap,
                     job,
@@ -353,15 +374,22 @@ impl Compressor {
 }
 
 /// The long distance matching state in `slot` reset for a frame with
-/// `params`, allocated on first use.
-fn reset_ldm_state(slot: &mut Option<LdmState>, params: LdmParams) -> &mut LdmState {
-    match slot.take() {
+/// `params`, allocated on first use, with the overflow correction knob
+/// `frequently` (see [`CompressOptions`]).
+fn reset_ldm_state(
+    slot: &mut Option<LdmState>,
+    params: LdmParams,
+    frequently: bool,
+) -> &mut LdmState {
+    let state = match slot.take() {
         Some(mut state) => {
             state.reset(params, 0);
             slot.insert(state)
         }
         None => slot.insert(LdmState::new(params, 0)),
-    }
+    };
+    state.set_correct_frequently(frequently);
+    state
 }
 
 /// Whether libzstd would compress through ZSTDMT: an explicit job size is
@@ -408,11 +436,13 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 /// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
 /// obtained from the previous job. `sizing` cuts the job into blocks;
-/// `split` runs every block through the post-sequence splitter.
+/// `split` runs every block through the post-sequence splitter;
+/// `frequently` is the overflow correction knob (see [`CompressOptions`]).
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
     cparams: CParams,
+    frequently: bool,
     sizing: BlockSizing,
     overlap: usize,
     job: Range<usize>,
@@ -438,6 +468,7 @@ fn compress_job(
         }
         None => MatchState::new(cparams, origin),
     };
+    ms.set_correct_frequently(frequently);
     let mut initial = BlockState::initial();
     if !first_job {
         block::load_prefix(&mut ms, data, origin..job.start);
@@ -915,6 +946,7 @@ mod tests {
                     compress_job(
                         src,
                         cparams,
+                        false,
                         sizing,
                         overlap,
                         job,
@@ -1079,6 +1111,7 @@ mod tests {
                     compress_job(
                         src,
                         cparams,
+                        false,
                         sizing,
                         overlap,
                         job,
@@ -1135,6 +1168,7 @@ mod tests {
         compress_job(
             data,
             cparams,
+            false,
             sizing,
             overlap,
             job,
@@ -1430,6 +1464,57 @@ mod tests {
         );
         assert_eq!(crate::decompress(&frame).unwrap(), data);
         assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), data);
+    }
+
+    /// Text, then copies of 4 KiB from anywhere earlier, each followed by
+    /// 64 noise bytes: matches at every distance up to the whole input.
+    fn repeats(len: usize) -> Vec<u8> {
+        let mut v = text(64 << 10);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        while v.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let start = (x >> 20) as usize % (v.len() - 4096);
+            v.extend_from_within(start..start + 4096);
+            v.extend_from_slice(&noise(64, x));
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// With `overflow_correct_frequently` the match state's window is
+    /// corrected in single-job and multi-job frames (blocks of a 2 MiB job
+    /// start past the correction threshold of a 1 MiB window), and the
+    /// frames are those without it: a correction keeps every index the
+    /// window reaches.
+    #[test]
+    fn frequent_overflow_correction_keeps_frames() {
+        let data = repeats(3 << 20);
+        let jobs = Some(2 << 20);
+        for (level, job_size) in [
+            (-5, None),
+            (1, None),
+            (2, None),
+            (5, None),
+            (-5, jobs),
+            (1, jobs),
+            (2, jobs),
+        ] {
+            let opts = CompressOptions {
+                level,
+                job_size,
+                ..Default::default()
+            };
+            let mut cx = Compressor::new(CompressOptions {
+                overflow_correct_frequently: true,
+                ..opts.clone()
+            });
+            let frame = cx.compress_to_vec(&data);
+            let name = format!("L{level} job {job_size:?}");
+            assert!(cx.overflow_corrections().0 > 0, "{name}: no correction");
+            assert!(frame == compress_with(&data, &opts), "{name}");
+        }
     }
 
     #[test]
