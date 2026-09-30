@@ -41,6 +41,7 @@
 )]
 
 use crate::constants::ZSTD_WINDOWLOG_MAX;
+use crate::xxhash::Xxh64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -3742,9 +3743,10 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 // ============================================================
 
 /// Decode every block of one frame from `data[*pos..]` straight into
-/// `output`, then skip the checksum. Matches may only reach back to the
-/// frame's own start (ZSTD_decompressFrame). Frames of at least
-/// `min_parallel_blocks` blocks are decoded by `parallel` when enabled.
+/// `output`, then check the content size and checksum. Matches may only
+/// reach back to the frame's own start (ZSTD_decompressFrame). Frames of at
+/// least `min_parallel_blocks` blocks are decoded by `parallel` when
+/// enabled.
 #[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
@@ -3764,7 +3766,7 @@ fn decode_frame(
     // `execute_with_copies`, through `decoded_block_max`, on what the block
     // decodes to.
     let block_size_max = window_size.min(u64::from(MAX_BLOCK_SIZE)) as usize;
-    let frame_base = output.len();
+    let mut frame = FrameContent::new(output.len(), header.descriptor.content_checksum_flag());
 
     if let Some(fcs) = header.frame_content_size() {
         // Room for the whole frame plus what a compressed block may write
@@ -3787,7 +3789,7 @@ fn decode_frame(
         data,
         pos,
         block_size_max,
-        frame_base,
+        &mut frame,
         output,
         min_parallel_blocks,
         simd,
@@ -3798,19 +3800,11 @@ fn decode_frame(
         false
     };
     if !decoded {
-        decode_blocks(data, pos, block_size_max, scratch, frame_base, output, simd)?;
-    }
-
-    // Skip the checksum if present; this decoder does not verify it.
-    if header.descriptor.content_checksum_flag() {
-        if data.len() - *pos < 4 {
-            return Err("Error reading checksum: truncated".to_string());
-        }
-        *pos += 4;
+        decode_blocks(data, pos, block_size_max, scratch, &mut frame, output, simd)?;
     }
 
     if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame_base) as u64;
+        let decoded = (output.len() - frame.base) as u64;
         if decoded != fcs {
             return Err(format!(
                 "Frame content size mismatch: header says {}, decoded {}",
@@ -3818,7 +3812,59 @@ fn decode_frame(
             ));
         }
     }
+
+    if let Some(computed) = frame.checksum(output) {
+        let stored = data
+            .get(*pos..*pos + 4)
+            .ok_or_else(|| "Error reading checksum: truncated".to_string())?;
+        *pos += 4;
+        let stored = u32::from_le_bytes(stored.try_into().unwrap());
+        if stored != computed {
+            return Err(format!(
+                "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
+                stored, computed
+            ));
+        }
+    }
     Ok(())
+}
+
+/// A frame's content in the output: where it starts and, when the frame
+/// has a Content_Checksum, the XXH64 of what has been decoded
+/// (ZSTD_decompressFrame's `xxhState`).
+struct FrameContent {
+    /// Output position of the frame's first byte.
+    base: usize,
+    checksum: Option<Xxh64>,
+    /// Output position up to which `checksum` has been fed.
+    fed: usize,
+}
+
+impl FrameContent {
+    fn new(base: usize, has_checksum: bool) -> Self {
+        Self {
+            base,
+            checksum: has_checksum.then(Xxh64::new),
+            fed: base,
+        }
+    }
+
+    /// Feed the checksum what has been decoded since the last call. The
+    /// block loops call this after each block, while it is in cache.
+    fn feed(&mut self, output: &[u8]) {
+        if let Some(h) = &mut self.checksum {
+            h.update(&output[self.fed..]);
+            self.fed = output.len();
+        }
+    }
+
+    /// The Content_Checksum of the frame decoded into `output`: the low
+    /// half of the XXH64 of every byte from `base`, whatever the block
+    /// loops fed.
+    fn checksum(&mut self, output: &[u8]) -> Option<u32> {
+        self.feed(output);
+        self.checksum.as_ref().map(|h| h.digest() as u32)
+    }
 }
 
 /// The most the blocks at the start of `data` decode to: the sum of each
@@ -3851,7 +3897,7 @@ fn decode_blocks(
     pos: &mut usize,
     block_size_max: usize,
     scratch: &mut DecoderScratch,
-    frame_base: usize,
+    frame: &mut FrameContent,
     output: &mut Vec<u8>,
     simd: Level,
 ) -> Result<(), String> {
@@ -3869,10 +3915,11 @@ fn decode_blocks(
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
             BlockType::Compressed => {
-                decompress_block(content, block_size_max, scratch, frame_base, output, simd)?
+                decompress_block(content, block_size_max, scratch, frame.base, output, simd)?
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
+        frame.feed(output);
 
         if block.last_block {
             break;
@@ -4574,7 +4621,7 @@ mod parallel {
         data: &[u8],
         pos: &mut usize,
         block_size_max: usize,
-        frame_base: usize,
+        frame: &mut FrameContent,
         output: &mut Vec<u8>,
         min_blocks: usize,
         simd: Level,
@@ -4660,12 +4707,13 @@ mod parallel {
                     &mut slot,
                     &mut hist,
                     block_size_max,
-                    frame_base,
+                    frame.base,
                     output,
                     simd,
                 )?;
                 drop(slot);
                 spawn_decode(i + ring.len());
+                frame.feed(output);
             }
             Ok::<(), String>(())
         })?;
