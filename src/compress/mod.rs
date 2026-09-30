@@ -18,6 +18,7 @@ pub mod dfast;
 pub mod fast;
 pub mod lazy;
 pub mod matchstate;
+pub mod opt;
 pub mod params;
 pub mod seqstore;
 
@@ -363,6 +364,8 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
     let overlap_log = match overlap_log {
         // ZSTDMT_overlapLog_default
         0 => match cparams.strategy {
+            Strategy::BtUltra2 => 9,
+            Strategy::BtOpt | Strategy::BtUltra => 8,
             Strategy::Lazy2 => 7,
             Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
         },

@@ -13,7 +13,7 @@
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
 use super::seqstore::SeqStore;
-use super::{dfast, fast, lazy};
+use super::{bt, dfast, fast, lazy, opt};
 use crate::constants::*;
 use crate::fse::{self, FseState};
 use crate::huf::{self, HufState};
@@ -153,6 +153,7 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => lazy::load_prefix(ms, src, range),
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => bt::load_prefix(ms, src, range),
     }
 }
 
@@ -189,6 +190,9 @@ pub fn build_seq_store(
         Strategy::DFast => dfast::compress_block(ms, src, block.clone(), rep, store),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
             lazy::compress_block(ms, src, block.clone(), rep, store)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block(ms, src, block.clone(), rep, store)
         }
     };
     // ZSTD_storeLastLiterals

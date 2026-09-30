@@ -139,7 +139,11 @@ fn depth_of(strategy: Strategy) -> u32 {
         Strategy::Greedy => 0,
         Strategy::Lazy => 1,
         Strategy::Lazy2 => 2,
-        Strategy::Fast | Strategy::DFast => unreachable!("not a lazy strategy"),
+        Strategy::Fast
+        | Strategy::DFast
+        | Strategy::BtOpt
+        | Strategy::BtUltra
+        | Strategy::BtUltra2 => unreachable!("not a lazy strategy"),
     }
 }
 
