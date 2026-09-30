@@ -151,32 +151,6 @@ C reference: `zstd_compress.c:4971` sets `ms->nextToUpdate = ip - base` (prefix 
 
 Impact: For an 8-byte prefix, libzstd's first lazy search inserts the prefix positions into the chain or row, and a later LDM `ZSTD_ldm_fillFastTables` fills them for fast/dfast. We never insert them, so matches into the prefix differ. For a prefix under 8 bytes, libzstd cannot reference it at all, while our window starts at the prefix. Not reachable today: `overlap_size` (`mod.rs:762`) is either 0 or at least `1 << (window_log - 7)`, and two jobs of at least `JOBSIZE_MIN` give window_log ≥ 19, i.e. at least 4 KiB (at least 2 KiB with LDM). Found by reading, not probed.
 
-### R1-16: [libzstd] An ldmHashRateLog above the size-adjusted windowLog wraps `windowLog - hashRateLog` and derives ldm hashLog 30: an 8 GiB zeroed table for a 1 KiB input (port copied the bug)
-
-Severity: Medium
-
-Class: libzstd bug
-
-Rust: `src/compress/ldm.rs:123-129` — `self.window_log.wrapping_sub(self.hash_rate_log).clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX)`, commented "a rate above the window log wraps to the max". The window log has already been shrunk by `cparams.adjust(src_size)` at `src/compress/mod.rs:218`. `ldm.rs:339` then allocates and fills 2^30 eight-byte entries.
-
-C reference: `lib/compress/zstd_ldm.c:155` — `BOUNDED(ZSTD_HASHLOG_MIN, params->windowLog - params->hashRateLog, ZSTD_HASHLOG_MAX)` is computed in U32.
-- windowLog comes from `lib/compress/zstd_compress.c:1646-1650`: 27 for LDM, then ZSTD_adjustCParams_internal shrinks it to the source log, minimum 10.
-- `zstd_compress.c:2224-2226` memsets the whole `ldmHSize * sizeof(ldmEntry_t)`.
-- The mirror rule at `zstd_ldm.c:145-147` guards `windowLog > hashLog` before subtracting; this path has no such guard. The intended result is ZSTD_HASHLOG_MIN.
-
-Impact: any explicit ZSTD_c_ldmHashRateLog greater than the adjusted windowLog triggers it. Examples: rate 11 on inputs up to 1 KiB, or rate 20 on inputs up to 512 KiB. Each frame then costs an 8 GiB memset.
-
-Measured on a 1 KiB input, level 3, LDM enabled, rate 25 (rate 11 gives the same result):
-
-| | time | maxrss |
-|---|---|---|
-| libzstd | 1.69 s | 8256 MiB |
-| port | 1.70 s | 8258 MiB |
-
-Both produce the same 1034-byte frame. At rate 10 both take 0.000 s and 2 MiB. On i686 the same wrap leads to R1-15. Proven by probe (scratch, not committed).
-
-Decided 2026-10-01: derive ZSTD_HASHLOG_MIN when the hash rate log is above the adjusted window log (diverges from libzstd, see Accepted divergences).
-
 ### R1-20: No content checksum (`ZSTD_c_checksumFlag`) on the compression side
 
 Severity: Low
