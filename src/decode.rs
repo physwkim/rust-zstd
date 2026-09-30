@@ -4018,15 +4018,26 @@ mod parallel {
     ) -> Result<(), String> {
         let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, fse)?;
         let mut st = [ll, ml, of];
-        seqs.reserve(num_sequences as usize);
-        for _ in 1..num_sequences {
-            seqs.push(decode_raw_sequence(
-                &mut br, &mut st, ll_dt, ml_dt, of_dt, false,
-            ));
+        // Zero-fill first: when the executing thread last read these lines
+        // from another CCD, the fill's bulk stores take ownership of them
+        // at memory bandwidth, where the loop's 12-byte stores would stall
+        // on one cross-CCD invalidation per line (4x slower on Zen 5).
+        let n = num_sequences as usize;
+        seqs.clear();
+        seqs.reserve(n);
+        // SAFETY: `n` elements are reserved, and zero bytes are a valid
+        // `RawSeq` (three u32s).
+        unsafe {
+            ptr::write_bytes(seqs.as_mut_ptr(), 0, n);
+            seqs.set_len(n);
         }
-        seqs.push(decode_raw_sequence(
-            &mut br, &mut st, ll_dt, ml_dt, of_dt, true,
-        ));
+        let (last, rest) = seqs
+            .split_last_mut()
+            .ok_or_else(|| "Missing sequences".to_string())?;
+        for s in rest {
+            *s = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
+        }
+        *last = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
         if !br.is_finished() {
             return Err("Sequence bitstream not fully consumed".to_string());
         }
