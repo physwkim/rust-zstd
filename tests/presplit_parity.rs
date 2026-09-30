@@ -8,9 +8,8 @@
 //! - `CompressOptions::parallel(level)` against ZSTDMT at 2 MiB jobs and
 //!   overlap log 8.
 //!
-//! A case is compared only where the frames with the pre-splitter off
-//! already agree, so that the match finders produced the same blocks. Every
-//! frame decodes on both decoders.
+//! The frames with the pre-splitter off must agree too. Every frame
+//! decodes on both decoders.
 //!
 //! `blocks_match_libzstd` runs on the shared datasets (the 8 MiB ones cut to
 //! 3 MiB); the ignored `blocks_match_libzstd_on_corpus` runs on the files of
@@ -141,7 +140,6 @@ fn keys(frame: &[u8], data: &[u8], what: &str) -> Vec<(u32, usize)> {
 fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
     use sys::ZSTD_cParameter::{ZSTD_c_jobSize, ZSTD_c_nbWorkers, ZSTD_c_overlapLog};
     let (mut compared, mut presplit) = (0, 0);
-    let mut skipped = Vec::new();
     for (name, data) in &inputs {
         for level in LEVELS {
             let parallel_mt: &[_] = &[
@@ -169,10 +167,7 @@ fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
                 let ours_off = keys(&compress_with(data, &off), data, &case);
                 let theirs_off = keys(&c_frame(data, level, c_params, 1), data, &case);
                 let ours = keys(&compress_with(data, &opts), data, &case);
-                if ours_off != theirs_off {
-                    skipped.push(case);
-                    continue;
-                }
+                assert_eq!(ours_off, theirs_off, "{case}: pre-splitter off");
                 let theirs = keys(&c_frame(data, level, c_params, 0), data, &case);
                 assert_eq!(ours, theirs, "{case}: block boundaries");
                 compared += 1;
@@ -180,7 +175,7 @@ fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
             }
         }
     }
-    eprintln!("compared {compared}, pre-split {presplit}, skipped {skipped:?}");
+    eprintln!("compared {compared}, pre-split {presplit}");
     presplit
 }
 
