@@ -184,14 +184,6 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
         };
         pos += header_len;
 
-        let window_size = frame_header.window_size()?;
-        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-            return Err(format!(
-                "Window size {} exceeds maximum allowed {}",
-                window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
-            ));
-        }
-
         let scratch = scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
         let simd = if opts.simd {
@@ -2697,12 +2689,6 @@ fn decompress_literals(
         .num_streams
         .ok_or_else(|| "Missing num_streams".to_string())?;
     let regenerated_size = section.regenerated_size as usize;
-    if regenerated_size > MAX_BLOCK_SIZE as usize {
-        return Err(format!(
-            "Literals size {} exceeds block size limit",
-            regenerated_size
-        ));
-    }
 
     let source = &source[0..compressed_size];
     let mut bytes_read = 0usize;
@@ -3745,6 +3731,16 @@ fn decode_frame(
     min_parallel_blocks: usize,
     simd: Level,
 ) -> Result<(), String> {
+    let window_size = header.window_size()?;
+    if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
+        return Err(format!(
+            "Window size {} exceeds maximum allowed {}",
+            window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
+        ));
+    }
+    // Block_Maximum_Size (fParams.blockSizeMax), the bound `split_block`
+    // puts on every compressed block and its literals.
+    let block_size_max = window_size.min(u64::from(MAX_BLOCK_SIZE)) as usize;
     let frame_base = output.len();
 
     if let Some(fcs) = header.frame_content_size() {
@@ -3760,15 +3756,22 @@ fn decode_frame(
     }
 
     #[cfg(feature = "parallel")]
-    let decoded =
-        parallel::decode_frame_blocks(data, pos, frame_base, output, min_parallel_blocks, simd)?;
+    let decoded = parallel::decode_frame_blocks(
+        data,
+        pos,
+        block_size_max,
+        frame_base,
+        output,
+        min_parallel_blocks,
+        simd,
+    )?;
     #[cfg(not(feature = "parallel"))]
     let decoded = {
         let _ = min_parallel_blocks;
         false
     };
     if !decoded {
-        decode_blocks(data, pos, scratch, frame_base, output, simd)?;
+        decode_blocks(data, pos, block_size_max, scratch, frame_base, output, simd)?;
     }
 
     // Skip the checksum if present; this decoder does not verify it.
@@ -3796,6 +3799,7 @@ fn decode_frame(
 fn decode_blocks(
     data: &[u8],
     pos: &mut usize,
+    block_size_max: usize,
     scratch: &mut DecoderScratch,
     frame_base: usize,
     output: &mut Vec<u8>,
@@ -3814,7 +3818,9 @@ fn decode_blocks(
             BlockType::RLE => {
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
-            BlockType::Compressed => decompress_block(content, scratch, frame_base, output, simd)?,
+            BlockType::Compressed => {
+                decompress_block(content, block_size_max, scratch, frame_base, output, simd)?
+            }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
 
@@ -3839,9 +3845,25 @@ struct BlockParts<'a> {
     sequences_src: &'a [u8],
 }
 
-fn split_block(raw: &[u8]) -> Result<BlockParts<'_>, String> {
+/// Locate the sections of compressed block `raw` in a frame whose
+/// Block_Maximum_Size is `block_size_max`, which bounds the block and its
+/// literals (ZSTD_decompressBlock_internal, ZSTD_decodeLiteralsBlock).
+fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, String> {
+    if raw.len() > block_size_max {
+        return Err(format!(
+            "Compressed block size {} exceeds Block_Maximum_Size {}",
+            raw.len(),
+            block_size_max
+        ));
+    }
     let mut section = LiteralsSection::new();
     let bytes_in_literals_header = section.parse_from_header(raw)?;
+    if section.regenerated_size as usize > block_size_max {
+        return Err(format!(
+            "Literals size {} exceeds Block_Maximum_Size {}",
+            section.regenerated_size, block_size_max
+        ));
+    }
     let raw = &raw[bytes_in_literals_header as usize..];
 
     let upper_limit_for_literals = match section.compressed_size {
@@ -3896,12 +3918,13 @@ fn decode_block_literals(
 
 fn decompress_block(
     raw: &[u8],
+    block_size_max: usize,
     workspace: &mut DecoderScratch,
     frame_base: usize,
     output: &mut Vec<u8>,
     simd: Level,
 ) -> Result<(), String> {
-    let parts = split_block(raw)?;
+    let parts = split_block(raw, block_size_max)?;
     decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
     let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
     let seq_section = parts.sequences;
@@ -3986,7 +4009,11 @@ mod parallel {
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
     /// decoder's scratch tables carry them from block to block.
-    fn plan_frame<'a>(data: &'a [u8], pos: &mut usize) -> Result<Vec<Plan<'a>>, String> {
+    fn plan_frame<'a>(
+        data: &'a [u8],
+        pos: &mut usize,
+        block_size_max: usize,
+    ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
         let mut huf_def = None;
         let mut fse_def: [Option<usize>; 3] = [None; 3];
@@ -4002,7 +4029,7 @@ mod parallel {
                 BlockType::Raw => Plan::Raw(content),
                 BlockType::RLE => Plan::Rle(content[0], block.decompressed_size as usize),
                 BlockType::Compressed => {
-                    let parts = split_block(content)?;
+                    let parts = split_block(content, block_size_max)?;
                     let huf = match parts.literals.ls_type {
                         LiteralsSectionType::Compressed => {
                             huf_def = Some(i);
@@ -4486,6 +4513,7 @@ mod parallel {
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
+        block_size_max: usize,
         frame_base: usize,
         output: &mut Vec<u8>,
         min_blocks: usize,
@@ -4495,7 +4523,7 @@ mod parallel {
             return Ok(false);
         }
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end)?;
+        let plans = plan_frame(data, &mut end, block_size_max)?;
         if plans.len() < min_blocks {
             return Ok(false);
         }
