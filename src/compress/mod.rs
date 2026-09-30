@@ -238,10 +238,10 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 
 /// A reusable `ZSTD_CCtx`: the options plus, as ZSTDMT keeps one context
 /// per job, a pool of per-job match states and block buffers that grows on
-/// demand and is kept across calls. A call sizes the tables for its input
-/// like `ZSTD_resetCCtx_internal` with `ZSTDcrp_makeClean`: allocations
-/// that are large enough are zeroed and kept, smaller ones replaced. Every
-/// frame is identical to [`compress_with`]'s.
+/// demand and is kept across calls. Each job's match state is reset for
+/// its input like `ZSTD_resetCCtx_internal`: indices continue from its
+/// previous input and its tables are kept, see [`MatchState::reset`].
+/// Every frame is identical to [`compress_with`]'s.
 pub struct Compressor {
     opts: CompressOptions,
     jobs: Vec<JobContext>,
@@ -272,9 +272,9 @@ impl Compressor {
     }
 
     /// Test hook for `CompressOptions::overflow_correct_frequently`: the
-    /// window overflow corrections of the match states and of the long
-    /// distance matchers since each was last reset, which for a fresh
-    /// `Compressor` are those of its one frame.
+    /// window overflow corrections of the match states since each last
+    /// restarted its indices, and of the long distance matchers since each
+    /// was last reset; for a fresh `Compressor`, those of its one frame.
     #[doc(hidden)]
     pub fn overflow_corrections(&self) -> (u32, u32) {
         let ms = self.jobs.iter().filter_map(|ctx| ctx.ms.as_ref());
@@ -748,6 +748,7 @@ fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::matchstate::WINDOW_START_INDEX;
 
     #[test]
     fn compress_empty() {
@@ -1527,8 +1528,10 @@ mod tests {
     }
 
     /// A `Compressor` fed different inputs back to back, so that its tables
-    /// grow, shrink and grow again and its job pool is reused, produces the
-    /// frames fresh `compress_with` calls produce.
+    /// shrink and grow again within their allocations and its job pool is
+    /// reused, continues every context's indices from its previous input
+    /// and still produces the frames fresh `compress_with` calls produce,
+    /// for every strategy.
     #[test]
     fn reused_compressor_matches_fresh_compress_with() {
         let a = text(1280 << 10);
@@ -1536,7 +1539,13 @@ mod tests {
         b.extend_from_slice(&text(384 << 10));
         let c = text(100 << 10);
         let empty = Vec::new();
-        for level in [1, 3, 7, 11] {
+        // The bt levels on smaller inputs: this runs unoptimized.
+        let (a_bt, b_bt, c_bt) = (&a[..600 << 10], &b[320 << 10..], &c[..40 << 10]);
+        let cases = [-5, 1, 2, 3, 5, 7, 11]
+            .map(|level| (level, [&a[..], &b, &c, &a, &empty]))
+            .into_iter()
+            .chain([13, 16, 19].map(|level| (level, [a_bt, b_bt, c_bt, a_bt, &empty])));
+        for (level, inputs) in cases {
             for job_size in [None, Some(512 << 10)] {
                 let opts = CompressOptions {
                     level,
@@ -1545,7 +1554,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut cx = Compressor::new(opts.clone());
-                for input in [&a, &b, &c, &a, &empty] {
+                for input in inputs {
                     let reused = cx.compress_to_vec(input);
                     assert!(
                         reused == compress_with(input, &opts),
@@ -1553,10 +1562,14 @@ mod tests {
                         input.len()
                     );
                 }
+                for ctx in &cx.jobs {
+                    let low = ctx.ms.as_ref().unwrap().window_low();
+                    assert!(low > WINDOW_START_INDEX, "level {level}: indices restarted");
+                }
                 let mut out = b"prefix".to_vec();
-                cx.compress(&b, &mut out);
+                cx.compress(inputs[1], &mut out);
                 assert!(out.starts_with(b"prefix"));
-                assert!(out[6..] == compress_with(&b, &opts)[..]);
+                assert!(out[6..] == compress_with(inputs[1], &opts)[..]);
             }
         }
     }

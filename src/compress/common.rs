@@ -15,8 +15,8 @@ pub const K_SEARCH_STRENGTH: u32 = 8;
 
 /// The input as the match finders address it: `window.base`. Byte `i` of
 /// the view is at index `i + lo()`, the index [`MatchState`] assigns to
-/// it (`ZSTD_WINDOW_START_INDEX` for the window's first byte); indices
-/// below `lo()` or from `end()` on are not readable. The finders get their
+/// it (the window's first byte is `window_low`); indices below `lo()` or
+/// from `end()` on are not readable. The finders get their
 /// view from [`MatchState::view`], so every index they compute is in the
 /// state's index space.
 ///
