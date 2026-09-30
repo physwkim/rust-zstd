@@ -924,7 +924,6 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     let ll0 = (opt[c].litlen == 0) as u32;
                     let previous_price = opt[c].price;
                     let base_price = previous_price + stats.ll_price::<OPT_LEVEL>(0);
-                    let cur_rep = opt[c].rep;
                     // SAFETY: `inr <= ilimit` so `inr + 8 <= iend`,
                     // `inr > ip >= window_low`.
                     let mut nb_matches = unsafe {
@@ -935,7 +934,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                             src,
                             inr,
                             iend,
-                            &cur_rep,
+                            &opt[c].rep,
                             ll0,
                             min_match,
                         )
