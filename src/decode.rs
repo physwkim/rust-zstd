@@ -3838,11 +3838,21 @@ mod parallel {
         off_base: u32,
     }
 
-    /// A ring position: its slot and the index plus one of the last block
-    /// decoded into it.
+    /// A ring position: its slot, and the index plus one of the last block
+    /// claimed for decoding into it and of the last block decoded into it.
     struct RingSlot {
+        claimed: AtomicUsize,
         done: AtomicUsize,
         slot: Mutex<Slot>,
+    }
+
+    impl RingSlot {
+        /// Take block `i`'s decode; false if someone already has. A task
+        /// that runs after block `i` has been decoded and its position
+        /// reused finds a later block's claim and fails too.
+        fn claim(&self, i: usize) -> bool {
+            self.claimed.fetch_max(i + 1, Ordering::AcqRel) < i + 1
+        }
     }
 
     /// Publishes a finished decode on drop.
@@ -4286,9 +4296,14 @@ mod parallel {
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
-        // spawned once block `i - ring.len()` has been executed from it.
+        // spawned once block `i - ring.len()` has been executed from it, or
+        // by the executing thread if no task has started it by the time
+        // that thread needs block `i`, or waits for block `i - 1`. It
+        // decodes no block further ahead, so a block it needs is never left
+        // waiting behind the decode of a later one.
         let ring: Vec<RingSlot> = (0..(2 * rayon::current_num_threads()).min(plans.len()))
             .map(|_| RingSlot {
+                claimed: AtomicUsize::new(0),
                 done: AtomicUsize::new(0),
                 slot: Mutex::new(Slot::new()),
             })
@@ -4302,6 +4317,9 @@ mod parallel {
                 };
                 let cell = &ring[i % ring.len()];
                 s.spawn_fifo(move |_| {
+                    if !cell.claim(i) {
+                        return;
+                    }
                     // Marks the block done even if decoding panics, so that
                     // the executing thread finds the poisoned lock instead
                     // of waiting forever.
@@ -4315,16 +4333,34 @@ mod parallel {
             }
             for (i, plan) in plans.iter().enumerate() {
                 let cell = &ring[i % ring.len()];
-                if let Plan::Compressed(_) = plan {
-                    while cell.done.load(Ordering::Acquire) != i + 1 {
-                        // Run queued decodes (block `i`'s, if no worker has
-                        // taken it yet) rather than only wait.
-                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
-                            std::hint::spin_loop();
-                        }
+                let mut slot = match plan {
+                    Plan::Compressed(cp) if cell.claim(i) => {
+                        let mut slot = cell.slot.lock().unwrap();
+                        slot.result = decode_block(&mut slot, i, cp, plans);
+                        slot
                     }
-                }
-                let mut slot = cell.slot.lock().unwrap();
+                    Plan::Compressed(_) => {
+                        while cell.done.load(Ordering::Acquire) != i + 1 {
+                            // If no task has started block `i + 1` either,
+                            // the decoders are behind: decode it here while
+                            // block `i` finishes. Its position is free, as
+                            // block `i + 1 - ring.len()` has been executed.
+                            let next = &ring[(i + 1) % ring.len()];
+                            match plans.get(i + 1) {
+                                Some(Plan::Compressed(np)) if next.claim(i + 1) => {
+                                    let _done = MarkDone(&next.done, i + 2);
+                                    let mut slot = next.slot.lock().unwrap();
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans);
+                                }
+                                // Hand the CPU to a worker the kernel may
+                                // have queued on it.
+                                _ => std::thread::yield_now(),
+                            }
+                        }
+                        cell.slot.lock().unwrap()
+                    }
+                    _ => cell.slot.lock().unwrap(),
+                };
                 execute_block(plan, &mut slot, &mut hist, frame_base, output, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
