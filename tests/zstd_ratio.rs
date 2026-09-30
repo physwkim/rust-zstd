@@ -41,8 +41,7 @@ fn compression_ratios_by_level() {
 
 /// libzstd single-threaded frame at `level` with both block splitters off
 /// (`ZSTD_c_blockSplitterLevel` = 1, `ZSTD_c_splitAfterSequences` =
-/// `ZSTD_ps_disable`): this crate has neither, so with them off libzstd
-/// compresses the same 128 KiB blocks.
+/// `ZSTD_ps_disable`).
 fn zstd_nosplit(data: &[u8], level: i32) -> Vec<u8> {
     unsafe {
         let cctx = sys::ZSTD_createCCtx();
@@ -68,13 +67,12 @@ fn zstd_nosplit(data: &[u8], level: i32) -> Vec<u8> {
     }
 }
 
-/// Levels 13-15 on inputs above 256 KiB run btlazy2 in both codecs, so with
-/// libzstd's splitters off the sequences and therefore the frame sizes are
-/// the same: no tolerance. With its splitters on libzstd is up to 1.3%
-/// smaller on these inputs (none on words); that gap is printed, not
-/// asserted, because it belongs to the splitters this crate lacks.
+/// Levels 13-15 on inputs above 256 KiB run btlazy2 in both codecs, so the
+/// sequences and therefore the frame sizes are the same, by default (the
+/// pre-splitter at `splitLevels[btlazy2]`, no post-sequence splitter below
+/// btopt) and with both splitters off: no tolerance.
 #[test]
-fn btlazy2_sizes_equal_libzstd_without_splitters() {
+fn btlazy2_sizes_equal_libzstd() {
     for ds in datasets() {
         if !matches!(ds.name, "rust_src_8m" | "elf_8m" | "words_1m") {
             continue;
@@ -82,6 +80,14 @@ fn btlazy2_sizes_equal_libzstd_without_splitters() {
         let data = &ds.data[..ds.data.len().min(MIB)];
         for level in [13, 14, 15] {
             let ours = rust_zstd::compress(data, level);
+            let ours_nosplit = rust_zstd::compress_with(
+                data,
+                &rust_zstd::CompressOptions {
+                    level,
+                    block_splitter_level: 1,
+                    ..Default::default()
+                },
+            );
             assert_eq!(
                 rust_zstd::decompress(&ours).as_deref(),
                 Ok(data),
@@ -91,13 +97,15 @@ fn btlazy2_sizes_equal_libzstd_without_splitters() {
             let c = zstd_nosplit(data, level);
             let c_default = zstd::bulk::compress(data, level).unwrap();
             eprintln!(
-                "{} level {level}: ours {} libzstd no-split {} default {}",
+                "{} level {level}: ours {} no-split {}, libzstd {} no-split {}",
                 ds.name,
                 ours.len(),
-                c.len(),
-                c_default.len()
+                ours_nosplit.len(),
+                c_default.len(),
+                c.len()
             );
-            assert_eq!(ours.len(), c.len(), "{} level {level}", ds.name);
+            assert_eq!(ours.len(), c_default.len(), "{} level {level}", ds.name);
+            assert_eq!(ours_nosplit.len(), c.len(), "{} level {level}", ds.name);
         }
     }
 }
