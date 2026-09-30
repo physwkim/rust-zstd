@@ -88,10 +88,10 @@ const fn bitmix(mut val: u64, len: u64) -> u64 {
     val ^ (val >> 28)
 }
 
-/// The `hashSalt` of a freshly created `ZSTD_CCtx`: `ZSTD_advanceHashSalt`
-/// applied to `hashSalt == 0` and `hashSaltEntropy == 0`.
-pub(super) const fn initial_hash_salt() -> u64 {
-    bitmix(0, 8) ^ bitmix(0, 4)
+/// `ZSTD_advanceHashSalt`: the salt a context reset mixes from the previous
+/// salt and the entropy the row searches since collected.
+pub(super) const fn advance_hash_salt(salt: u64, entropy: u32) -> u64 {
+    bitmix(salt, 8) ^ bitmix(entropy as u64, 4)
 }
 
 /// `BOUNDED(4, minMatch, 6)`.
@@ -270,7 +270,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
 /// `ZSTD_DUBT_UNSORTED_MARK`: the second slot of a node that was inserted
 /// by [`BtSearch::update_dubt`] but not yet sorted into the tree. No real
 /// candidate is ever `1`: candidates are `> window_low >= WINDOW_START_INDEX`.
-const DUBT_UNSORTED_MARK: usize = 1;
+pub(super) const DUBT_UNSORTED_MARK: usize = 1;
 
 /// `search_binaryTree`: a "delayed update binary tree" in the chain table,
 /// two entries per position (`bt[2 * (idx & btMask)]` the smaller child,
@@ -292,7 +292,7 @@ const BT_DUMMY: usize = usize::MAX;
 struct BtParams {
     /// `btMask = (1 << (chainLog - 1)) - 1`.
     bt_mask: usize,
-    /// `window.lowLimit` (`ms.window_low`).
+    /// `window.lowLimit` (`ms.window_low()`).
     window_valid: usize,
     /// `1 << windowLog`.
     max_distance: usize,
@@ -302,7 +302,7 @@ impl BtParams {
     fn of(ms: &MatchState) -> Self {
         BtParams {
             bt_mask: (1usize << (ms.cparams.chain_log - 1)) - 1,
-            window_valid: ms.window_low,
+            window_valid: ms.window_low(),
             max_distance: 1usize << ms.cparams.window_log,
         }
     }
@@ -1216,7 +1216,7 @@ fn lazy_generic<S: Search>(
     let mut anchor = istart;
     // Below `istart + 1` the loop conditions are false anyway.
     let ilimit = iend.saturating_sub(S::ILIMIT_MARGIN);
-    let prefix_lowest = ms.window_low;
+    let prefix_lowest = ms.window_low();
 
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
@@ -1757,16 +1757,15 @@ pub fn compress_block_with(
 /// `ms.search_method`: insert every
 /// position of `range` up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
-/// at `iend - HASH_READ_SIZE`) and set `next_to_update =
-/// end`. Expects the tables of a fresh [`MatchState`] (C zeroes the tag table
-/// here; `MatchState::new` already did). The hash width is `BOUNDED(4,
-/// minMatch, 6)` as in the block loop, where C's chain loader passes
-/// `minMatch` itself; they differ only for `minMatch == 7`, which no level
-/// table produces.
+/// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
+/// finder's tag table is zeroed first, as C does here. The hash width is
+/// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
+/// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
+/// level table produces.
 pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     let end = range.end;
     assert_block_bounds(ms, src, end);
-    let start = ms.next_to_update.max(range.start).max(ms.window_low);
+    let start = ms.next_to_update.max(range.start).max(ms.window_low());
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
@@ -1787,6 +1786,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
                 };
             }
             SearchMethod::RowHash => {
+                ms.ws.tables_mut().2.fill(0);
                 macro_rules! go {
                     ($mls:literal, $row_log:literal) => {
                         unsafe {
@@ -1822,6 +1822,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
 mod tests {
     use super::super::common::testutil::run_block;
     use super::*;
+    use crate::compress::matchstate::WINDOW_START_INDEX;
     use crate::compress::params::CParams;
     use crate::constants::ZSTD_BLOCKSIZE_MAX;
 
@@ -2081,15 +2082,15 @@ mod tests {
     }
 
     /// `MatchState::reset` on a context that compressed something else, with
-    /// other table sizes, leaves exactly `MatchState::new`'s state (tables,
-    /// update pointer, salt) and therefore the same sequences from both
-    /// finders, in either direction of table growth.
+    /// other table sizes, gives the sequences of `MatchState::new` from both
+    /// finders: smaller tables continue the indices over the first input's
+    /// entries, larger ones outgrow the allocation and restart them.
     #[test]
     fn reset_context_matches_fresh_context() {
         let a = crate_sources();
         let b = current_exe(300_000);
         // Explicit table sizes: the level tables give both inputs the same
-        // hash_log, and the reset must shrink and grow the allocations.
+        // hash_log, and the reset must shrink and grow the tables.
         let mut cp_a = lazy_params(11, a.len(), Strategy::Lazy2, 5);
         cp_a.hash_log = 20;
         cp_a.chain_log = 20;
@@ -2098,18 +2099,23 @@ mod tests {
         cp_b.chain_log = 16;
         let level = Level::new();
         for m in METHODS {
-            for (first, cp_first, second, cp_second) in [(&a, cp_a, &b, cp_b), (&b, cp_b, &a, cp_a)]
+            for (first, cp_first, second, cp_second, continues) in
+                [(&a, cp_a, &b, cp_b, true), (&b, cp_b, &a, cp_a, false)]
             {
                 let mut reused = MatchState::new_for(cp_first, 0, m);
                 collect_on(&mut reused, first, 40_000, level);
-                assert!(reused.tables().0.iter().any(|&e| e != 0));
                 reused.reset_for(cp_second, 0, m);
                 let mut fresh = MatchState::new_for(cp_second, 0, m);
-                assert!(reused.tables() == fresh.tables());
-                assert_eq!(reused.next_to_update, fresh.next_to_update);
-                assert_eq!(reused.window_low, fresh.window_low);
-                assert_eq!(reused.hash_salt, fresh.hash_salt);
-                assert_eq!(reused.hash_salt_entropy, fresh.hash_salt_entropy);
+                if continues {
+                    assert_eq!(reused.window_low(), WINDOW_START_INDEX + first.len());
+                    assert!(reused.tables().0.iter().any(|&e| e != 0));
+                } else {
+                    assert_eq!(reused.window_low(), WINDOW_START_INDEX);
+                    assert!(reused.tables() == fresh.tables());
+                }
+                assert_eq!(reused.next_to_update, reused.window_low());
+                // Only the reused context's second reset advanced its salt.
+                assert_ne!(reused.hash_salt, fresh.hash_salt);
                 assert_eq!(reused.cparams, fresh.cparams);
                 let (r_store, r_rep) = collect_on(&mut reused, second, 40_000, level);
                 let (f_store, f_rep) = collect_on(&mut fresh, second, 40_000, level);
@@ -2389,8 +2395,8 @@ mod tests {
     fn salt_and_hash_match_c_constants() {
         // ZSTD_bitmix(0, 8) ^ ZSTD_bitmix(0, 4), evaluated by hand from the
         // C definition: both terms are pure functions of `len`.
-        assert_eq!(initial_hash_salt(), bitmix(0, 8) ^ bitmix(0, 4));
-        assert_ne!(initial_hash_salt(), 0);
+        assert_eq!(advance_hash_salt(0, 0), bitmix(0, 8) ^ bitmix(0, 4));
+        assert_ne!(advance_hash_salt(0, 0), 0);
         let src = b"abcdefghijklmnop";
         // SAFETY: `0 + 8 <= src.len()`.
         let (h4, h5, h6) = unsafe {

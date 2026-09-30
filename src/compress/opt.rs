@@ -503,7 +503,7 @@ pub fn compress_block(
             // prefix, no ldm preprocessing.
             let (src, block) = if state.stats.lit_length_sum == 0 // first block
                 && out.seqs.is_empty() // no ldm
-                && block.start == ms.window_low // start of frame, nothing loaded nor skipped
+                && block.start == ms.window_low() // start of frame, nothing loaded nor skipped
                 && block.len() > ZSTD_PREDEF_THRESHOLD
             {
                 init_stats_ultra(ms, &mut state, src, block, rep, out, finders)
@@ -535,7 +535,7 @@ fn init_stats_ultra<'a>(
     let mut tmp_rep = *rep; // updated rep codes will sink here
     debug_assert!(state.stats.lit_length_sum == 0); // first block
     debug_assert!(out.seqs.is_empty()); // no ldm
-    debug_assert_eq!(ms.next_to_update, ms.window_low); // no prefix
+    debug_assert_eq!(ms.next_to_update, ms.window_low()); // no prefix
 
     // generate stats into ms.opt
     opt_generic::<2>(ms, state, src, block.clone(), &mut tmp_rep, out, finders);
@@ -734,7 +734,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     // init
     stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end));
     // C: `ip += (ip == prefixStart)`
-    let prefix_lowest = ms.window_low;
+    let prefix_lowest = ms.window_low();
     let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
@@ -1216,11 +1216,11 @@ mod tests {
             );
             assert!(out.seqs.is_empty() && out.lits.is_empty());
             assert!(state.stats.lit_length_sum > 0, "mm{min_match}");
-            assert_eq!(ms.window_low, WINDOW_START_INDEX + data.len());
+            assert_eq!(ms.window_low(), WINDOW_START_INDEX + data.len());
             assert_eq!(block, ms.index(0)..ms.index(data.len()));
             assert_eq!(ms.next_to_update, block.start, "mm{min_match}");
             assert_eq!(view.slice(block.start, block.end), &data[..]);
-            let low = ms.window_low as u32;
+            let low = ms.window_low() as u32;
             let (hash, chain, hash3) = ms.ws.opt_tables_mut();
             assert!(hash.iter().any(|&e| e != 0), "mm{min_match}: hash");
             for (name, t) in [("hash", &*hash), ("chain", &*chain), ("hash3", &*hash3)] {

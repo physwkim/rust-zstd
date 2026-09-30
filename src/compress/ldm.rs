@@ -10,15 +10,16 @@
 //! then runs the strategy's block compressor on the literals between those
 //! sequences and stores the sequences themselves verbatim.
 //!
-//! Positions are absolute indices into the input, as everywhere in the
-//! compressor. libzstd's window indices are these positions plus a
-//! constant, so every comparison is the same; its overflow correction
-//! (`ZSTD_ldm_reduceTable`, from 3500 MiB of input on) is not ported, as
-//! for the match state.
+//! The hash table holds `u32` indices of the state's own [`Window`], as
+//! libzstd's `ldmState->window`: the first byte of the input is
+//! [`WINDOW_START_INDEX`](super::matchstate::WINDOW_START_INDEX), and
+//! before a 1 MiB chunk would end above
+//! [`CURRENT_MAX`](super::matchstate::CURRENT_MAX) the window is corrected
+//! and the table reduced (`ZSTD_ldm_reduceTable`).
 
 use super::block;
 use super::common::{count, prefetch_l1, Src, HASH_READ_SIZE};
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, MatchState, Window};
 use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
@@ -306,9 +307,9 @@ pub struct LdmState {
     params: LdmParams,
     hash_table: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,
-    /// `window.lowLimit` (== `dictLimit`) as a position: entries at or
-    /// below it are stale, and a match may extend backwards down to it.
-    low: usize,
+    /// `window`: entries at or below its `lowLimit` are stale, and a match
+    /// may extend backwards down to it.
+    window: Window,
     /// `zc->ldmSequences`: a block's sequences on the single-context path.
     block_seqs: RawSeqStore,
 }
@@ -321,7 +322,7 @@ impl LdmState {
             params,
             hash_table: Vec::new(),
             bucket_offsets: Vec::new(),
-            low: first,
+            window: Window::new(first, false),
             block_seqs: RawSeqStore::default(),
         };
         state.reset(params, first);
@@ -330,7 +331,8 @@ impl LdmState {
 
     /// `ZSTD_resetCCtx_internal` / `ZSTDMT_serialState_reset`: zeroed
     /// tables for `params` (kept allocations are reused) and an empty
-    /// window starting at `first`.
+    /// window starting at `first`. The overflow correction knob
+    /// ([`LdmState::set_correct_frequently`]) survives the reset.
     pub fn reset(&mut self, params: LdmParams, first: usize) {
         debug_assert!(params.window_log != 0, "LdmParams::adjusted not applied");
         self.params = params;
@@ -340,11 +342,23 @@ impl LdmState {
         self.bucket_offsets.clear();
         self.bucket_offsets
             .resize(1 << (params.hash_log - params.bucket_size_log), 0);
-        self.low = first;
+        self.window = Window::new(first, self.window.correct_frequently());
         self.block_seqs = RawSeqStore {
             seqs: std::mem::take(&mut self.block_seqs.seqs),
             ..Default::default()
         };
+    }
+
+    /// Test knob: `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, see
+    /// [`Window::need_overflow_correction`].
+    #[doc(hidden)]
+    pub fn set_correct_frequently(&mut self, on: bool) {
+        self.window.set_correct_frequently(on);
+    }
+
+    /// `window`.
+    pub fn window(&self) -> &Window {
+        &self.window
     }
 
     pub fn params(&self) -> &LdmParams {
@@ -365,15 +379,24 @@ impl LdmState {
         out.seqs.clear();
         out.pos = 0;
         out.pos_in_sequence = 0;
-        let max_dist = 1usize << self.params.window_log;
+        let max_dist = 1u32 << self.params.window_log;
         let mut leftover = 0usize;
         let mut chunk_start = range.start;
         // The input could be very large (in zstdmt), so it must be broken
-        // up into chunks to enforce the maximum distance.
+        // up into chunks to enforce the maximum distance and handle
+        // overflow correction.
         while chunk_start < range.end && out.seqs.len() < max_seqs {
             let chunk_end = range.end.min(chunk_start + MAX_CHUNK_SIZE);
-            // ZSTD_window_enforceMaxDist(&ldmState->window, chunkEnd, ...)
-            self.low = self.low.max(chunk_end.saturating_sub(max_dist));
+            // 1. Perform overflow correction if necessary.
+            if self
+                .window
+                .need_overflow_correction(0, max_dist, chunk_start, chunk_end)
+            {
+                let correction = self.window.correct_overflow(0, max_dist, chunk_start);
+                reduce_table(&mut self.hash_table, correction);
+            }
+            // 2. We enforce the maximum offset allowed.
+            self.window.enforce_max_dist(chunk_end, max_dist as usize);
             let prev = out.seqs.len();
             let new_leftover =
                 self.generate_sequences_internal(src, chunk_start..chunk_end, &mut out.seqs);
@@ -427,7 +450,9 @@ impl LdmState {
         let min_match = params.min_match_length as usize;
         let ents_per_bucket = 1usize << params.bucket_size_log;
         let h_bits = params.hash_log - params.bucket_size_log;
-        let lowest = self.low;
+        let window = self.window;
+        let lowest = window.low();
+        let low_pos = window.pos(lowest);
         let (istart, iend) = (chunk.start, chunk.end);
         // Below `istart + min_match` the loop condition is false anyway.
         let ilimit = iend.saturating_sub(HASH_READ_SIZE);
@@ -457,8 +482,9 @@ impl LdmState {
             }
 
             for &(split, hash, checksum) in &candidates[..num_splits] {
+                let split_index = window.index(split) as u32;
                 let new_entry = LdmEntry {
-                    offset: split as u32,
+                    offset: split_index,
                     checksum,
                 };
 
@@ -478,15 +504,15 @@ impl LdmState {
                     if cur.checksum != checksum || cur.offset as usize <= lowest {
                         continue;
                     }
-                    let p_match = cur.offset as usize;
+                    let p_match = window.pos(cur.offset as usize);
                     // SAFETY: every entry is an earlier split, so
-                    // `p_match < split < iend <= src.len()`. The LDM table
-                    // holds positions, so `src` is read at index = position.
+                    // `p_match < split < iend <= src.len()`; `src` is read
+                    // at index = position.
                     let cur_forward = unsafe { count(Src::new(src, 0, 0), split, p_match, iend) };
                     if cur_forward < min_match {
                         continue;
                     }
-                    let cur_backward = count_backwards(src, split, anchor, p_match, lowest);
+                    let cur_backward = count_backwards(src, split, anchor, p_match, low_pos);
                     let cur_total = cur_forward + cur_backward;
                     if cur_total > best_length {
                         best_length = cur_total;
@@ -503,7 +529,7 @@ impl LdmState {
 
                 // Match found
                 seqs.push(RawSeq {
-                    offset: split as u32 - best_offset,
+                    offset: split_index - best_offset,
                     lit_length: (split - backward - anchor) as u32,
                     match_length: (forward + backward) as u32,
                 });
@@ -528,6 +554,14 @@ impl LdmState {
         }
 
         iend - anchor
+    }
+}
+
+/// `ZSTD_ldm_reduceTable`: subtract `reducer` from every entry's index,
+/// squashing the ones below it to `0`.
+fn reduce_table(table: &mut [LdmEntry], reducer: u32) {
+    for entry in table {
+        entry.offset = entry.offset.saturating_sub(reducer);
     }
 }
 
@@ -1193,5 +1227,63 @@ mod tests {
         assert!(run(18, 0).is_empty());
         // starting at 1 (the harness convention) changes only `low`
         assert_eq!(run(20, 1).len(), seqs.len());
+    }
+
+    /// `ZSTD_ldm_reduceTable`: an index below the reducer becomes 0.
+    #[test]
+    fn reduce_table_squashes_below_reducer() {
+        let mut table = [0, 99, 100, 101, 5000].map(|offset| LdmEntry {
+            offset,
+            checksum: 7,
+        });
+        reduce_table(&mut table, 100);
+        assert_eq!(table.map(|e| e.offset), [0, 0, 0, 1, 4900]);
+        assert!(table.iter().all(|e| e.checksum == 7));
+    }
+
+    /// With `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY` a 1 MiB window is
+    /// corrected once past 1 MiB, 2 MiB and 3 MiB above its previous
+    /// correction (`nbOverflowCorrections` backs the threshold off), and
+    /// the sequences are those of the uncorrected window, which has to
+    /// drop the repeats from more than 1 MiB back.
+    #[test]
+    fn frequent_correction_keeps_sequences() {
+        let len = 6 << 20;
+        let mut data = Vec::with_capacity(len + 4096);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        while data.len() < len {
+            let dist = [300 << 10, 900 << 10, (1 << 20) + 4096, 2 << 20][(x & 3) as usize];
+            if data.len() >= dist {
+                let start = data.len() - dist;
+                data.extend_from_within(start..start + 4096);
+            }
+            for _ in 0..4096 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                data.push((x >> 56) as u8);
+            }
+        }
+        let params = LdmParams {
+            window_log: 20,
+            ..params(16, 4, 4)
+        };
+        let run = |frequently: bool| {
+            let mut state = LdmState::new(params, 0);
+            state.set_correct_frequently(frequently);
+            let mut out = RawSeqStore::default();
+            let mut seqs = Vec::new();
+            for start in (0..len).step_by(128 << 10) {
+                state.generate_sequences(&data, start..start + (128 << 10), usize::MAX, &mut out);
+                seqs.extend_from_slice(&out.seqs);
+            }
+            (seqs, state.window().nb_overflow_corrections())
+        };
+        let (off, none) = run(false);
+        let (on, corrections) = run(true);
+        assert_eq!(none, 0);
+        assert_eq!(corrections, 3);
+        assert!(off.len() > 100);
+        assert!(on == off);
     }
 }

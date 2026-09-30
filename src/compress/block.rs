@@ -10,7 +10,7 @@
 //! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
 //! discard the candidate, including its repeat offsets.
 
-use super::common::Src;
+use super::common::{Src, HASH_READ_SIZE};
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
 use super::matchstate::{Block, MatchState};
 use super::params::{CParams, Strategy};
@@ -154,12 +154,18 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 /// indexed ("larger than we can reasonably index in our tables"); matches
 /// may still reach the whole prefix, which `window_low` keeps valid.
 /// `range` is in positions of `data`, starting at the window's origin.
+/// The indexed suffix gets the overflow correction a block gets
+/// ([`MatchState::correct_overflow_if_needed`]); a prefix, at most a
+/// window, never needs one.
 pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
     let cp = &ms.cparams;
     let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
+    let range = range.start.max(range.end.saturating_sub(max_dict_size))..range.end;
+    if range.len() > HASH_READ_SIZE {
+        ms.correct_overflow_if_needed(range.clone());
+    }
     let src = ms.view(data);
-    let range =
-        ms.index(range.start.max(range.end.saturating_sub(max_dict_size)))..ms.index(range.end);
+    let range = ms.index(range.start)..ms.index(range.end);
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
@@ -650,8 +656,8 @@ impl JobBlocks {
 
 /// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks sized by
 /// `sizing`, appended to `out`, each through the post-sequence splitter
-/// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N+1's match
-/// finding runs on rayon next to block N's entropy stage and emission
+/// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N's entropy
+/// stage and emission run on rayon next to block N+1's match finding
 /// whenever every block N is written as is proven (`proven_rep_after`) to
 /// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
 /// the decoder will hold, and N+1's size is fixed without N's compressed
@@ -817,7 +823,10 @@ fn compress_blocks_pipelined(
             let mut rep_following = rep_next;
             let cur_store = &mut *cur;
             let state = &mut *state;
-            let (compressed, ()) = rayon::join(
+            // The match state stays on this thread, whose caches hold its
+            // tables; block N's entropy stage is the part a thief takes.
+            let ((), compressed) = rayon::join(
+                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
                 || {
                     emit_block(
                         src,
@@ -832,7 +841,6 @@ fn compress_blocks_pipelined(
                         out,
                     )
                 },
-                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
             );
             // The proof is what made block N+1 start from the decoder's
             // offsets, with the size the written block N gives it.

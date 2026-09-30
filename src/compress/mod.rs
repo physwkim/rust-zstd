@@ -6,10 +6,12 @@
 //! against the committed cross-block [`BlockState`].
 //!
 //! Above that, ZSTDMT's job architecture: the input is cut into jobs, each
-//! compressed independently with its own [`MatchState`] and block state after
-//! indexing an overlap of the preceding bytes (`ZSTDMT_computeOverlapSize`),
-//! and the job outputs are concatenated. The job loop is the same with and
-//! without the `parallel` feature, so both builds emit identical frames.
+//! compressed independently with a block state of its own, on a context
+//! taken from a pool of at most one per worker thread (`ZSTDMT_CCtxPool`)
+//! whose [`MatchState`] it resets, after indexing an overlap of the
+//! preceding bytes (`ZSTDMT_computeOverlapSize`), and the job outputs are
+//! concatenated. The job loop is the same with and without the `parallel`
+//! feature, so both builds emit identical frames.
 
 pub mod block;
 pub mod bt;
@@ -36,6 +38,12 @@ pub use params::{CParams, ParamSwitch, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
 use std::ops::Range;
+use std::sync::Mutex;
+#[cfg(feature = "parallel")]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Condvar,
+};
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
@@ -46,9 +54,6 @@ pub const JOBSIZE_MAX: usize = 1 << 30;
 const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`Compressor`] and [`compress_with`].
-///
-/// Inputs must be smaller than 4 GiB: match positions are `u32` indices into
-/// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
     /// Compression level, `ZSTD_c_compressionLevel`, as libzstd reads it:
@@ -126,6 +131,14 @@ pub struct CompressOptions {
     /// every job is whole. Values above 6 panic (libzstd rejects them
     /// with `parameter_outOfBound`).
     pub block_splitter_level: u8,
+    /// Test knob, libzstd's `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`:
+    /// correct the match state's and the long distance matcher's windows
+    /// whenever a correction keeps the whole window, not only before an
+    /// index would pass 3500 MiB, so that small inputs exercise the
+    /// correction. The frames then equal those of a libzstd built with
+    /// that macro set to 1.
+    #[doc(hidden)]
+    pub overflow_correct_frequently: bool,
 }
 
 impl Default for CompressOptions {
@@ -141,6 +154,7 @@ impl Default for CompressOptions {
             ldm_hash_rate_log: 0,
             split_after_sequences: ParamSwitch::Auto,
             block_splitter_level: 0,
+            overflow_correct_frequently: false,
         }
     }
 }
@@ -225,47 +239,92 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
     Compressor::new(opts.clone()).compress_to_vec(data)
 }
 
-/// A reusable `ZSTD_CCtx`: the options plus, as ZSTDMT keeps one context
-/// per job, a pool of per-job match states and block buffers that grows on
-/// demand and is kept across calls. A call sizes the tables for its input
-/// like `ZSTD_resetCCtx_internal` with `ZSTDcrp_makeClean`: allocations
-/// that are large enough are zeroed and kept, smaller ones replaced. Every
-/// frame is identical to [`compress_with`]'s.
+/// A reusable `ZSTD_CCtx`: the options plus ZSTDMT's pool of contexts
+/// ([`ContextPool`]), which every job, a single-threaded frame's one job
+/// included, runs on, and which is kept across calls. A context's match
+/// state is reset for each job like `ZSTD_resetCCtx_internal`: indices
+/// continue from its previous input and its tables are kept, see
+/// [`MatchState::reset`]. Every frame is identical to [`compress_with`]'s.
 pub struct Compressor {
     opts: CompressOptions,
-    jobs: Vec<JobContext>,
+    contexts: ContextPool,
     /// ZSTDMT's long distance matching state (`serialState.ldmState`),
     /// once a multithreaded frame has used it.
     serial_ldm: Option<LdmState>,
 }
 
-/// One job's reusable state: its match state once a job has run, its
-/// block buffers, the long distance matching state a single-threaded frame
-/// generates each block's matches from (the context's `ldmState`), and the
-/// long distance matches ZSTDMT generated for the job (`rawSeqStore`).
+/// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
+/// match state once a job has run, its block buffers, and the long distance
+/// matching state a single-threaded frame generates each block's matches
+/// from (`ldmState`).
 #[derive(Default)]
-struct JobContext {
+struct Context {
     ms: Option<MatchState>,
     scratch: BlockScratch,
     ldm_state: Option<LdmState>,
-    ldm_seqs: RawSeqStore,
+}
+
+/// `ZSTDMT_CCtxPool`: the contexts jobs run on, last in first out. A job
+/// takes a context as it starts and gives it back when it finishes, so a
+/// frame creates no more contexts than it runs jobs at once, at most one
+/// per worker thread, and the pool keeps no more than that across frames.
+#[derive(Default)]
+struct ContextPool {
+    free: Mutex<Vec<Context>>,
+    /// `totalCCtx`: how many contexts the pool keeps.
+    capacity: usize,
+}
+
+impl ContextPool {
+    /// `ZSTDMT_expandCCtxPool`: keep a context for each of `workers`
+    /// threads; the pool never shrinks.
+    fn expand(&mut self, workers: usize) {
+        self.capacity = self.capacity.max(workers);
+    }
+
+    /// Run `f` on the last context given back, or a new one if none is free
+    /// (`ZSTDMT_getCCtx`), and give it back once `f` returns
+    /// (`ZSTDMT_releaseCCtx`) unless the pool is full. A context `f` unwinds
+    /// from is dropped, never reused.
+    fn with_context<R>(&self, f: impl FnOnce(&mut Context) -> R) -> R {
+        let free = self.free.lock().unwrap().pop();
+        let mut ctx = free.unwrap_or_default();
+        let r = f(&mut ctx);
+        let mut free = self.free.lock().unwrap();
+        if free.len() < self.capacity {
+            free.push(ctx);
+        }
+        r
+    }
 }
 
 impl Compressor {
     pub fn new(opts: CompressOptions) -> Self {
         Self {
             opts,
-            jobs: Vec::new(),
+            contexts: ContextPool::default(),
             serial_ldm: None,
         }
     }
 
+    /// Test hook for `CompressOptions::overflow_correct_frequently`: the
+    /// window overflow corrections of the match states since each last
+    /// restarted its indices, and of the long distance matchers since each
+    /// was last reset; for a fresh `Compressor`, those of its one frame.
+    #[doc(hidden)]
+    pub fn overflow_corrections(&self) -> (u32, u32) {
+        let contexts = self.contexts.free.lock().unwrap();
+        let ms = contexts.iter().filter_map(|ctx| ctx.ms.as_ref());
+        let ldm = contexts.iter().filter_map(|ctx| ctx.ldm_state.as_ref());
+        let ldm = ldm.chain(self.serial_ldm.as_ref());
+        (
+            ms.map(|ms| ms.window().nb_overflow_corrections()).sum(),
+            ldm.map(|ldm| ldm.window().nb_overflow_corrections()).sum(),
+        )
+    }
+
     /// Append one frame holding `src` to `out`.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        assert!(
-            src.len() < u32::MAX as usize,
-            "inputs of 4 GiB or more are not supported (match indices are u32)"
-        );
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();
@@ -285,55 +344,50 @@ impl Compressor {
         let n_jobs = jobs.len();
         let mt = multithreaded(&self.opts, src.len());
         let sizing = block_sizing(&self.opts, &cparams, mt, header_len);
-        if self.jobs.len() < n_jobs {
-            self.jobs.resize_with(n_jobs, JobContext::default);
-        }
         let pipelined = cfg!(feature = "parallel");
         // ZSTDMT_serialState: every job's long distance matches from the one
         // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
         // single-threaded frame generates each block's as it compresses the
         // block (ZSTD_buildSeqStore), from its context's state.
+        let frequently = self.opts.overflow_correct_frequently;
         let mut serial_ldm = ldm_params
             .filter(|_| mt)
-            .map(|params| reset_ldm_state(&mut self.serial_ldm, params));
+            .map(|params| reset_ldm_state(&mut self.serial_ldm, params, frequently));
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
-        // A job spawned only once its sequences are generated would be taken
-        // by a thread waiting in an earlier job's block join, holding that job
-        // back by a whole job; such jobs compress their blocks serially, as
-        // ZSTDMT's workers do.
-        let blocks_pipelined = pipelined && (n_jobs == 1 || serial_ldm.is_none());
         run_jobs(
             &jobs,
-            &mut self.jobs[..n_jobs],
+            &mut self.contexts,
             pipelined,
             // ZSTDMT_serialState_update
-            |job, ctx| {
+            |job, seqs| {
                 if let Some(state) = &mut serial_ldm {
-                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                    state.generate_sequences(src, job.clone(), max_seqs, seqs);
                 }
             },
-            |k, job, ctx, out| {
-                let JobContext {
+            |k, job, ctx, seqs, out| {
+                let Context {
                     ms,
                     scratch,
                     ldm_state,
-                    ldm_seqs,
                 } = ctx;
                 let mut ldm = match ldm_params {
                     None => BlockLdm::Off,
-                    Some(_) if mt => BlockLdm::External(ldm_seqs),
-                    Some(params) => BlockLdm::Internal(reset_ldm_state(ldm_state, params)),
+                    Some(_) if mt => BlockLdm::External(seqs),
+                    Some(params) => {
+                        BlockLdm::Internal(reset_ldm_state(ldm_state, params, frequently))
+                    }
                 };
                 compress_job(
                     src,
                     cparams,
+                    frequently,
                     sizing,
                     overlap,
                     job,
                     k == 0,
                     k + 1 == n_jobs,
                     split,
-                    blocks_pipelined,
+                    pipelined,
                     ms,
                     scratch,
                     &mut ldm,
@@ -353,15 +407,22 @@ impl Compressor {
 }
 
 /// The long distance matching state in `slot` reset for a frame with
-/// `params`, allocated on first use.
-fn reset_ldm_state(slot: &mut Option<LdmState>, params: LdmParams) -> &mut LdmState {
-    match slot.take() {
+/// `params`, allocated on first use, with the overflow correction knob
+/// `frequently` (see [`CompressOptions`]).
+fn reset_ldm_state(
+    slot: &mut Option<LdmState>,
+    params: LdmParams,
+    frequently: bool,
+) -> &mut LdmState {
+    let state = match slot.take() {
         Some(mut state) => {
             state.reset(params, 0);
             slot.insert(state)
         }
         None => slot.insert(LdmState::new(params, 0)),
-    }
+    };
+    state.set_correct_frequently(frequently);
+    state
 }
 
 /// Whether libzstd would compress through ZSTDMT: an explicit job size is
@@ -408,11 +469,13 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 /// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
 /// obtained from the previous job. `sizing` cuts the job into blocks;
-/// `split` runs every block through the post-sequence splitter.
+/// `split` runs every block through the post-sequence splitter;
+/// `frequently` is the overflow correction knob (see [`CompressOptions`]).
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
     cparams: CParams,
+    frequently: bool,
     sizing: BlockSizing,
     overlap: usize,
     job: Range<usize>,
@@ -438,6 +501,7 @@ fn compress_job(
         }
         None => MatchState::new(cparams, origin),
     };
+    ms.set_correct_frequently(frequently);
     let mut initial = BlockState::initial();
     if !first_job {
         block::load_prefix(&mut ms, data, origin..job.start);
@@ -453,46 +517,189 @@ fn compress_job(
     *ms_slot = Some(ms);
 }
 
-/// Run `f` over every job, in job order, appending to `out`; `ctxs[k]` is
-/// job `k`'s context. `prepare` runs on each job's context, in job order and
-/// one at a time, before the job starts: with the feature enabled and
-/// `parallel`, on the calling task while the earlier jobs run on rayon, as
-/// ZSTDMT serializes its long distance matching across jobs. Job 0 writes
-/// straight into `out`, the others into buffers of their own that are
-/// appended afterwards; the serial loop hands every job `out`. The job
-/// function is the same either way, so the frame is identical.
+/// Run `f` over every job, in job order, appending to `out`, each job on a
+/// context of `contexts` ([`ContextPool::with_context`]) and with long
+/// distance matches of its own (the job's `rawSeqStore`). `prepare`
+/// generates job `k`'s matches, in job order and one job at a time, before
+/// the job starts: with the feature enabled and `parallel`, on the calling
+/// task while the earlier jobs run on rayon, as ZSTDMT serializes its long
+/// distance matching across jobs. Job 0 writes straight into `out`, the
+/// others into buffers of their own that are appended afterwards; the
+/// serial loop hands every job `out`. The job function is the same either
+/// way, so the frame is identical.
+///
+/// Jobs are never rayon tasks: every worker gets one [`JobQueue`] runner
+/// (`spawn_broadcast`), which claims jobs in order until none is left. A
+/// thread waiting in a job's block `rayon::join` runs whatever rayon hands
+/// it; were jobs tasks, it could take a queued job and finish its own a
+/// whole job late. It can still take its own runner, or another frame's,
+/// which is why a runner that starts inside a job claims nothing. A thread
+/// thus runs one of the frame's jobs at a time, and the frame holds at most
+/// one context per worker thread.
 fn run_jobs<P, F>(
     jobs: &[Range<usize>],
-    ctxs: &mut [JobContext],
+    contexts: &mut ContextPool,
     parallel: bool,
     mut prepare: P,
     f: F,
     out: &mut Vec<u8>,
 ) where
-    P: FnMut(&Range<usize>, &mut JobContext) + Send,
-    F: Fn(usize, Range<usize>, &mut JobContext, &mut Vec<u8>) + Sync,
+    P: FnMut(&Range<usize>, &mut RawSeqStore) + Send,
+    F: Fn(usize, Range<usize>, &mut Context, &mut RawSeqStore, &mut Vec<u8>) + Sync,
 {
-    debug_assert_eq!(jobs.len(), ctxs.len());
+    let mut seqs: Vec<RawSeqStore> = jobs.iter().map(|_| RawSeqStore::default()).collect();
     #[cfg(feature = "parallel")]
     if parallel {
+        contexts.expand(rayon::current_num_threads());
         let mut rest_out = vec![Vec::new(); jobs.len().saturating_sub(1)];
-        let outs = std::iter::once(&mut *out).chain(&mut rest_out);
-        let f = &f;
-        rayon::scope(|s| {
-            for (k, ((job, ctx), o)) in jobs.iter().zip(ctxs).zip(outs).enumerate() {
-                prepare(job, ctx);
-                s.spawn(move |_| f(k, job.clone(), ctx, o));
-            }
-        });
+        {
+            let outs = std::iter::once(&mut *out).chain(&mut rest_out);
+            let queue = JobQueue::new(jobs, contexts, seqs.iter_mut().zip(outs));
+            let (queue, f) = (&queue, &f);
+            rayon::scope(|s| {
+                if jobs.len() > 1 {
+                    s.spawn_broadcast(move |_, _| {
+                        if !IN_JOB.get() {
+                            queue.run(f);
+                        }
+                    });
+                }
+                queue.prepare_all(&mut prepare);
+                // The calling task runs jobs whether or not it is inside one:
+                // the frame is its to finish.
+                queue.run(f);
+            });
+        }
         for o in &rest_out {
             out.extend_from_slice(o);
         }
         return;
     }
     let _ = parallel;
-    for (k, (job, ctx)) in jobs.iter().zip(ctxs.iter_mut()).enumerate() {
-        prepare(job, ctx);
-        f(k, job.clone(), ctx, out);
+    contexts.expand(1);
+    for (k, (job, seqs)) in jobs.iter().zip(&mut seqs).enumerate() {
+        prepare(job, seqs);
+        contexts.with_context(|ctx| f(k, job.clone(), ctx, seqs, out));
+    }
+}
+
+#[cfg(feature = "parallel")]
+thread_local! {
+    /// Whether this thread is running one of [`JobQueue::run`]'s jobs.
+    static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as inside a job until dropped.
+#[cfg(feature = "parallel")]
+struct InJob(bool);
+
+#[cfg(feature = "parallel")]
+impl InJob {
+    fn enter() -> Self {
+        InJob(IN_JOB.replace(true))
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Drop for InJob {
+    fn drop(&mut self) {
+        IN_JOB.set(self.0);
+    }
+}
+
+/// A job's long distance matches and output.
+#[cfg(feature = "parallel")]
+type JobSlot<'a> = (&'a mut RawSeqStore, &'a mut Vec<u8>);
+
+/// One frame's jobs for [`run_jobs`]' runners, claimed in job order, each
+/// once its `prepare` has run.
+#[cfg(feature = "parallel")]
+struct JobQueue<'a> {
+    jobs: &'a [Range<usize>],
+    contexts: &'a ContextPool,
+    /// Job `k`'s slot, until its runner takes it.
+    slots: Vec<Mutex<Option<JobSlot<'a>>>>,
+    /// The next job to claim.
+    next: AtomicUsize,
+    /// How many jobs, in job order, have been prepared; `None` once
+    /// preparing unwound, so that no runner waits for the rest.
+    prepared: Mutex<Option<usize>>,
+    prepared_cv: Condvar,
+}
+
+#[cfg(feature = "parallel")]
+impl<'a> JobQueue<'a> {
+    fn new(
+        jobs: &'a [Range<usize>],
+        contexts: &'a ContextPool,
+        slots: impl Iterator<Item = JobSlot<'a>>,
+    ) -> Self {
+        Self {
+            jobs,
+            contexts,
+            slots: slots.map(|s| Mutex::new(Some(s))).collect(),
+            next: AtomicUsize::new(0),
+            prepared: Mutex::new(Some(0)),
+            prepared_cv: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, prepared: Option<usize>) {
+        *self.prepared.lock().unwrap() = prepared;
+        self.prepared_cv.notify_all();
+    }
+
+    /// `prepare` every job, in job order, releasing each to the runners.
+    fn prepare_all<P>(&self, prepare: &mut P)
+    where
+        P: FnMut(&Range<usize>, &mut RawSeqStore),
+    {
+        struct Unwinding<'q, 'a>(&'q JobQueue<'a>);
+        impl Drop for Unwinding<'_, '_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.publish(None);
+                }
+            }
+        }
+        let _unwinding = Unwinding(self);
+        for (k, (job, slot)) in self.jobs.iter().zip(&self.slots).enumerate() {
+            if let Some((seqs, _)) = slot.lock().unwrap().as_mut() {
+                prepare(job, seqs);
+            }
+            self.publish(Some(k + 1));
+        }
+    }
+
+    /// Claim the next job, wait until it is prepared and run it on a
+    /// context of the pool, until no job is left.
+    fn run<F>(&self, f: &F)
+    where
+        F: Fn(usize, Range<usize>, &mut Context, &mut RawSeqStore, &mut Vec<u8>),
+    {
+        loop {
+            let k = self.next.fetch_add(1, Ordering::Relaxed);
+            let Some(job) = self.jobs.get(k) else {
+                return;
+            };
+            let mut prepared = self.prepared.lock().unwrap();
+            loop {
+                match *prepared {
+                    None => return,
+                    Some(n) if n > k => break,
+                    Some(_) => prepared = self.prepared_cv.wait(prepared).unwrap(),
+                }
+            }
+            drop(prepared);
+            let (seqs, out) = self.slots[k]
+                .lock()
+                .unwrap()
+                .take()
+                .expect("job claimed twice");
+            let _in_job = InJob::enter();
+            self.contexts
+                .with_context(|ctx| f(k, job.clone(), ctx, seqs, out));
+        }
     }
 }
 
@@ -587,6 +794,7 @@ fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::matchstate::WINDOW_START_INDEX;
 
     #[test]
     fn compress_empty() {
@@ -900,21 +1108,20 @@ mod tests {
             let max_seqs = job_size / ldm.min_match_length as usize;
             let generate = || {
                 let mut state = LdmState::new(ldm, 0);
-                move |job: &Range<usize>, ctx: &mut JobContext| {
-                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                move |job: &Range<usize>, seqs: &mut RawSeqStore| {
+                    state.generate_sequences(src, job.clone(), max_seqs, seqs);
                 }
             };
             let f = |pipelined: bool| {
-                move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
-                    let JobContext {
-                        ms,
-                        scratch,
-                        ldm_seqs,
-                        ..
-                    } = ctx;
+                move |k: usize,
+                      job: Range<usize>,
+                      ctx: &mut Context,
+                      seqs: &mut RawSeqStore,
+                      out: &mut Vec<u8>| {
                     compress_job(
                         src,
                         cparams,
+                        false,
                         sizing,
                         overlap,
                         job,
@@ -922,18 +1129,18 @@ mod tests {
                         k + 1 == n,
                         split,
                         pipelined,
-                        ms,
-                        scratch,
-                        &mut BlockLdm::External(ldm_seqs),
+                        &mut ctx.ms,
+                        &mut ctx.scratch,
+                        &mut BlockLdm::External(seqs),
                         out,
                     )
                 }
             };
-            let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
+            let mut contexts = ContextPool::default();
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, generate(), f(true), &mut par);
+            run_jobs(&jobs, &mut contexts, true, generate(), f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, generate(), f(false), &mut seq);
+            run_jobs(&jobs, &mut contexts, false, generate(), f(false), &mut seq);
             assert!(par == seq, "L{level}: job outputs differ");
             assert!(compress_with(src, &opts).ends_with(&seq), "L{level}");
         }
@@ -991,9 +1198,8 @@ mod tests {
         overlap_size(&CParams::for_level(1, 1 << 20), 10, false);
     }
 
-    /// The preset runs three jobs on 4.25 MiB, counted as the job contexts
-    /// a fresh `Compressor` leaves holding a match state, and its frame
-    /// decodes through both decoders.
+    /// The preset runs three jobs on 4.25 MiB, on at most three contexts,
+    /// and its frame decodes through both decoders.
     #[test]
     fn parallel_preset_roundtrips() {
         let mut data = text(2 << 20);
@@ -1002,10 +1208,16 @@ mod tests {
         for level in [1, 3, 7, 11] {
             let opts = CompressOptions::parallel(level);
             assert_eq!((opts.job_size, opts.overlap_log), (Some(2 << 20), 8));
+            let (cparams, _) = opts.frame_params(data.len());
+            let overlap = overlap_size(&cparams, opts.overlap_log, false);
+            let jobs = job_ranges(data.len(), job_size_for(opts.job_size, overlap));
+            assert!(multithreaded(&opts, data.len()), "L{level}");
+            assert_eq!(jobs.len(), 3, "L{level}: jobs");
             let mut cx = Compressor::new(opts.clone());
             let frame = cx.compress_to_vec(&data);
-            let ran = cx.jobs.iter().filter(|j| j.ms.is_some()).count();
-            assert_eq!(ran, 3, "L{level}: jobs run");
+            let contexts = cx.contexts.free.get_mut().unwrap();
+            assert!((1..=3).contains(&contexts.len()), "L{level}: contexts");
+            assert!(contexts.iter().all(|ctx| ctx.ms.is_some()), "L{level}");
             assert!(frame == compress_with(&data, &opts), "L{level}");
             assert_eq!(crate::decompress(&frame).unwrap(), data, "L{level}");
             let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
@@ -1075,10 +1287,15 @@ mod tests {
             let sizing = block_sizing(&opts, &cparams, mt, header_len(&data, &cparams));
             let src = data.as_slice();
             let f = |pipelined: bool| {
-                move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
+                move |k: usize,
+                      job: Range<usize>,
+                      ctx: &mut Context,
+                      _: &mut RawSeqStore,
+                      out: &mut Vec<u8>| {
                     compress_job(
                         src,
                         cparams,
+                        false,
                         sizing,
                         overlap,
                         job,
@@ -1093,13 +1310,13 @@ mod tests {
                     )
                 }
             };
-            // The same contexts serve both runs, so the serial run also
-            // covers the reset of used contexts.
-            let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
+            // The same pool serves both runs, so the serial run also covers
+            // the reset of used contexts.
+            let mut contexts = ContextPool::default();
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, |_, _| {}, f(true), &mut par);
+            run_jobs(&jobs, &mut contexts, true, |_, _| {}, f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, |_, _| {}, f(false), &mut seq);
+            run_jobs(&jobs, &mut contexts, false, |_, _| {}, f(false), &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
             assert!(
@@ -1129,12 +1346,13 @@ mod tests {
         let cparams = CParams::for_level(level, data.len());
         let sizing = block_sizing(&opts, &cparams, mt, header_len(data, &cparams));
         let overlap = overlap_size(&cparams, 0, false);
-        let mut ctx = JobContext::default();
+        let mut ctx = Context::default();
         let mut out = Vec::new();
         let job = 0..data.len();
         compress_job(
             data,
             cparams,
+            false,
             sizing,
             overlap,
             job,
@@ -1314,9 +1532,72 @@ mod tests {
         }
     }
 
+    /// A thread waiting in a job's block join runs no other job meanwhile:
+    /// with more jobs than threads and each join's second half slower than
+    /// its first, so that a thread waits whenever a half is stolen, no job
+    /// runs within another's run on the same thread, and the frame's jobs
+    /// hold no more contexts than there are threads.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn no_job_runs_inside_another() {
+        use std::time::{Duration, Instant};
+        let spin = |d: Duration| {
+            let t = Instant::now();
+            while t.elapsed() < d {
+                std::hint::spin_loop();
+            }
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let jobs: Vec<Range<usize>> = (0..24).map(|k| k..k + 1).collect();
+        let mut contexts = ContextPool::default();
+        let runs = Mutex::new(Vec::new());
+        // Contexts held, each by one running job, and the most at once.
+        let (held, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let t0 = Instant::now();
+        pool.install(|| {
+            let job = |k: usize,
+                       _: Range<usize>,
+                       _: &mut Context,
+                       _: &mut RawSeqStore,
+                       _: &mut Vec<u8>| {
+                most.fetch_max(held.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let start = t0.elapsed();
+                for _ in 0..4 {
+                    rayon::join(
+                        || spin(Duration::from_micros(50)),
+                        || spin(Duration::from_micros(500)),
+                    );
+                }
+                let run = (k, rayon::current_thread_index(), start, t0.elapsed());
+                runs.lock().unwrap().push(run);
+                held.fetch_sub(1, Ordering::SeqCst);
+            };
+            run_jobs(&jobs, &mut contexts, true, |_, _| {}, job, &mut Vec::new());
+        });
+        let runs = runs.into_inner().unwrap();
+        assert_eq!(runs.len(), jobs.len());
+        let most = most.into_inner();
+        assert!((1..=4).contains(&most), "{most} contexts held at once");
+        for (k, thread, start, end) in &runs {
+            for (inner, t, s, e) in &runs {
+                assert!(
+                    !(t == thread && s > start && e < end),
+                    "job {inner} ran inside job {k} on thread {thread:?}"
+                );
+            }
+        }
+    }
+
     /// A `Compressor` fed different inputs back to back, so that its tables
-    /// grow, shrink and grow again and its job pool is reused, produces the
-    /// frames fresh `compress_with` calls produce.
+    /// shrink and grow again within their allocations and its contexts are
+    /// reused, continues a context's indices from its previous input and
+    /// still produces the frames fresh `compress_with` calls produce, for
+    /// every strategy. Single-job frames all run on one context; the
+    /// multi-job ones run more jobs than they can hold contexts, so some
+    /// context runs two.
     #[test]
     fn reused_compressor_matches_fresh_compress_with() {
         let a = text(1280 << 10);
@@ -1324,7 +1605,13 @@ mod tests {
         b.extend_from_slice(&text(384 << 10));
         let c = text(100 << 10);
         let empty = Vec::new();
-        for level in [1, 3, 7, 11] {
+        // The bt levels on smaller inputs: this runs unoptimized.
+        let (a_bt, b_bt, c_bt) = (&a[..600 << 10], &b[320 << 10..], &c[..40 << 10]);
+        let cases = [-5, 1, 2, 3, 5, 7, 11]
+            .map(|level| (level, [&a[..], &b, &c, &a, &empty]))
+            .into_iter()
+            .chain([13, 16, 19].map(|level| (level, [a_bt, b_bt, c_bt, a_bt, &empty])));
+        for (level, inputs) in cases {
             for job_size in [None, Some(512 << 10)] {
                 let opts = CompressOptions {
                     level,
@@ -1333,7 +1620,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut cx = Compressor::new(opts.clone());
-                for input in [&a, &b, &c, &a, &empty] {
+                for input in inputs {
                     let reused = cx.compress_to_vec(input);
                     assert!(
                         reused == compress_with(input, &opts),
@@ -1341,12 +1628,64 @@ mod tests {
                         input.len()
                     );
                 }
+                let contexts = cx.contexts.free.get_mut().unwrap();
+                let continued = contexts
+                    .iter()
+                    .filter(|ctx| ctx.ms.as_ref().unwrap().window_low() > WINDOW_START_INDEX)
+                    .count();
+                assert!(continued > 0, "level {level}: indices restarted");
+                if job_size.is_none() {
+                    assert_eq!(contexts.len(), 1, "level {level}: contexts");
+                }
                 let mut out = b"prefix".to_vec();
-                cx.compress(&b, &mut out);
+                cx.compress(inputs[1], &mut out);
                 assert!(out.starts_with(b"prefix"));
-                assert!(out[6..] == compress_with(&b, &opts)[..]);
+                assert!(out[6..] == compress_with(inputs[1], &opts)[..]);
             }
         }
+    }
+
+    /// With one worker thread, every job of a frame runs on the one context,
+    /// which continues its indices from job to job, and the frame is
+    /// `compress_with`'s.
+    #[test]
+    fn one_worker_runs_every_job_on_one_context() {
+        let data = text(3 << 20);
+        let opts = CompressOptions {
+            level: 3,
+            job_size: Some(JOBSIZE_MIN),
+            ..Default::default()
+        };
+        let mut cx = Compressor::new(opts.clone());
+        #[cfg(feature = "parallel")]
+        let frame = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| cx.compress_to_vec(&data));
+        #[cfg(not(feature = "parallel"))]
+        let frame = cx.compress_to_vec(&data);
+        assert!(frame == compress_with(&data, &opts));
+        let contexts = cx.contexts.free.get_mut().unwrap();
+        assert_eq!(contexts.len(), 1);
+        // Past the five earlier jobs' inputs.
+        let low = contexts[0].ms.as_ref().unwrap().window_low();
+        assert!(low >= WINDOW_START_INDEX + 5 * JOBSIZE_MIN, "{low}");
+    }
+
+    /// Contexts in use at once beyond the pool's capacity are created, and
+    /// the pool keeps `capacity` of them as they are given back.
+    #[test]
+    fn context_pool_keeps_at_most_its_capacity() {
+        let mut pool = ContextPool::default();
+        for capacity in [1, 2] {
+            pool.expand(capacity);
+            pool.with_context(|_| pool.with_context(|_| pool.with_context(|_| {})));
+            assert_eq!(pool.free.get_mut().unwrap().len(), capacity);
+        }
+        pool.expand(1);
+        pool.with_context(|_| {});
+        assert_eq!(pool.free.get_mut().unwrap().len(), 2, "shrank");
     }
 
     /// An input of at most `JOBSIZE_MIN` bytes compresses identically with
@@ -1430,6 +1769,57 @@ mod tests {
         );
         assert_eq!(crate::decompress(&frame).unwrap(), data);
         assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), data);
+    }
+
+    /// Text, then copies of 4 KiB from anywhere earlier, each followed by
+    /// 64 noise bytes: matches at every distance up to the whole input.
+    fn repeats(len: usize) -> Vec<u8> {
+        let mut v = text(64 << 10);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        while v.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let start = (x >> 20) as usize % (v.len() - 4096);
+            v.extend_from_within(start..start + 4096);
+            v.extend_from_slice(&noise(64, x));
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// With `overflow_correct_frequently` the match state's window is
+    /// corrected in single-job and multi-job frames (blocks of a 2 MiB job
+    /// start past the correction threshold of a 1 MiB window), and the
+    /// frames are those without it: a correction keeps every index the
+    /// window reaches.
+    #[test]
+    fn frequent_overflow_correction_keeps_frames() {
+        let data = repeats(3 << 20);
+        let jobs = Some(2 << 20);
+        for (level, job_size) in [
+            (-5, None),
+            (1, None),
+            (2, None),
+            (5, None),
+            (-5, jobs),
+            (1, jobs),
+            (2, jobs),
+        ] {
+            let opts = CompressOptions {
+                level,
+                job_size,
+                ..Default::default()
+            };
+            let mut cx = Compressor::new(CompressOptions {
+                overflow_correct_frequently: true,
+                ..opts.clone()
+            });
+            let frame = cx.compress_to_vec(&data);
+            let name = format!("L{level} job {job_size:?}");
+            assert!(cx.overflow_corrections().0 > 0, "{name}: no correction");
+            assert!(frame == compress_with(&data, &opts), "{name}");
+        }
     }
 
     #[test]

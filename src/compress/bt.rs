@@ -138,6 +138,11 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
         if match_length > best_length {
             best_length = match_length;
             if match_length > match_end_idx - match_index {
+                // Only a repetitive match, running past `ip + 9`, gets
+                // here. This and the long-match skip below stay branches:
+                // as selects they make the returned step, and so the next
+                // insert's hash load, wait on this whole tree walk.
+                std::hint::cold_path();
                 match_end_idx = match_index + match_length;
             }
         }
@@ -182,6 +187,7 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
     *larger_ptr = 0;
     let positions = if best_length > 384 {
         // speed optimization
+        std::hint::cold_path();
         192.min(best_length - 384)
     } else {
         0
@@ -248,7 +254,7 @@ unsafe fn insert_and_find_first_index_hash3(
 /// the number of matches, in increasing length.
 ///
 /// # Safety
-/// `ip + HASH_READ_SIZE <= i_limit <= src.end()`, `ip >= ms.window_low`,
+/// `ip + HASH_READ_SIZE <= i_limit <= src.end()`, `ip >= ms.window_low()`,
 /// `ms.next_to_update >= ip`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -269,7 +275,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     let curr = ip;
     let min_match: u32 = if MLS == 3 { 3 } else { 4 };
     let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
-    let dict_limit = ms.window_low;
+    let dict_limit = ms.window_low();
     let bt_low = curr.saturating_sub(bt_mask);
     let window_low = ms.lowest_prefix_index(curr);
     // `matchLow = windowLow ? windowLow : 1`; `window_low >= WINDOW_START_INDEX`.
@@ -438,7 +444,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
 ///
 /// # Safety
 /// `ip + HASH_READ_SIZE <= i_high_limit <= src.end()`,
-/// `ip >= ms.window_low`, and the tables pass [`assert_opt_bounds`].
+/// `ip >= ms.window_low()`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32>(
@@ -486,10 +492,10 @@ pub(crate) fn assert_opt_bounds(ms: &MatchState, src: Src, end: usize) {
 /// `nextToUpdate = end`.
 pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     assert!(
-        range.start >= ms.window_low,
+        range.start >= ms.window_low(),
         "prefix start {} below window_low {}",
         range.start,
-        ms.window_low
+        ms.window_low()
     );
     ms.next_to_update = range.start;
     if range.len() <= HASH_READ_SIZE {
