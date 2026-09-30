@@ -16,13 +16,14 @@ pub mod common;
 pub mod dfast;
 pub mod fast;
 pub mod lazy;
+pub mod ldm;
 pub mod matchstate;
 pub mod params;
 pub mod seqstore;
 
 use crate::constants::*;
 use block::{
-    write_raw_block, write_rle_block, BlockScratch, BlockState, CommittedBlockState,
+    write_raw_block, write_rle_block, BlockLdm, BlockScratch, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
 use matchstate::MatchState;
@@ -276,6 +277,7 @@ fn compress_job(
         last_job,
         &mut state,
         &mut ctx.scratch,
+        &mut BlockLdm::Off,
         out,
         pipelined,
     );

@@ -85,7 +85,14 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
             if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
                 let mut rep = prev.rep;
                 let t = Instant::now();
-                block::build_seq_store(&mut ms, data, start..end, &mut rep, &mut scratch.store);
+                block::build_seq_store(
+                    &mut ms,
+                    data,
+                    start..end,
+                    &mut rep,
+                    &mut scratch.store,
+                    &mut block::BlockLdm::Off,
+                );
                 st.block += t.elapsed();
                 let store = &scratch.store;
                 let cbuf = &mut scratch.cbuf;

@@ -110,7 +110,14 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
             if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
                 tally.blocks += 1;
                 let mut rep = prev.rep;
-                block::build_seq_store(&mut ms, data, start..end, &mut rep, &mut scratch.store);
+                block::build_seq_store(
+                    &mut ms,
+                    data,
+                    start..end,
+                    &mut rep,
+                    &mut scratch.store,
+                    &mut block::BlockLdm::Off,
+                );
                 let store = &scratch.store;
                 let proven = literals_section_bound(store.lits.len())
                     + sequences_section_bound(&store.seqs)
