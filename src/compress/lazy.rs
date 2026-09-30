@@ -2081,6 +2081,45 @@ mod tests {
         (all, rep)
     }
 
+    /// One context reused across row-finder and hash-chain levels, where
+    /// the tag table and the chain table take each other's words, gives
+    /// the sequences of a fresh context at every step.
+    #[test]
+    fn reset_across_row_and_chain_levels_matches_fresh_context() {
+        let big = crate_sources();
+        let big = &big[..big.len().min(600_000)];
+        let small = current_exe(12_000);
+        let row = CParams::for_level(11, big.len());
+        let chain = CParams::for_level(7, small.len());
+        assert_eq!(default_search_method(&row), SearchMethod::RowHash);
+        assert_eq!(default_search_method(&chain), SearchMethod::HashChain);
+        let level = Level::new();
+        let mut reused = MatchState::new(row, 0);
+        let steps: [(&[u8], CParams, Option<SearchMethod>); 5] = [
+            (big, row, None),
+            (&small, chain, None),
+            (big, row, None),
+            // The row level's tables with the hash chain, then the row
+            // finder again: its tags over the chain table's words.
+            (big, row, Some(SearchMethod::HashChain)),
+            (big, row, None),
+        ];
+        for (k, &(data, cp, method)) in steps.iter().enumerate() {
+            let method = method.unwrap_or(default_search_method(&cp));
+            if k > 0 {
+                reused.reset_for(cp, 0, method);
+            }
+            assert_eq!(reused.search_method, method);
+            let mut fresh = MatchState::new_for(cp, 0, method);
+            let (r_store, r_rep) = collect_on(&mut reused, data, 40_000, level);
+            let (f_store, f_rep) = collect_on(&mut fresh, data, 40_000, level);
+            assert_eq!(r_store.seqs, f_store.seqs, "step {k} {method:?}");
+            assert_eq!(r_store.lits, f_store.lits, "step {k}");
+            assert_eq!(r_rep, f_rep, "step {k}");
+            assert!(r_store.seqs.len() > 100, "step {k}");
+        }
+    }
+
     /// `MatchState::reset` on a context that compressed something else, with
     /// other table sizes, gives the sequences of `MatchState::new` from both
     /// finders: smaller tables continue the indices over the first input's
