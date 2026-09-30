@@ -251,6 +251,46 @@ fn proven_compressed(
             < block_len - CParams::min_gain(block_len, strategy)
 }
 
+/// Proof, before entropy coding, that [`emit_block`] writes every block of
+/// `src[block]` COMPRESSED from `store` cut into `parts`, returning the
+/// repeat offsets the decoder then holds: the finder's `rep` for a block
+/// kept whole; for a split one the history through every sequence from
+/// `prev_rep`, since with no partition RAW or RLE [`resolve_off_codes`]
+/// never sees `d_rep` and `c_rep` differ, rewrites nothing, and leaves
+/// `d_rep` equal to `c_rep`.
+#[cfg(feature = "parallel")]
+fn proven_rep_after(
+    src: &[u8],
+    block: Range<usize>,
+    store: &SeqStore,
+    rep: [u32; 3],
+    parts: Option<&[Partition]>,
+    prev_rep: [u32; 3],
+    strategy: Strategy,
+) -> Option<[u32; 3]> {
+    let parts = match parts {
+        None | Some([]) => {
+            return proven_compressed(src, block, &store.lits, &store.seqs, strategy)
+                .then_some(rep);
+        }
+        Some(parts) => parts,
+    };
+    let mut start = block.start;
+    for part in parts {
+        let range = start..start + part.src_len;
+        let lits = &store.lits[part.lits.clone()];
+        if !proven_compressed(src, range, lits, &store.seqs[part.seqs.clone()], strategy) {
+            return None;
+        }
+        start += part.src_len;
+    }
+    let mut rep = prev_rep;
+    for seq in &store.seqs {
+        super::seqstore::update_rep(&mut rep, seq.off_base, seq.lit_len == 0);
+    }
+    Some(rep)
+}
+
 /// `ZSTD_entropyCompressSeqStore` and the block-type decision of
 /// `ZSTD_compressBlock_internal` / `ZSTD_compressSeqStore_singleBlock`:
 /// from `built` (`None` when compression was not attempted) write the
@@ -446,13 +486,12 @@ pub fn compress_block(
 
 /// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks of
 /// `block_size`, appended to `out`, each through the post-sequence splitter
-/// when `split`. With `pipelined` (parallel feature only) and without
-/// `split`, block N+1's match finding runs on rayon next to block N's
-/// entropy stage and emission whenever N is
-/// [proven](proven_compressed) to be written COMPRESSED, so that the repeat
-/// offsets N+1 starts from are the ones the decoder will hold; otherwise
-/// N's entropy stage runs first and N+1 starts from the committed offsets.
-/// Output is identical either way.
+/// when `split`. With `pipelined` (parallel feature only) block N+1's match
+/// finding runs on rayon next to block N's entropy stage and emission
+/// whenever every block N is written as is [proven](proven_rep_after) to
+/// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
+/// the decoder will hold; otherwise N's entropy stage runs first and N+1
+/// starts from the committed offsets. Output is identical either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_blocks(
     ms: &mut MatchState,
@@ -468,9 +507,9 @@ pub fn compress_blocks(
     pipelined: bool,
 ) {
     #[cfg(feature = "parallel")]
-    if pipelined && !split {
+    if pipelined {
         compress_blocks_pipelined(
-            ms, src, job, block_size, first_job, last_job, state, scratch, out,
+            ms, src, job, block_size, first_job, last_job, split, state, scratch, out,
         );
         return;
     }
@@ -511,6 +550,7 @@ fn compress_blocks_pipelined(
     block_size: usize,
     first_job: bool,
     last_job: bool,
+    split: bool,
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     out: &mut Vec<u8>,
@@ -523,7 +563,10 @@ fn compress_blocks_pipelined(
         .collect();
     scratch.next.reserve(block_size);
     let BlockScratch {
-        store, next, cbuf, ..
+        store,
+        next,
+        cbuf,
+        splitter,
     } = scratch;
     let (mut cur, mut nxt) = (store, next);
     // `built`: block i's store is in `cur`, with the finder's offsets after it.
@@ -537,6 +580,12 @@ fn compress_blocks_pipelined(
     for (i, block) in blocks.iter().enumerate() {
         let is_first_block = first_job && i == 0;
         let is_last = last_job && i + 1 == blocks.len();
+        // ZSTD_deriveBlockSplits runs against the state committed by block
+        // i - 1, before block i + 1's finder may start.
+        let parts = split.then(|| match built {
+            Some(_) => splitter.derive(cur, state.prev(), &cparams, block.len()),
+            None => &[][..],
+        });
         let following = blocks
             .get(i + 1)
             .filter(|b| attempts_compression(b.len()))
@@ -546,7 +595,7 @@ fn compress_blocks_pipelined(
                 src,
                 block.clone(),
                 built.map(|rep| (&mut *cur, rep)),
-                None,
+                parts,
                 &cparams,
                 is_first_block,
                 is_last,
@@ -557,20 +606,30 @@ fn compress_blocks_pipelined(
             built = None;
             continue;
         };
-        let proven = built.filter(|_| {
-            proven_compressed(src, block.clone(), &cur.lits, &cur.seqs, cparams.strategy)
+        let proven = built.and_then(|rep| {
+            proven_rep_after(
+                src,
+                block.clone(),
+                cur,
+                rep,
+                parts,
+                state.prev().rep,
+                cparams.strategy,
+            )
+            .map(|rep_next| (rep, rep_next))
         });
-        if let Some(rep) = proven {
+        if let Some((rep, rep_next)) = proven {
             PIPELINE_OVERLAPPED.fetch_add(1, Relaxed);
-            let mut rep_next = rep;
+            let mut rep_following = rep_next;
             let cur_store = &mut *cur;
+            let state = &mut *state;
             let (compressed, ()) = rayon::join(
                 || {
                     emit_block(
                         src,
                         block.clone(),
                         Some((cur_store, rep)),
-                        None,
+                        parts,
                         &cparams,
                         is_first_block,
                         is_last,
@@ -579,18 +638,20 @@ fn compress_blocks_pipelined(
                         out,
                     )
                 },
-                || build_seq_store(ms, src, following.clone(), &mut rep_next, nxt),
+                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt),
             );
-            // The proof is what made `rep_next` the decoder's offsets.
+            // The proof is what made block i + 1 start from the decoder's
+            // offsets.
             assert!(compressed, "section bound proof failed");
-            built = Some(rep_next);
+            assert_eq!(state.prev().rep, rep_next, "repeat offset proof failed");
+            built = Some(rep_following);
         } else {
             PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
             emit_block(
                 src,
                 block.clone(),
                 built.map(|rep| (&mut *cur, rep)),
-                None,
+                parts,
                 &cparams,
                 is_first_block,
                 is_last,
@@ -598,9 +659,9 @@ fn compress_blocks_pipelined(
                 cbuf,
                 out,
             );
-            let mut rep_next = state.prev().rep;
-            build_seq_store(ms, src, following, &mut rep_next, nxt);
-            built = Some(rep_next);
+            let mut rep_following = state.prev().rep;
+            build_seq_store(ms, src, following, &mut rep_following, nxt);
+            built = Some(rep_following);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }

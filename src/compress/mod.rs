@@ -752,6 +752,80 @@ mod tests {
         }
     }
 
+    /// Blocks in a frame, from the block headers.
+    #[cfg(feature = "parallel")]
+    fn count_blocks(frame: &[u8]) -> usize {
+        let fcs = |d: u8| match d >> 6 {
+            0 => (d >> 5) as usize & 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        let single = (frame[4] >> 5) & 1 == 1;
+        let mut pos = 5 + (!single) as usize + fcs(frame[4]);
+        let mut n = 0;
+        loop {
+            let h = u32::from_le_bytes([frame[pos], frame[pos + 1], frame[pos + 2], 0]);
+            let ty = (h >> 1) & 3;
+            pos += 3 + if ty == 1 { 1 } else { (h >> 3) as usize };
+            n += 1;
+            if h & 1 == 1 {
+                assert_eq!(pos, frame.len());
+                return n;
+            }
+        }
+    }
+
+    /// With the post-sequence splitter on, the pipelined block loop still
+    /// writes the serial loop's bytes and still overlaps split blocks; the
+    /// frame splits blocks and both decoders accept it.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn pipelined_split_blocks_match_serial() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sources = super::common::testutil::crate_sources();
+        let random = noise(1 << 20, 9);
+        let mut mixed = text(300 << 10);
+        mixed.extend_from_slice(&noise(200 << 10, 4));
+        mixed.extend_from_slice(&vec![0u8; 300 << 10]);
+        mixed.extend_from_slice(&sources[..333 << 10]);
+        for level in [3, 5, 7, 11] {
+            for (name, data) in [
+                ("sources", &sources),
+                ("random", &random),
+                ("mixed", &mixed),
+            ] {
+                let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
+                let serial = one_job(data, level, true, false);
+                let piped = one_job(data, level, true, true);
+                assert!(piped == serial, "{name} L{level}: pipelined != serial");
+                let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
+                if name != "random" {
+                    assert!(overlapped > 0, "{name} L{level}: never overlapped");
+                }
+                let opts = |split_after_sequences| CompressOptions {
+                    level,
+                    split_after_sequences,
+                    ..Default::default()
+                };
+                let frame = compress_with(data, &opts(ParamSwitch::Enable));
+                assert!(frame.ends_with(&serial), "{name} L{level}: frame != job");
+                assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name} L{level}");
+                let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
+                assert_eq!(&theirs, data, "{name} L{level}");
+                if name == "sources" {
+                    let whole = compress_with(data, &opts(ParamSwitch::Disable));
+                    assert!(whole == compress_with(data, &opts(ParamSwitch::Auto)));
+                    assert!(
+                        count_blocks(&frame) > count_blocks(&whole),
+                        "{name} L{level}: no block split"
+                    );
+                    assert!(frame.len() < whole.len(), "{name} L{level}");
+                }
+            }
+        }
+    }
+
     /// A `Compressor` fed different inputs back to back, so that its tables
     /// grow, shrink and grow again and its job pool is reused, produces the
     /// frames fresh `compress_with` calls produce.
