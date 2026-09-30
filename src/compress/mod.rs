@@ -86,11 +86,13 @@ impl CompressOptions {
     /// into several jobs, so the `parallel` feature can compress them
     /// concurrently; the frame still does not depend on the thread count.
     ///
-    /// Measured on 8 threads against the default options (`tests/mt_grid.rs`
-    /// on the 8 MiB ELF and Rust-source corpus files) the size cost is at
-    /// most 0.17% at levels 1 to 7 and 0.55% at level 11 (ELF), and the
-    /// speedup (geometric mean over the ELF, source and 1 MiB words files)
-    /// is 1.06x at level 1, 2.3x at 3, 1.5x at 5, 1.7x at 7 and 1.2x at 11.
+    /// Measured on 8 threads against the default options (`tests/mt_grid.rs`,
+    /// median of four runs) on the 8 MiB ELF and Rust-source corpus files:
+    /// the size cost is at most 0.17% at levels 1 to 7 and 0.55% at level
+    /// 11 (ELF), and the speedup (ELF / source) is 1.14x / 1.03x at level 1,
+    /// 1.85x / 2.48x at 3, 1.74x / 2.27x at 5, 2.01x / 2.14x at 7 and
+    /// 2.29x / 1.92x at 11. A 1 MiB input is one job under either option,
+    /// so its frame and speed are unchanged.
     pub fn parallel(level: i32) -> Self {
         Self {
             level,
