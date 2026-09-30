@@ -1099,7 +1099,7 @@ mod tests {
     /// (as in libzstd) a store's last sequence is offered only where it
     /// covers the block start: without the trailing sequence the second
     /// block gets no candidate at its start and reaches the repeat one byte
-    /// later as repcode 1 (rep[0] is the offset since the first block).
+    /// later as repcode 1 (`rep[0]` is the offset since the first block).
     #[test]
     fn opt_parser_takes_ldm_candidates() {
         let n = 96 << 10;
