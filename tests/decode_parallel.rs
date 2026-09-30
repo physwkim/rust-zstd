@@ -104,6 +104,7 @@ fn mt_decodes_multi_job_frames_from_our_encoder() {
             let opts = rust_zstd::CompressOptions {
                 level,
                 job_size: Some(512 * 1024),
+                ..rust_zstd::CompressOptions::default()
             };
             let compressed = rust_zstd::compress_with(data, &opts);
             let decoded = pool
