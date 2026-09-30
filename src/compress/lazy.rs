@@ -1703,9 +1703,10 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     load_prefix_with(ms, src, range, default_search_method(&ms.cparams))
 }
 
-/// `ZSTD_loadDictionaryContent`, lazy arm: insert every position of `range`
-/// up to `end - HASH_READ_SIZE` (`ZSTD_insertAndFindFirstIndex` /
-/// `ZSTD_row_update` at `iend - HASH_READ_SIZE`) and set `next_to_update =
+/// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms: insert every
+/// position of `range` up to `end - HASH_READ_SIZE`
+/// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
+/// at `iend - HASH_READ_SIZE`) and set `next_to_update =
 /// end`. Expects the tables of a fresh [`MatchState`] (C zeroes the tag table
 /// here; `MatchState::new` already did). The hash width is `BOUNDED(4,
 /// minMatch, 6)` as in the block loop, where C's chain loader passes
@@ -1763,14 +1764,9 @@ pub fn load_prefix_with(
                     _ => go!(6, 6),
                 }
             }
-            // Interim: C sorts the prefix with `ZSTD_updateTree`
-            // (zstd_opt.c); until that port lands the prefix is appended
-            // unsorted (`ZSTD_updateDUBT`), which the search sorts on demand.
-            SearchMethod::BinaryTree => match mls_of(&ms.cparams) {
-                4 => unsafe { BtSearch::<4>::update_dubt(ms, src, target) },
-                5 => unsafe { BtSearch::<5>::update_dubt(ms, src, target) },
-                _ => unsafe { BtSearch::<6>::update_dubt(ms, src, target) },
-            },
+            // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
+            // the dictionary table fully sorted".
+            SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
         }
     }
     ms.next_to_update = end;
