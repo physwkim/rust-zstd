@@ -40,6 +40,7 @@
     dead_code
 )]
 
+use crate::constants::ZSTD_WINDOWLOG_MAX;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -51,7 +52,6 @@ use std::ptr;
 
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
-const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 /// `ZSTD_MAXWINDOWSIZE_DEFAULT`: libzstd's default decoder limit,
 /// `(1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`, which admits the window log
@@ -2464,7 +2464,11 @@ impl FrameHeader {
             let exp = self.window_descriptor >> 3;
             let mantissa = self.window_descriptor & 0x7;
 
-            let window_log = 10 + u64::from(exp);
+            let window_log = 10 + u32::from(exp);
+            // frameParameter_windowTooLarge of ZSTD_getFrameHeader
+            if window_log > ZSTD_WINDOWLOG_MAX {
+                return Err(format!("Window log {} too large", window_log));
+            }
             let window_base = 1u64 << window_log;
             let window_add = (window_base / 8) * u64::from(mantissa);
 
@@ -2472,8 +2476,6 @@ impl FrameHeader {
 
             if window_size < MIN_WINDOW_SIZE {
                 Err(format!("Window size {} too small", window_size))
-            } else if window_size >= MAX_WINDOW_SIZE {
-                Err(format!("Window size {} too big", window_size))
             } else {
                 Ok(window_size)
             }
