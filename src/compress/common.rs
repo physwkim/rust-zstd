@@ -397,6 +397,27 @@ pub mod testutil {
     use crate::compress::params::CParams;
     use crate::compress::seqstore::{SeqStore, ZSTD_REP_NUM};
     use std::ops::Range;
+    use zstd::zstd_safe::zstd_sys as sys;
+
+    /// `ZSTD_cParam_getBounds(param)` of the linked libzstd, which is built
+    /// for the same target as this crate.
+    pub fn c_bounds(param: sys::ZSTD_cParameter) -> (i32, i32) {
+        // SAFETY: reads no memory of ours.
+        let bounds = unsafe { sys::ZSTD_cParam_getBounds(param) };
+        assert_eq!(bounds.error, 0, "{param:?}");
+        (bounds.lowerBound, bounds.upperBound)
+    }
+
+    /// Whether `ZSTD_CCtx_setParameter(param, value)` succeeds.
+    pub fn c_accepts(param: sys::ZSTD_cParameter, value: i32) -> bool {
+        // SAFETY: the context is used only here.
+        unsafe {
+            let cctx = sys::ZSTD_createCCtx();
+            let r = sys::ZSTD_CCtx_setParameter(cctx, param, value);
+            sys::ZSTD_freeCCtx(cctx);
+            sys::ZSTD_isError(r) == 0
+        }
+    }
 
     pub type BlockFn = fn(&mut MatchState, Src, Block, &mut [u32; 3], &mut SeqStore) -> usize;
     pub type PrefixFn = fn(&mut MatchState, Src, Range<usize>);
