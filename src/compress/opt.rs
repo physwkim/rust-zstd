@@ -15,7 +15,12 @@
 //! dictionaries `optPtr->symbolCosts` never holds a valid Huffman table
 //! when the statistics are initialized, so that branch of
 //! `ZSTD_rescaleFreqs` does not exist: the parser reads nothing produced
-//! by the entropy stage.
+//! by the entropy stage. Block N+1's parse may therefore overlap block N's
+//! entropy stage in [`compress_blocks`](super::block::compress_blocks):
+//! its inputs are the repeat offsets, which the pipeline already takes
+//! from the committed state, and the statistics in [`MatchState::opt`],
+//! which the parser alone updates whatever type block N is written as
+//! (C keeps them in `ms->opt`, outside the block state too).
 
 use super::bt::{self, assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
 use super::common::{simd_level, HASH_READ_SIZE};

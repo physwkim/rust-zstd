@@ -698,7 +698,8 @@ mod tests {
     /// text (the proof holds and blocks overlap), on random data (every
     /// block RAW, the proof fails) and with a RAW and an RLE block between
     /// compressed ones (the next block must start from the committed, not
-    /// the finder's, repeat offsets).
+    /// the finder's, repeat offsets). Levels 16, 18 and 19 run the opt
+    /// parsers, whose statistics carry across blocks in the match state.
     #[cfg(feature = "parallel")]
     #[test]
     fn pipelined_block_loop_matches_serial() {
@@ -709,7 +710,7 @@ mod tests {
         mixed.extend_from_slice(&noise(200 << 10, 4));
         mixed.extend_from_slice(&vec![0u8; 300 << 10]);
         mixed.extend_from_slice(&text(333 << 10));
-        for level in [1, 3, 5, 11] {
+        for level in [1, 3, 5, 11, 16, 18, 19] {
             for (name, data) in [
                 ("sources", &sources),
                 ("random", &random),
