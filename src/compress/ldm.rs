@@ -121,10 +121,12 @@ impl LdmParams {
             }
         }
         if self.hash_log == 0 {
-            // U32 arithmetic: a rate above the window log wraps to the max.
+            // A rate above the window log gives the min. libzstd subtracts
+            // in U32, so it wraps and clamps to the max: a 2^30-entry
+            // table however small the input.
             self.hash_log = self
                 .window_log
-                .wrapping_sub(self.hash_rate_log)
+                .saturating_sub(self.hash_rate_log)
                 .clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
         }
         if self.min_match_length == 0 {
@@ -1006,13 +1008,16 @@ mod tests {
             LdmParams::requested(27, 0, 0, 0).adjusted(&fast27),
             params(27, 4, 0)
         );
-        // a rate above the window log wraps in U32 and clamps to the max
-        assert_eq!(
-            LdmParams::requested(0, 0, 0, HASHRATELOG_MAX)
-                .adjusted(&cparams(Strategy::Fast, 20))
-                .hash_log,
-            ZSTD_HASHLOG_MAX
-        );
+        // a rate above the window log gives the min (libzstd wraps in U32
+        // and clamps to the max), as does a rate equal to it
+        for rate in [21, HASHRATELOG_MAX, 20] {
+            assert_eq!(
+                LdmParams::requested(0, 0, 0, rate)
+                    .adjusted(&cparams(Strategy::Fast, 20))
+                    .hash_log,
+                ZSTD_HASHLOG_MIN
+            );
+        }
         // a small difference clamps to the min
         assert_eq!(
             LdmParams::requested(0, 0, 0, 24).adjusted(&fast27).hash_log,
