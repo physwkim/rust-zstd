@@ -9,8 +9,8 @@
 //! Every frame must be libzstd's byte for byte, except where one of two
 //! known differences applies, each left out by the condition that produces
 //! it: a row whose libzstd strategy this crate runs as another one (L13's
-//! btlazy2/btopt/btultra rows, see `Strategy`), and a frame's first block
-//! where libzstd's matches reach the positions our job-0 search skips (see
+//! btlazy2/btopt/btultra rows, see `Strategy`), and a frame in which
+//! libzstd's matches reach the positions our job-0 search skips (see
 //! [`c_uses_job_start`]). The two rules above decide the block without the
 //! match finder, so they are checked on those cases too.
 
@@ -113,16 +113,17 @@ fn shapes(n: usize) -> [(&'static str, Vec<u8>); 4] {
     ]
 }
 
-/// Space-separated words drawn from a small vocabulary after one 0xff byte:
-/// compresses, so the block after it follows a COMPRESSED block, and its
-/// first byte never recurs, so no finder can match from it.
+/// Space-separated words drawn from a small vocabulary after the bytes 0xff
+/// 0xfe: compresses, so the block after it follows a COMPRESSED block, and
+/// its first two bytes never recur, so libzstd cannot match from the
+/// positions [`c_uses_job_start`] names.
 fn text(len: usize) -> Vec<u8> {
     const WORDS: [&str; 16] = [
         "block", "frame", "the", "of", "literal", "sequence", "match", "offset", "huffman",
         "table", "raw", "window", "entropy", "a", "and", "repeat",
     ];
     let mut out = Vec::with_capacity(len + 16);
-    out.push(0xff);
+    out.extend_from_slice(&[0xff, 0xfe]);
     for b in lcg_bytes(len, 5) {
         if out.len() >= len {
             break;
@@ -193,12 +194,12 @@ fn small_blocks_match_libzstd() {
                         other_strategy += 1;
                         continue;
                     }
-                    let c_head = &theirs[..theirs.len() - c_last.c_size];
-                    assert!(ours.starts_with(c_head), "{case}: frame before the block");
-                    if ours != theirs && prefix.is_empty() && c_uses_job_start(&data, level) {
+                    if ours != theirs && c_uses_job_start(&data, level) {
                         job_start.push(case);
                         continue;
                     }
+                    let c_head = &theirs[..theirs.len() - c_last.c_size];
+                    assert!(ours.starts_with(c_head), "{case}: frame before the block");
                     compared += 1;
                     if ours != theirs {
                         bad.push(format!("{case}: ours {our_last:?} libzstd {c_last:?}"));
