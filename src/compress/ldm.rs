@@ -17,7 +17,7 @@
 //! for the match state.
 
 use super::block;
-use super::common::{count, HASH_READ_SIZE};
+use super::common::{count, prefetch_l1, HASH_READ_SIZE};
 use super::matchstate::MatchState;
 use super::opt;
 use super::params::{CParams, Strategy};
@@ -451,6 +451,8 @@ impl LdmState {
                 let split = ip + split_n - min_match;
                 let xxhash = xxh64(&src[split..split + min_match]);
                 let hash = (xxhash as u32 & ((1u32 << h_bits) - 1)) as usize;
+                // ZSTD_ldm_getBucket
+                prefetch_l1(&self.hash_table, hash << params.bucket_size_log);
                 *cand = (split, hash, (xxhash >> 32) as u32);
             }
 

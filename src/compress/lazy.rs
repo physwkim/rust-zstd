@@ -15,7 +15,8 @@
 //! followed by C's own `ip += (dictAndPrefixLength == 0)` skip).
 
 use super::common::{
-    byte, candidate_valid, count, read32, read64, tget, tset, MatchCount, HASH_READ_SIZE,
+    byte, candidate_valid, count, prefetch_l1, read32, read64, tget, tset, MatchCount,
+    HASH_READ_SIZE,
 };
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
@@ -96,28 +97,6 @@ const fn bitmix(mut val: u64, len: u64) -> u64 {
 /// applied to `hashSalt == 0` and `hashSaltEntropy == 0`.
 pub(super) const fn initial_hash_salt() -> u64 {
     bitmix(0, 8) ^ bitmix(0, 4)
-}
-
-/// `PREFETCH_L1(&slice[idx])`. `idx` may point past the end: C prefetches
-/// `base + matchIndex` and table rows the same way, and the hint never
-/// faults.
-#[inline(always)]
-fn prefetch_l1<T>(slice: &[T], idx: usize) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        #[target_feature(enable = "sse")]
-        #[inline]
-        fn prefetch(p: *const i8) {
-            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p)
-        }
-        // SAFETY: SSE is part of the x86_64 baseline, so the target feature
-        // the callee asks for is always present.
-        unsafe { prefetch(slice.as_ptr().wrapping_add(idx) as *const i8) }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (slice, idx);
-    }
 }
 
 /// `BOUNDED(4, minMatch, 6)`.
