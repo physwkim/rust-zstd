@@ -18,6 +18,7 @@ pub mod dfast;
 pub mod fast;
 pub mod lazy;
 pub mod matchstate;
+pub mod opt;
 pub mod params;
 pub mod presplit;
 pub mod seqstore;
@@ -442,6 +443,8 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
     let overlap_log = match overlap_log {
         // ZSTDMT_overlapLog_default
         0 => match cparams.strategy {
+            Strategy::BtUltra2 => 9,
+            Strategy::BtOpt | Strategy::BtUltra => 8,
             Strategy::Lazy2 | Strategy::BtLazy2 => 7,
             Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
         },
@@ -800,7 +803,9 @@ mod tests {
     /// the finder's, repeat offsets). The pre-splitter is on, so block
     /// N+1's size is fixed from the least savings of a COMPRESSED block N;
     /// `mixed` also runs in ZSTDMT's 512 KiB chunks, where job 0 owes the
-    /// frame header from its second chunk on.
+    /// frame header from its second chunk on. Levels 16, 18 and 19 run the
+    /// opt parsers, whose statistics carry across blocks in the match state,
+    /// and the post-splitter default options enable for them.
     #[cfg(feature = "parallel")]
     #[test]
     fn pipelined_block_loop_matches_serial() {
@@ -811,15 +816,18 @@ mod tests {
         mixed.extend_from_slice(&noise(200 << 10, 4));
         mixed.extend_from_slice(&vec![0u8; 300 << 10]);
         mixed.extend_from_slice(&text(333 << 10));
-        for level in [1, 3, 5, 11] {
+        for level in [1, 3, 5, 11, 16, 18, 19] {
             for (name, data) in [
                 ("sources", &sources),
                 ("random", &random),
                 ("mixed", &mixed),
             ] {
+                // Default options: the post-splitter runs from btopt on.
+                let cparams = CParams::for_level(level, data.len());
+                let split = split::block_splitter_enabled(ParamSwitch::Auto, &cparams);
                 let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
-                let serial = one_job(data, level, false, false, false);
-                let piped = one_job(data, level, false, true, false);
+                let serial = one_job(data, level, split, false, false);
+                let piped = one_job(data, level, split, true, false);
                 assert!(piped == serial, "{name} L{level}: pipelined != serial");
                 let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
                 if name != "random" {
@@ -842,8 +850,10 @@ mod tests {
                     );
                 }
             }
-            let serial = one_job(&mixed, level, false, false, true);
-            let piped = one_job(&mixed, level, false, true, true);
+            let cparams = CParams::for_level(level, mixed.len());
+            let split = split::block_splitter_enabled(ParamSwitch::Auto, &cparams);
+            let serial = one_job(&mixed, level, split, false, true);
+            let piped = one_job(&mixed, level, split, true, true);
             assert!(
                 piped == serial,
                 "mixed L{level}: ZSTDMT pipelined != serial"

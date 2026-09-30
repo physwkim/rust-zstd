@@ -15,7 +15,7 @@ use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
 use super::split::{resolve_off_codes, BlockSplitter, Partition};
-use super::{dfast, fast, lazy};
+use super::{bt, dfast, fast, lazy, opt};
 use crate::constants::*;
 use crate::fse::{self, FseState};
 use crate::huf::{self, HufState};
@@ -161,6 +161,7 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
             lazy::load_prefix(ms, src, range)
         }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => bt::load_prefix(ms, src, range),
     }
 }
 
@@ -197,6 +198,9 @@ pub fn build_seq_store(
         Strategy::DFast => dfast::compress_block(ms, src, block.clone(), rep, store),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
             lazy::compress_block(ms, src, block.clone(), rep, store)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block(ms, src, block.clone(), rep, store)
         }
     };
     // ZSTD_storeLastLiterals

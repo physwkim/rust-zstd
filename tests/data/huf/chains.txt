@@ -11,3 +11,8 @@ steep4000 4 steep4000:200
 sampled41000_suspect 1 sampled41000:0
 sampled41000_trusted 1 sampled41000:100000
 ties1000 5 ties1000:50
+skew200_btopt 7 skew200:10
+skew200_ultra 8 skew200:10
+raw63_ultra 8 raw63:5
+skew800_chain_ultra 8 skew800_0:40 skew800_1:40 skew800_2:40
+ties1000_ultra2 9 ties1000:50

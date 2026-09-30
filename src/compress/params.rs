@@ -6,12 +6,8 @@
 
 /// Match-finder strategy. Numeric values follow `ZSTD_strategy`.
 ///
-/// libzstd's `ZSTD_btopt`, `ZSTD_btultra` and `ZSTD_btultra2` are not
-/// ported: levels whose table row selects one of them keep that row's
-/// numeric parameters but run with `Lazy2` (and `ZSTD_cycleLog`'s btScale
-/// of `Lazy2`). libzstd built with the btopt/btultra exclusions would
-/// cascade them to `ZSTD_btlazy2` instead; they stay on `Lazy2` until the
-/// optimal parser is ported.
+/// Every `ZSTD_strategy` is ported; a level's table row selects the
+/// strategy it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Strategy {
     Fast = 1,
@@ -20,6 +16,37 @@ pub enum Strategy {
     Lazy = 4,
     Lazy2 = 5,
     BtLazy2 = 6,
+    BtOpt = 7,
+    BtUltra = 8,
+    BtUltra2 = 9,
+}
+
+impl Strategy {
+    /// `ZSTD_cycleLog`'s `btScale`: the binary-tree strategies keep two
+    /// chain-table entries per position.
+    pub fn bt_scale(self) -> u32 {
+        match self {
+            Strategy::Fast
+            | Strategy::DFast
+            | Strategy::Greedy
+            | Strategy::Lazy
+            | Strategy::Lazy2 => 0,
+            Strategy::BtLazy2 | Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => 1,
+        }
+    }
+
+    /// Runs the optimal parser (`ZSTD_compressBlock_btopt` and up).
+    pub fn is_opt(self) -> bool {
+        match self {
+            Strategy::Fast
+            | Strategy::DFast
+            | Strategy::Greedy
+            | Strategy::Lazy
+            | Strategy::Lazy2
+            | Strategy::BtLazy2 => false,
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => true,
+        }
+    }
 }
 
 /// `ZSTD_ParamSwitch_e`: a feature left to libzstd's default for the
@@ -57,7 +84,7 @@ const ZSTD_TARGETLENGTH_MAX: i32 = 1 << 17;
 const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 
 /// Strategy column of `ZSTD_defaultCParameters`, including the unported
-/// binary-tree strategies so the table below is a verbatim copy.
+/// `BtLazy2` so the table below is a verbatim copy.
 #[derive(Clone, Copy)]
 enum Strat {
     Fast,
@@ -79,8 +106,11 @@ impl Strat {
             Strat::DFast => Strategy::DFast,
             Strat::Greedy => Strategy::Greedy,
             Strat::Lazy => Strategy::Lazy,
+            Strat::Lazy2 => Strategy::Lazy2,
             Strat::BtLazy2 => Strategy::BtLazy2,
-            Strat::Lazy2 | Strat::BtOpt | Strat::BtUltra | Strat::BtUltra2 => Strategy::Lazy2,
+            Strat::BtOpt => Strategy::BtOpt,
+            Strat::BtUltra => Strategy::BtUltra,
+            Strat::BtUltra2 => Strategy::BtUltra2,
         }
     }
 }
@@ -258,8 +288,7 @@ impl CParams {
             // dictSize == 0: ZSTD_dictAndWindowLog() returns windowLog unchanged.
             let dict_and_window_log = self.window_log;
             // ZSTD_cycleLog(): the binary tree holds two entries per position.
-            let bt_scale = (self.strategy >= Strategy::BtLazy2) as u32;
-            let cycle_log = self.chain_log - bt_scale;
+            let cycle_log = self.chain_log - self.strategy.bt_scale();
             if self.hash_log > dict_and_window_log + 1 {
                 self.hash_log = dict_and_window_log + 1;
             }
@@ -285,19 +314,38 @@ impl CParams {
 
     /// `ZSTD_rowMatchFinderSupported`.
     pub fn row_match_finder_supported(&self) -> bool {
-        matches!(
-            self.strategy,
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2
-        )
+        match self.strategy {
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => true,
+            Strategy::Fast
+            | Strategy::DFast
+            | Strategy::BtLazy2
+            | Strategy::BtOpt
+            | Strategy::BtUltra
+            | Strategy::BtUltra2 => false,
+        }
+    }
+
+    /// `hashLog3` of `ZSTD_reset_matchState`: the optimal parser's 3-byte
+    /// hash table exists only for `min_match == 3`, with
+    /// `min(ZSTD_HASHLOG3_MAX, window_log)` bits; `0` means no table.
+    pub fn hash_log3(&self) -> u32 {
+        const ZSTD_HASHLOG3_MAX: u32 = 17;
+        if self.strategy.is_opt() && self.min_match == 3 {
+            ZSTD_HASHLOG3_MAX.min(self.window_log)
+        } else {
+            0
+        }
     }
 
     /// `ZSTD_minGain(src_size, strategy)`: minimum saving required to emit a
     /// compressed block or a compressed literals section.
     pub fn min_gain(src_size: usize, strategy: Strategy) -> usize {
-        // minlog = (strat >= ZSTD_btultra) ? strat - 1 : 6; btultra is not
-        // ported, so minlog is 6.
-        let _ = strategy;
-        (src_size >> 6) + 2
+        let min_log = if strategy >= Strategy::BtUltra {
+            strategy as u32 - 1
+        } else {
+            6
+        };
+        (src_size >> min_log) + 2
     }
 }
 
@@ -352,12 +400,36 @@ mod tests {
     }
 
     #[test]
-    fn opt_strategies_cascade_to_lazy2() {
+    fn opt_levels_select_the_bt_strategies() {
+        let strat = |level| CParams::for_level(level, 8 << 20).strategy;
+        assert_eq!(strat(16), Strategy::BtOpt);
+        assert_eq!(strat(17), Strategy::BtOpt);
+        assert_eq!(strat(18), Strategy::BtUltra);
+        for level in 19..=22 {
+            assert_eq!(strat(level), Strategy::BtUltra2);
+        }
         let cp = CParams::for_level(19, 8 << 20);
-        assert_eq!(cp.strategy, Strategy::Lazy2);
-        assert_eq!(cp.window_log, 23);
-        assert_eq!(cp.hash_log, 22);
-        assert_eq!(cp.search_log, 7);
+        assert_eq!(
+            (cp.window_log, cp.chain_log, cp.hash_log, cp.search_log),
+            (23, 24, 22, 7)
+        );
+        // Level 22 on 8 MiB: windowLog 23, hashLog 27 -> 24, and the tree's
+        // cycleLog 27 - 1 = 26 shrinks chainLog by 3 to 24.
+        let cp = CParams::for_level(22, 8 << 20);
+        assert_eq!((cp.window_log, cp.chain_log, cp.hash_log), (23, 24, 24));
+        assert_eq!(cp.hash_log3(), 17);
+        assert_eq!(CParams::for_level(17, 8 << 20).hash_log3(), 0);
+        // 1000 bytes at level 19: windowLog 10, cycleLog 18 - 1 -> chainLog 11.
+        let cp = CParams::for_level(19, 1000);
+        assert_eq!((cp.window_log, cp.chain_log), (10, 11));
+        assert_eq!(cp.hash_log3(), 10);
+    }
+
+    #[test]
+    fn min_gain_follows_strategy() {
+        assert_eq!(CParams::min_gain(1 << 17, Strategy::BtOpt), (1 << 11) + 2);
+        assert_eq!(CParams::min_gain(1 << 17, Strategy::BtUltra), (1 << 10) + 2);
+        assert_eq!(CParams::min_gain(1 << 17, Strategy::BtUltra2), (1 << 9) + 2);
     }
 
     #[test]

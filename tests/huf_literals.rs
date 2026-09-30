@@ -26,6 +26,10 @@ fn strategy(n: u32) -> Strategy {
         3 => Strategy::Greedy,
         4 => Strategy::Lazy,
         5 => Strategy::Lazy2,
+        6 => Strategy::BtLazy2,
+        7 => Strategy::BtOpt,
+        8 => Strategy::BtUltra,
+        9 => Strategy::BtUltra2,
         _ => panic!("strategy {n}"),
     }
 }
@@ -94,7 +98,7 @@ fn literals_sections_match_libzstd_and_decode() {
         }
         decodes_to(&sections, &all_literals, chain);
     }
-    assert_eq!(n_steps, 15);
+    assert_eq!(n_steps, 22);
 }
 
 #[test]

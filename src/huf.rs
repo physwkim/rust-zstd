@@ -838,6 +838,64 @@ fn compress_ctable_internal(
 const SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE: usize = 4096;
 const SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO: usize = 10;
 
+/// The `HUF_flags_e` bits `HUF_compress_internal` reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct HufFlags {
+    /// `HUF_flags_preferRepeat`.
+    prefer_repeat: bool,
+    /// `HUF_flags_optimalDepth`.
+    optimal_depth: bool,
+    /// `HUF_flags_suspectUncompressible`.
+    suspect_uncompressible: bool,
+}
+
+/// `HUF_optimalTableLog`: the table log to build `count[..=max_symbol]`
+/// with. `optimal_depth` probes depths from `HUF_minTableLog` up, stops
+/// once the header plus estimated payload grows by more than a byte or the
+/// tree no longer reaches the probed depth, and keeps the smallest seen.
+fn optimal_table_log(
+    max_table_log: u32,
+    src_size: usize,
+    max_symbol: usize,
+    count: &[u32; 256],
+    optimal_depth: bool,
+) -> u32 {
+    debug_assert!(src_size > 1);
+    if !optimal_depth {
+        // cheap evaluation, based on FSE
+        return fse::optimal_table_log_internal(max_table_log, src_size, max_symbol, 1);
+    }
+    let cardinality = count[..=max_symbol].iter().filter(|&&c| c != 0).count() as u32;
+    let min_table_log = highbit32(cardinality) + 1;
+    let mut opt_size = usize::MAX - 1;
+    let mut opt_log = max_table_log;
+    let mut header = Vec::with_capacity(HUF_SYMBOLVALUE_MAX + 2);
+    // Search until size increases
+    for guess in min_table_log..=max_table_log {
+        let Some(table) = build_ctable(count, max_symbol, guess) else {
+            continue;
+        };
+        let max_bits = table.table_log as u32;
+        if max_bits < guess && guess > min_table_log {
+            break;
+        }
+        header.clear();
+        let Some(h_size) = write_ctable(&mut header, &table, max_symbol, max_bits) else {
+            continue;
+        };
+        let new_size = estimate_compressed_size(&table, count, max_symbol) + h_size;
+        if new_size > opt_size + 1 {
+            break;
+        }
+        if new_size < opt_size {
+            opt_size = new_size;
+            opt_log = guess;
+        }
+    }
+    debug_assert!(opt_log <= HUF_TABLELOG_MAX);
+    opt_log
+}
+
 /// `HUF_compress_internal` for `HUF_compress1X_repeat` /
 /// `HUF_compress4X_repeat` with `maxSymbolValue = 255` and
 /// `huffLog = LitHufLog`. Appends the tree description (if any) and the
@@ -850,8 +908,7 @@ fn compress_internal(
     single_stream: bool,
     table: &mut Option<HufTable>,
     repeat: &mut HufRepeat,
-    prefer_repeat: bool,
-    suspect_uncompressible: bool,
+    flags: HufFlags,
 ) -> Option<usize> {
     let src_size = src.len();
     let ostart = out.len();
@@ -863,7 +920,7 @@ fn compress_internal(
     }
     let huff_log = HUF_TABLELOG_DEFAULT;
 
-    if prefer_repeat && *repeat == HufRepeat::Valid {
+    if flags.prefer_repeat && *repeat == HufRepeat::Valid {
         let old = table.as_ref()?;
         return Some(compress_ctable_internal(
             out,
@@ -875,7 +932,7 @@ fn compress_internal(
     }
 
     let mut count = [0u32; 256];
-    if suspect_uncompressible
+    if flags.suspect_uncompressible
         && src_size >= SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO
     {
         let (largest_begin, _) = hist_count(&mut count, &src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE]);
@@ -904,7 +961,7 @@ fn compress_internal(
     {
         *repeat = HufRepeat::None;
     }
-    if prefer_repeat && *repeat != HufRepeat::None {
+    if flags.prefer_repeat && *repeat != HufRepeat::None {
         let old = table.as_ref()?;
         return Some(compress_ctable_internal(
             out,
@@ -915,8 +972,13 @@ fn compress_internal(
         ));
     }
 
-    // HUF_optimalTableLog without HUF_flags_optimalDepth
-    let huff_log = fse::optimal_table_log_internal(huff_log, src_size, max_symbol_value, 1);
+    let huff_log = optimal_table_log(
+        huff_log,
+        src_size,
+        max_symbol_value,
+        &count,
+        flags.optimal_depth,
+    );
     let new_table = build_ctable(&count, max_symbol_value, huff_log)?;
     let huff_log = new_table.table_log as u32;
 
@@ -994,6 +1056,10 @@ fn min_literals_to_compress(strategy: Strategy, repeat: HufRepeat) -> usize {
         8usize << shift
     }
 }
+
+/// `HUF_OPTIMAL_DEPTH_THRESHOLD`: the first strategy whose literals get
+/// `HUF_flags_optimalDepth`.
+const HUF_OPTIMAL_DEPTH_THRESHOLD: Strategy = Strategy::BtUltra;
 
 /// `SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO`.
 const SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO: usize = 20;
@@ -1076,9 +1142,15 @@ pub fn estimate_literals_section(
     {
         repeat = HufRepeat::None;
     }
-    // HUF_optimalTableLog without HUF_flags_optimalDepth, as in
-    // `compress_internal`.
-    let huff_log = fse::optimal_table_log_internal(HUF_TABLELOG_DEFAULT, src_size, max_symbol, 1);
+    // `ZSTD_buildBlockEntropyStats` passes `HUF_flags_optimalDepth` by the
+    // same strategy rule as `compress_literals`.
+    let huff_log = optimal_table_log(
+        HUF_TABLELOG_DEFAULT,
+        src_size,
+        max_symbol,
+        &count,
+        cparams.strategy >= HUF_OPTIMAL_DEPTH_THRESHOLD,
+    );
     let table = build_ctable(&count, max_symbol, huff_log)?;
     let new_c_size = estimate_compressed_size(&table, &count, max_symbol);
     desc.clear();
@@ -1138,9 +1210,12 @@ pub fn compress_literals_with(
         return prev.clone();
     }
 
-    let suspect_uncompressible =
-        nb_seq == 0 || src_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO;
-    let prefer_repeat = strategy < Strategy::Lazy && src_size <= 1024;
+    let flags = HufFlags {
+        prefer_repeat: strategy < Strategy::Lazy && src_size <= 1024,
+        optimal_depth: strategy >= HUF_OPTIMAL_DEPTH_THRESHOLD,
+        suspect_uncompressible: nb_seq == 0
+            || src_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO,
+    };
     let (mut table, mut repeat) = match prev {
         HufState::None => (None, HufRepeat::None),
         HufState::Check(t) => (Some(t.clone()), HufRepeat::Check),
@@ -1151,15 +1226,8 @@ pub fn compress_literals_with(
     }
     let ostart = out.len();
     out.resize(ostart + lh_size, 0);
-    let c_lit_size = compress_internal(
-        out,
-        literals,
-        single_stream,
-        &mut table,
-        &mut repeat,
-        prefer_repeat,
-        suspect_uncompressible,
-    );
+    let c_lit_size =
+        compress_internal(out, literals, single_stream, &mut table, &mut repeat, flags);
     if repeat != HufRepeat::None {
         // reused the existing table
         h_type = LIT_TYPE_TREELESS;

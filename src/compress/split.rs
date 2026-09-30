@@ -12,7 +12,7 @@
 //! rewritten to the raw offset `c_rep` gives it.
 
 use super::block::{BlockState, ZSTD_BLOCKHEADERSIZE};
-use super::params::{CParams, ParamSwitch};
+use super::params::{CParams, ParamSwitch, Strategy};
 use super::seqstore::{
     offbase_is_repcode, offbase_to_repcode, offset_to_offbase, update_rep, Seq, SeqStore,
     ZSTD_REP_NUM,
@@ -26,17 +26,14 @@ use std::ops::Range;
 const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
 /// `ZSTD_MAX_NB_BLOCK_SPLITS`.
 const ZSTD_MAX_NB_BLOCK_SPLITS: usize = 196;
-/// `ZSTD_btopt` in `ZSTD_strategy`.
-const ZSTD_BTOPT: u32 = 7;
 
 /// `ZSTD_resolveBlockSplitterMode` + `ZSTD_blockSplitterEnabled`: `Auto`
-/// splits for `strategy >= ZSTD_btopt` with `window_log >= 17`, which no
-/// ported strategy reaches yet.
+/// splits for `strategy >= ZSTD_btopt` with `window_log >= 17`.
 pub fn block_splitter_enabled(mode: ParamSwitch, cparams: &CParams) -> bool {
     match mode {
         ParamSwitch::Enable => true,
         ParamSwitch::Disable => false,
-        ParamSwitch::Auto => cparams.strategy as u32 >= ZSTD_BTOPT && cparams.window_log >= 17,
+        ParamSwitch::Auto => cparams.strategy >= Strategy::BtOpt && cparams.window_log >= 17,
     }
 }
 
@@ -319,10 +316,15 @@ mod tests {
     /// `Auto` follows `ZSTD_resolveBlockSplitterMode`: off for every ported
     /// strategy.
     #[test]
-    fn auto_mode_is_off_below_btopt() {
+    fn auto_mode_splits_from_btopt() {
         for level in 1..=22 {
             let cp = CParams::for_level(level, 8 << 20);
-            assert!(!block_splitter_enabled(ParamSwitch::Auto, &cp), "L{level}");
+            // L16 is the first btopt row for large inputs.
+            assert_eq!(
+                block_splitter_enabled(ParamSwitch::Auto, &cp),
+                level >= 16,
+                "L{level}"
+            );
             assert!(block_splitter_enabled(ParamSwitch::Enable, &cp));
             assert!(!block_splitter_enabled(ParamSwitch::Disable, &cp));
         }
