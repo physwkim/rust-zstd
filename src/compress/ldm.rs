@@ -17,8 +17,8 @@
 //! for the match state.
 
 use super::block;
-use super::common::{count, prefetch_l1, HASH_READ_SIZE};
-use super::matchstate::MatchState;
+use super::common::{count, prefetch_l1, Src, HASH_READ_SIZE};
+use super::matchstate::{Block, MatchState};
 use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
@@ -480,8 +480,9 @@ impl LdmState {
                     }
                     let p_match = cur.offset as usize;
                     // SAFETY: every entry is an earlier split, so
-                    // `p_match < split < iend <= src.len()`.
-                    let cur_forward = unsafe { count(src, split, p_match, iend) };
+                    // `p_match < split < iend <= src.len()`. The LDM table
+                    // holds positions, so `src` is read at index = position.
+                    let cur_forward = unsafe { count(Src::new(src, 0, 0), split, p_match, iend) };
                     if cur_forward < min_match {
                         continue;
                     }
@@ -549,19 +550,10 @@ fn count_backwards(
     len
 }
 
-/// `ZSTD_ldm_limitTableUpdate`: after a long match, index at most the
-/// last 512 positions (fewer while the backlog is under 1536) of the
-/// backlog before `anchor`.
-fn limit_table_update(ms: &mut MatchState, anchor: usize) {
-    if anchor > ms.next_to_update + 1024 {
-        ms.next_to_update = anchor - 512.min(anchor - ms.next_to_update - 1024);
-    }
-}
-
 /// `ZSTD_ldm_fillFastTables`: index the positions from
 /// `ms.next_to_update` to `end` into the fast and double-fast tables; the
 /// other strategies index inside their block compressors.
-fn fill_fast_tables(ms: &mut MatchState, src: &[u8], end: usize) {
+fn fill_fast_tables(ms: &mut MatchState, src: Src, end: usize) {
     match ms.cparams.strategy {
         Strategy::Fast => super::fast::fill_hash_table_to(ms, src, end),
         Strategy::DFast => super::dfast::fill_double_hash_table_to(ms, src, end),
@@ -576,31 +568,31 @@ fn fill_fast_tables(ms: &mut MatchState, src: &[u8], end: usize) {
 }
 
 /// `ZSTD_ldm_blockCompress`: from btopt on, run the optimal parser on
-/// `src[block]` with the long matches of `seqs` as extra candidates; below
-/// it, store the long matches that fall in the block (cut at the block
-/// end) and run the strategy's block compressor on the literals between
-/// them. Either way `seqs` moves past the block. Returns the anchor of the
-/// block's trailing literals.
+/// `block` with the long matches of `seqs` as extra candidates; below it,
+/// store the long matches that fall in the block (cut at the block end) and
+/// run the strategy's block compressor on the literals between them, each
+/// run set up by [`MatchState::ldm_sub_block`]. Either way `seqs` moves
+/// past the block. Returns the anchor of the block's trailing literals.
 pub fn block_compress(
     seqs: &mut RawSeqStore,
     ms: &mut MatchState,
-    src: &[u8],
-    block: Range<usize>,
+    src: Src,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
     // If using opt parser, use LDMs only as candidates rather than always
     // accepting them
     if ms.cparams.strategy >= Strategy::BtOpt {
-        let block_len = block.len();
+        let block_len = block.range().len();
         let anchor = opt::compress_block(ms, src, block, rep, out, seqs.view());
         seqs.skip_raw_seq_store_bytes(block_len);
         return anchor;
     }
 
     let min_match = ms.cparams.min_match;
-    let iend = block.end;
-    let mut ip = block.start;
+    let iend = block.range().end;
+    let mut ip = block.range().start;
     // Loop through each sequence and apply the block compressor to the
     // literals
     while !seqs.is_exhausted() && ip < iend {
@@ -612,11 +604,11 @@ pub fn block_compress(
         debug_assert!(ip + (seq.lit_length + seq.match_length) as usize <= iend);
 
         // Fill tables for block compressor
-        limit_table_update(ms, ip);
+        let lit_end = ip + seq.lit_length as usize;
+        let lits = ms.ldm_sub_block(block, ip..lit_end);
         fill_fast_tables(ms, src, ip);
         // Run the block compressor
-        let lit_end = ip + seq.lit_length as usize;
-        let anchor = block::run_block_compressor(ms, src, ip..lit_end, rep, out);
+        let anchor = block::run_block_compressor(ms, src, lits, rep, out);
         ip = lit_end;
         // Update the repcodes
         rep[2] = rep[1];
@@ -634,10 +626,10 @@ pub fn block_compress(
         ip += seq.match_length as usize;
     }
     // Fill the tables for the block compressor
-    limit_table_update(ms, ip);
+    let lits = ms.ldm_sub_block(block, ip..iend);
     fill_fast_tables(ms, src, ip);
     // Compress the last literals
-    block::run_block_compressor(ms, src, ip..iend, rep, out)
+    block::run_block_compressor(ms, src, lits, rep, out)
 }
 
 /// `ldmRollingHashState_t`: the gear hash.
@@ -1112,7 +1104,7 @@ mod tests {
     fn opt_parser_takes_ldm_candidates() {
         let n = 96 << 10;
         let mut x = 0x2545_F491_4F6C_DD1Du64;
-        let mut src = vec![0u8]; // the window starts at 1
+        let mut src = vec![0u8]; // the window starts at position 1
         src.extend((0..n).map(|_| {
             x ^= x << 13;
             x ^= x >> 7;
@@ -1126,14 +1118,15 @@ mod tests {
             assert!(cp.strategy >= Strategy::BtOpt);
             let mut ms = MatchState::new(cp, 1);
             // The first copy is never inserted into the binary tree.
-            ms.next_to_update = 1 + n;
+            ms.next_to_update = ms.index(1 + n);
             let mut seqs = store(seqs);
             let mut rep = [1, 4, 8];
             let mut blocks = vec![];
             for block in [1 + n..split, split..src.len()] {
                 let mut out = SeqStore::new();
-                let anchor =
-                    block_compress(&mut seqs, &mut ms, &src, block.clone(), &mut rep, &mut out);
+                let (view, b) = ms.start_block(&src, block.clone());
+                let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out);
+                let anchor = ms.pos(anchor);
                 let found: Vec<_> = out
                     .seqs
                     .iter()

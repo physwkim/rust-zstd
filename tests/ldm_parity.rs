@@ -3,10 +3,7 @@
 //! an input above `ZSTDMT_JOBSIZE_MIN` full of long repeats. The default
 //! options are single-threaded `ZSTD_compress2`, which generates each
 //! block's long distance matches as it compresses the block; an explicit
-//! job size is ZSTDMT, which generates each job's in job order. The input
-//! starts with two bytes that never recur, so that job 0 not matching from
-//! `src[0]` leaves the frames alike; fast and dfast (levels 1-4) also start
-//! their search a byte later than libzstd and are left out.
+//! job size is ZSTDMT, which generates each job's in job order.
 
 mod common;
 
@@ -17,7 +14,7 @@ use sys::ZSTD_cParameter::{
 };
 use zstd::zstd_safe::zstd_sys as sys;
 
-const LEVELS: [i32; 5] = [7, 11, 16, 19, 22];
+const LEVELS: [i32; 9] = [1, 2, 3, 4, 7, 11, 16, 19, 22];
 const JOB_SIZE: usize = 1 << 20;
 
 /// `[0xfe, 0xff]`, 512 KiB of 16-letter text, then 300-byte copies from

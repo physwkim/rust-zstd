@@ -27,8 +27,8 @@ pub mod split;
 
 use crate::constants::*;
 use block::{
-    write_raw_block, write_rle_block, BlockLdm, BlockScratch, BlockSizing, BlockState,
-    CommittedBlockState, ZSTD_BLOCKHEADERSIZE,
+    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
+    ZSTD_BLOCKHEADERSIZE,
 };
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
 use matchstate::MatchState;
@@ -51,8 +51,10 @@ const JOBLOG_MAX: u32 = 30;
 /// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
-    /// Compression level, `ZSTD_c_compressionLevel`. `<= 0` emits raw/RLE
-    /// blocks only; `1..=22` map to libzstd's parameter rows.
+    /// Compression level, `ZSTD_c_compressionLevel`, as libzstd reads it:
+    /// `1..=22` select its parameter rows (higher clamps to 22), `0` is the
+    /// default level 3, and a negative level is the fast strategy
+    /// accelerated by `-level` (clamped at `ZSTD_minCLevel`, -131072).
     pub level: i32,
     /// Job size in bytes (`ZSTD_c_jobSize`). `None` (the default) compresses
     /// the input as one job, as single-threaded `ZSTD_compress2`
@@ -275,22 +277,6 @@ impl Compressor {
             return;
         }
 
-        // blockSizeMax = MIN(ZSTD_BLOCKSIZE_MAX, 1 << windowLog)
-        let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-        let n_blocks = src.len().div_ceil(block_size);
-
-        if self.opts.level <= 0 {
-            for (i, chunk) in src.chunks(block_size).enumerate() {
-                let is_last = i + 1 == n_blocks;
-                if block::is_rle(chunk) {
-                    write_rle_block(out, chunk[0], chunk.len(), is_last);
-                } else {
-                    write_raw_block(out, chunk, is_last);
-                }
-            }
-            return;
-        }
-
         let ldm_on = ldm_params.is_some();
         let overlap = overlap_size(&cparams, self.opts.overlap_log, ldm_on);
         let job_size = job_size_for(self.opts.job_size, overlap);
@@ -416,13 +402,13 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
 /// appended to `out`, on the match state in `ms_slot` reset for this job
 /// (allocated on first use) with `scratch`'s buffers and the long distance
-/// matches of `ldm`. Job 0 starts from `repStartValue` with
-/// `window_low = 1`; a later job indexes `overlap` bytes before its start
-/// (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with
-/// invalidated repeat offsets and no entropy tables, so its first block
-/// cannot reference state the decoder obtained from the previous job.
-/// `sizing` cuts the job into blocks; `split` runs every block through
-/// the post-sequence splitter.
+/// matches of `ldm`. Job 0 starts from `repStartValue` with its first byte
+/// as the window start; a later job's window starts `overlap` bytes before
+/// it, and the job indexes that prefix (`ZSTD_loadDictionaryContent` on the
+/// raw-content prefix), starts with invalidated repeat offsets and no
+/// entropy tables, so its first block cannot reference state the decoder
+/// obtained from the previous job. `sizing` cuts the job into blocks;
+/// `split` runs every block through the post-sequence splitter.
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
@@ -439,21 +425,22 @@ fn compress_job(
     ldm: &mut BlockLdm,
     out: &mut Vec<u8>,
 ) {
-    let window_low = if first_job {
-        1
+    // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
+    let origin = if first_job {
+        job.start
     } else {
-        job.start.saturating_sub(overlap).max(1)
+        job.start.saturating_sub(overlap)
     };
     let mut ms = match ms_slot.take() {
         Some(mut ms) => {
-            ms.reset(cparams, window_low);
+            ms.reset(cparams, origin);
             ms
         }
-        None => MatchState::new(cparams, window_low),
+        None => MatchState::new(cparams, origin),
     };
     let mut initial = BlockState::initial();
     if !first_job {
-        block::load_prefix(&mut ms, data, window_low..job.start);
+        block::load_prefix(&mut ms, data, origin..job.start);
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);

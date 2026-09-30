@@ -1,14 +1,16 @@
 //! Persistent match-finder state: port of `ZSTD_MatchState_t`
 //! (zstd_compress_internal.h) for the no-dictionary case.
 //!
-//! Positions are absolute indices into the source slice handed to the block
-//! functions and are stored as `u32`, so a job's source must be smaller than
-//! 4 GiB. Table entry `0` means "empty"; `window_low >= 1` guarantees that no
-//! real position is ever `0` (libzstd achieves the same by starting indices
-//! at `ZSTD_WINDOW_START_INDEX` and skipping the first prefix byte with
-//! `ip0 += (ip0 == prefixStart)`).
+//! The finders address the input by index, as libzstd does through
+//! `window.base`: the window's first byte (position `origin` of the input
+//! slice) is index [`WINDOW_START_INDEX`], so index `0` can mean "empty"
+//! in a table and `1` is `ZSTD_DUBT_UNSORTED_MARK`. [`MatchState`] is the
+//! only owner of the position <-> index mapping ([`MatchState::index`],
+//! [`MatchState::pos`], [`MatchState::view`]). Indices are stored as `u32`,
+//! so a job's window must stay below 4 GiB ([`MatchState::view`] asserts
+//! it; libzstd would correct overflow instead).
 //!
-//! A candidate index `c` is usable at position `cur` only if
+//! A candidate index `c` is usable at index `cur` only if
 //! `c >= window_low` and `cur - c <= (1 << window_log)`; see
 //! [`MatchState::lowest_prefix_index`].
 //!
@@ -16,8 +18,14 @@
 //! `ZSTD_cwksp`), so the allocator sees one request per context rather
 //! than three that straddle glibc's dynamic mmap threshold.
 
+use std::ops::Range;
+
+use super::common::Src;
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
+
+/// `ZSTD_WINDOW_START_INDEX`: the index of a window's first byte.
+pub const WINDOW_START_INDEX: usize = 2;
 
 pub struct MatchState {
     pub cparams: CParams,
@@ -27,8 +35,13 @@ pub struct MatchState {
     pub ws: Workspace,
     /// `nextToUpdate`: index from which table insertion resumes.
     pub next_to_update: usize,
-    /// `window.dictLimit` / `window.lowLimit`: lowest valid index (`>= 1`).
+    /// `window.dictLimit` / `window.lowLimit`: lowest valid index.
     pub window_low: usize,
+    /// `window.base` as a position of the input slice: the position of
+    /// index 0 (wrapping, it lies before the input).
+    base: usize,
+    /// Position of the window's first byte, the lowest readable one.
+    origin: usize,
     /// `hashSalt`: salt of the row-based finder's hash (`ZSTD_hashPtrSalted`),
     /// so that a reused tag table does not produce phantom matches. Starts
     /// at the value a fresh `ZSTD_CCtx` has after its first
@@ -152,43 +165,61 @@ impl Workspace {
     }
 }
 
+/// The indices of one block about to be searched. Only
+/// [`MatchState::start_block`] makes one, after the block-start
+/// `nextToUpdate` clamp, so no finder can run without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    start: usize,
+    end: usize,
+}
+
+impl Block {
+    #[inline]
+    pub fn range(self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
 impl MatchState {
-    /// Allocate zeroed tables for `cparams.strategy`; positions below
-    /// `window_low` (which must be `>= 1`) are never referenced.
-    pub fn new(cparams: CParams, window_low: usize) -> Self {
+    /// Allocate zeroed tables for `cparams.strategy` and start a window at
+    /// position `origin`, see [`MatchState::reset`].
+    pub fn new(cparams: CParams, origin: usize) -> Self {
         let mut ms = Self {
             cparams,
             ws: Workspace::default(),
             next_to_update: 0,
             window_low: 0,
+            base: 0,
+            origin: 0,
             hash_salt: 0,
             hash_salt_entropy: 0,
             opt: None,
         };
-        ms.reset(cparams, window_low);
+        ms.reset(cparams, origin);
         ms
     }
 
     /// `ZSTD_reset_matchState` with `ZSTDcrp_makeClean` on a reused context:
     /// size the tables for `cparams`, keeping an allocation that is large
-    /// enough and zeroing it (`ZSTD_cwksp_clean_tables`), and start over at
-    /// `window_low`. The result equals [`MatchState::new`], so a reused
-    /// context compresses identically.
+    /// enough and zeroing it (`ZSTD_cwksp_clean_tables`), and start a window
+    /// whose first byte is position `origin` of the input, at index
+    /// [`WINDOW_START_INDEX`] (`ZSTD_window_init`, then the non-contiguous
+    /// `ZSTD_window_update` of the job's first input). The result equals
+    /// [`MatchState::new`], so a reused context compresses identically.
     ///
     /// Deviation: libzstd keeps the row finder's stale tag table and
     /// advances the hash salt instead (`ZSTD_advanceHashSalt`,
     /// `ZSTD_cwksp_reserve_aligned_init_once`), which makes the frame depend
     /// on the context's history; the tag table is cleared here and the salt
     /// stays at its initial value.
-    pub fn reset(&mut self, cparams: CParams, window_low: usize) {
-        assert!(
-            window_low >= 1,
-            "window_low must be >= 1 (0 marks an empty table entry)"
-        );
+    pub fn reset(&mut self, cparams: CParams, origin: usize) {
         self.ws.reset(&cparams);
         self.cparams = cparams;
-        self.next_to_update = window_low;
-        self.window_low = window_low;
+        self.origin = origin;
+        self.base = origin.wrapping_sub(WINDOW_START_INDEX);
+        self.next_to_update = WINDOW_START_INDEX;
+        self.window_low = WINDOW_START_INDEX;
         self.hash_salt = super::lazy::initial_hash_salt();
         self.hash_salt_entropy = 0;
         // ZSTD_invalidateMatchState: `opt.litLengthSum = 0` forces the next
@@ -198,6 +229,87 @@ impl MatchState {
                 .get_or_insert_with(|| Box::new(OptState::new()))
                 .invalidate();
         }
+    }
+
+    /// The index of position `pos` (`pos >= origin`).
+    #[inline]
+    pub fn index(&self, pos: usize) -> usize {
+        debug_assert!(pos >= self.origin);
+        pos.wrapping_sub(self.base)
+    }
+
+    /// The position of index `idx`.
+    #[inline]
+    pub fn pos(&self, idx: usize) -> usize {
+        idx.wrapping_add(self.base)
+    }
+
+    /// `data[origin..]` addressed by index. Panics if an index of `data`
+    /// does not fit the `u32` tables.
+    #[inline]
+    pub fn view<'a>(&self, data: &'a [u8]) -> Src<'a> {
+        let src = Src::new(data, self.origin, self.index(self.origin));
+        assert!(
+            u32::try_from(src.end() - 1).is_ok(),
+            "window of {} bytes exceeds the u32 index space",
+            data.len() - self.origin
+        );
+        src
+    }
+
+    /// `ZSTD_buildSeqStore`'s set-up of a block: `data[positions]` as
+    /// indices of this window, after the "limited update after a very long
+    /// match" clamp: when the previous block left more than 384 positions
+    /// uninserted (its last match ran past the block end), insert at most
+    /// the 192 positions before the block (fewer while the backlog is under
+    /// 576) instead of the whole backlog.
+    pub fn start_block<'a>(&mut self, data: &'a [u8], positions: Range<usize>) -> (Src<'a>, Block) {
+        let src = self.view(data);
+        let (start, end) = (self.index(positions.start), self.index(positions.end));
+        if start > self.next_to_update + 384 {
+            self.next_to_update = start - 192.min(start - self.next_to_update - 384);
+        }
+        (src, Block { start, end })
+    }
+
+    /// The literal run `range` of `block` (indices) that
+    /// `ZSTD_ldm_blockCompress` hands to the block compressor, after
+    /// `ZSTD_ldm_limitTableUpdate`: when more than 1024 positions before it
+    /// are uninserted, insert at most the last 512 of them (fewer while the
+    /// backlog is under 1536).
+    pub fn ldm_sub_block(&mut self, block: Block, range: Range<usize>) -> Block {
+        assert!(block.start <= range.start && range.start <= range.end && range.end <= block.end);
+        let start = range.start;
+        if start > self.next_to_update + 1024 {
+            self.next_to_update = start - 512.min(start - self.next_to_update - 1024);
+        }
+        Block {
+            start,
+            end: range.end,
+        }
+    }
+
+    /// Move the window past the `len` bytes that begin it, as
+    /// `ZSTD_initStats_ultra` forgets its first pass: `base -= len`,
+    /// `dictLimit` and `lowLimit` up by `len`, `nextToUpdate = dictLimit`.
+    /// Every index already in the tables falls below the window, and every
+    /// byte's index grows by `len`; returns `src` and `block` re-addressed.
+    pub fn skip_window<'a>(
+        &mut self,
+        src: Src<'a>,
+        block: Range<usize>,
+        len: usize,
+    ) -> (Src<'a>, Range<usize>) {
+        debug_assert_eq!(block.start, self.window_low);
+        self.base = self.base.wrapping_sub(len);
+        self.window_low += len;
+        self.next_to_update = self.window_low;
+        let src = src.rebased(len);
+        assert!(
+            u32::try_from(src.end() - 1).is_ok(),
+            "window moved past the u32 index space"
+        );
+        (src, block.start + len..block.end + len)
     }
 
     /// `(hashTable, chainTable, tagTable)`; borrows the whole state, use
@@ -214,16 +326,47 @@ impl MatchState {
     }
 
     /// `ZSTD_getLowestPrefixIndex(ms, cur, windowLog)` without a dictionary:
-    /// the lowest index a match may reference from position `cur`.
+    /// the lowest index a match may reference from index `cur`.
     #[inline]
     pub fn lowest_prefix_index(&self, cur: usize) -> usize {
         let max_distance = 1usize << self.cparams.window_log;
-        // C: `curr - lowestValid > maxDistance`, rearranged so that it is
-        // also total for `cur < window_low` (block 0 starts at position 0).
-        if cur > self.window_low + max_distance {
+        debug_assert!(cur >= self.window_low);
+        // C: `curr - lowestValid > maxDistance`
+        if cur - self.window_low > max_distance {
             cur - max_distance
         } else {
             self.window_low
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_block_limits_update_after_long_match() {
+        let data = vec![0u8; 500_000];
+        let mut ms = MatchState::new(CParams::for_level(5, 1 << 20), 0);
+        // The clamp for a block starting at index `idx`.
+        let mut clamp = |next_to_update: Option<usize>, idx: usize| {
+            if let Some(n) = next_to_update {
+                ms.next_to_update = n;
+            }
+            let pos = idx - WINDOW_START_INDEX;
+            let (_, block) = ms.start_block(&data, pos..pos);
+            assert_eq!(block.range(), idx..idx);
+            ms.next_to_update
+        };
+        // Backlog of exactly 384: untouched.
+        assert_eq!(clamp(Some(1000), 1384), 1000);
+        // Backlog 385..575: only the excess over 384 gets inserted.
+        assert_eq!(clamp(Some(1000), 1385), 1384);
+        assert_eq!(clamp(Some(1000), 1575), 1384);
+        // Backlog >= 576: insert only the last 192 positions.
+        assert_eq!(clamp(Some(1000), 1576), 1384);
+        assert_eq!(clamp(Some(1000), 500_000), 500_000 - 192);
+        // Idempotent.
+        assert_eq!(clamp(None, 500_000), 500_000 - 192);
     }
 }

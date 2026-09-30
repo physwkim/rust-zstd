@@ -61,7 +61,7 @@ The decoder reverses this pipeline: parse frame/block headers, decode FSE sequen
 - **Pure Rust** — no C bindings, no `unsafe`, no `libc`
 - **Compress + Decompress** — full codec, not decode-only
 - **Spec-compliant** — output is decodable by any standard zstd decoder (C `libzstd`, Python `zstandard`, etc.)
-- **Compression levels 0–11** — from raw storage to deep lazy matching
+- **Compression levels** — libzstd's: negative levels accelerate the fast strategy, 0 is the default (3), positive levels select libzstd's parameter rows
 - **Parallel compression** — optional rayon job-level parallelism as in ZSTDMT (enabled by default; the frame is identical with and without it)
 - **Competitive ratios** — within 0–5% of C zstd, better on some workloads
 - **Fast decoder** — 1.05–68x faster than C zstd across tested datasets
@@ -94,7 +94,8 @@ use zstd_rs::compress;
 let compressed = compress(b"Hello, World!", 3);
 
 // Level guide:
-//   0     — no compression (raw blocks, fastest)
+//   < 0   — fast strategy accelerated by -level (fastest)
+//   0     — the default level, 3
 //   1-2   — greedy matching (fast)
 //   3-5   — lazy matching (balanced)
 //   6-8   — lazy matching + deeper search

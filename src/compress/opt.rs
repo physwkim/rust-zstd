@@ -5,9 +5,8 @@
 //! (`ZSTD_initStats_ultra`). The match finder is `bt_get_all_matches` in
 //! [`bt`].
 //!
-//! Positions follow the [`MatchState`] convention (absolute indices into
-//! `src`, `window_low >= 1`); the block loop starts like the lazy one, see
-//! [`lazy`](super::lazy).
+//! Positions are the indices [`MatchState`] assigns, libzstd's
+//! `window.base`-relative ones.
 //!
 //! Literals are always entropy-coded for these strategies
 //! (`ZSTD_resolveLiteralsCompression` disables them only for negative
@@ -22,10 +21,10 @@
 //! which the parser alone updates whatever type block N is written as
 //! (C keeps them in `ms->opt`, outside the block state too).
 
-use super::bt::{self, assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
-use super::common::{simd_level, HASH_READ_SIZE};
+use super::bt::{assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
+use super::common::{simd_level, Src};
 use super::ldm::RawSeqView;
-use super::matchstate::MatchState;
+use super::matchstate::{Block, MatchState};
 use super::params::Strategy;
 use super::seqstore::{offset_to_offbase, update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
@@ -365,7 +364,7 @@ type GetAllMatches = unsafe fn(
     &mut [Match; ZSTD_OPT_SIZE],
     &mut MatchState,
     &mut usize,
-    &[u8],
+    Src,
     usize,
     usize,
     &[u32; 3],
@@ -382,7 +381,7 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -415,7 +414,7 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -469,18 +468,21 @@ fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
 /// `ZSTD_compressBlock_btopt` / `_btultra` / `_btultra2`: find the
 /// sequences of `src[block]` with the optimal parser and store them into
 /// `out`. Returns the anchor: the start of the trailing literals, which the
-/// caller appends to `out.lits` (`ZSTD_storeLastLiterals`). `rep` is the
-/// repeat-offset history on entry and is updated on exit. `ldm` holds the
-/// long distance matches from the block start on (`ms->ldmSeqStore`); the
-/// caller moves its store past the block.
+/// caller appends to `out.lits` (`ZSTD_storeLastLiterals`), as an index of
+/// `ms` on return: btultra2's first block moves the window
+/// ([`MatchState::skip_window`]). `rep` is the repeat-offset history on
+/// entry and is updated on exit. `ldm` holds the long distance matches from
+/// the block start on (`ms->ldmSeqStore`); the caller moves its store past
+/// the block.
 pub fn compress_block(
     ms: &mut MatchState,
-    src: &[u8],
-    block: Range<usize>,
+    src: Src,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
     ldm: RawSeqView,
 ) -> usize {
+    let block = block.range();
     assert_opt_bounds(ms, src, block.end);
     let finders = Finders {
         get_all_matches: select_get_all_matches(ms.cparams.min_match, simd_level()),
@@ -499,13 +501,15 @@ pub fn compress_block(
             // round's statistics with it. This can only work if no data has
             // been previously loaded in tables, aka, no dictionary, no
             // prefix, no ldm preprocessing.
-            if state.stats.lit_length_sum == 0 // first block
+            let (src, block) = if state.stats.lit_length_sum == 0 // first block
                 && out.seqs.is_empty() // no ldm
-                && block.start <= ms.window_low // start of frame, nothing loaded nor skipped
+                && block.start == ms.window_low // start of frame, nothing loaded nor skipped
                 && block.len() > ZSTD_PREDEF_THRESHOLD
             {
-                init_stats_ultra(ms, &mut state, src, block.clone(), rep, out, finders);
-            }
+                init_stats_ultra(ms, &mut state, src, block, rep, out, finders)
+            } else {
+                (src, block)
+            };
             opt_generic::<2>(ms, &mut state, src, block, rep, out, finders)
         }
         s => unreachable!("opt::compress_block called for {s:?}"),
@@ -516,42 +520,30 @@ pub fn compress_block(
 
 /// `ZSTD_initStats_ultra`: a first compression pass over the first block,
 /// only to seed the statistics with more accurate starting values; its
-/// sequences and repcodes are dropped.
-///
-/// libzstd then forgets the pass by moving the window past it (`base -=
-/// srcSize`, `dictLimit` and `lowLimit` up by `srcSize`, `nextToUpdate =
-/// dictLimit`), which leaves every index the pass inserted below the
-/// window. Here positions stay put, so the pass is forgotten instead by
-/// emptying the hash buckets it filled (the tables were empty before it)
-/// and restoring `next_to_update`. Tree nodes need no clearing: a tree walk
-/// only enters a node through a hash bucket or a child link written after
-/// that node's own re-insertion, so pass-1 nodes are unreachable.
-fn init_stats_ultra(
+/// sequences and repcodes are dropped, and the window moves past it
+/// ([`MatchState::skip_window`]) so the matches it inserted are forgotten.
+/// Returns `src` and `block` in the moved window's indices.
+fn init_stats_ultra<'a>(
     ms: &mut MatchState,
     state: &mut OptState,
-    src: &[u8],
+    src: Src<'a>,
     block: Range<usize>,
     rep: &[u32; 3],
     out: &mut SeqStore,
     finders: Finders,
-) {
+) -> (Src<'a>, Range<usize>) {
     let mut tmp_rep = *rep; // updated rep codes will sink here
     debug_assert!(state.stats.lit_length_sum == 0); // first block
     debug_assert!(out.seqs.is_empty()); // no ldm
     debug_assert_eq!(ms.next_to_update, ms.window_low); // no prefix
-    let first_update = ms.next_to_update;
 
     // generate stats into ms.opt
     opt_generic::<2>(ms, state, src, block.clone(), &mut tmp_rep, out, finders);
 
     // invalidate first scan from history, only keep entropy stats
     out.clear();
-    // The pass inserted positions up to its `ilimit = iend - 8`.
-    let inserted_end = (block.end + 1)
-        .saturating_sub(HASH_READ_SIZE)
-        .max(first_update);
-    bt::clear_hash_buckets(ms, src, first_update..inserted_end);
-    ms.next_to_update = first_update;
+    let len = block.len();
+    ms.skip_window(src, block, len)
 }
 
 /// `ZSTD_optLdm_t`: the long distance match the parser may use around its
@@ -709,7 +701,7 @@ impl<'a> OptLdm<'a> {
 fn opt_generic<const OPT_LEVEL: u32>(
     ms: &mut MatchState,
     state: &mut OptState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -727,7 +719,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let istart = block.start;
     let iend = block.end;
     let mut anchor = istart;
-    // Below `istart + 1` the loop condition is false anyway (`ip >= 1`).
+    // Below `istart + 1` the loop condition is false anyway.
     let ilimit = iend.saturating_sub(8);
     let cp = ms.cparams;
 
@@ -740,11 +732,10 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let mut opt_ldm = OptLdm::new(ldm, (iend - istart) as u32);
 
     // init
-    stats.rescale_freqs::<OPT_LEVEL>(&src[block.clone()]);
-    // C: `ip += (ip == prefixStart)` with ip starting at the block start;
-    // here positions below `window_low` do not exist (block 0).
+    stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end));
+    // C: `ip += (ip == prefixStart)`
     let prefix_lowest = ms.window_low;
-    let mut ip = istart.max(prefix_lowest);
+    let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
     }
@@ -755,7 +746,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             // find first match
             let litlen = (ip - anchor) as u32;
             let ll0 = (litlen == 0) as u32;
-            // SAFETY: `ip + 8 < iend <= src.len()`, `ip >= window_low`, the
+            // SAFETY: `ip + 8 < iend <= src.end()`, `ip >= window_low`, the
             // tables passed `assert_opt_bounds` in `compress_block`.
             let mut nb_matches = unsafe {
                 get_all_matches(
@@ -850,7 +841,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     {
                         let litlen = opt[c - 1].litlen + 1;
                         let price = opt[c - 1].price
-                            + stats.lit_price::<OPT_LEVEL>(src[ip + c - 1])
+                            + stats.lit_price::<OPT_LEVEL>(src.at(ip + c - 1))
                             + stats.ll_inc_price::<OPT_LEVEL>(litlen);
                         debug_assert!(price < 1_000_000_000); // overflow check
                         if price <= opt[c].price {
@@ -866,10 +857,10 @@ fn opt_generic<const OPT_LEVEL: u32>(
                                 // check next position, in case it would be
                                 // cheaper
                                 let with1literal = prev_match.price
-                                    + stats.lit_price::<OPT_LEVEL>(src[ip + c])
+                                    + stats.lit_price::<OPT_LEVEL>(src.at(ip + c))
                                     + stats.ll_inc_price::<OPT_LEVEL>(1);
                                 let with_more_literals = price
-                                    + stats.lit_price::<OPT_LEVEL>(src[ip + c])
+                                    + stats.lit_price::<OPT_LEVEL>(src.at(ip + c))
                                     + stats.ll_inc_price::<OPT_LEVEL>(litlen + 1);
                                 if with1literal < with_more_literals
                                     && with1literal < opt[c + 1].price
@@ -1092,7 +1083,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             }
 
             debug_assert!(anchor + llen <= iend);
-            stats.update_stats(&src[anchor..anchor + llen], off_base, mlen);
+            stats.update_stats(src.slice(anchor, anchor + llen), off_base, mlen);
             out.store_seq(src, anchor, llen, iend, off_base, mlen as usize);
             anchor += advance;
             ip = anchor;
@@ -1110,6 +1101,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
 mod tests {
     use super::*;
     use crate::compress::common::testutil::{roundtrip_blocks, roundtrip_job, Finder};
+    use crate::compress::matchstate::WINDOW_START_INDEX;
     use crate::compress::params::CParams;
     use crate::compress::{compress_with, CompressOptions, JOBSIZE_MIN};
 
@@ -1117,7 +1109,7 @@ mod tests {
         compress_block: |ms, src, block, rep, out| {
             compress_block(ms, src, block, rep, out, RawSeqView::default())
         },
-        load_prefix: bt::load_prefix,
+        load_prefix: super::super::bt::load_prefix,
     };
 
     fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -1166,7 +1158,7 @@ mod tests {
         for strategy in [Strategy::BtOpt, Strategy::BtUltra, Strategy::BtUltra2] {
             for min_match in 3..=7 {
                 let cp = cparams(strategy, min_match, data.len());
-                let s = roundtrip_blocks(&OPT, &data, cp, 1 << 17, 1, [1, 4, 8]);
+                let s = roundtrip_blocks(&OPT, &data, cp, 1 << 17, [1, 4, 8]);
                 assert!(s.seqs > 1000, "{strategy:?} mm{min_match}: {s:?}");
                 assert!(s.cross_block_matches > 0, "{strategy:?} mm{min_match}");
                 let s = roundtrip_job(&OPT, &data, cp, 1 << 17, 5000, 200 << 10, [1, 4, 8]);
@@ -1191,53 +1183,50 @@ mod tests {
         for strategy in [Strategy::BtOpt, Strategy::BtUltra2] {
             let mut cp = cparams(strategy, 3, data.len());
             cp.window_log = 17;
-            roundtrip_blocks(&OPT, &data, cp, 1 << 17, 1, [1, 4, 8]);
+            roundtrip_blocks(&OPT, &data, cp, 1 << 17, [1, 4, 8]);
         }
     }
 
-    /// btultra2's statistics pass leaves no trace in the match state: every
-    /// hash bucket (and hash3 bucket) it filled is empty again and
-    /// `next_to_update` is back at the block start, while the statistics it
-    /// collected are kept.
+    /// btultra2's statistics pass leaves no trace in the match state: the
+    /// window moves past the block, so every index the pass put in the
+    /// tables lies below `window_low`, `next_to_update` is at the block's
+    /// new start, the re-addressed block holds the same bytes, and the
+    /// statistics the pass collected are kept.
     #[test]
     fn ultra_first_pass_is_forgotten() {
-        // Random 16-letter text ending in a repeat that spans the pass's
-        // `ilimit = end - 8` and then 5 bytes found nowhere else: the pass
-        // must insert `ilimit`, the last position it can insert, whose
-        // hashes cover a unique window (so no other cleared position
-        // empties its bucket by collision).
-        let mut letters: Vec<u8> = noise(1 << 17, 5).iter().map(|b| b'a' + (b & 15)).collect();
-        let n = letters.len();
-        letters.copy_within(1000..1008, n - 13);
-        letters[n - 5..].copy_from_slice(b"QRSTU");
-        for (data, min_match) in (3..=6)
-            .map(|mm| (corpus(1 << 17), mm))
-            .chain((3..=6).map(|mm| (letters.clone(), mm)))
-        {
+        let data = corpus(1 << 17);
+        for min_match in 3..=6 {
             let cp = cparams(Strategy::BtUltra2, min_match, data.len());
-            let mut ms = MatchState::new(cp, 1);
+            let mut ms = MatchState::new(cp, 0);
+            let (view, block) = (ms.view(&data), ms.index(0)..ms.index(data.len()));
             let mut state = ms.opt.take().unwrap();
             let mut out = SeqStore::new();
             let finders = Finders {
                 get_all_matches: select_get_all_matches(cp.min_match, simd_level()),
                 ldm: RawSeqView::default(),
             };
-            init_stats_ultra(
+            let (view, block) = init_stats_ultra(
                 &mut ms,
                 &mut state,
-                &data,
-                0..data.len(),
+                view,
+                block,
                 &[1, 4, 8],
                 &mut out,
                 finders,
             );
             assert!(out.seqs.is_empty() && out.lits.is_empty());
-            assert_eq!(ms.next_to_update, 1, "mm{min_match}");
             assert!(state.stats.lit_length_sum > 0, "mm{min_match}");
-            let (hash, _, hash3) = ms.ws.opt_tables_mut();
-            assert!(hash.iter().all(|&e| e == 0), "mm{min_match}: hash");
+            assert_eq!(ms.window_low, WINDOW_START_INDEX + data.len());
+            assert_eq!(block, ms.index(0)..ms.index(data.len()));
+            assert_eq!(ms.next_to_update, block.start, "mm{min_match}");
+            assert_eq!(view.slice(block.start, block.end), &data[..]);
+            let low = ms.window_low as u32;
+            let (hash, chain, hash3) = ms.ws.opt_tables_mut();
+            assert!(hash.iter().any(|&e| e != 0), "mm{min_match}: hash");
+            for (name, t) in [("hash", &*hash), ("chain", &*chain), ("hash3", &*hash3)] {
+                assert!(t.iter().all(|&e| e < low), "mm{min_match}: {name}");
+            }
             assert_eq!(hash3.is_empty(), min_match != 3);
-            assert!(hash3.iter().all(|&e| e == 0), "mm{min_match}: hash3");
         }
     }
 

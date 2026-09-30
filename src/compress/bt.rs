@@ -8,14 +8,14 @@
 //! the suffix starting at their position; every insertion makes the new
 //! position the root of its hash bucket and splits the old tree around it.
 //!
-//! Positions follow the [`MatchState`] convention: absolute indices into
-//! `src`, `window_low >= 1`, table entry `0` means empty.
+//! Positions are the indices [`MatchState`] assigns, libzstd's
+//! `window.base`-relative ones; table entry `0` means empty.
 //!
 //! `bt_get_all_matches` is the optimal parser's finder
 //! (`ZSTD_btGetAllMatches`): it inserts the position and collects every
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
-use super::common::{byte, read32, tget, MatchCount, HASH_READ_SIZE};
+use super::common::{byte, read32, tget, MatchCount, Src, HASH_READ_SIZE};
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, repcode_to_offbase, ZSTD_REP_NUM};
 use fearless_simd::Fallback;
@@ -40,9 +40,9 @@ const PRIME3: u32 = 506832829;
 /// `ZSTD_hash3Ptr(p, h)`: hash of the 3 bytes at `src[pos]`.
 ///
 /// # Safety
-/// `pos + 4 <= src.len()` (`MEM_readLE32`).
+/// `pos + 4 <= src.end()` (`MEM_readLE32`).
 #[inline(always)]
-unsafe fn hash3_ptr(src: &[u8], pos: usize, h: u32) -> usize {
+unsafe fn hash3_ptr(src: Src, pos: usize, h: u32) -> usize {
     debug_assert!((1..=32).contains(&h));
     ((read32(src, pos) << 8).wrapping_mul(PRIME3) >> (32 - h)) as usize
 }
@@ -51,9 +51,9 @@ unsafe fn hash3_ptr(src: &[u8], pos: usize, h: u32) -> usize {
 /// for `length == 3`; only for comparisons.
 ///
 /// # Safety
-/// `pos + 4 <= src.len()`.
+/// `pos + 4 <= src.end()`.
 #[inline(always)]
-unsafe fn read_min_match(src: &[u8], pos: usize, length: u32) -> u32 {
+unsafe fn read_min_match(src: Src, pos: usize, length: u32) -> u32 {
     if length == 3 {
         read32(src, pos) << 8
     } else {
@@ -63,13 +63,13 @@ unsafe fn read_min_match(src: &[u8], pos: usize, length: u32) -> u32 {
 
 /// Checks behind every unchecked table access of this module: the tables
 /// have the sizes the tree needs and `end` lies inside `src`.
-pub(crate) fn assert_tree_bounds(ms: &MatchState, src: &[u8], end: usize) {
+pub(crate) fn assert_tree_bounds(ms: &MatchState, src: Src, end: usize) {
     let cp = &ms.cparams;
     let (hash_table, chain_table, _) = ms.tables();
     assert!(
-        end <= src.len(),
-        "tree end {end} past src.len() {}",
-        src.len()
+        end <= src.end(),
+        "tree end {end} past src.end() {}",
+        src.end()
     );
     assert_eq!(hash_table.len(), 1usize << cp.hash_log, "hash_table size");
     assert!(cp.chain_log >= 1, "chain_log {} too small", cp.chain_log);
@@ -88,13 +88,13 @@ pub(crate) fn assert_tree_bounds(ms: &MatchState, src: &[u8], end: usize) {
 /// `MLS` is the hash width of `ZSTD_hashPtr` (`3` hashes like `4`).
 ///
 /// # Safety
-/// `ip <= target`, `ip + HASH_READ_SIZE <= iend <= src.len()`, and the
+/// `ip <= target`, `ip + HASH_READ_SIZE <= iend <= src.end()`, and the
 /// tables pass [`assert_tree_bounds`].
 #[inline(always)]
 pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
     m: M,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     ip: usize,
     iend: usize,
     target: usize,
@@ -194,13 +194,13 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
 /// `[next_to_update, ip)` into the tree and set `next_to_update = ip`.
 ///
 /// # Safety
-/// `ip + HASH_READ_SIZE <= iend <= src.len()` and the tables pass
+/// `ip + HASH_READ_SIZE <= iend <= src.end()` and the tables pass
 /// [`assert_tree_bounds`].
 #[inline(always)]
 pub(crate) unsafe fn update_tree_internal<M: MatchCount, const MLS: u32>(
     m: M,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     ip: usize,
     iend: usize,
 ) {
@@ -219,14 +219,14 @@ pub(crate) unsafe fn update_tree_internal<M: MatchCount, const MLS: u32>(
 /// `ip`'s hash.
 ///
 /// # Safety
-/// `ip + 4 <= src.len()`; `hash_table3` holds `1 << hash_log3` entries,
+/// `ip + 4 <= src.end()`; `hash_table3` holds `1 << hash_log3` entries,
 /// `hash_log3 >= 1`.
 #[inline(always)]
 unsafe fn insert_and_find_first_index_hash3(
     hash_table3: &mut [u32],
     hash_log3: u32,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
 ) -> usize {
     let mut idx = *next_to_update3;
@@ -248,7 +248,7 @@ unsafe fn insert_and_find_first_index_hash3(
 /// the number of matches, in increasing length.
 ///
 /// # Safety
-/// `ip + HASH_READ_SIZE <= i_limit <= src.len()`, `ip >= ms.window_low`,
+/// `ip + HASH_READ_SIZE <= i_limit <= src.end()`, `ip >= ms.window_low`,
 /// `ms.next_to_update >= ip`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -257,7 +257,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_limit: usize,
     rep: &[u32; 3],
@@ -272,7 +272,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     let dict_limit = ms.window_low;
     let bt_low = curr.saturating_sub(bt_mask);
     let window_low = ms.lowest_prefix_index(curr);
-    // `matchLow = windowLow ? windowLow : 1`; `window_low >= 1` here.
+    // `matchLow = windowLow ? windowLow : 1`; `window_low >= WINDOW_START_INDEX`.
     let match_low = window_low;
     let hash_log3 = cp.hash_log3();
     let (hash_table, bt, hash_table3) = ms.ws.opt_tables_mut();
@@ -437,7 +437,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
 /// `ip` and collect `ip`'s matches, see [`insert_bt_and_get_all_matches`].
 ///
 /// # Safety
-/// `ip + HASH_READ_SIZE <= i_high_limit <= src.len()`,
+/// `ip + HASH_READ_SIZE <= i_high_limit <= src.end()`,
 /// `ip >= ms.window_low`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -446,7 +446,7 @@ pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -472,52 +472,11 @@ pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32>(
 }
 
 /// [`assert_tree_bounds`] plus the 3-byte hash table of `hash_log3`.
-pub(crate) fn assert_opt_bounds(ms: &MatchState, src: &[u8], end: usize) {
+pub(crate) fn assert_opt_bounds(ms: &MatchState, src: Src, end: usize) {
     assert_tree_bounds(ms, src, end);
     let log3 = ms.cparams.hash_log3();
     let want = if log3 == 0 { 0 } else { 1usize << log3 };
     assert_eq!(ms.ws.hash3().len(), want, "hash_table3 size");
-}
-
-/// Empty the `hashTable` bucket, and the `hashTable3` bucket when there is
-/// one, of every position in `range`, hashed as [`bt_get_all_matches`]
-/// hashes them (`mls = BOUNDED(3, minMatch, 6)`). Undoes the insertions of
-/// a parse over `range` into tables that were empty before it.
-pub(crate) fn clear_hash_buckets(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
-    assert!(
-        range.is_empty() || range.end - 1 + HASH_READ_SIZE <= src.len(),
-        "range {range:?} too close to src end {}",
-        src.len()
-    );
-    assert_opt_bounds(ms, src, 0);
-    let cp = ms.cparams;
-    let hash_log3 = cp.hash_log3();
-    let (hash_table, _, hash_table3) = ms.ws.opt_tables_mut();
-    fn clear<const MLS: u32>(
-        hash_table: &mut [u32],
-        hash_log: u32,
-        hash_table3: &mut [u32],
-        hash_log3: u32,
-        src: &[u8],
-        range: Range<usize>,
-    ) {
-        for p in range {
-            // SAFETY: `p + HASH_READ_SIZE <= src.len()` (asserted above);
-            // the hashes are below the asserted table sizes.
-            unsafe {
-                *hash_table.get_unchecked_mut(super::common::hash_ptr::<MLS>(src, p, hash_log)) = 0;
-                if hash_log3 != 0 {
-                    *hash_table3.get_unchecked_mut(hash3_ptr(src, p, hash_log3)) = 0;
-                }
-            }
-        }
-    }
-    let (h, h3) = (cp.hash_log, hash_log3);
-    match cp.min_match.clamp(3, 6) {
-        5 => clear::<5>(hash_table, h, hash_table3, h3, src, range),
-        6 => clear::<6>(hash_table, h, hash_table3, h3, src, range),
-        _ => clear::<4>(hash_table, h, hash_table3, h3, src, range),
-    }
 }
 
 /// `ZSTD_loadDictionaryContent`, binary-tree arm, for a raw-content prefix
@@ -525,7 +484,7 @@ pub(crate) fn clear_hash_buckets(ms: &mut MatchState, src: &[u8], range: Range<u
 /// the prefix start, then, unless the prefix is at most `HASH_READ_SIZE`
 /// bytes, `ZSTD_updateTree(ms, end - HASH_READ_SIZE, end)` and
 /// `nextToUpdate = end`.
-pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     assert!(
         range.start >= ms.window_low,
         "prefix start {} below window_low {}",
@@ -545,9 +504,9 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
 /// `ZSTD_loadDictionaryContent`'s `ZSTD_updateTree(ms, iend - 8, iend)`
 /// that sorts a prefix into the tree before a job's first block.
 ///
-/// Panics unless `ip + HASH_READ_SIZE <= iend <= src.len()` and the match
+/// Panics unless `ip + HASH_READ_SIZE <= iend <= src.end()` and the match
 /// state has a chain table of `1 << chain_log` entries.
-pub fn update_tree(ms: &mut MatchState, src: &[u8], ip: usize, iend: usize) {
+pub fn update_tree(ms: &mut MatchState, src: Src, ip: usize, iend: usize) {
     assert!(
         ip + super::common::HASH_READ_SIZE <= iend,
         "update_tree target {ip} closer than HASH_READ_SIZE to {iend}"
@@ -614,21 +573,28 @@ mod tests {
         for (alphabet, min_match) in [(2u8, 4u32), (4, 5), (26, 6), (3, 3)] {
             let src = xorshift_text(20_000, alphabet);
             let cp = tree_params(16, 6, min_match);
-            let mut ms = MatchState::new(cp, 1);
-            let end = src.len();
-            update_tree(&mut ms, &src, end - 8, end);
+            let mut ms = MatchState::new(cp, 0);
+            let v = ms.view(&src);
+            let end = v.end();
+            update_tree(&mut ms, v, end - 8, end);
             assert_eq!(ms.next_to_update, end - 8);
             let mut linked = 0;
-            for idx in 1..end - 8 {
+            for idx in v.lo()..end - 8 {
                 let (smaller, larger) = children(&ms, idx);
                 if smaller != 0 {
                     assert!(smaller < idx, "smaller child {smaller} of {idx} not older");
-                    assert!(src[smaller..end] < src[idx..end], "smaller child of {idx}");
+                    assert!(
+                        v.slice(smaller, end) < v.slice(idx, end),
+                        "smaller child of {idx}"
+                    );
                     linked += 1;
                 }
                 if larger != 0 {
                     assert!(larger < idx, "larger child {larger} of {idx} not older");
-                    assert!(src[larger..end] > src[idx..end], "larger child of {idx}");
+                    assert!(
+                        v.slice(larger, end) > v.slice(idx, end),
+                        "larger child of {idx}"
+                    );
                     linked += 1;
                 }
             }
@@ -645,18 +611,19 @@ mod tests {
         src[1000..3000].fill(b'z');
         src[3000] = b'a';
         let cp = tree_params(16, 6, 4);
-        let mut ms = MatchState::new(cp, 1);
-        let end = src.len();
-        assert_tree_bounds(&ms, &src, end);
+        let mut ms = MatchState::new(cp, 0);
+        let v = ms.view(&src);
+        let end = v.end();
+        let p1001 = ms.index(1001);
+        assert_tree_bounds(&ms, v, end);
         // SAFETY: bounds asserted; 1000 + 8 <= end.
         unsafe {
-            ms.next_to_update = 1;
-            update_tree_internal::<_, 4>(Fallback::new(), &mut ms, &src, 1001, end);
-            assert_eq!(ms.next_to_update, 1001);
+            update_tree_internal::<_, 4>(Fallback::new(), &mut ms, v, p1001, end);
+            assert_eq!(ms.next_to_update, p1001);
             // Position 1001 matches 1000 for 1999 bytes (up to 2999), so
             // the match ends at 1000 + 1999 and the next 1990 positions are
             // skipped.
-            let forward = insert_bt1::<_, 4>(Fallback::new(), &mut ms, &src, 1001, end, 1001);
+            let forward = insert_bt1::<_, 4>(Fallback::new(), &mut ms, v, p1001, end, p1001);
             assert_eq!(forward, 1000 + 1999 - (1001 + 8));
         }
     }
@@ -670,14 +637,15 @@ mod tests {
         let copy: Vec<u8> = src[a..a + 1000].to_vec();
         src[b..b + 1000].copy_from_slice(&copy);
         let cp = tree_params(16, 6, 4);
-        let mut ms = MatchState::new(cp, 1);
-        let end = src.len();
-        assert_tree_bounds(&ms, &src, end);
+        let mut ms = MatchState::new(cp, 0);
+        let v = ms.view(&src);
+        let end = v.end();
+        let b = ms.index(b);
+        assert_tree_bounds(&ms, v, end);
         // SAFETY: bounds asserted.
         unsafe {
-            ms.next_to_update = 1;
-            update_tree_internal::<_, 4>(Fallback::new(), &mut ms, &src, b, end);
-            let forward = insert_bt1::<_, 4>(Fallback::new(), &mut ms, &src, b, end, b);
+            update_tree_internal::<_, 4>(Fallback::new(), &mut ms, v, b, end);
+            let forward = insert_bt1::<_, 4>(Fallback::new(), &mut ms, v, b, end, b);
             // The match at `a` ends at `a + 1000` (or a little later by
             // chance), far below `b + 9`: only the 384-rule applies.
             assert_eq!(forward, 192);
@@ -688,7 +656,9 @@ mod tests {
     #[should_panic(expected = "closer than HASH_READ_SIZE")]
     fn update_tree_rejects_target_near_end() {
         let src = xorshift_text(100, 4);
-        let mut ms = MatchState::new(tree_params(10, 4, 4), 1);
-        update_tree(&mut ms, &src, 95, 100);
+        let mut ms = MatchState::new(tree_params(10, 4, 4), 0);
+        let v = ms.view(&src);
+        let (ip, end) = (ms.index(95), ms.index(100));
+        update_tree(&mut ms, v, ip, end);
     }
 }

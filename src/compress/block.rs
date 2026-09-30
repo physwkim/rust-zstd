@@ -10,8 +10,9 @@
 //! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
 //! discard the candidate, including its repeat offsets.
 
+use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::MatchState;
+use super::matchstate::{Block, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -148,14 +149,17 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 }
 
 /// `ZSTD_loadDictionaryContent` for a raw-content prefix: index
-/// `src[range]` into the strategy's tables before the first block of a job.
+/// `data[range]` into the strategy's tables before the first block of a job.
 /// Only the last `1 << min(max(hashLog + 3, chainLog + 1), 31)` bytes are
 /// indexed ("larger than we can reasonably index in our tables"); matches
 /// may still reach the whole prefix, which `window_low` keeps valid.
-pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+/// `range` is in positions of `data`, starting at the window's origin.
+pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
     let cp = &ms.cparams;
     let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
-    let range = range.start.max(range.end.saturating_sub(max_dict_size))..range.end;
+    let src = ms.view(data);
+    let range =
+        ms.index(range.start.max(range.end.saturating_sub(max_dict_size)))..ms.index(range.end);
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
@@ -166,35 +170,24 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     }
 }
 
-/// `ZSTD_buildSeqStore`, "limited update after a very long match": when the
-/// previous block left more than 384 positions uninserted (its last match ran
-/// past the block end), insert at most the 192 positions before `curr` (fewer
-/// while the backlog is under 576) instead of the whole backlog.
-#[inline]
-fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
-    if curr > ms.next_to_update + 384 {
-        ms.next_to_update = curr - 192.min(curr - ms.next_to_update - 384);
-    }
-}
-
 /// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, ZSTD_noDict)`
-/// run on `src[range]`: store its sequences into `out` and return the
-/// anchor of the trailing literals.
+/// run on `block`: store its sequences into `out` and return the anchor of
+/// the trailing literals.
 pub fn run_block_compressor(
     ms: &mut MatchState,
-    src: &[u8],
-    range: Range<usize>,
+    src: Src,
+    block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
     match ms.cparams.strategy {
-        Strategy::Fast => fast::compress_block(ms, src, range, rep, out),
-        Strategy::DFast => dfast::compress_block(ms, src, range, rep, out),
+        Strategy::Fast => fast::compress_block(ms, src, block, rep, out),
+        Strategy::DFast => dfast::compress_block(ms, src, block, rep, out),
         Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::compress_block(ms, src, range, rep, out)
+            lazy::compress_block(ms, src, block, rep, out)
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            opt::compress_block(ms, src, range, rep, out, RawSeqView::default())
+            opt::compress_block(ms, src, block, rep, out, RawSeqView::default())
         }
     }
 }
@@ -219,39 +212,44 @@ pub enum BlockLdm<'a> {
     External(&'a mut RawSeqStore),
 }
 
-/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, apply
-/// the nextToUpdate clamp, run the strategy's block compressor (through
-/// `ZSTD_ldm_blockCompress` when `ldm` provides long matches) and store the
-/// trailing literals (`ZSTD_storeLastLiterals`). `rep` holds the committed
-/// repeat offsets on entry and the block's candidates on return.
+/// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, set
+/// up positions `block` of `data` ([`MatchState::start_block`], which
+/// applies the nextToUpdate clamp), run the strategy's block compressor on
+/// it (through `ZSTD_ldm_blockCompress` when `ldm` provides long matches)
+/// and store the trailing literals (`ZSTD_storeLastLiterals`). `rep` holds
+/// the committed repeat offsets on entry and the block's candidates on
+/// return.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
 #[inline(never)]
 pub fn build_seq_store(
     ms: &mut MatchState,
-    src: &[u8],
+    data: &[u8],
     block: Range<usize>,
     rep: &mut [u32; 3],
     store: &mut SeqStore,
     ldm: &mut BlockLdm,
 ) {
     store.clear();
-    limit_update_after_long_match(ms, block.start);
+    let (block_len, block_end) = (block.len(), block.end);
+    let positions = block.clone();
+    let (src, block) = ms.start_block(data, block);
     let anchor = match ldm {
         BlockLdm::External(seqs) if !seqs.is_exhausted() => {
-            ldm::block_compress(seqs, ms, src, block.clone(), rep, store)
+            ldm::block_compress(seqs, ms, src, block, rep, store)
         }
         BlockLdm::Internal(state) => {
-            let seqs = state.generate_block_sequences(src, block.clone());
-            ldm::block_compress(seqs, ms, src, block.clone(), rep, store)
+            let seqs = state.generate_block_sequences(data, positions);
+            ldm::block_compress(seqs, ms, src, block, rep, store)
         }
-        BlockLdm::Off | BlockLdm::External(_) => {
-            run_block_compressor(ms, src, block.clone(), rep, store)
-        }
+        BlockLdm::Off | BlockLdm::External(_) => run_block_compressor(ms, src, block, rep, store),
     };
-    // ZSTD_storeLastLiterals
-    store.lits.extend_from_slice(&src[anchor..block.end]);
+    // ZSTD_storeLastLiterals; btultra2 may have moved the window
+    // (`ZSTD_initStats_ultra`), so the anchor is read back through `ms`.
+    store
+        .lits
+        .extend_from_slice(&data[ms.pos(anchor)..block_end]);
     debug_assert_eq!(
         store.lits.len()
             + store
@@ -259,7 +257,7 @@ pub fn build_seq_store(
                 .iter()
                 .map(|s| s.match_len() as usize)
                 .sum::<usize>(),
-        block.len()
+        block_len
     );
 }
 
@@ -895,10 +893,11 @@ mod tests {
             })
             .collect();
         let lowest = |len: usize| {
-            let mut ms = MatchState::new(cp, 1);
-            load_prefix(&mut ms, &src, src.len() - len..src.len());
+            let origin = src.len() - len;
+            let mut ms = MatchState::new(cp, origin);
+            load_prefix(&mut ms, &src, origin..src.len());
             let (hash, _, _) = ms.tables();
-            hash.iter().filter(|&&e| e != 0).min().copied().unwrap() as usize
+            ms.pos(hash.iter().filter(|&&e| e != 0).min().copied().unwrap() as usize)
         };
         assert!(lowest(cap + 1000) >= src.len() - cap);
         assert!(lowest(cap) >= src.len() - cap);
@@ -1044,33 +1043,6 @@ mod tests {
         frame.extend_from_slice(&blocks);
         assert_eq!(crate::decompress(&frame).unwrap(), b.src);
         assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), b.src);
-    }
-
-    #[test]
-    fn limit_update_after_long_match_boundaries() {
-        let cp = CParams::for_level(5, 1 << 20);
-        let mut ms = MatchState::new(cp, 1);
-        // Backlog of exactly 384: untouched.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1384);
-        assert_eq!(ms.next_to_update, 1000);
-        // Backlog 385..575: only the excess over 384 gets inserted.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1385);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1575);
-        assert_eq!(ms.next_to_update, 1384);
-        // Backlog >= 576: insert only the last 192 positions.
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 1576);
-        assert_eq!(ms.next_to_update, 1384);
-        ms.next_to_update = 1000;
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
-        // Idempotent.
-        limit_update_after_long_match(&mut ms, 500_000);
-        assert_eq!(ms.next_to_update, 500_000 - 192);
     }
 
     /// 1 MiB of period-21 text with noise over `[40 KiB, 128 KiB)`: the
