@@ -26,7 +26,7 @@ pub mod split;
 
 use crate::constants::*;
 use block::{
-    write_raw_block, write_rle_block, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
+    write_raw_block, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
 use matchstate::MatchState;
@@ -46,8 +46,10 @@ pub const JOBSIZE_MAX: usize = 1 << 30;
 /// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
-    /// Compression level, `ZSTD_c_compressionLevel`. `<= 0` emits raw/RLE
-    /// blocks only; `1..=22` map to libzstd's parameter rows.
+    /// Compression level, `ZSTD_c_compressionLevel`, as libzstd reads it:
+    /// `1..=22` select its parameter rows (higher clamps to 22), `0` is the
+    /// default level 3, and a negative level is the fast strategy
+    /// accelerated by `-level` (clamped at `ZSTD_minCLevel`, -131072).
     pub level: i32,
     /// Job size in bytes (`ZSTD_c_jobSize`). `None` (the default) compresses
     /// the input as one job, as single-threaded `ZSTD_compress2`
@@ -202,22 +204,6 @@ impl Compressor {
 
         if src.is_empty() {
             write_raw_block(out, &[], true);
-            return;
-        }
-
-        // blockSizeMax = MIN(ZSTD_BLOCKSIZE_MAX, 1 << windowLog)
-        let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-        let n_blocks = src.len().div_ceil(block_size);
-
-        if self.opts.level <= 0 {
-            for (i, chunk) in src.chunks(block_size).enumerate() {
-                let is_last = i + 1 == n_blocks;
-                if block::is_rle(chunk) {
-                    write_rle_block(out, chunk[0], chunk.len(), is_last);
-                } else {
-                    write_raw_block(out, chunk, is_last);
-                }
-            }
             return;
         }
 
