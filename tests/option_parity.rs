@@ -4,9 +4,11 @@
 
 mod common;
 
-use rust_zstd::{compress_with, decompress, CompressOptions};
+use rust_zstd::compress::JOBSIZE_MIN;
+use rust_zstd::{compress_with, decompress, CompressOptions, ParamSwitch};
 use sys::ZSTD_cParameter::{
-    ZSTD_c_compressionLevel, ZSTD_c_jobSize, ZSTD_c_nbWorkers, ZSTD_c_overlapLog,
+    ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching, ZSTD_c_jobSize, ZSTD_c_nbWorkers,
+    ZSTD_c_overlapLog,
 };
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -68,6 +70,55 @@ fn overlap_log_above_max_matches_libzstd() {
             );
             let name = format!("L{level} overlap_log {overlap_log}");
             assert!(decompress(&ours).unwrap() == data, "{name}: roundtrip");
+            assert!(ours == c, "{name}: frame differs from libzstd");
+        }
+    }
+}
+
+/// `ZSTD_c_jobSize` 0 at 8 workers is ZSTDMT's automatic job size,
+/// `ZSTDMT_computeTargetJobLog`: 2 MiB at level 1, 8 MiB at level 3 and
+/// 16 MiB at level 11 (one job of ZSTDMT), and with long distance
+/// matching 2 MiB at both levels, from the chain log. At
+/// `ZSTDMT_JOBSIZE_MIN` libzstd compresses single-threaded; one byte more
+/// is ZSTDMT. `ZSTD_c_jobSize` 1 still clamps to `ZSTDMT_JOBSIZE_MIN`.
+#[test]
+fn job_size_zero_matches_libzstd() {
+    let data = input(10 << 20);
+    let cases = [
+        (1, false, 0),
+        (3, false, 0),
+        (11, false, 0),
+        (1, true, 0),
+        (3, true, 0),
+        (1, false, 1),
+    ];
+    for (level, ldm, job_size) in cases {
+        for len in [JOBSIZE_MIN, JOBSIZE_MIN + 1, data.len()] {
+            let src = &data[..len];
+            let ours = compress_with(
+                src,
+                &CompressOptions {
+                    level,
+                    job_size: Some(job_size),
+                    ldm: if ldm {
+                        ParamSwitch::Enable
+                    } else {
+                        ParamSwitch::Auto
+                    },
+                    ..Default::default()
+                },
+            );
+            let c = common::c_compress2(
+                src,
+                &[
+                    (ZSTD_c_compressionLevel, level),
+                    (ZSTD_c_nbWorkers, 8),
+                    (ZSTD_c_jobSize, job_size as i32),
+                    (ZSTD_c_enableLongDistanceMatching, ldm as i32),
+                ],
+            );
+            let name = format!("L{level} ldm {ldm} job_size {job_size} len {len}");
+            assert!(decompress(&ours).unwrap() == src, "{name}: roundtrip");
             assert!(ours == c, "{name}: frame differs from libzstd");
         }
     }
