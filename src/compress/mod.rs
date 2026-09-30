@@ -36,6 +36,11 @@ pub use params::{CParams, ParamSwitch, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
 use std::ops::Range;
+#[cfg(feature = "parallel")]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Condvar, Mutex,
+};
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
@@ -297,11 +302,6 @@ impl Compressor {
             .filter(|_| mt)
             .map(|params| reset_ldm_state(&mut self.serial_ldm, params));
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
-        // A job spawned only once its sequences are generated would be taken
-        // by a thread waiting in an earlier job's block join, holding that job
-        // back by a whole job; such jobs compress their blocks serially, as
-        // ZSTDMT's workers do.
-        let blocks_pipelined = pipelined && (n_jobs == 1 || serial_ldm.is_none());
         run_jobs(
             &jobs,
             &mut self.jobs[..n_jobs],
@@ -333,7 +333,7 @@ impl Compressor {
                     k == 0,
                     k + 1 == n_jobs,
                     split,
-                    blocks_pipelined,
+                    pipelined,
                     ms,
                     scratch,
                     &mut ldm,
@@ -461,6 +461,13 @@ fn compress_job(
 /// straight into `out`, the others into buffers of their own that are
 /// appended afterwards; the serial loop hands every job `out`. The job
 /// function is the same either way, so the frame is identical.
+///
+/// Jobs are never rayon tasks: every worker gets one [`JobQueue`] runner
+/// (`spawn_broadcast`), which claims jobs in order until none is left. A
+/// thread waiting in a job's block `rayon::join` runs whatever rayon hands
+/// it; were jobs tasks, it could take a queued job and finish its own a
+/// whole job late. It can still take its own runner, or another frame's,
+/// which is why a runner that starts inside a job claims nothing.
 fn run_jobs<P, F>(
     jobs: &[Range<usize>],
     ctxs: &mut [JobContext],
@@ -476,14 +483,24 @@ fn run_jobs<P, F>(
     #[cfg(feature = "parallel")]
     if parallel {
         let mut rest_out = vec![Vec::new(); jobs.len().saturating_sub(1)];
-        let outs = std::iter::once(&mut *out).chain(&mut rest_out);
-        let f = &f;
-        rayon::scope(|s| {
-            for (k, ((job, ctx), o)) in jobs.iter().zip(ctxs).zip(outs).enumerate() {
-                prepare(job, ctx);
-                s.spawn(move |_| f(k, job.clone(), ctx, o));
-            }
-        });
+        {
+            let outs = std::iter::once(&mut *out).chain(&mut rest_out);
+            let queue = JobQueue::new(jobs, ctxs.iter_mut().zip(outs));
+            let (queue, f) = (&queue, &f);
+            rayon::scope(|s| {
+                if jobs.len() > 1 {
+                    s.spawn_broadcast(move |_, _| {
+                        if !IN_JOB.get() {
+                            queue.run(f);
+                        }
+                    });
+                }
+                queue.prepare_all(&mut prepare);
+                // The calling task runs jobs whether or not it is inside one:
+                // the frame is its to finish.
+                queue.run(f);
+            });
+        }
         for o in &rest_out {
             out.extend_from_slice(o);
         }
@@ -493,6 +510,119 @@ fn run_jobs<P, F>(
     for (k, (job, ctx)) in jobs.iter().zip(ctxs.iter_mut()).enumerate() {
         prepare(job, ctx);
         f(k, job.clone(), ctx, out);
+    }
+}
+
+#[cfg(feature = "parallel")]
+thread_local! {
+    /// Whether this thread is running one of [`JobQueue::run`]'s jobs.
+    static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as inside a job until dropped.
+#[cfg(feature = "parallel")]
+struct InJob(bool);
+
+#[cfg(feature = "parallel")]
+impl InJob {
+    fn enter() -> Self {
+        InJob(IN_JOB.replace(true))
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Drop for InJob {
+    fn drop(&mut self) {
+        IN_JOB.set(self.0);
+    }
+}
+
+/// A job's context and output.
+#[cfg(feature = "parallel")]
+type JobSlot<'a> = (&'a mut JobContext, &'a mut Vec<u8>);
+
+/// One frame's jobs for [`run_jobs`]' runners, claimed in job order, each
+/// once its `prepare` has run.
+#[cfg(feature = "parallel")]
+struct JobQueue<'a> {
+    jobs: &'a [Range<usize>],
+    /// Job `k`'s slot, until its runner takes it.
+    slots: Vec<Mutex<Option<JobSlot<'a>>>>,
+    /// The next job to claim.
+    next: AtomicUsize,
+    /// How many jobs, in job order, have been prepared; `None` once
+    /// preparing unwound, so that no runner waits for the rest.
+    prepared: Mutex<Option<usize>>,
+    prepared_cv: Condvar,
+}
+
+#[cfg(feature = "parallel")]
+impl<'a> JobQueue<'a> {
+    fn new(jobs: &'a [Range<usize>], slots: impl Iterator<Item = JobSlot<'a>>) -> Self {
+        Self {
+            jobs,
+            slots: slots.map(|s| Mutex::new(Some(s))).collect(),
+            next: AtomicUsize::new(0),
+            prepared: Mutex::new(Some(0)),
+            prepared_cv: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, prepared: Option<usize>) {
+        *self.prepared.lock().unwrap() = prepared;
+        self.prepared_cv.notify_all();
+    }
+
+    /// `prepare` every job, in job order, releasing each to the runners.
+    fn prepare_all<P>(&self, prepare: &mut P)
+    where
+        P: FnMut(&Range<usize>, &mut JobContext),
+    {
+        struct Unwinding<'q, 'a>(&'q JobQueue<'a>);
+        impl Drop for Unwinding<'_, '_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.publish(None);
+                }
+            }
+        }
+        let _unwinding = Unwinding(self);
+        for (k, (job, slot)) in self.jobs.iter().zip(&self.slots).enumerate() {
+            if let Some((ctx, _)) = slot.lock().unwrap().as_mut() {
+                prepare(job, ctx);
+            }
+            self.publish(Some(k + 1));
+        }
+    }
+
+    /// Claim the next job, wait until it is prepared and run it, until no
+    /// job is left.
+    fn run<F>(&self, f: &F)
+    where
+        F: Fn(usize, Range<usize>, &mut JobContext, &mut Vec<u8>),
+    {
+        loop {
+            let k = self.next.fetch_add(1, Ordering::Relaxed);
+            let Some(job) = self.jobs.get(k) else {
+                return;
+            };
+            let mut prepared = self.prepared.lock().unwrap();
+            loop {
+                match *prepared {
+                    None => return,
+                    Some(n) if n > k => break,
+                    Some(_) => prepared = self.prepared_cv.wait(prepared).unwrap(),
+                }
+            }
+            drop(prepared);
+            let (ctx, out) = self.slots[k]
+                .lock()
+                .unwrap()
+                .take()
+                .expect("job claimed twice");
+            let _in_job = InJob::enter();
+            f(k, job.clone(), ctx, out);
+        }
     }
 }
 
@@ -1310,6 +1440,54 @@ mod tests {
                         "{name} L{level}: no block split"
                     );
                 }
+            }
+        }
+    }
+
+    /// A thread waiting in a job's block join runs no other job meanwhile:
+    /// with more jobs than threads and each join's second half slower than
+    /// its first, so that a thread waits whenever a half is stolen, no job
+    /// runs within another's run on the same thread.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn no_job_runs_inside_another() {
+        use std::time::{Duration, Instant};
+        let spin = |d: Duration| {
+            let t = Instant::now();
+            while t.elapsed() < d {
+                std::hint::spin_loop();
+            }
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let jobs: Vec<Range<usize>> = (0..24).map(|k| k..k + 1).collect();
+        let mut ctxs: Vec<JobContext> = jobs.iter().map(|_| JobContext::default()).collect();
+        let runs = Mutex::new(Vec::new());
+        let t0 = Instant::now();
+        pool.install(|| {
+            let job = |k: usize, _: Range<usize>, _: &mut JobContext, _: &mut Vec<u8>| {
+                let start = t0.elapsed();
+                for _ in 0..4 {
+                    rayon::join(
+                        || spin(Duration::from_micros(50)),
+                        || spin(Duration::from_micros(500)),
+                    );
+                }
+                let run = (k, rayon::current_thread_index(), start, t0.elapsed());
+                runs.lock().unwrap().push(run);
+            };
+            run_jobs(&jobs, &mut ctxs, true, |_, _| {}, job, &mut Vec::new());
+        });
+        let runs = runs.into_inner().unwrap();
+        assert_eq!(runs.len(), jobs.len());
+        for (k, thread, start, end) in &runs {
+            for (inner, t, s, e) in &runs {
+                assert!(
+                    !(t == thread && s > start && e < end),
+                    "job {inner} ran inside job {k} on thread {thread:?}"
+                );
             }
         }
     }
