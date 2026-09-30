@@ -52,6 +52,9 @@ pub const JOBSIZE_MAX: usize = if MEM_32BITS { 512 << 20 } else { 1 << 30 };
 /// bits.
 const JOBLOG_MAX: u32 = if MEM_32BITS { 29 } else { 30 };
 
+/// `ZSTD_OVERLAPLOG_MAX`: upper bound of `ZSTD_c_overlapLog`.
+const OVERLAPLOG_MAX: u8 = 9;
+
 /// Options for [`Compressor`] and [`compress_with`].
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
@@ -84,8 +87,8 @@ pub struct CompressOptions {
     /// `ZSTDMT_overlapLog_default` (6 for `Fast`..`Lazy`, 7 for `Lazy2` and
     /// `BtLazy2`, 8 for `BtOpt` and `BtUltra`, 9 for `BtUltra2`), `1` means
     /// no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
-    /// so `9` is the full window. Values above 9 panic (libzstd rejects
-    /// them with `parameter_outOfBound`). With long distance matching the
+    /// so `9` is the full window. Values above 9 are 9, as
+    /// `ZSTD_CCtx_setParameter` clamps them. With long distance matching the
     /// fraction is of `min(window, 1 << (job_log - 2))` instead, with
     /// `job_log = min(max(21, cycleLog + 3), 30)` (29 where `usize` is 32
     /// bits), and `1` no longer means
@@ -114,7 +117,8 @@ pub struct CompressOptions {
     /// explicit hash log, else `7 - strategy / 3`), else `1..=25`
     /// (`1..=24` where `usize` is 32 bits).
     ///
-    /// Out-of-range LDM values panic, as `overlap_log` does.
+    /// Out-of-range LDM values panic, where `ZSTD_CCtx_setParameter`
+    /// returns `parameter_outOfBound`.
     pub ldm_hash_rate_log: u32,
     /// `ZSTD_c_splitAfterSequences`: after the match finder, cut a block
     /// into several where separate entropy tables are estimated to pay for
@@ -689,12 +693,8 @@ pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
 /// result is `0` or `1 << (window_log - (9 - overlap_log))`, with it
 /// `1 << (min(window_log, job_log - 2) - (9 - overlap_log))`.
 pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
-    assert!(
-        overlap_log <= 9,
-        "overlap_log {overlap_log} out of range 0..=9"
-    );
-    // ZSTDMT_overlapLog
-    let overlap_log = match overlap_log {
+    // ZSTDMT_overlapLog, of the value ZSTD_cParam_clampBounds leaves
+    let overlap_log = match overlap_log.min(OVERLAPLOG_MAX) {
         // ZSTDMT_overlapLog_default
         0 => match cparams.strategy {
             Strategy::BtUltra2 => 9,
@@ -1178,20 +1178,29 @@ mod tests {
         );
     }
 
-    /// `overlap_size` accepts exactly the overlap logs within
-    /// `ZSTD_c_overlapLog`'s bounds, and panics one past them.
+    /// `overlap_size` reads an overlap log as `ZSTD_CCtx_setParameter`
+    /// stores it, clamped to `ZSTD_c_overlapLog`'s bounds.
     #[test]
     fn overlap_log_bounds_match_libzstd() {
-        use crate::compress::common::testutil::c_bounds;
+        use crate::compress::common::testutil::{c_accepts, c_bounds};
         use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::ZSTD_c_overlapLog;
 
         let (lo, hi) = c_bounds(ZSTD_c_overlapLog);
-        assert_eq!(lo, 0);
-        let cp = CParams::for_level(1, 1 << 20);
-        for v in 0..=hi + 1 {
+        assert_eq!(hi, OVERLAPLOG_MAX as i32);
+        assert!(c_accepts(ZSTD_c_overlapLog, hi + 1));
+        for cp in [
+            CParams::for_level(1, 1 << 20),
+            CParams::for_level(19, 1 << 20),
+        ] {
             for ldm in [false, true] {
-                let ours = std::panic::catch_unwind(|| overlap_size(&cp, v as u8, ldm)).is_ok();
-                assert_eq!(ours, v <= hi, "{v} ldm {ldm}");
+                for v in 0..=u8::MAX {
+                    let clamped = (v as i32).clamp(lo, hi) as u8;
+                    assert_eq!(
+                        overlap_size(&cp, v, ldm),
+                        overlap_size(&cp, clamped, ldm),
+                        "{v} ldm {ldm}"
+                    );
+                }
             }
         }
     }
