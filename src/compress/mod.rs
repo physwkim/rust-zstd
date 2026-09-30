@@ -12,6 +12,7 @@
 //! without the `parallel` feature, so both builds emit identical frames.
 
 pub mod block;
+pub mod bt;
 pub mod common;
 pub mod dfast;
 pub mod fast;
@@ -63,7 +64,8 @@ pub struct CompressOptions {
     pub job_size: Option<usize>,
     /// `ZSTD_c_overlapLog`, `0..=9`: the history a job indexes from before
     /// its start, as a fraction of the window. `0` selects
-    /// `ZSTDMT_overlapLog_default` (6 for `Fast`..`Lazy`, 7 for `Lazy2`),
+    /// `ZSTDMT_overlapLog_default` (6 for `Fast`..`Lazy`, 7 for `Lazy2` and
+    /// `BtLazy2`),
     /// `1` means no overlap, and `n` in `2..=9` means `window >> (9 - n)`,
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
     /// them with `parameter_outOfBound`).
@@ -371,7 +373,7 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8) -> usize {
     let overlap_log = match overlap_log {
         // ZSTDMT_overlapLog_default
         0 => match cparams.strategy {
-            Strategy::Lazy2 => 7,
+            Strategy::Lazy2 | Strategy::BtLazy2 => 7,
             Strategy::Fast | Strategy::DFast | Strategy::Greedy | Strategy::Lazy => 6,
         },
         n => n as u32,

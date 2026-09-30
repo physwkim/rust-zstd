@@ -152,7 +152,9 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => lazy::load_prefix(ms, src, range),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            lazy::load_prefix(ms, src, range)
+        }
     }
 }
 
@@ -187,7 +189,7 @@ pub fn build_seq_store(
     let anchor = match ms.cparams.strategy {
         Strategy::Fast => fast::compress_block(ms, src, block.clone(), rep, store),
         Strategy::DFast => dfast::compress_block(ms, src, block.clone(), rep, store),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
             lazy::compress_block(ms, src, block.clone(), rep, store)
         }
     };
