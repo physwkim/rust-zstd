@@ -3495,6 +3495,27 @@ impl WildCopy for Fallback {
     unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize) {
         wildcopy(dst, src, len)
     }
+
+    #[inline(always)]
+    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize) {
+        let _ = avail;
+        let src = dst.sub(offset) as *const u8;
+        if offset >= 16 {
+            // Two chunks before the first length test: `wildcopy`'s
+            // `len <= 16` exit and loop exit mispredict on source code's
+            // matches.
+            copy16(dst, src);
+            copy16(dst.add(16), src.add(16));
+            if ml > 32 {
+                wildcopy(dst.add(32), src.add(32), ml - 32);
+            }
+        } else {
+            let (dst, src) = overlap_copy8(dst, src, offset);
+            if ml > 8 {
+                wildcopy_overlap8(dst, src, ml - 8);
+            }
+        }
+    }
 }
 
 /// Portable copies for blocks with many short offsets
