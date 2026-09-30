@@ -95,8 +95,8 @@ pub fn decode_huf_weights_from_fse(source: &[u8], header: u8) -> Result<Vec<u8>,
     let mut ht = HuffmanTable::new();
     let mut full = vec![header];
     full.extend_from_slice(source);
-    let _ = ht.read_weights(&full)?;
-    Ok(ht.weights.clone())
+    let (_, nb_weights) = ht.read_weights(&full)?;
+    Ok(ht.weights[..nb_weights].to_vec())
 }
 
 /// Decode a Huffman tree description and reconstruct canonical codes.
@@ -288,138 +288,6 @@ impl<'s> BitReader<'s> {
 }
 
 // ============================================================
-// BitReaderReversed
-// ============================================================
-
-struct BitReaderReversed<'s> {
-    index: usize,
-    bits_consumed: u8,
-    extra_bits: usize,
-    source: &'s [u8],
-    bit_container: u64,
-}
-
-impl<'s> BitReaderReversed<'s> {
-    fn bits_remaining(&self) -> isize {
-        self.index as isize * 8 + (64 - self.bits_consumed as isize) - self.extra_bits as isize
-    }
-
-    fn new(source: &'s [u8]) -> BitReaderReversed<'s> {
-        BitReaderReversed {
-            index: source.len(),
-            bits_consumed: 64,
-            source,
-            bit_container: 0,
-            extra_bits: 0,
-        }
-    }
-
-    #[cold]
-    fn refill(&mut self) {
-        let bytes_consumed = self.bits_consumed as usize / 8;
-        if bytes_consumed == 0 {
-            return;
-        }
-
-        if self.index >= bytes_consumed {
-            self.index -= bytes_consumed;
-            self.bits_consumed &= 7;
-            let remaining = self.source.len() - self.index;
-            if remaining >= 8 {
-                self.bit_container =
-                    u64::from_le_bytes(self.source[self.index..][..8].try_into().unwrap());
-            } else {
-                let mut value = [0u8; 8];
-                value[..remaining].copy_from_slice(&self.source[self.index..]);
-                self.bit_container = u64::from_le_bytes(value);
-            }
-        } else if self.index > 0 {
-            if self.source.len() >= 8 {
-                self.bit_container = u64::from_le_bytes(self.source[..8].try_into().unwrap());
-            } else {
-                let mut value = [0; 8];
-                value[..self.source.len()].copy_from_slice(self.source);
-                self.bit_container = u64::from_le_bytes(value);
-            }
-
-            self.bits_consumed -= 8 * self.index as u8;
-            self.index = 0;
-
-            self.bit_container <<= self.bits_consumed;
-            self.extra_bits += self.bits_consumed as usize;
-            self.bits_consumed = 0;
-        } else if self.bits_consumed < 64 {
-            self.bit_container <<= self.bits_consumed;
-            self.extra_bits += self.bits_consumed as usize;
-            self.bits_consumed = 0;
-        } else {
-            self.extra_bits += self.bits_consumed as usize;
-            self.bits_consumed = 0;
-            self.bit_container = 0;
-        }
-
-        debug_assert!(self.bits_consumed < 8);
-    }
-
-    #[inline(always)]
-    fn get_bits(&mut self, n: u8) -> u64 {
-        if self.bits_consumed + n > 64 {
-            self.refill();
-        }
-        let value = self.peek_bits(n);
-        self.consume(n);
-        value
-    }
-
-    #[inline(always)]
-    fn peek_bits(&mut self, n: u8) -> u64 {
-        if n == 0 {
-            return 0;
-        }
-        let mask = (1u64 << n) - 1u64;
-        let shift_by = 64 - self.bits_consumed - n;
-        (self.bit_container >> shift_by) & mask
-    }
-
-    #[inline(always)]
-    fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        if sum == 0 {
-            return (0, 0, 0);
-        }
-        let all_three = self.bit_container >> (64 - self.bits_consumed - sum);
-
-        let mask1 = (1u64 << n1) - 1u64;
-        let val1 = (all_three >> (n3 + n2)) & mask1;
-
-        let mask2 = (1u64 << n2) - 1u64;
-        let val2 = (all_three >> n3) & mask2;
-
-        let mask3 = (1u64 << n3) - 1u64;
-        let val3 = all_three & mask3;
-
-        (val1, val2, val3)
-    }
-
-    #[inline(always)]
-    fn consume(&mut self, n: u8) {
-        self.bits_consumed += n;
-        debug_assert!(self.bits_consumed <= 64);
-    }
-
-    #[inline(always)]
-    fn get_bits_triple(&mut self, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        let sum = n1 + n2 + n3;
-        if sum <= 56 {
-            self.refill();
-            let triple = self.peek_bits_triple(sum, n1, n2, n3);
-            self.consume(sum);
-            return triple;
-        }
-        (self.get_bits(n1), self.get_bits(n2), self.get_bits(n3))
-    }
-}
-
-// ============================================================
 // FSE Table and Decoder
 // ============================================================
 
@@ -435,17 +303,29 @@ struct FSEEntry {
     base_value: u32,
 }
 
+/// Table log of the largest FSE table (libzstd MaxFSELog), that of the
+/// literal and match length tables; offsets use 8 and Huffman weights 6.
+const FSE_MAX_TABLE_LOG: u8 = LL_MAX_LOG;
+const FSE_MAX_TABLE_SIZE: usize = 1 << FSE_MAX_TABLE_LOG;
+
 #[derive(Debug, Clone)]
 struct FSETable {
     max_symbol: u8,
-    decode: Vec<FSEEntry>,
+    /// Cells for the largest table, like libzstd's fixed DTable arrays,
+    /// sized by the first build: a build writes the cells of its own table
+    /// and clears nothing.
+    cells: Vec<FSEEntry>,
+    /// Cells of the built table, `1 << accuracy_log`, or 0 while none is.
+    size: usize,
     accuracy_log: u8,
     symbol_probabilities: Vec<i32>,
-    /// Per-symbol next-state counter while building (libzstd symbolNext).
-    symbol_counter: Vec<u32>,
-    /// Symbols laid out in order before spreading (libzstd spread).
+    /// Per-symbol next-state counter while building (libzstd symbolNext),
+    /// 256 entries once sized.
+    symbol_next: Vec<u16>,
+    /// Symbols laid out in order before spreading, with room for the last
+    /// 8-byte write (libzstd spread), sized like `symbol_next`.
     spread: Vec<u8>,
-    /// True while `decode` holds a predefined sequence distribution, so the
+    /// True while the table holds a predefined sequence distribution, so the
     /// next block in Predefined mode can reuse it without rebuilding.
     predefined: bool,
 }
@@ -454,19 +334,24 @@ impl FSETable {
     fn new(max_symbol: u8) -> FSETable {
         FSETable {
             max_symbol,
-            symbol_probabilities: Vec::with_capacity(256),
-            symbol_counter: Vec::with_capacity(256),
-            spread: Vec::new(),
-            decode: Vec::new(),
+            cells: Vec::new(),
+            size: 0,
             accuracy_log: 0,
+            symbol_probabilities: Vec::with_capacity(256),
+            symbol_next: Vec::new(),
+            spread: Vec::new(),
             predefined: false,
         }
     }
 
+    /// The decoding table: `1 << accuracy_log` cells once built, else none.
+    fn decode(&self) -> &[FSEEntry] {
+        &self.cells[..self.size]
+    }
+
     fn reset(&mut self) {
-        self.symbol_counter.clear();
         self.symbol_probabilities.clear();
-        self.decode.clear();
+        self.size = 0;
         self.accuracy_log = 0;
         self.predefined = false;
     }
@@ -475,12 +360,14 @@ impl FSETable {
     /// (ZSTD_buildSeqTable_rle): accuracy log 0, no state bits.
     fn build_rle(&mut self, symbol: u8, base: &[u32], bits: &[u8]) {
         self.reset();
-        self.decode.push(FSEEntry {
+        self.cells.resize(FSE_MAX_TABLE_SIZE, FSEEntry::default());
+        self.cells[0] = FSEEntry {
             next_state: 0,
             num_bits: 0,
             extra_bits: bits[symbol as usize],
             base_value: base[symbol as usize],
-        });
+        };
+        self.size = 1;
     }
 
     /// Parse an FSE table description and build the decoding table. With
@@ -492,103 +379,103 @@ impl FSETable {
         max_log: u8,
         codes: Option<(&[u32], &[u8])>,
     ) -> Result<usize, String> {
-        self.accuracy_log = 0;
-        self.predefined = false;
+        self.reset();
         let bytes_read = self.read_probabilities(source, max_log)?;
-        self.build_decoding_table(codes)?;
+        self.build_decoding_table(codes);
         Ok(bytes_read)
     }
 
+    /// Build the decoding table from counts that did not come from a table
+    /// description, so are checked here as `read_ncount_body` checks those.
     fn build_from_probabilities(
         &mut self,
         acc_log: u8,
         probs: &[i32],
         codes: Option<(&[u32], &[u8])>,
     ) -> Result<(), String> {
-        if acc_log == 0 {
-            return Err("Accuracy log is zero".to_string());
+        self.reset();
+        let cells: i64 = probs.iter().map(|&p| i64::from(p.abs())).sum();
+        if !(ACC_LOG_OFFSET..=FSE_MAX_TABLE_LOG).contains(&acc_log)
+            || probs.len() > usize::from(self.max_symbol) + 1
+            || probs.iter().any(|&p| p < -1)
+            || cells != 1 << acc_log
+        {
+            return Err(format!(
+                "Invalid FSE distribution: {} counts over {} cells at accuracy log {}",
+                probs.len(),
+                cells,
+                acc_log
+            ));
         }
-        self.symbol_probabilities.clear();
         self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
-        self.predefined = false;
-        self.build_decoding_table(codes)
+        self.build_decoding_table(codes);
+        Ok(())
     }
 
-    /// Port of ZSTD_buildFSETable_body: lay low-probability symbols at the
-    /// top, spread the rest, then derive each cell's bit count and next
-    /// state from a per-symbol counter in one pass.
-    fn build_decoding_table(&mut self, codes: Option<(&[u32], &[u8])>) -> Result<(), String> {
-        let num_symbols = self.symbol_probabilities.len();
-        if num_symbols > self.max_symbol as usize + 1 {
-            return Err(format!(
-                "Too many symbols: {}, max: {}",
-                num_symbols,
-                self.max_symbol + 1
-            ));
-        }
+    /// Port of ZSTD_buildFSETable_body (with `codes`) and
+    /// FSE_buildDTable_internal (without): lay low-probability symbols at
+    /// the top, spread the rest, then derive each cell's bit count and next
+    /// state from `symbol_next` in one pass. The counts tile the table:
+    /// `read_ncount_body` or `build_from_probabilities` checked them.
+    fn build_decoding_table(&mut self, codes: Option<(&[u32], &[u8])>) {
         let table_log = u32::from(self.accuracy_log);
+        assert!(table_log <= u32::from(FSE_MAX_TABLE_LOG));
         let table_size = 1usize << table_log;
-        let total: i64 = self
-            .symbol_probabilities
-            .iter()
-            .map(|&p| if p < 0 { 1 } else { i64::from(p) })
-            .sum();
-        if total != table_size as i64 {
-            return Err(format!(
-                "FSE probabilities sum to {}, expected {}",
-                total, table_size
-            ));
-        }
-
-        self.decode.clear();
-        self.decode.resize(table_size, FSEEntry::default());
-        self.symbol_counter.clear();
-        self.symbol_counter.resize(num_symbols, 0);
+        let mask = table_size - 1;
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+        // No-ops after the first build.
+        self.cells.resize(FSE_MAX_TABLE_SIZE, FSEEntry::default());
+        self.symbol_next.resize(256, 0);
+        self.spread.resize(FSE_MAX_TABLE_SIZE + 8, 0);
+        let dt = self.cells.first_chunk_mut::<FSE_MAX_TABLE_SIZE>().unwrap();
+        let symbol_next = self.symbol_next.first_chunk_mut::<256>().unwrap();
+        let counts = &self.symbol_probabilities[..];
 
         // Low-probability symbols occupy the highest cells.
         let mut high_threshold = table_size;
-        for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
-            if prob == -1 {
+        for ((s, &n), next) in counts.iter().enumerate().zip(&mut *symbol_next) {
+            if n == -1 {
                 high_threshold -= 1;
-                self.decode[high_threshold].base_value = symbol as u32;
-                self.symbol_counter[symbol] = 1;
+                dt[high_threshold].base_value = s as u32;
+                *next = 1;
             } else {
-                self.symbol_counter[symbol] = prob as u32;
+                *next = n as u16;
             }
         }
 
-        let step = (table_size >> 1) + (table_size >> 3) + 3;
-        let mask = table_size - 1;
         if high_threshold == table_size {
             // No low-probability symbols: lay the symbols down in order with
             // 8-byte writes, then scatter them across the table, so neither
             // loop has a data-dependent trip count.
-            self.spread.clear();
-            self.spread.resize(table_size + 8, 0);
+            let spread = self
+                .spread
+                .first_chunk_mut::<{ FSE_MAX_TABLE_SIZE + 8 }>()
+                .unwrap();
             let mut pos = 0;
-            for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
-                let n = prob as usize;
-                let sv = [symbol as u8; 8];
-                self.spread[pos..pos + 8].copy_from_slice(&sv);
+            let mut sv = 0u64;
+            for &n in counts {
+                let n = n as usize;
+                spread[pos..pos + 8].copy_from_slice(&sv.to_le_bytes());
                 let mut i = 8;
                 while i < n {
-                    self.spread[pos + i..pos + i + 8].copy_from_slice(&sv);
+                    spread[pos + i..pos + i + 8].copy_from_slice(&sv.to_le_bytes());
                     i += 8;
                 }
                 pos += n;
+                sv = sv.wrapping_add(0x0101_0101_0101_0101);
             }
             let mut position = 0;
             for s in (0..table_size).step_by(2) {
-                self.decode[position].base_value = u32::from(self.spread[s]);
-                self.decode[(position + step) & mask].base_value = u32::from(self.spread[s + 1]);
+                dt[position].base_value = u32::from(spread[s]);
+                dt[(position + step) & mask].base_value = u32::from(spread[s + 1]);
                 position = (position + 2 * step) & mask;
             }
         } else {
             let mut position = 0;
-            for (symbol, &prob) in self.symbol_probabilities.iter().enumerate() {
-                for _ in 0..prob.max(0) {
-                    self.decode[position].base_value = symbol as u32;
+            for (s, &n) in counts.iter().enumerate() {
+                for _ in 0..n.max(0) {
+                    dt[position].base_value = s as u32;
                     position = (position + step) & mask;
                     while position >= high_threshold {
                         position = (position + step) & mask;
@@ -597,19 +484,29 @@ impl FSETable {
             }
         }
 
-        for cell in &mut self.decode {
-            let symbol = cell.base_value as usize;
-            let next_state = self.symbol_counter[symbol];
-            self.symbol_counter[symbol] += 1;
-            let nb_bits = table_log - (u32::BITS - 1 - next_state.leading_zeros());
-            cell.num_bits = nb_bits as u8;
-            cell.next_state = ((next_state << nb_bits) - table_size as u32) as u16;
-            if let Some((base, bits)) = codes {
-                cell.extra_bits = bits[symbol];
-                cell.base_value = base[symbol];
+        let cells = &mut dt[..table_size];
+        match codes {
+            Some((base, bits)) => {
+                for cell in cells {
+                    let symbol = usize::from(cell.base_value as u8);
+                    let (num_bits, next_state) = fse_cell_state(symbol_next, symbol, table_log);
+                    *cell = FSEEntry {
+                        next_state,
+                        num_bits,
+                        extra_bits: bits[symbol],
+                        base_value: base[symbol],
+                    };
+                }
+            }
+            None => {
+                for cell in cells {
+                    let symbol = usize::from(cell.base_value as u8);
+                    (cell.num_bits, cell.next_state) =
+                        fse_cell_state(symbol_next, symbol, table_log);
+                }
             }
         }
-        Ok(())
+        self.size = table_size;
     }
 
     /// Read the normalized counts header (FSE_readNCount): four bits of
@@ -759,37 +656,84 @@ pub(crate) fn highest_bit_set(x: u32) -> u32 {
     u32::BITS - x.leading_zeros()
 }
 
-struct FSEDecoder<'table> {
-    state: FSEEntry,
-    table: &'table FSETable,
+/// Bit count and next-state baseline of the next cell of `symbol`, taking
+/// its next state from `symbol_next` (the last pass of the FSE table builds).
+#[inline(always)]
+fn fse_cell_state(symbol_next: &mut [u16; 256], symbol: usize, table_log: u32) -> (u8, u16) {
+    let next_state = u32::from(symbol_next[symbol]);
+    symbol_next[symbol] += 1;
+    let nb_bits = table_log - (u32::BITS - 1 - next_state.leading_zeros());
+    (
+        nb_bits as u8,
+        ((next_state << nb_bits) - (1 << table_log)) as u16,
+    )
 }
 
-impl<'t> FSEDecoder<'t> {
-    fn new(table: &'t FSETable) -> FSEDecoder<'t> {
-        FSEDecoder {
-            state: table.decode.first().copied().unwrap_or_default(),
-            table,
+/// Size in u32 words of FSE_decompress_wksp's workspace for a table of
+/// `table_log` over symbols `0..=max_symbol` (FSE_DECOMPRESS_WKSP_SIZE_U32).
+const fn fse_decompress_wksp_u32(table_log: usize, max_symbol: usize) -> usize {
+    let dtable = 1 + (1 << table_log);
+    let build = (2 * (max_symbol + 1) + (1 << table_log) + 8).div_ceil(4);
+    dtable + 1 + build + 256 / 2 + 1
+}
+
+/// Decode the weights of a Huffman tree description from an FSE bitstream
+/// with two interleaved states (FSE_decompress_usingDTable_generic): four
+/// symbols per reload while the stream lasts, then one at a time until it
+/// overflows. Returns the number of weights.
+fn fse_decompress_weights(
+    table: &FSETable,
+    src: &[u8],
+    out: &mut [u8; 255],
+) -> Result<usize, String> {
+    let dt = table.decode();
+    let table_log = u32::from(table.accuracy_log);
+    let mut br = BitDStream::new(src)?;
+    // FSE_initDState reloads after each initial state.
+    let mut state1 = br.read_bits(table_log);
+    br.reload();
+    let mut state2 = br.read_bits(table_log);
+    br.reload();
+    if br.reload() == HufStreamStatus::Overflow {
+        return Err("Huffman weights stream is too short".to_string());
+    }
+    // FSE_decodeSymbol: the state's symbol, then the next state. Every
+    // cell's `next_state` plus its `num_bits` bits stays below the table
+    // size, so a state is always a valid index.
+    let decode = |state: &mut usize, br: &mut BitDStream<'_>| {
+        let cell = dt[*state];
+        *state = usize::from(cell.next_state) + br.read_bits(u32::from(cell.num_bits));
+        cell.base_value as u8
+    };
+    let too_many = || Err("Too many Huffman weights".to_string());
+    let omax = out.len();
+    let mut op = 0;
+    while br.reload() == HufStreamStatus::Unfinished && op < omax - 3 {
+        out[op] = decode(&mut state1, &mut br);
+        out[op + 1] = decode(&mut state2, &mut br);
+        out[op + 2] = decode(&mut state1, &mut br);
+        out[op + 3] = decode(&mut state2, &mut br);
+        op += 4;
+    }
+    loop {
+        if op > omax - 2 {
+            return too_many();
         }
-    }
-
-    fn decode_symbol(&self) -> u8 {
-        self.state.base_value as u8
-    }
-
-    fn init_state(&mut self, bits: &mut BitReaderReversed<'_>) -> Result<(), String> {
-        if self.table.accuracy_log == 0 {
-            return Err("FSE table is uninitialized".to_string());
+        out[op] = decode(&mut state1, &mut br);
+        op += 1;
+        if br.reload() == HufStreamStatus::Overflow {
+            out[op] = decode(&mut state2, &mut br);
+            return Ok(op + 1);
         }
-        let new_state = bits.get_bits(self.table.accuracy_log);
-        self.state = self.table.decode[new_state as usize];
-        Ok(())
-    }
-
-    fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
-        let num_bits = self.state.num_bits;
-        let add = bits.get_bits(num_bits);
-        let new_state = usize::from(self.state.next_state) + add as usize;
-        self.state = self.table.decode[new_state];
+        if op > omax - 2 {
+            return too_many();
+        }
+        out[op] = decode(&mut state2, &mut br);
+        op += 1;
+        if br.reload() == HufStreamStatus::Overflow {
+            out[op] = decode(&mut state1, &mut br);
+            return Ok(op + 1);
+        }
     }
 }
 
@@ -799,19 +743,31 @@ impl<'t> FSEDecoder<'t> {
 
 /// Single-symbol table cell (libzstd HUF_DEltX1).
 #[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
 struct HuffmanEntry {
     symbol: u8,
     num_bits: u8,
 }
 
+// SAFETY: two `u8` fields under `repr(C)`: no padding, and every bit
+// pattern is a valid cell.
+unsafe impl bytemuck::Zeroable for HuffmanEntry {}
+unsafe impl bytemuck::Pod for HuffmanEntry {}
+
 /// Double-symbol table cell (libzstd HUF_DEltX2): `sequence` holds one or
 /// two symbols little-endian, `length` how many.
 #[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
 struct HufEntryX2 {
     sequence: u16,
     nb_bits: u8,
     length: u8,
 }
+
+// SAFETY: a `u16` and two `u8` fields under `repr(C)`: no padding, and every
+// bit pattern is a valid cell.
+unsafe impl bytemuck::Zeroable for HufEntryX2 {}
+unsafe impl bytemuck::Pod for HufEntryX2 {}
 
 /// Table log of every decoding table (libzstd HUF_DECODER_FAST_TABLELOG):
 /// single-symbol tables are scaled up to it so that the 4-stream fast
@@ -858,19 +814,23 @@ fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
 }
 
 struct HuffmanTable {
-    /// Single-symbol table, `1 << HUF_FAST_TABLE_LOG` cells, when `!is_x2`.
+    /// Single-symbol table, `1 << HUF_FAST_TABLE_LOG` cells once the first
+    /// single-symbol build sized it; the built table when `!is_x2`.
     decode: Vec<HuffmanEntry>,
-    /// Double-symbol table, `1 << HUF_FAST_TABLE_LOG` cells, when `is_x2`.
+    /// Double-symbol table, sized like `decode` by the first double-symbol
+    /// build; the built table when `is_x2`.
     decode_x2: Vec<HufEntryX2>,
     is_x2: bool,
-    /// Weight per symbol, including the implied last one after a build.
-    weights: Vec<u8>,
+    /// Weight per symbol (libzstd huffWeight): after a build, the first
+    /// `nb_symbols`, the last of them implied by the others.
+    weights: [u8; 256],
+    nb_symbols: usize,
     /// Table log of the Huffman code; 0 while no table is built.
     max_num_bits: u8,
     /// Number of symbols of each weight (libzstd rankStats).
     rank_stats: [u32; MAX_MAX_NUM_BITS as usize + 2],
-    /// Symbols ordered by weight (libzstd sortedSymbol).
-    sorted: Vec<u8>,
+    /// Symbols ordered by weight (libzstd symbols, sortedSymbol).
+    sorted: [u8; 256],
     fse_table: FSETable,
 }
 
@@ -880,21 +840,21 @@ impl HuffmanTable {
             decode: Vec::new(),
             decode_x2: Vec::new(),
             is_x2: false,
-            weights: Vec::with_capacity(256),
+            weights: [0; 256],
+            nb_symbols: 0,
             max_num_bits: 0,
             rank_stats: [0; MAX_MAX_NUM_BITS as usize + 2],
-            sorted: Vec::with_capacity(256),
+            sorted: [0; 256],
             fse_table: FSETable::new(255),
         }
     }
 
+    /// Forget the table. Its cells stay allocated for the next build, which
+    /// writes every one of them.
     fn reset(&mut self) {
-        self.decode.clear();
-        self.decode_x2.clear();
         self.is_x2 = false;
-        self.weights.clear();
+        self.nb_symbols = 0;
         self.max_num_bits = 0;
-        self.sorted.clear();
         self.fse_table.reset();
     }
 
@@ -910,185 +870,106 @@ impl HuffmanTable {
         four_streams: bool,
     ) -> Result<u32, String> {
         self.max_num_bits = 0;
-        let bytes_used = self.read_weights(source)?;
-        self.weight_stats()?;
+        let (bytes_used, nb_weights) = self.read_weights(source)?;
+        self.weight_stats(nb_weights)?;
         self.is_x2 = four_streams && huf_select_x2(dst_size, source.len());
         if self.is_x2 {
             self.fill_x2();
         } else {
-            self.fill_x1()?;
+            self.fill_x1();
         }
-        Ok(bytes_used)
+        Ok(bytes_used as u32)
     }
 
-    fn read_weights(&mut self, source: &[u8]) -> Result<u32, String> {
-        if source.is_empty() {
+    /// Read the weights of a tree description (HUF_readStats_body before the
+    /// statistics): a header byte of 128 or more is followed by
+    /// `header - 127` 4-bit weights, a smaller one by that many bytes of
+    /// FSE-compressed weights. Returns the length of the description and
+    /// the number of weights read.
+    fn read_weights(&mut self, source: &[u8]) -> Result<(usize, usize), String> {
+        let Some(&header) = source.first() else {
             return Err("Huffman source is empty".to_string());
-        }
-        let header = source[0];
-        let mut bits_read = 8;
-
-        match header {
-            0..=127 => {
-                let fse_stream = &source[1..];
-                if (header as usize) > fse_stream.len() {
-                    return Err(format!(
-                        "Not enough bytes for weights: have {}, need {}",
-                        fse_stream.len(),
-                        header
-                    ));
-                }
-                let bytes_used_by_fse_header = self.fse_table.build_decoder(fse_stream, 6, None)?;
-
-                if bytes_used_by_fse_header > header as usize {
-                    return Err(format!(
-                        "FSE table used {} bytes but only {} available",
-                        bytes_used_by_fse_header, header
-                    ));
-                }
-
-                let mut dec1 = FSEDecoder::new(&self.fse_table);
-                let mut dec2 = FSEDecoder::new(&self.fse_table);
-
-                let compressed_start = bytes_used_by_fse_header;
-                let compressed_length = header as usize - bytes_used_by_fse_header;
-
-                let compressed_weights = &fse_stream[compressed_start..];
-                if compressed_weights.len() < compressed_length {
-                    return Err(format!(
-                        "Not enough bytes to decompress weights: have {}, need {}",
-                        compressed_weights.len(),
-                        compressed_length
-                    ));
-                }
-                let compressed_weights = &compressed_weights[..compressed_length];
-                let mut br = BitReaderReversed::new(compressed_weights);
-
-                bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
-
-                let mut skipped_bits = 0;
-                loop {
-                    let val = br.get_bits(1);
-                    skipped_bits += 1;
-                    if val == 1 || skipped_bits > 8 {
-                        break;
-                    }
-                }
-                if skipped_bits > 8 {
-                    return Err(format!("Extra padding: {} bits skipped", skipped_bits));
-                }
-
-                dec1.init_state(&mut br)?;
-                dec2.init_state(&mut br)?;
-
-                self.weights.clear();
-
-                loop {
-                    let w = dec1.decode_symbol();
-                    self.weights.push(w);
-                    dec1.update_state(&mut br);
-
-                    if br.bits_remaining() <= -1 {
-                        self.weights.push(dec2.decode_symbol());
-                        break;
-                    }
-
-                    let w = dec2.decode_symbol();
-                    self.weights.push(w);
-                    dec2.update_state(&mut br);
-
-                    if br.bits_remaining() <= -1 {
-                        self.weights.push(dec1.decode_symbol());
-                        break;
-                    }
-                    if self.weights.len() > 255 {
-                        return Err(format!("Too many weights: {}", self.weights.len()));
-                    }
-                }
-                if self.weights.len() > 255 {
-                    return Err(format!("Too many weights: {}", self.weights.len()));
-                }
-            }
-            _ => {
-                let weights_raw = &source[1..];
-                let num_weights = header - 127;
-                self.weights.resize(num_weights as usize, 0);
-
-                let bytes_needed = if num_weights % 2 == 0 {
-                    num_weights as usize / 2
-                } else {
-                    (num_weights as usize / 2) + 1
-                };
-
-                if weights_raw.len() < bytes_needed {
-                    return Err(format!(
-                        "Not enough bytes in source: have {}, need {}",
-                        weights_raw.len(),
-                        bytes_needed
-                    ));
-                }
-
-                for idx in 0..num_weights {
-                    if idx % 2 == 0 {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] >> 4;
-                    } else {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] & 0xF;
-                    }
-                    bits_read += 4;
-                }
-            }
-        }
-
-        let bytes_read = if bits_read % 8 == 0 {
-            bits_read / 8
-        } else {
-            (bits_read / 8) + 1
         };
-        Ok(bytes_read as u32)
+        let header = usize::from(header);
+        if header >= 128 {
+            let nb_weights = header - 127;
+            let size = nb_weights.div_ceil(2);
+            let Some(packed) = source.get(1..1 + size) else {
+                return Err(format!(
+                    "Not enough bytes for {} raw Huffman weights",
+                    nb_weights
+                ));
+            };
+            for (pair, &b) in self.weights.as_chunks_mut::<2>().0.iter_mut().zip(packed) {
+                pair[0] = b >> 4;
+                pair[1] = b & 15;
+            }
+            Ok((1 + size, nb_weights))
+        } else {
+            let Some(src) = source.get(1..1 + header) else {
+                return Err(format!(
+                    "Not enough bytes for weights: have {}, need {}",
+                    source.len() - 1,
+                    header
+                ));
+            };
+            let ncount = self.fse_table.build_decoder(src, 6, None)?;
+            // FSE_decompress_wksp's table must fit HUF_readStats's workspace,
+            // sized for 6-bit tables over weights 0..=11.
+            let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
+            let log = usize::from(self.fse_table.accuracy_log);
+            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
+                return Err(format!(
+                    "Huffman weights table of log {} over {} symbols is too large",
+                    log,
+                    max_symbol + 1
+                ));
+            }
+            let out = self.weights.first_chunk_mut::<255>().unwrap();
+            let nb_weights = fse_decompress_weights(&self.fse_table, &src[ncount..], out)?;
+            Ok((1 + header, nb_weights))
+        }
     }
 
-    /// Validate the weights, derive the table log and the implied last
-    /// weight, and count symbols per weight (the checks of HUF_readStats).
-    fn weight_stats(&mut self) -> Result<(), String> {
-        let mut weight_sum: u32 = 0;
-        for w in &self.weights {
-            if *w > MAX_MAX_NUM_BITS {
+    /// The statistics and checks of HUF_readStats_body over the
+    /// `nb_weights` weights read: symbols per weight, the table log, the
+    /// implied last weight and a full binary tree.
+    fn weight_stats(&mut self, nb_weights: usize) -> Result<(), String> {
+        let mut rank_stats = [0u32; MAX_MAX_NUM_BITS as usize + 2];
+        let mut weight_total = 0u32;
+        for &w in &self.weights[..nb_weights] {
+            if w > MAX_MAX_NUM_BITS {
                 return Err(format!("Weight {} exceeds max {}", w, MAX_MAX_NUM_BITS));
             }
-            weight_sum += if *w > 0 { 1_u32 << (*w - 1) } else { 0 };
+            rank_stats[usize::from(w)] += 1;
+            weight_total += (1 << w) >> 1;
         }
-
-        if weight_sum == 0 {
+        if weight_total == 0 {
             return Err("Missing weights".to_string());
         }
-
-        let max_bits = highest_bit_set(weight_sum) as u8;
-        if max_bits > MAX_MAX_NUM_BITS {
-            return Err(format!("Max bits {} too high", max_bits));
+        let table_log = highest_bit_set(weight_total);
+        if table_log > u32::from(MAX_MAX_NUM_BITS) {
+            return Err(format!("Max bits {} too high", table_log));
         }
-        let left_over = (1u32 << max_bits) - weight_sum;
-
-        if !left_over.is_power_of_two() {
-            return Err(format!("Leftover {} is not a power of 2", left_over));
+        // The last weight completes the total to a power of 2.
+        let rest = (1 << table_log) - weight_total;
+        if !rest.is_power_of_two() {
+            return Err(format!("Leftover {} is not a power of 2", rest));
         }
-
-        let last_weight = highest_bit_set(left_over) as u8;
-        self.weights.push(last_weight);
-
-        self.rank_stats = [0; MAX_MAX_NUM_BITS as usize + 2];
-        for &w in &self.weights {
-            self.rank_stats[usize::from(w)] += 1;
-        }
+        let last_weight = highest_bit_set(rest);
+        self.weights[nb_weights] = last_weight as u8;
+        rank_stats[last_weight as usize] += 1;
         // A full binary tree has an even number of leaves at its deepest
         // level, and at least two.
-        if self.rank_stats[1] < 2 || self.rank_stats[1] & 1 != 0 {
+        if rank_stats[1] < 2 || rank_stats[1] & 1 != 0 {
             return Err(format!(
                 "Huffman tree has {} symbols of weight 1",
-                self.rank_stats[1]
+                rank_stats[1]
             ));
         }
-
-        self.max_num_bits = max_bits;
+        self.rank_stats = rank_stats;
+        self.nb_symbols = nb_weights + 1;
+        self.max_num_bits = table_log as u8;
         Ok(())
     }
 
@@ -1097,104 +978,84 @@ impl HuffmanTable {
     /// bits owns `1 << (HUF_FAST_TABLE_LOG - n)` consecutive cells, ordered
     /// by code length. Scaling the weights up leaves every code length
     /// unchanged, so only the cell counts differ from a `max_bits` table.
-    fn fill_x1(&mut self) -> Result<(), String> {
+    /// The weights tile the table (`weight_stats`): every cell is written.
+    fn fill_x1(&mut self) {
         let max_bits = u32::from(self.max_num_bits);
-        let table_log = HUF_FAST_TABLE_LOG;
-        let rescale = table_log - max_bits;
-        let nb_symbols = self.weights.len();
-
-        // Cells covered by every weight class must tile the table exactly.
-        let covered: usize = (1..=max_bits as usize)
-            .map(|w| (self.rank_stats[w] as usize) << (w - 1 + rescale as usize))
-            .sum();
-        if covered != 1 << table_log {
-            return Err(format!(
-                "Huffman code lengths cover {} of {} cells",
-                covered,
-                1 << table_log
-            ));
-        }
+        let rescale = HUF_FAST_TABLE_LOG - max_bits;
+        let rank_stats = &self.rank_stats;
 
         // Symbols ordered by weight, then by value (libzstd symbols[]).
         let mut rank_start = [0usize; MAX_MAX_NUM_BITS as usize + 2];
         let mut next = 0usize;
         for w in 0..=max_bits as usize {
             rank_start[w] = next;
-            next += self.rank_stats[w] as usize;
+            next += rank_stats[w] as usize;
         }
-        self.sorted.clear();
-        self.sorted.resize(nb_symbols, 0);
-        for (s, &w) in self.weights.iter().enumerate() {
-            let w = usize::from(w);
-            self.sorted[rank_start[w]] = s as u8;
-            rank_start[w] += 1;
+        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
+            let r = &mut rank_start[usize::from(w)];
+            self.sorted[*r] = s as u8;
+            *r += 1;
         }
 
         // Fill the table one weight at a time, so that the run length is a
-        // constant of each loop and the common short runs are unrolled.
-        self.decode.clear();
-        self.decode.resize(1 << table_log, HuffmanEntry::default());
-        let dt = &mut self.decode[..];
-        let mut symbol = self.rank_stats[0] as usize;
+        // constant of each loop, writing each symbol's cells four to a word
+        // (HUF_DEltX1_set4) over the table's bytes.
+        self.decode
+            .resize(1 << HUF_FAST_TABLE_LOG, HuffmanEntry::default());
+        let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut self.decode[..]);
+        let mut symbol = rank_stats[0] as usize;
         let mut u = 0usize;
         for w in 1..=max_bits as usize {
-            let count = self.rank_stats[w] as usize;
+            let count = rank_stats[w] as usize;
             let length = 1usize << (w - 1 + rescale as usize);
             let num_bits = (max_bits + 1 - w as u32) as u8;
             let syms = &self.sorted[symbol..symbol + count];
-            let entry = |s: u8| HuffmanEntry {
-                symbol: s,
-                num_bits,
-            };
+            let d4 = |s: u8| u64::from(u16::from_le_bytes([s, num_bits])) * 0x0001_0001_0001_0001;
+            let run = &mut cells[2 * u..2 * (u + count * length)];
             match length {
                 1 => {
-                    for &s in syms {
-                        dt[u] = entry(s);
-                        u += 1;
+                    for (c, &s) in run.as_chunks_mut::<2>().0.iter_mut().zip(syms) {
+                        *c = (d4(s) as u16).to_le_bytes();
                     }
                 }
                 2 => {
-                    for &s in syms {
-                        dt[u] = entry(s);
-                        dt[u + 1] = entry(s);
-                        u += 2;
+                    for (c, &s) in run.as_chunks_mut::<4>().0.iter_mut().zip(syms) {
+                        *c = (d4(s) as u32).to_le_bytes();
                     }
                 }
                 4 => {
-                    for &s in syms {
-                        dt[u..u + 4].copy_from_slice(&[entry(s); 4]);
-                        u += 4;
+                    for (c, &s) in run.as_chunks_mut::<8>().0.iter_mut().zip(syms) {
+                        *c = d4(s).to_le_bytes();
                     }
                 }
                 8 => {
-                    for &s in syms {
-                        dt[u..u + 8].copy_from_slice(&[entry(s); 8]);
-                        u += 8;
+                    for (c, &s) in run.as_chunks_mut::<16>().0.iter_mut().zip(syms) {
+                        *c = bytemuck::cast([d4(s).to_le_bytes(); 2]);
                     }
                 }
                 _ => {
-                    for &s in syms {
-                        dt[u..u + length].fill(entry(s));
-                        u += length;
+                    for (r, &s) in run.chunks_exact_mut(2 * length).zip(syms) {
+                        let d16: [u8; 32] = bytemuck::cast([d4(s).to_le_bytes(); 4]);
+                        for c in r.as_chunks_mut::<32>().0 {
+                            *c = d16;
+                        }
                     }
                 }
             }
+            u += count * length;
             symbol += count;
         }
-
-        Ok(())
     }
 
     /// Fill the double-symbol table (HUF_readDTableX2_wksp after
     /// HUF_readStats): sort symbols by weight, compute where each weight's
     /// run starts for every number of already-consumed bits, then tile the
     /// table so that a cell holds two symbols whenever both fit in
-    /// `HUF_FAST_TABLE_LOG` bits.
+    /// `HUF_FAST_TABLE_LOG` bits. Every cell is written, as in `fill_x1`.
     fn fill_x2(&mut self) {
         let table_log = u32::from(self.max_num_bits);
         let target_log = HUF_FAST_TABLE_LOG;
         let nb_bits_baseline = table_log + 1;
-        let nb_symbols = self.weights.len();
 
         // Highest weight in use; weight 1 is always present.
         let mut max_w = table_log as usize;
@@ -1211,21 +1072,13 @@ impl HuffmanTable {
         }
         rank_start[max_w + 1] = next;
 
-        self.sorted.clear();
-        self.sorted.resize(nb_symbols, 0);
-        {
-            let mut fill = rank_start;
-            let mut zero_at = next;
-            for s in 0..nb_symbols {
-                let w = usize::from(self.weights[s]);
-                if w == 0 {
-                    self.sorted[zero_at] = s as u8;
-                    zero_at += 1;
-                } else {
-                    self.sorted[fill[w]] = s as u8;
-                    fill[w] += 1;
-                }
-            }
+        // Weight-0 symbols go after all others, and are never read.
+        let mut fill = rank_start;
+        fill[0] = next;
+        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
+            let r = &mut fill[usize::from(w)];
+            self.sorted[*r] = s as u8;
+            *r += 1;
         }
 
         // rank_val[consumed][w]: first cell of weight w once `consumed` bits
@@ -1244,10 +1097,12 @@ impl HuffmanTable {
             }
         }
 
-        self.decode_x2.clear();
         self.decode_x2
             .resize(1 << target_log, HufEntryX2::default());
-        let dt = &mut self.decode_x2[..];
+        let dt = self
+            .decode_x2
+            .first_chunk_mut::<{ 1 << HUF_FAST_TABLE_LOG }>()
+            .unwrap();
         let sorted = &self.sorted[..];
         let scale_log = nb_bits_baseline as i32 - target_log as i32;
 
@@ -1305,7 +1160,8 @@ fn huf_build_x2(symbol: u8, nb_bits: u32, base_seq: u8, level: u8) -> HufEntryX2
 }
 
 /// Write every symbol of one weight into consecutive runs of
-/// `1 << (target_log - nb_bits)` cells (HUF_fillDTableX2ForWeight).
+/// `1 << (target_log - nb_bits)` cells (HUF_fillDTableX2ForWeight), with
+/// one loop per run length.
 fn huf_fill_x2_for_weight(
     dt: &mut [HufEntryX2],
     symbols: &[u8],
@@ -1315,10 +1171,35 @@ fn huf_fill_x2_for_weight(
     level: u8,
 ) {
     let length = 1usize << (target_log - nb_bits);
-    let mut off = 0;
-    for &symbol in symbols {
-        dt[off..off + length].fill(huf_build_x2(symbol, nb_bits, base_seq, level));
-        off += length;
+    let cell =
+        |symbol: u8| -> [u8; 4] { bytemuck::cast(huf_build_x2(symbol, nb_bits, base_seq, level)) };
+    // HUF_buildDEltX2U64: the cell twice in a word.
+    let cell2 = |symbol: u8| -> [u8; 8] { bytemuck::cast([cell(symbol); 2]) };
+    let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut dt[..symbols.len() * length]);
+    match length {
+        1 => {
+            for (c, &symbol) in cells.as_chunks_mut::<4>().0.iter_mut().zip(symbols) {
+                *c = cell(symbol);
+            }
+        }
+        2 => {
+            for (c, &symbol) in cells.as_chunks_mut::<8>().0.iter_mut().zip(symbols) {
+                *c = cell2(symbol);
+            }
+        }
+        4 => {
+            for (c, &symbol) in cells.as_chunks_mut::<16>().0.iter_mut().zip(symbols) {
+                *c = bytemuck::cast([cell2(symbol); 2]);
+            }
+        }
+        _ => {
+            for (run, &symbol) in cells.chunks_exact_mut(4 * length).zip(symbols) {
+                let c8: [u8; 32] = bytemuck::cast([cell2(symbol); 4]);
+                for c in run.as_chunks_mut::<32>().0 {
+                    *c = c8;
+                }
+            }
+        }
     }
 }
 
@@ -1339,8 +1220,25 @@ fn huf_fill_x2_level2(
     base_seq: u8,
 ) {
     if min_weight > 1 {
+        // Whole runs of 2, 4 or 8 cells as in libzstd; the cells written
+        // past `skip` are overwritten by the second symbols below.
+        let cell: [u8; 4] = bytemuck::cast(huf_build_x2(base_seq, consumed_bits, 0, 1));
+        let cell2: [u8; 8] = bytemuck::cast([cell; 2]);
         let skip = rank_val[min_weight] as usize;
-        dt[..skip].fill(huf_build_x2(base_seq, consumed_bits, 0, 1));
+        let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut dt[..]);
+        match cells.len() / 4 {
+            2 => cells.copy_from_slice(&cell2),
+            4 => cells.copy_from_slice(&bytemuck::cast::<_, [u8; 16]>([cell2; 2])),
+            _ => {
+                let c8: [u8; 32] = bytemuck::cast([cell2; 4]);
+                for c in cells[..4 * skip.next_multiple_of(8)]
+                    .as_chunks_mut::<32>()
+                    .0
+                {
+                    *c = c8;
+                }
+            }
+        }
     }
     for w in min_weight..max_weight1 {
         let begin = rank_start[w];
@@ -2427,10 +2325,6 @@ struct FSEScratch {
     offsets: FSETable,
     literal_lengths: FSETable,
     match_lengths: FSETable,
-    /// At least `SHORT_OFFSET_SHARE_MIN` of 256 cells of `offsets` give new
-    /// offsets below 29: set whenever that table is built, kept while
-    /// blocks repeat it.
-    short_offsets: bool,
 }
 
 struct DecoderScratch {
@@ -2451,7 +2345,6 @@ impl DecoderScratch {
                 offsets: FSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-                short_offsets: false,
             },
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
@@ -2464,7 +2357,6 @@ impl DecoderScratch {
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
-        self.fse.short_offsets = false;
         self.huf.table.reset();
     }
 }
@@ -2937,9 +2829,6 @@ fn build_sequence_tables(
             &SEQ_TABLES[t],
         )?;
     }
-    if !matches!(modes.of_mode(), ModeType::Repeat) {
-        scratch.short_offsets = short_offset_share(&scratch.offsets) >= SHORT_OFFSET_SHARE_MIN;
-    }
     Ok(bytes_read)
 }
 
@@ -2957,7 +2846,7 @@ fn short_offset_share(table: &FSETable) -> usize {
     let short = if table.accuracy_log == 0 {
         usize::from(
             table
-                .decode
+                .decode()
                 .first()
                 .is_some_and(|e| (2..=4).contains(&e.extra_bits)),
         )
@@ -3005,7 +2894,7 @@ fn build_sequence_table(
             Ok(0)
         }
         ModeType::Repeat => {
-            if table.decode.is_empty() {
+            if table.decode().is_empty() {
                 return Err(format!(
                     "Repeat mode without a previous {} table",
                     kind.name
@@ -3035,43 +2924,82 @@ fn seq_error_message(e: SeqError) -> String {
     }
 }
 
-/// Decode every sequence of the block and execute it straight into `out`;
-/// matches may reach back no further than `prefix_start`.
-///
-/// `literals` holds the block's decoded literals followed by exactly
-/// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
-/// plus slack up front so that all copies use fixed-size chunks and may
-/// overshoot; it is truncated to the real length on return.
-#[inline(always)]
-fn decode_and_execute_sequences_body<W: WildCopy>(
-    w: W,
-    seqs: SeqInput<'_>,
+/// A block's sequences, executed into the frame by `execute_with_copies`
+/// with the copies it picks.
+trait BlockSequences {
+    /// Execute the sequences straight into `out`, whose bytes from
+    /// `prefix_start` on are the frame so far: matches reach back no
+    /// further. `out` is grown by the block limit plus slack up front so
+    /// that all copies use fixed-size chunks and may overshoot; it is
+    /// truncated to the real length on return.
+    fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        prefix_start: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String>;
+}
+
+/// Execute `seqs` with the copies for its block, for the fused decoder and
+/// the MT decoder's stage 3 alike: 32-byte ones on the AVX2 level, 16-byte
+/// ones otherwise, and the `ShortOffsets` variants when the block's offsets
+/// table gives many short offsets. Each copy type runs in a function of its
+/// own.
+fn execute_with_copies<S: BlockSequences>(
+    simd: Level,
+    offsets: &FSETable,
+    seqs: S,
     offset_hist: &mut [u32; 3],
     prefix_start: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let base = out.len();
-    // Spare capacity only: the block's bytes are written by the copies in
-    // `exec_sequence`, so zero-filling them first is wasted work.
-    out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
-    // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
-    // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which is
-    // the extent `run_sequences` may write (see its contract).
-    let end = unsafe {
-        run_sequences(
-            w,
+    let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
+    match simd {
+        // SAFETY: fearless_simd makes an `Avx2` only after detecting AVX2
+        // and FMA on this CPU (`Level::new`).
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(w) => unsafe {
+            if short {
+                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix_start, out)
+            } else {
+                execute_avx2(w, seqs, offset_hist, prefix_start, out)
+            }
+        },
+        _ if short => execute_portable(
+            FallbackShortOffsets(Fallback::new()),
             seqs,
             offset_hist,
-            out.as_mut_ptr().add(prefix_start),
-            base - prefix_start,
-        )?
-    };
-    // SAFETY: on success `run_sequences` initialized every byte of
-    // `prefix_start + (base - prefix_start)..prefix_start + end`, and
-    // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length within
-    // the reserved capacity.
-    unsafe { out.set_len(prefix_start + end) };
-    Ok(())
+            prefix_start,
+            out,
+        ),
+        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix_start, out),
+    }
+}
+
+#[inline(never)]
+fn execute_portable<W: WildCopy, S: BlockSequences>(
+    w: W,
+    seqs: S,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    seqs.execute(w, offset_hist, prefix_start, out)
+}
+
+/// `execute_portable` compiled with AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+fn execute_avx2<W: WildCopy, S: BlockSequences>(
+    w: W,
+    seqs: S,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    seqs.execute(w, offset_hist, prefix_start, out)
 }
 
 /// A compressed block's sequences section after its tables, with the
@@ -3084,57 +3012,41 @@ struct SeqInput<'a> {
     literals: &'a [u8],
 }
 
-/// `decode_and_execute_sequences_body` with 16-byte copies.
-#[inline(never)]
-fn decode_and_execute_sequences(
-    w: Fallback,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences` for blocks with many short offsets.
-#[inline(never)]
-fn decode_and_execute_sequences_short(
-    w: FallbackShortOffsets,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences_body` compiled with AVX2, with 32-byte
-/// copies.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline(never)]
-fn decode_and_execute_sequences_avx2(
-    w: Avx2,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences_avx2` for blocks with many short offsets.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline(never)]
-fn decode_and_execute_sequences_avx2_short(
-    w: Avx2ShortOffsets,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
+/// Decoding each sequence and executing it at once. `literals` holds the
+/// block's decoded literals followed by exactly `WILDCOPY_OVERLENGTH` bytes
+/// of slack.
+impl BlockSequences for SeqInput<'_> {
+    #[inline(always)]
+    fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        prefix_start: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let base = out.len();
+        // Spare capacity only: the block's bytes are written by the copies
+        // in `exec_sequence`, so zero-filling them first is wasted work.
+        out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+        // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
+        // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which is
+        // the extent `run_sequences` may write (see its contract).
+        let end = unsafe {
+            run_sequences(
+                w,
+                self,
+                offset_hist,
+                out.as_mut_ptr().add(prefix_start),
+                base - prefix_start,
+            )?
+        };
+        // SAFETY: on success `run_sequences` initialized every byte of
+        // `prefix_start + (base - prefix_start)..prefix_start + end`, and
+        // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length
+        // within the reserved capacity.
+        unsafe { out.set_len(prefix_start + end) };
+        Ok(())
+    }
 }
 
 /// Execute the block's sequences into the buffer at `out`, which starts at
@@ -3160,9 +3072,9 @@ unsafe fn run_sequences<W: WildCopy>(
         fse,
         literals,
     } = seqs;
-    let ll_dt = &fse.literal_lengths.decode[..];
-    let of_dt = &fse.offsets.decode[..];
-    let ml_dt = &fse.match_lengths.decode[..];
+    let ll_dt = fse.literal_lengths.decode();
+    let of_dt = fse.offsets.decode();
+    let ml_dt = fse.match_lengths.decode();
     let ll_log = u32::from(fse.literal_lengths.accuracy_log);
     let of_log = u32::from(fse.offsets.accuracy_log);
     let ml_log = u32::from(fse.match_lengths.accuracy_log);
@@ -3521,7 +3433,7 @@ impl WildCopy for Fallback {
 }
 
 /// Portable copies for blocks with many short offsets
-/// (`FSEScratch::short_offsets`), whose `offset < 8` and `offset < 16`
+/// (`execute_with_copies`), whose `offset < 8` and `offset < 16`
 /// tests in `copy_match` are unpredictable: the first 16 bytes of a match
 /// take the same straight-line copy at every offset, continued in 8-byte
 /// chunks.
@@ -3573,7 +3485,7 @@ impl WildCopy for Avx2 {
 }
 
 /// AVX2 copies for blocks with many short offsets
-/// (`FSEScratch::short_offsets`), whose `offset >= 32` and `offset >= 16`
+/// (`execute_with_copies`), whose `offset >= 32` and `offset >= 16`
 /// tests in `copy_match` are unpredictable: the first 32 bytes of a match
 /// take one shuffled store at every offset.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -3954,44 +3866,14 @@ fn decompress_block(
             fse: &workspace.fse,
             literals: &workspace.literals_buffer,
         };
-        match simd {
-            // SAFETY: fearless_simd makes an `Avx2` only after detecting
-            // AVX2 and FMA on this CPU (`Level::new`).
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Level::Avx2(w) => unsafe {
-                if workspace.fse.short_offsets {
-                    decode_and_execute_sequences_avx2_short(
-                        Avx2ShortOffsets(w),
-                        seqs,
-                        &mut workspace.offset_hist,
-                        frame_base,
-                        output,
-                    )?
-                } else {
-                    decode_and_execute_sequences_avx2(
-                        w,
-                        seqs,
-                        &mut workspace.offset_hist,
-                        frame_base,
-                        output,
-                    )?
-                }
-            },
-            _ if workspace.fse.short_offsets => decode_and_execute_sequences_short(
-                FallbackShortOffsets(Fallback::new()),
-                seqs,
-                &mut workspace.offset_hist,
-                frame_base,
-                output,
-            )?,
-            _ => decode_and_execute_sequences(
-                Fallback::new(),
-                seqs,
-                &mut workspace.offset_hist,
-                frame_base,
-                output,
-            )?,
-        }
+        execute_with_copies(
+            simd,
+            &workspace.fse.offsets,
+            seqs,
+            &mut workspace.offset_hist,
+            frame_base,
+            output,
+        )?;
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -4288,7 +4170,7 @@ mod parallel {
         if tables
             .iter()
             .zip(logs)
-            .any(|(t, log)| t.decode.len() != 1 << log)
+            .any(|(t, log)| t.decode().len() != 1 << log)
         {
             return Err("FSE table is uninitialized".to_string());
         }
@@ -4298,7 +4180,7 @@ mod parallel {
             *s = br.read_bits(log);
             br.reload();
         }
-        Ok((br, states, tables.map(|t| &t.decode[..])))
+        Ok((br, states, tables.map(|t| t.decode())))
     }
 
     /// A sequence bitstream after its initial LL, OF, ML states, with the
@@ -4456,29 +4338,52 @@ mod parallel {
                     output.extend_from_slice(&slot.literals[..literals_len]);
                     return Ok(());
                 }
-                let base = output.len();
-                output.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
-                // SAFETY: `frame_base <= base`, and the capacity holds
-                // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
-                // the extent `execute_sequences` may write.
-                let (seqs, literals) = (&slot.seqs[..], &slot.literals[..]);
-                let op = base - frame_base;
-                let end = unsafe {
-                    let out = output.as_mut_ptr().add(frame_base);
-                    match simd {
-                        // fearless_simd makes an `Avx2` only after
-                        // detecting AVX2 and FMA on this CPU.
-                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                        Level::Avx2(w) => execute_sequences_avx2(w, seqs, literals, hist, out, op)?,
-                        _ => execute_sequences(Fallback::new(), seqs, literals, hist, out, op)?,
-                    }
+                let seqs = DecodedSeqs {
+                    seqs: &slot.seqs,
+                    literals: &slot.literals,
                 };
-                // SAFETY: on success every byte up to `frame_base + end`
-                // is initialized, within the reserved capacity.
-                unsafe { output.set_len(frame_base + end) };
+                execute_with_copies(simd, &slot.fse.offsets, seqs, hist, frame_base, output)?;
             }
         }
         Ok(())
+    }
+
+    /// A block's sequences as stage 2 decoded them, with its literals
+    /// followed by `WILDCOPY_OVERLENGTH` bytes of slack.
+    struct DecodedSeqs<'a> {
+        seqs: &'a [RawSeq],
+        literals: &'a [u8],
+    }
+
+    impl BlockSequences for DecodedSeqs<'_> {
+        #[inline(always)]
+        fn execute<W: WildCopy>(
+            self,
+            w: W,
+            offset_hist: &mut [u32; 3],
+            prefix_start: usize,
+            out: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let base = out.len();
+            out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+            // SAFETY: `prefix_start <= base`, and the capacity holds
+            // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, the
+            // extent `execute_sequences` may write.
+            let end = unsafe {
+                execute_sequences(
+                    w,
+                    self.seqs,
+                    self.literals,
+                    offset_hist,
+                    out.as_mut_ptr().add(prefix_start),
+                    base - prefix_start,
+                )?
+            };
+            // SAFETY: on success every byte up to `prefix_start + end` is
+            // initialized, within the reserved capacity.
+            unsafe { out.set_len(prefix_start + end) };
+            Ok(())
+        }
     }
 
     /// Execute decoded sequences from `op` in the buffer at `out` (the
@@ -4489,7 +4394,7 @@ mod parallel {
     /// `out..out + op` is initialized and
     /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
     #[inline(always)]
-    unsafe fn execute_sequences_body<W: WildCopy>(
+    unsafe fn execute_sequences<W: WildCopy>(
         w: W,
         seqs: &[RawSeq],
         literals: &[u8],
@@ -4524,40 +4429,6 @@ mod parallel {
         ptr::copy_nonoverlapping(cur.lit, cur.op, rest);
         *offset_hist = hist.map(|o| o as u32);
         Ok(cur.op as usize + rest - out as usize)
-    }
-
-    /// `execute_sequences_body` with 16-byte copies.
-    ///
-    /// # Safety
-    /// As `execute_sequences_body`.
-    #[inline(never)]
-    unsafe fn execute_sequences(
-        w: Fallback,
-        seqs: &[RawSeq],
-        literals: &[u8],
-        offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-    ) -> Result<usize, String> {
-        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
-    }
-
-    /// `execute_sequences_body` compiled with AVX2, with 32-byte copies.
-    ///
-    /// # Safety
-    /// As `execute_sequences_body`.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    #[inline(never)]
-    unsafe fn execute_sequences_avx2(
-        w: Avx2,
-        seqs: &[RawSeq],
-        literals: &[u8],
-        offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-    ) -> Result<usize, String> {
-        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
     }
 
     /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
@@ -4688,6 +4559,289 @@ mod tests {
         }
     }
 
+    extern "C" {
+        // lib/common/huf.h; linked from zstd-sys's static libzstd.
+        fn HUF_readStats(
+            huff_weight: *mut u8,
+            hw_size: usize,
+            rank_stats: *mut u32,
+            nb_symbols: *mut u32,
+            table_log: *mut u32,
+            src: *const u8,
+            src_size: usize,
+        ) -> usize;
+        fn HUF_buildCTable_wksp(
+            tree: *mut usize,
+            count: *const u32,
+            max_symbol_value: u32,
+            max_nb_bits: u32,
+            workspace: *mut u64,
+            wksp_size: usize,
+        ) -> usize;
+        fn HUF_writeCTable_wksp(
+            dst: *mut u8,
+            max_dst_size: usize,
+            ctable: *const usize,
+            max_symbol_value: u32,
+            huff_log: u32,
+            workspace: *mut u64,
+            wksp_size: usize,
+        ) -> usize;
+    }
+
+    /// (description length, weights with the implied last one, rank
+    /// statistics up to weight 11, table log) of a tree description.
+    type HufStats = (usize, Vec<u8>, Vec<u32>, u32);
+
+    fn huf_stats_c(src: &[u8]) -> Option<HufStats> {
+        let mut weights = [0u8; 256];
+        let mut rank_stats = [0u32; 13];
+        let (mut nb_symbols, mut table_log) = (0u32, 0u32);
+        // SAFETY: the buffers have the sizes HUF_readStats is given (rankStats
+        // takes HUF_TABLELOG_MAX + 1 = 13 entries).
+        let (r, error) = unsafe {
+            let r = HUF_readStats(
+                weights.as_mut_ptr(),
+                weights.len(),
+                rank_stats.as_mut_ptr(),
+                &mut nb_symbols,
+                &mut table_log,
+                src.as_ptr(),
+                src.len(),
+            );
+            (r, zstd::zstd_safe::zstd_sys::ZSTD_isError(r) != 0)
+        };
+        if error {
+            return None;
+        }
+        let n = nb_symbols as usize;
+        Some((
+            r,
+            weights[..n].to_vec(),
+            rank_stats[..12].to_vec(),
+            table_log,
+        ))
+    }
+
+    fn huf_stats_ours(src: &[u8]) -> Option<HufStats> {
+        let mut t = HuffmanTable::new();
+        let (used, nb_weights) = t.read_weights(src).ok()?;
+        t.weight_stats(nb_weights).ok()?;
+        let n = t.nb_symbols;
+        Some((
+            used,
+            t.weights[..n].to_vec(),
+            t.rank_stats[..12].to_vec(),
+            u32::from(t.max_num_bits),
+        ))
+    }
+
+    /// libzstd's tree description of a code for `counts` of at most
+    /// `max_bits` bits; `None` when HUF_writeCTable cannot write it (more
+    /// than 128 symbols whose weights FSE does not compress).
+    fn huf_description_c(counts: &[u32], max_bits: u32) -> Option<Vec<u8>> {
+        let max_sv = counts.len() as u32 - 1;
+        let mut ctable = [0usize; 258];
+        let mut wksp = [0u64; 2048];
+        let mut out = [0u8; 256];
+        // SAFETY: `ctable` holds HUF_CTABLE_SIZE_ST(255) entries and `wksp`
+        // exceeds HUF_WORKSPACE_SIZE.
+        unsafe {
+            let bits = HUF_buildCTable_wksp(
+                ctable.as_mut_ptr(),
+                counts.as_ptr(),
+                max_sv,
+                max_bits,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            assert_eq!(zstd::zstd_safe::zstd_sys::ZSTD_isError(bits), 0);
+            let n = HUF_writeCTable_wksp(
+                out.as_mut_ptr(),
+                out.len(),
+                ctable.as_ptr(),
+                max_sv,
+                bits as u32,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            (zstd::zstd_safe::zstd_sys::ZSTD_isError(n) == 0).then(|| out[..n].to_vec())
+        }
+    }
+
+    /// `read_weights` + `weight_stats` against HUF_readStats on libzstd's
+    /// descriptions of random codes (raw and FSE-compressed, 2 to 256
+    /// symbols, 6- to 11-bit), every truncation of them, single-byte
+    /// corruptions and random bytes: the same outcome, and on success the
+    /// same length, weights, statistics and table log, except that 12-bit
+    /// codes are errors. Hundreds of the corrupted and random inputs are
+    /// valid descriptions.
+    #[test]
+    fn huf_stats_match_libzstd() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let check = |src: &[u8]| {
+            let theirs = huf_stats_c(src);
+            // libzstd takes weights and table logs up to HUF_TABLELOG_MAX = 12;
+            // the format caps the table log at 11 (MAX_MAX_NUM_BITS).
+            let want = theirs.filter(|&(.., log)| log <= u32::from(MAX_MAX_NUM_BITS));
+            let ours = huf_stats_ours(src);
+            assert_eq!(ours, want, "input {src:02x?}");
+            usize::from(ours.is_some())
+        };
+        let (mut raw, mut written, mut bad_ok, mut random_ok) = (0, 0, 0, 0);
+        for case in 0..3000 {
+            let nb = 2 + rand() as usize % 255;
+            let skew = rand() % 20;
+            let counts: Vec<u32> = (0..nb)
+                .map(|_| 1 + (rand() >> (31 - skew % 31)) % 5000)
+                .collect();
+            // HUF_minTableLog: at least enough bits for `nb` leaves.
+            let max_bits = (6 + case % 6).max(highest_bit_set(nb as u32) + 1);
+            let Some(desc) = huf_description_c(&counts, max_bits) else {
+                continue;
+            };
+            written += 1;
+            raw += usize::from(desc[0] >= 128);
+            for len in 0..=desc.len() {
+                check(&desc[..len]);
+            }
+            let mut bad = desc.clone();
+            let pos = rand() as usize % desc.len();
+            bad[pos] ^= 1 << (rand() % 8);
+            bad_ok += check(&bad);
+            bad[pos] = rand() as u8;
+            bad_ok += check(&bad);
+        }
+        assert!(raw > 100 && written - raw > 1000, "{raw} raw of {written}");
+        for _ in 0..200_000 {
+            let len = 1 + rand() as usize % 40;
+            let mut src: Vec<u8> = (0..len).map(|_| rand() as u8).collect();
+            src[0] %= 1 + len as u8;
+            random_ok += check(&src);
+        }
+        assert!(
+            bad_ok > 500 && random_ok > 1000,
+            "{bad_ok} {random_ok} accepted"
+        );
+    }
+
+    /// Raw 4-bit weights (an odd number of them) through the statistics and
+    /// both fills: each symbol of weight `w` owns `1 << (w - 1 + rescale)`
+    /// single-symbol cells of `max_bits + 1 - w` bits, in weight order, and
+    /// each double-symbol cell holds the single-symbol lookup of its index
+    /// plus, exactly when both fit in the table log, the lookup that
+    /// follows it.
+    #[test]
+    fn raw_weights_fill_both_tables() {
+        // Weights 3 3 2 2 1 0 1 sum to 14 halves; the implied eighth is 2.
+        let src = [127 + 7, 0x33, 0x22, 0x10, 0x10];
+        let mut t = HuffmanTable::new();
+        let (used, nb_weights) = t.read_weights(&src).unwrap();
+        assert_eq!((used, nb_weights), (5, 7));
+        t.weight_stats(nb_weights).unwrap();
+        assert_eq!((t.nb_symbols, t.max_num_bits), (8, 4));
+        let weights = [3u8, 3, 2, 2, 1, 0, 1, 2];
+        assert_eq!(t.weights[..8], weights);
+        t.fill_x1();
+        t.fill_x2();
+        let log = HUF_FAST_TABLE_LOG;
+        let x1 = &t.decode[..];
+        let mut cells = [0usize; 8];
+        let mut last_key = (0, 0);
+        for e in x1 {
+            let w = u32::from(weights[usize::from(e.symbol)]);
+            assert_eq!(u32::from(e.num_bits), 4 + 1 - w);
+            assert!((w, e.symbol) >= last_key);
+            last_key = (w, e.symbol);
+            cells[usize::from(e.symbol)] += 1;
+        }
+        for (s, &w) in weights.iter().enumerate() {
+            let want = if w == 0 { 0 } else { 1 << (w - 1 + 7) };
+            assert_eq!(cells[s], want, "symbol {s}");
+        }
+        for (i, x) in t.decode_x2.iter().enumerate() {
+            let first = x1[i];
+            let next = x1[(i << first.num_bits) & ((1 << log) - 1)];
+            let both = u32::from(first.num_bits + next.num_bits) <= log;
+            assert_eq!(x.length, if both { 2 } else { 1 }, "cell {i}");
+            assert_eq!(x.sequence as u8, first.symbol, "cell {i}");
+            if both {
+                assert_eq!((x.sequence >> 8) as u8, next.symbol, "cell {i}");
+                assert_eq!(x.nb_bits, first.num_bits + next.num_bits, "cell {i}");
+            } else {
+                assert_eq!(x.nb_bits, first.num_bits, "cell {i}");
+            }
+        }
+    }
+
+    /// A table rebuilt over a larger one, an RLE one or one with -1 counts
+    /// equals the same table built fresh: builds clear no cells, so none of
+    /// the previous table's may show through.
+    #[test]
+    fn rebuilt_table_equals_fresh_build() {
+        let ll = &SEQ_TABLES[0];
+        let codes = Some((ll.base, ll.bits));
+        let cells = |t: &FSETable| {
+            t.decode()
+                .iter()
+                .map(|e| (e.next_state, e.num_bits, e.extra_bits, e.base_value))
+                .collect::<Vec<_>>()
+        };
+        let mut wide = vec![-1i32; 36];
+        wide[0] = 512 - 35;
+        let mut narrow = vec![0i32; 36];
+        narrow[1] = 20;
+        narrow[7] = 12;
+        let dists: [(u8, &[i32]); 4] = [
+            (9, &wide),
+            (5, &narrow),
+            (ll.default_log, ll.default_distribution),
+            (5, &narrow),
+        ];
+        let mut reused = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+        for (i, (log, probs)) in dists.into_iter().enumerate() {
+            if i == 3 {
+                reused.build_rle(3, ll.base, ll.bits);
+            }
+            reused.build_from_probabilities(log, probs, codes).unwrap();
+            let mut fresh = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+            fresh.build_from_probabilities(log, probs, codes).unwrap();
+            assert_eq!(reused.decode().len(), 1 << log);
+            assert!(cells(&reused) == cells(&fresh), "build {i}");
+        }
+    }
+
+    /// `build_from_probabilities` refuses what `read_ncount_body` refuses
+    /// in a table description: counts that do not tile the table, counts
+    /// below -1, too many symbols and accuracy logs out of range.
+    #[test]
+    fn build_from_probabilities_checks_counts() {
+        let mut t = FSETable::new(MAX_OFFSET_CODE);
+        // Each failing case breaks one rule and keeps the others.
+        let mut probs = vec![1i32; 32];
+        assert!(t.build_from_probabilities(5, &probs, None).is_ok());
+        probs[0] = 2;
+        assert!(t.build_from_probabilities(5, &probs, None).is_err());
+        assert!(t.decode().is_empty());
+        probs[0] = -2;
+        probs[1] = 0;
+        assert!(t.build_from_probabilities(5, &probs, None).is_err());
+        let mut many = vec![-1i32; 32];
+        assert!(t.build_from_probabilities(5, &many, None).is_ok());
+        many.insert(0, 0);
+        assert!(t.build_from_probabilities(5, &many, None).is_err());
+        assert!(t.build_from_probabilities(4, &[-1; 16], None).is_err());
+        let mut big = vec![0i32; 32];
+        big[0] = 1024;
+        assert!(t.build_from_probabilities(10, &big, None).is_err());
+    }
+
     /// `short_offset_share` from the counts equals a scan of the cells, for
     /// RLE tables, the predefined table and built ones with -1 counts.
     #[test]
@@ -4696,11 +4850,11 @@ mod tests {
         let codes = Some((of.base, of.bits));
         let scan = |t: &FSETable| {
             let short = t
-                .decode
+                .decode()
                 .iter()
                 .filter(|e| (2..=4).contains(&e.extra_bits))
                 .count();
-            short * 256 / t.decode.len()
+            short * 256 / t.decode().len()
         };
         let mut t = FSETable::new(MAX_OFFSET_CODE);
         for code in 0..=MAX_OFFSET_CODE {
@@ -4717,6 +4871,56 @@ mod tests {
         t.build_from_probabilities(8, &probs, codes).unwrap();
         assert_eq!(short_offset_share(&t), scan(&t), "built");
         assert_eq!(short_offset_share(&t), 100 + 60 + 1);
+    }
+
+    /// Fails with the name of the copy type it is executed with.
+    struct CopyProbe;
+
+    impl BlockSequences for CopyProbe {
+        fn execute<W: WildCopy>(
+            self,
+            _: W,
+            _: &mut [u32; 3],
+            _: usize,
+            _: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let name = std::any::type_name::<W>();
+            Err(name.rsplit("::").next().unwrap_or(name).to_string())
+        }
+    }
+
+    /// `execute_with_copies` runs the `ShortOffsets` copies from a share of
+    /// `SHORT_OFFSET_SHARE_MIN` on and the plain ones below it, on the
+    /// portable level and on AVX2.
+    #[test]
+    fn execute_with_copies_follows_offsets_table() {
+        assert_eq!(SHORT_OFFSET_SHARE_MIN, 32);
+        let of = &SEQ_TABLES[1];
+        let codes = Some((of.base, of.bits));
+        let mut levels = vec![(Level::fallback(), "Fallback", "FallbackShortOffsets")];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if let Level::Avx2(w) = Level::new() {
+            levels.push((Level::Avx2(w), "Avx2", "Avx2ShortOffsets"));
+        }
+        let pick = |level, t: &FSETable| {
+            execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, &mut Vec::new())
+                .unwrap_err()
+        };
+        let mut t = FSETable::new(MAX_OFFSET_CODE);
+        for (level, plain, short) in levels {
+            for (share, want) in [(31, plain), (32, short), (0, plain), (256, short)] {
+                let mut probs = vec![0i32; 11];
+                probs[3] = share;
+                probs[10] = 256 - share;
+                t.build_from_probabilities(8, &probs, codes).unwrap();
+                assert_eq!(short_offset_share(&t), share as usize);
+                assert_eq!(pick(level, &t), want, "share {share}");
+            }
+            t.build_rle(3, of.base, of.bits);
+            assert_eq!(pick(level, &t), short, "RLE 3");
+            t.build_rle(10, of.base, of.bits);
+            assert_eq!(pick(level, &t), plain, "RLE 10");
+        }
     }
 
     #[test]
