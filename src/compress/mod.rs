@@ -154,16 +154,13 @@ impl CompressOptions {
         }
         let enabled = match self.ldm {
             // wlog >= 27, strategy >= btopt
-            ParamSwitch::Auto => cparams.strategy as u32 >= ZSTD_BTOPT && cparams.window_log >= 27,
+            ParamSwitch::Auto => cparams.strategy >= Strategy::BtOpt && cparams.window_log >= 27,
             ParamSwitch::Enable => true,
             ParamSwitch::Disable => false,
         };
         (cparams, enabled.then(|| requested.adjusted(&cparams)))
     }
 }
-
-/// `ZSTD_btopt`.
-const ZSTD_BTOPT: u32 = 7;
 
 /// Compress `data` into a zstd frame at `level`.
 ///
@@ -468,17 +465,14 @@ pub fn job_size_for(
 /// matching (whose window is typically oversized) from the cycle log.
 fn target_job_log(cparams: &CParams, ldm: bool) -> u32 {
     let job_log = if ldm {
-        // ZSTD_cycleLog(chainLog, strategy): btScale = strategy >= btlazy2
-        let cycle_log = cparams.chain_log - (cparams.strategy as u32 >= ZSTD_BTLAZY2) as u32;
+        // ZSTD_cycleLog(chainLog, strategy)
+        let cycle_log = cparams.chain_log - cparams.strategy.bt_scale();
         21.max(cycle_log + 3)
     } else {
         20.max(cparams.window_log + 2)
     };
     job_log.min(JOBLOG_MAX)
 }
-
-/// `ZSTD_btlazy2`.
-const ZSTD_BTLAZY2: u32 = 6;
 
 /// Job boundaries: `[0, job_size)`, `[job_size, 2 * job_size)`, ... with the
 /// last job truncated to `len`.
@@ -767,6 +761,12 @@ mod tests {
         let mut lazy2 = logs(27, 24);
         lazy2.strategy = Strategy::Lazy2;
         assert_eq!(overlap_size(&lazy2, 0, true), 1 << 23);
+        // The binary-tree strategies halve the cycle: level 22's chain log
+        // 27 gives job log 26 + 3, and btultra2's overlap log 9 the whole
+        // job log - 2 window.
+        let l22 = CParams::for_level(22, 1 << 30);
+        assert_eq!(job_size_for(None, &l22, true, 0), 1 << 29);
+        assert_eq!(overlap_size(&l22, 0, true), 1 << 27);
     }
 
     /// `len + gap` noise bytes, then the first `len` of them again: a

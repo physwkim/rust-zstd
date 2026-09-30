@@ -129,7 +129,7 @@ impl LdmParams {
         }
         if self.min_match_length == 0 {
             self.min_match_length = LDM_MIN_MATCH_LENGTH;
-            if strategy >= ZSTD_BTULTRA {
+            if cparams.strategy >= Strategy::BtUltra {
                 self.min_match_length /= 2;
             }
         }
@@ -140,9 +140,6 @@ impl LdmParams {
         self
     }
 }
-
-/// `ZSTD_btultra`.
-const ZSTD_BTULTRA: u32 = 8;
 
 /// `rawSeq`: `lit_length` literals, then `match_length` bytes at `offset`
 /// back. `offset == 0` marks "the rest is literals" in
@@ -873,6 +870,20 @@ mod tests {
         assert_eq!(
             derive.adjusted(&cparams(Strategy::Lazy2, 27)),
             params(21, 5, 6)
+        );
+        // btopt (7): rate 7 - 7/3, bucket size log 7
+        assert_eq!(
+            derive.adjusted(&cparams(Strategy::BtOpt, 27)),
+            params(22, 7, 5)
+        );
+        // btultra2 (9): rate 4, bucket size log capped at 8, and from
+        // btultra on half the minimum match length
+        assert_eq!(
+            derive.adjusted(&cparams(Strategy::BtUltra2, 27)),
+            LdmParams {
+                min_match_length: 32,
+                ..params(23, 8, 4)
+            }
         );
         // an explicit hash log sets the rate to the window log above it...
         let fast27 = cparams(Strategy::Fast, 27);
