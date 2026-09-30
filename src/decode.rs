@@ -2621,14 +2621,9 @@ fn parse_block_header(src: &[u8]) -> Result<(BlockHeader, usize), String> {
         return Err("Found reserved block type".to_string());
     }
 
+    // Raw and RLE blocks are bounded by the output alone (ZSTD_copyRawBlock,
+    // ZSTD_setRleBlock); `split_block` bounds a compressed one.
     let block_size = u32::from(buf[0] >> 3) | (u32::from(buf[1]) << 5) | (u32::from(buf[2]) << 13);
-
-    if block_size > MAX_BLOCK_SIZE {
-        return Err(format!(
-            "Block size {} exceeds max {}",
-            block_size, MAX_BLOCK_SIZE
-        ));
-    }
 
     let decompressed_size = match block_type {
         BlockType::Raw | BlockType::RLE => block_size,

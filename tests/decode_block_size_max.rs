@@ -144,10 +144,16 @@ fn one_sequence_block(ml: u32) -> Block {
     Block::Compressed(v)
 }
 
+/// Output capacity given to libzstd. ZSTD_decompressFrame bounds raw and
+/// RLE blocks by the capacity left, and places a block's literals by it
+/// (ZSTD_allocateLiteralsBuffer); this decoder's output grows as needed,
+/// which a capacity well above every frame here stands for.
+const CAPACITY: usize = 8 << 20;
+
 /// Decode `f` with libzstd's one-shot decoder, check its outcome is
 /// `accept`, and check ours gives the same outcome and bytes.
 fn check(name: &str, f: &[u8], accept: bool) {
-    let theirs = zstd::bulk::decompress(f, 1 << 20);
+    let theirs = zstd::bulk::decompress(f, CAPACITY);
     assert_eq!(
         theirs.is_ok(),
         accept,
@@ -228,20 +234,39 @@ fn literals_size_is_at_most_block_maximum_size() {
     }
 }
 
-/// Neither bound applies to the decoded size of a compressed block, nor to
-/// raw or RLE blocks, in ZSTD_decompressFrame (only ZSTD_decompressStream
-/// checks them): below 128 KiB, both decoders take them past the window.
+/// Block_Maximum_Size does not bound the decoded size of a compressed
+/// block in ZSTD_decompressFrame (only ZSTD_decompressStream checks it):
+/// below 128 KiB, both decoders take it past the window.
 #[test]
-fn decoded_and_uncompressed_blocks_past_the_window_decode_like_libzstd() {
+fn decoded_size_past_the_window_decodes_like_libzstd() {
     for (wd, max) in WINDOWS.into_iter().filter(|&(_, max)| max < 128 << 10) {
         for n in [max, max + 1] {
             let f = around(wd, one_sequence_block(n as u32 - 1));
             check(&format!("max {max}: block decoding to {n}"), &f, true);
+        }
+    }
+}
+
+/// ZSTD_decompressFrame bounds raw and RLE blocks by the output capacity
+/// alone, not by Block_Maximum_Size or 128 KiB (only ZSTD_decompressStream
+/// does): up to the 21-bit Block_Size maximum, in windowed frames and in a
+/// single-segment frame whose window is the block.
+#[test]
+fn raw_and_rle_blocks_are_bounded_by_the_output_alone() {
+    const BLOCK_SIZE_FIELD_MAX: usize = (1 << 21) - 1;
+    for (wd, max) in WINDOWS {
+        for n in [max, max + 1, (128 << 10) + 1, BLOCK_SIZE_FIELD_MAX] {
             let f = around(wd, Block::Raw(vec![3; n]));
             check(&format!("max {max}: raw block of {n}"), &f, true);
             let f = around(wd, Block::Rle(4, n));
             check(&format!("max {max}: RLE block of {n}"), &f, true);
         }
+    }
+    for n in [(128 << 10) + 1, BLOCK_SIZE_FIELD_MAX] {
+        let f = frame(&single_segment(n as u32), &[Block::Raw(vec![5; n])]);
+        check(&format!("single segment: raw block of {n}"), &f, true);
+        let f = frame(&single_segment(n as u32), &[Block::Rle(6, n)]);
+        check(&format!("single segment: RLE block of {n}"), &f, true);
     }
 }
 
