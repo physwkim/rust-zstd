@@ -109,7 +109,34 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 ///
 /// Supports one or more concatenated zstd frames. Skippable frames are skipped.
 /// Dictionary frames are not supported.
+///
+/// With the `parallel` feature, frames of four or more blocks are decoded on
+/// the current rayon pool when it has more than one thread; the output is
+/// the same either way.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "parallel")]
+    let min_parallel_blocks = if rayon::current_num_threads() > 1 {
+        parallel::MIN_BLOCKS
+    } else {
+        usize::MAX
+    };
+    #[cfg(not(feature = "parallel"))]
+    let min_parallel_blocks = usize::MAX;
+    decompress_frames(data, min_parallel_blocks)
+}
+
+/// `decompress` with frames of at least `min_blocks` blocks decoded on the
+/// current rayon pool, whatever its size; `usize::MAX` never does. For
+/// testing the multi-threaded path on small inputs.
+#[doc(hidden)]
+pub fn decompress_with_min_parallel_blocks(
+    data: &[u8],
+    min_blocks: usize,
+) -> Result<Vec<u8>, String> {
+    decompress_frames(data, min_blocks)
+}
+
+fn decompress_frames(data: &[u8], min_parallel_blocks: usize) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut scratch: Option<DecoderScratch> = None;
     let mut pos = 0usize;
@@ -146,7 +173,14 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
         let scratch = scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
-        decode_frame(&frame_header, data, &mut pos, scratch, &mut output)?;
+        decode_frame(
+            &frame_header,
+            data,
+            &mut pos,
+            scratch,
+            &mut output,
+            min_parallel_blocks,
+        )?;
     }
 
     Ok(output)
@@ -2787,6 +2821,9 @@ const WILDCOPY_OVERLENGTH: usize = 32;
 /// (libzstd WILDCOPY_VECLEN).
 const WILDCOPY_VECLEN: usize = 16;
 
+/// Number of repeat offsets (libzstd ZSTD_REP_NUM).
+const ZSTD_REP_NUM: usize = 3;
+
 /// Parameters of one of the three sequence code tables.
 struct SeqTableKind {
     max_log: u8,
@@ -3339,7 +3376,8 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 
 /// Decode every block of one frame from `data[*pos..]` straight into
 /// `output`, then skip the checksum. Matches may only reach back to the
-/// frame's own start (ZSTD_decompressFrame).
+/// frame's own start (ZSTD_decompressFrame). Frames of at least
+/// `min_parallel_blocks` blocks are decoded by `parallel` when enabled.
 #[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
@@ -3347,6 +3385,7 @@ fn decode_frame(
     pos: &mut usize,
     scratch: &mut DecoderScratch,
     output: &mut Vec<u8>,
+    min_parallel_blocks: usize,
 ) -> Result<(), String> {
     let frame_base = output.len();
 
@@ -3362,6 +3401,47 @@ fn decode_frame(
             .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))?;
     }
 
+    #[cfg(feature = "parallel")]
+    let decoded =
+        parallel::decode_frame_blocks(data, pos, frame_base, output, min_parallel_blocks)?;
+    #[cfg(not(feature = "parallel"))]
+    let decoded = {
+        let _ = min_parallel_blocks;
+        false
+    };
+    if !decoded {
+        decode_blocks(data, pos, scratch, frame_base, output)?;
+    }
+
+    // Skip the checksum if present; this decoder does not verify it.
+    if header.descriptor.content_checksum_flag() {
+        if data.len() - *pos < 4 {
+            return Err("Error reading checksum: truncated".to_string());
+        }
+        *pos += 4;
+    }
+
+    if let Some(fcs) = header.frame_content_size() {
+        let decoded = (output.len() - frame_base) as u64;
+        if decoded != fcs {
+            return Err(format!(
+                "Frame content size mismatch: header says {}, decoded {}",
+                fcs, decoded
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The serial block loop of `decode_frame`: decode every block of the
+/// frame at `data[*pos..]` into `output`.
+fn decode_blocks(
+    data: &[u8],
+    pos: &mut usize,
+    scratch: &mut DecoderScratch,
+    frame_base: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     loop {
         let (block, header_len) = parse_block_header(&data[*pos..])?;
         *pos += header_len;
@@ -3381,24 +3461,6 @@ fn decode_frame(
 
         if block.last_block {
             break;
-        }
-    }
-
-    // Skip the checksum if present; this decoder does not verify it.
-    if header.descriptor.content_checksum_flag() {
-        if data.len() - *pos < 4 {
-            return Err("Error reading checksum: truncated".to_string());
-        }
-        *pos += 4;
-    }
-
-    if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame_base) as u64;
-        if decoded != fcs {
-            return Err(format!(
-                "Frame content size mismatch: header says {}, decoded {}",
-                fcs, decoded
-            ));
         }
     }
     Ok(())
@@ -3507,6 +3569,570 @@ fn decompress_block(
     }
 
     Ok(())
+}
+
+// ============================================================
+// Multi-threaded frame decoder (feature `parallel`)
+//
+// Stage 1 (sequential) locates every block and resolves which earlier
+// block defined each Huffman / FSE table a block reuses. Stage 2 (rayon
+// tasks, at most a ring's worth of blocks ahead) builds the tables, decodes
+// the literals and decodes the sequences with their offsets still in
+// OFFBASE form. Stage 3 (one thread, in block order, as soon as each block
+// is decoded) resolves the repeat offsets and executes the sequences into
+// the output.
+// ============================================================
+
+#[cfg(feature = "parallel")]
+mod parallel {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Frames with fewer blocks take the fused serial path.
+    pub(super) const MIN_BLOCKS: usize = 4;
+
+    /// One block of a frame, as located by the pre-pass.
+    enum Plan<'a> {
+        Raw(&'a [u8]),
+        Rle(u8, usize),
+        Compressed(CompressedPlan<'a>),
+    }
+
+    struct CompressedPlan<'a> {
+        parts: BlockParts<'a>,
+        /// For Huffman-coded literals, the block whose tree description
+        /// they use: this block for Compressed literals, the last earlier
+        /// block with Compressed literals for Treeless ones.
+        huf_def: Option<usize>,
+        /// For LL, OF and ML (`SEQ_TABLES` order), the block whose mode
+        /// defined the table this block uses. Unused without sequences.
+        fse_def: [usize; 3],
+    }
+
+    fn compressed<'p, 'a>(plan: &'p Plan<'a>) -> &'p CompressedPlan<'a> {
+        match plan {
+            Plan::Compressed(c) => c,
+            // `plan_frame` only records compressed blocks as definitions.
+            _ => unreachable!("table definition in a non-compressed block"),
+        }
+    }
+
+    /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
+    /// and resolving Treeless / Repeat references the way the serial
+    /// decoder's scratch tables carry them from block to block.
+    fn plan_frame<'a>(data: &'a [u8], pos: &mut usize) -> Result<Vec<Plan<'a>>, String> {
+        let mut plans = Vec::new();
+        let mut huf_def = None;
+        let mut fse_def: [Option<usize>; 3] = [None; 3];
+        loop {
+            let (block, header_len) = parse_block_header(&data[*pos..])?;
+            *pos += header_len;
+            let content = data
+                .get(*pos..*pos + block.content_size as usize)
+                .ok_or_else(|| "Block content extends past end of input".to_string())?;
+            *pos += content.len();
+            let i = plans.len();
+            plans.push(match block.block_type {
+                BlockType::Raw => Plan::Raw(content),
+                BlockType::RLE => Plan::Rle(content[0], block.decompressed_size as usize),
+                BlockType::Compressed => {
+                    let parts = split_block(content)?;
+                    let huf = match parts.literals.ls_type {
+                        LiteralsSectionType::Compressed => {
+                            huf_def = Some(i);
+                            huf_def
+                        }
+                        LiteralsSectionType::Treeless => Some(huf_def.ok_or_else(|| {
+                            "Uninitialized Huffman table for treeless literals".to_string()
+                        })?),
+                        LiteralsSectionType::Raw | LiteralsSectionType::RLE => None,
+                    };
+                    let mut defs = [0; 3];
+                    if parts.sequences.num_sequences != 0 {
+                        let modes = parts
+                            .sequences
+                            .modes
+                            .ok_or_else(|| "Missing compression mode".to_string())?;
+                        for (t, mode) in modes.all().into_iter().enumerate() {
+                            if !matches!(mode, ModeType::Repeat) {
+                                fse_def[t] = Some(i);
+                            }
+                            defs[t] = fse_def[t].ok_or_else(|| {
+                                format!(
+                                    "Repeat mode without a previous {} table",
+                                    SEQ_TABLES[t].name
+                                )
+                            })?;
+                        }
+                    }
+                    Plan::Compressed(CompressedPlan {
+                        parts,
+                        huf_def: huf,
+                        fse_def: defs,
+                    })
+                }
+                BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
+            });
+            if block.last_block {
+                return Ok(plans);
+            }
+        }
+    }
+
+    /// One sequence before repeat-offset resolution.
+    #[derive(Clone, Copy)]
+    struct RawSeq {
+        ll: u32,
+        ml: u32,
+        /// libzstd OFFBASE: 1..=3 name a repeat offset, larger values are
+        /// the offset plus `ZSTD_REP_NUM`.
+        off_base: u32,
+    }
+
+    /// A ring position: its slot and the index plus one of the last block
+    /// decoded into it.
+    struct RingSlot {
+        done: AtomicUsize,
+        slot: Mutex<Slot>,
+    }
+
+    /// Publishes a finished decode on drop.
+    struct MarkDone<'a>(&'a AtomicUsize, usize);
+
+    impl Drop for MarkDone<'_> {
+        fn drop(&mut self) {
+            self.0.store(self.1, Ordering::Release);
+        }
+    }
+
+    /// Per-ring-position worker state: tables tagged with the block that
+    /// defined them (so a run of blocks reusing one table builds it once),
+    /// and the decoded literals and sequences of the current block.
+    struct Slot {
+        huf: HuffmanScratch,
+        huf_from: Option<usize>,
+        fse: FSEScratch,
+        fse_from: [Option<usize>; 3],
+        literals: Vec<u8>,
+        seqs: Vec<RawSeq>,
+        result: Result<(), String>,
+    }
+
+    impl Slot {
+        fn new() -> Slot {
+            let scratch = DecoderScratch::new();
+            Slot {
+                huf: scratch.huf,
+                huf_from: None,
+                fse: scratch.fse,
+                fse_from: [None; 3],
+                literals: Vec::new(),
+                seqs: Vec::new(),
+                result: Ok(()),
+            }
+        }
+    }
+
+    /// Stage 2 for compressed block `i`.
+    fn decode_block(
+        slot: &mut Slot,
+        i: usize,
+        plan: &CompressedPlan<'_>,
+        plans: &[Plan<'_>],
+    ) -> Result<(), String> {
+        if let Some(d) = plan.huf_def {
+            if d == i {
+                // `decode_block_literals` builds it from this block.
+                slot.huf_from = None;
+            } else if slot.huf_from != Some(d) {
+                slot.huf_from = None;
+                // The same arguments as the defining block's own build in
+                // `decompress_literals`, so the same table kind (X1 / X2).
+                let def = compressed(&plans[d]);
+                let lit = &def.parts.literals;
+                slot.huf.table.build_decoder(
+                    def.parts.literals_src,
+                    lit.regenerated_size as usize,
+                    lit.num_streams == Some(4),
+                )?;
+                slot.huf_from = Some(d);
+            }
+        }
+        decode_block_literals(&plan.parts, &mut slot.huf, &mut slot.literals)?;
+        if plan.huf_def == Some(i) {
+            slot.huf_from = Some(i);
+        }
+
+        slot.seqs.clear();
+        let seq = plan.parts.sequences;
+        let src = plan.parts.sequences_src;
+        if seq.num_sequences == 0 {
+            if !src.is_empty() {
+                return Err(format!(
+                    "Extra bits remaining: {} bits",
+                    src.len() as isize * 8
+                ));
+            }
+            return Ok(());
+        }
+        let modes = seq
+            .modes
+            .ok_or_else(|| "Missing compression mode".to_string())?;
+        let mut used = 0;
+        for (t, mode) in modes.all().into_iter().enumerate() {
+            let d = plan.fse_def[t];
+            if d == i {
+                slot.fse_from[t] = None;
+                used += build_sequence_table(
+                    mode,
+                    &src[used..],
+                    slot.fse.table_mut(t),
+                    &SEQ_TABLES[t],
+                )?;
+                slot.fse_from[t] = Some(i);
+            } else if slot.fse_from[t] != Some(d) {
+                slot.fse_from[t] = None;
+                build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                slot.fse_from[t] = Some(d);
+            }
+        }
+        decode_sequences(seq.num_sequences, &src[used..], &slot.fse, &mut slot.seqs)
+    }
+
+    /// Build table `t` from its description in the earlier block `def`,
+    /// skipping the descriptions that precede it there.
+    fn build_table_from(
+        def: &CompressedPlan<'_>,
+        t: usize,
+        table: &mut FSETable,
+    ) -> Result<(), String> {
+        let modes = def
+            .parts
+            .sequences
+            .modes
+            .ok_or_else(|| "Missing compression mode".to_string())?
+            .all();
+        let src = def.parts.sequences_src;
+        let mut used = 0;
+        for (u, kind) in SEQ_TABLES.iter().enumerate().take(t) {
+            used += match modes[u] {
+                ModeType::FSECompressed => {
+                    FSETable::new(kind.max_code).read_probabilities(&src[used..], kind.max_log)?
+                }
+                ModeType::RLE if used < src.len() => 1,
+                ModeType::RLE => return Err(format!("Missing byte for RLE {} table", kind.name)),
+                ModeType::Predefined | ModeType::Repeat => 0,
+            };
+        }
+        build_sequence_table(modes[t], &src[used..], table, &SEQ_TABLES[t]).map(|_| ())
+    }
+
+    /// The block's three sequence tables, checked for the unchecked state
+    /// lookups of `decode_raw_sequence`, and the bitstream positioned after
+    /// the initial states (ZSTD_initFseState). Same checks and reads as the
+    /// start of `run_sequences`.
+    fn seq_stream_begin<'a>(
+        bit_stream: &'a [u8],
+        fse: &'a FSEScratch,
+    ) -> Result<SeqStream<'a>, String> {
+        let tables = [&fse.literal_lengths, &fse.offsets, &fse.match_lengths];
+        let logs = tables.map(|t| u32::from(t.accuracy_log));
+        // Every state is `accuracy_log` bits or `next_state + bits` of a
+        // cell, which `build_decoding_table` / `build_rle` keep below
+        // `1 << accuracy_log`, the table length checked here.
+        if tables
+            .iter()
+            .zip(logs)
+            .any(|(t, log)| t.decode.len() != 1 << log)
+        {
+            return Err("FSE table is uninitialized".to_string());
+        }
+        let mut br = BitDStream::new(bit_stream)?;
+        let mut states = [0; 3];
+        for (s, log) in states.iter_mut().zip(logs) {
+            *s = br.read_bits(log);
+            br.reload();
+        }
+        Ok((br, states, tables.map(|t| &t.decode[..])))
+    }
+
+    /// A sequence bitstream after its initial LL, OF, ML states, with the
+    /// LL, OF, ML decoding tables.
+    type SeqStream<'a> = (BitDStream<'a>, [usize; 3], [&'a [FSEEntry]; 3]);
+
+    /// Stage 2's sequence loop: `run_sequences` without execution.
+    fn decode_sequences(
+        num_sequences: u32,
+        bit_stream: &[u8],
+        fse: &FSEScratch,
+        seqs: &mut Vec<RawSeq>,
+    ) -> Result<(), String> {
+        let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, fse)?;
+        let mut st = [ll, ml, of];
+        seqs.reserve(num_sequences as usize);
+        for _ in 1..num_sequences {
+            seqs.push(decode_raw_sequence(
+                &mut br, &mut st, ll_dt, ml_dt, of_dt, false,
+            ));
+        }
+        seqs.push(decode_raw_sequence(
+            &mut br, &mut st, ll_dt, ml_dt, of_dt, true,
+        ));
+        if !br.is_finished() {
+            return Err("Sequence bitstream not fully consumed".to_string());
+        }
+        Ok(())
+    }
+
+    /// `decode_sequence` with the offset left as OFFBASE; `st` is the LL,
+    /// ML, OF states. Kept separate from `decode_sequence`: sharing one
+    /// body changed the fused loop's register allocation and cost it 2-3%.
+    #[inline(always)]
+    fn decode_raw_sequence(
+        br: &mut BitDStream<'_>,
+        st: &mut [usize; 3],
+        ll_dt: &[FSEEntry],
+        ml_dt: &[FSEEntry],
+        of_dt: &[FSEEntry],
+        is_last: bool,
+    ) -> RawSeq {
+        // SAFETY: each state is below its table's length (see
+        // `seq_stream_begin`).
+        let (ll_e, ml_e, of_e) = unsafe {
+            (
+                table_entry(ll_dt, st[0]),
+                table_entry(ml_dt, st[1]),
+                table_entry(of_dt, st[2]),
+            )
+        };
+        let mut ll = ll_e.base_value as usize;
+        let mut ml = ml_e.base_value as usize;
+        let ll_bits = u32::from(ll_e.extra_bits);
+        let ml_bits = u32::from(ml_e.extra_bits);
+        let of_bits = u32::from(of_e.extra_bits);
+        let total_bits = ll_bits + ml_bits + of_bits;
+
+        // Offset codes 0 and 1 are repeat codes (base value 0, or base
+        // value 1 plus one extra bit) and give 1..=3; larger codes carry
+        // the offset, stored plus ZSTD_REP_NUM.
+        let off_base = if of_bits > 1 {
+            of_e.base_value as usize + br.read_bits_fast(of_bits) + ZSTD_REP_NUM
+        } else if of_bits == 1 {
+            of_e.base_value as usize + br.read_bits_fast(1) + 1
+        } else {
+            of_e.base_value as usize + 1
+        };
+        if ml_bits > 0 {
+            ml += br.read_bits_fast(ml_bits);
+        }
+        // Same reload rule as `decode_sequence`.
+        if total_bits >= 57 - 26 {
+            br.reload();
+        }
+        if ll_bits > 0 {
+            ll += br.read_bits_fast(ll_bits);
+        }
+        if !is_last {
+            st[0] = usize::from(ll_e.next_state) + br.read_bits(u32::from(ll_e.num_bits));
+            st[1] = usize::from(ml_e.next_state) + br.read_bits(u32::from(ml_e.num_bits));
+            st[2] = usize::from(of_e.next_state) + br.read_bits(u32::from(of_e.num_bits));
+            br.reload();
+        }
+        // Lengths are below 2^17 and OFFBASE at most 2^32 - 1 (offset code
+        // 31: base 2^31 - 3 plus 31 extra bits plus 3), so all fit in u32.
+        RawSeq {
+            ll: ll as u32,
+            ml: ml as u32,
+            off_base: off_base as u32,
+        }
+    }
+
+    /// The repeat-offset update of `decode_sequence`, applied to OFFBASE.
+    /// `ll` is the sequence's literal length.
+    #[inline(always)]
+    fn resolve_offset(hist: &mut [usize; 3], off_base: usize, ll: usize) -> usize {
+        if off_base > ZSTD_REP_NUM {
+            let o = off_base - ZSTD_REP_NUM;
+            hist[2] = hist[1];
+            hist[1] = hist[0];
+            hist[0] = o;
+            return o;
+        }
+        // Without literals the repeat codes shift by one: code 1 names the
+        // second offset, and code 3 means the first offset minus one.
+        let idx = off_base - 1 + usize::from(ll == 0);
+        if idx == 0 {
+            return hist[0];
+        }
+        let mut temp = if idx == 3 {
+            hist[0].wrapping_sub(1)
+        } else {
+            hist[idx]
+        };
+        if temp == 0 {
+            // Corrupt input: force an offset that execution rejects.
+            temp = usize::MAX;
+        }
+        if idx != 1 {
+            hist[2] = hist[1];
+        }
+        hist[1] = hist[0];
+        hist[0] = temp;
+        temp
+    }
+
+    /// Stage 3 for one block.
+    fn execute_block(
+        plan: &Plan<'_>,
+        slot: &mut Slot,
+        hist: &mut [u32; 3],
+        frame_base: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        match plan {
+            Plan::Raw(content) => output.extend_from_slice(content),
+            Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
+            Plan::Compressed(cp) => {
+                std::mem::replace(&mut slot.result, Ok(()))?;
+                let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
+                if cp.parts.sequences.num_sequences == 0 {
+                    output.extend_from_slice(&slot.literals[..literals_len]);
+                    return Ok(());
+                }
+                let base = output.len();
+                output.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+                // SAFETY: `frame_base <= base`, and the capacity holds
+                // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
+                // the extent `execute_sequences` may write.
+                let end = unsafe {
+                    execute_sequences(
+                        &slot.seqs,
+                        &slot.literals,
+                        hist,
+                        output.as_mut_ptr().add(frame_base),
+                        base - frame_base,
+                    )?
+                };
+                // SAFETY: on success every byte up to `frame_base + end`
+                // is initialized, within the reserved capacity.
+                unsafe { output.set_len(frame_base + end) };
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute decoded sequences from `op` in the buffer at `out` (the
+    /// frame start); returns the block's end. Same contract as
+    /// `run_sequences`.
+    ///
+    /// # Safety
+    /// `out..out + op` is initialized and
+    /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
+    unsafe fn execute_sequences(
+        seqs: &[RawSeq],
+        literals: &[u8],
+        offset_hist: &mut [u32; 3],
+        out: *mut u8,
+        op: usize,
+    ) -> Result<usize, String> {
+        let mut hist = offset_hist.map(|o| o as usize);
+        let lit = literals.as_ptr();
+        // In bounds by the contract, and `literals` ends with
+        // `WILDCOPY_OVERLENGTH` bytes of slack.
+        let mut cur = SeqCursor {
+            op: out.add(op),
+            lit,
+        };
+        let lim = SeqLimits {
+            oend_w: out.add(op + MAX_BLOCK_SIZE as usize),
+            lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
+            prefix: out,
+        };
+        for s in seqs {
+            let ll = s.ll as usize;
+            let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
+            exec_sequence(&mut cur, &lim, ll, s.ml as usize, offset).map_err(seq_error_message)?;
+        }
+        // Last literals; both cursors only advanced within their buffers.
+        let rest = lim.lit_limit as usize - cur.lit as usize;
+        if cur.op as usize + rest > lim.oend_w as usize {
+            return Err(seq_error_message(SeqError::BlockTooLarge));
+        }
+        ptr::copy_nonoverlapping(cur.lit, cur.op, rest);
+        *offset_hist = hist.map(|o| o as u32);
+        Ok(cur.op as usize + rest - out as usize)
+    }
+
+    /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
+    /// current rayon pool. Returns `Ok(false)` without consuming input when
+    /// the frame has fewer than `min_blocks` blocks.
+    pub(super) fn decode_frame_blocks(
+        data: &[u8],
+        pos: &mut usize,
+        frame_base: usize,
+        output: &mut Vec<u8>,
+        min_blocks: usize,
+    ) -> Result<bool, String> {
+        if min_blocks == usize::MAX {
+            return Ok(false);
+        }
+        let mut end = *pos;
+        let plans = plan_frame(data, &mut end)?;
+        if plans.len() < min_blocks {
+            return Ok(false);
+        }
+        let plans = &plans[..];
+
+        // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
+        // spawned once block `i - ring.len()` has been executed from it.
+        let ring: Vec<RingSlot> = (0..(2 * rayon::current_num_threads()).min(plans.len()))
+            .map(|_| RingSlot {
+                done: AtomicUsize::new(0),
+                slot: Mutex::new(Slot::new()),
+            })
+            .collect();
+        let ring = &ring[..];
+        let mut hist = [1u32, 4, 8];
+        rayon::scope_fifo(|s| {
+            let spawn_decode = |i: usize| {
+                let Some(Plan::Compressed(cp)) = plans.get(i) else {
+                    return;
+                };
+                let cell = &ring[i % ring.len()];
+                s.spawn_fifo(move |_| {
+                    // Marks the block done even if decoding panics, so that
+                    // the executing thread finds the poisoned lock instead
+                    // of waiting forever.
+                    let _done = MarkDone(&cell.done, i + 1);
+                    let mut slot = cell.slot.lock().unwrap();
+                    slot.result = decode_block(&mut slot, i, cp, plans);
+                });
+            };
+            for i in 0..ring.len() {
+                spawn_decode(i);
+            }
+            for (i, plan) in plans.iter().enumerate() {
+                let cell = &ring[i % ring.len()];
+                if let Plan::Compressed(_) = plan {
+                    while cell.done.load(Ordering::Acquire) != i + 1 {
+                        // Run queued decodes (block `i`'s, if no worker has
+                        // taken it yet) rather than only wait.
+                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+                let mut slot = cell.slot.lock().unwrap();
+                execute_block(plan, &mut slot, &mut hist, frame_base, output)?;
+                drop(slot);
+                spawn_decode(i + ring.len());
+            }
+            Ok::<(), String>(())
+        })?;
+        *pos = end;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
