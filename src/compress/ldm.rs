@@ -376,8 +376,7 @@ impl LdmState {
         let mut candidates = [(0usize, 0usize, 0u32); LDM_BATCH_SIZE];
 
         while ip < ilimit {
-            let mut num_splits = 0;
-            let hashed = hash_state.feed(&src[ip..ilimit], &mut splits, &mut num_splits);
+            let (hashed, num_splits) = hash_state.feed(&src[ip..ilimit], &mut splits);
 
             for (cand, &split_n) in candidates.iter_mut().zip(&splits[..num_splits]) {
                 let split = ip + split_n - min_match;
@@ -580,30 +579,69 @@ impl GearState {
 
     /// `ZSTD_ldm_gear_feed`: record in `splits` the end offset of every
     /// split point in `data`, stopping after `LDM_BATCH_SIZE` of them.
-    /// Returns the number of bytes processed.
-    #[inline]
-    fn feed(
-        &mut self,
-        data: &[u8],
-        splits: &mut [usize; LDM_BATCH_SIZE],
-        num_splits: &mut usize,
-    ) -> usize {
+    /// Returns the number of bytes processed and of splits recorded.
+    ///
+    /// Not inlined, and unrolled by four as in C: inlined into
+    /// `generate_sequences_internal`, the rolling hash was kept in a stack
+    /// slot, putting a store-to-load round trip on its per-byte chain.
+    #[inline(never)]
+    fn feed(&mut self, data: &[u8], splits: &mut [usize; LDM_BATCH_SIZE]) -> (usize, usize) {
         let mut hash = self.rolling;
         let mask = self.stop_mask;
         let mut n = 0;
-        while n < data.len() {
-            hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-            n += 1;
-            if hash & mask == 0 {
-                splits[*num_splits] = n;
-                *num_splits += 1;
-                if *num_splits == LDM_BATCH_SIZE {
-                    break;
+        let mut num_splits = 0;
+        macro_rules! gear_iter_once {
+            ($done:lifetime) => {
+                hash = gear_step(hash, GEAR_TAB[data[n] as usize]);
+                n += 1;
+                if hash & mask == 0 {
+                    splits[num_splits] = n;
+                    num_splits += 1;
+                    if num_splits == LDM_BATCH_SIZE {
+                        break $done;
+                    }
                 }
+            };
+        }
+        'feed: {
+            while n + 3 < data.len() {
+                gear_iter_once!('feed);
+                gear_iter_once!('feed);
+                gear_iter_once!('feed);
+                gear_iter_once!('feed);
+            }
+            while n < data.len() {
+                gear_iter_once!('feed);
             }
         }
         self.rolling = hash;
-        n
+        (n, num_splits)
+    }
+}
+
+/// One gear round, `(hash << 1) + gear`, as the single `lea` libzstd
+/// compiles it to on x86-64: LLVM folds the table load into a second
+/// dependent `add` instead, two cycles per input byte on the rolling
+/// hash's chain rather than one.
+#[inline(always)]
+fn gear_step(hash: u64, gear: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut hash = hash;
+        // SAFETY: register arithmetic only.
+        unsafe {
+            std::arch::asm!(
+                "lea {h}, [{g} + {h} * 2]",
+                h = inout(reg) hash,
+                g = in(reg) gear,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        hash
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (hash << 1).wrapping_add(gear)
     }
 }
 
