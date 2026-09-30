@@ -63,41 +63,54 @@ pub struct MatchState {
 /// entries per node, for `BtLazy2` and the opt strategies), `hashTable3`
 /// (`1 << hash_log3` entries, opt strategies with `min_match == 3` only)
 /// and `tagTable` (`1 << hash_log` bytes, row-based lazy finder only, else
-/// empty). Every table starts on a 64-byte boundary, as `ZSTD_cwksp`
-/// places them (`ZSTD_CWKSP_ALIGNMENT_BYTES`): the allocation is of
-/// 64-byte `Line`s and every table length is a multiple of 16 entries
-/// (`hash_log`, `chain_log` and `hash_log3` are at least 6).
+/// empty), in that order.
+///
+/// Every table starts on a 4 KiB page boundary: the allocation is of
+/// `Page`s and each table fills whole pages. A row of the row finder
+/// (`1 << row_log` entries at a multiple of its size, at most 256 bytes of
+/// `hashTable` and 64 of `tagTable`) therefore never crosses a page or a
+/// cache line. `ZSTD_cwksp` only guarantees 64-byte alignment
+/// (`ZSTD_CWKSP_ALIGNMENT_BYTES`); where its tables land within a page
+/// depends on the sizes of the objects reserved before them.
 #[derive(Default)]
 pub struct Workspace {
-    lines: Vec<Line>,
+    pages: Vec<Page>,
     hash_len: usize,
+    chain_off: usize,
     chain_len: usize,
+    hash3_off: usize,
     hash3_len: usize,
+    tag_off: usize,
     tag_len: usize,
 }
 
-/// One 64-byte cache line of table entries: the allocation unit of
-/// [`Workspace`], so that its tables are line-aligned.
+/// The page size tables are aligned to.
+const PAGE: usize = 4096;
+
+/// `u32` entries per [`PAGE`] bytes.
+const PAGE_WORDS: usize = PAGE / 4;
+
+/// One page of table entries: the allocation unit of [`Workspace`].
 #[derive(Clone, Copy)]
-#[repr(C, align(64))]
-struct Line([u32; 16]);
+#[repr(C, align(4096))]
+struct Page([u32; PAGE_WORDS]);
 
-// SAFETY: 16 `u32`s are 64 bytes, the alignment, so `Line` has no padding
-// and every bit pattern is valid.
-unsafe impl bytemuck::Zeroable for Line {}
-unsafe impl bytemuck::Pod for Line {}
+// SAFETY: 1024 `u32`s are 4096 bytes, the alignment, so `Page` has no
+// padding and every bit pattern is valid.
+unsafe impl bytemuck::Zeroable for Page {}
+unsafe impl bytemuck::Pod for Page {}
 
-/// `n` zeroed `Line`s through `alloc_zeroed` (as `vec![0u32; n]` does), so
+/// `n` zeroed `Page`s through `alloc_zeroed` (as `vec![0u32; n]` does), so
 /// fresh tables stay untouched zero pages.
-fn zeroed_lines(n: usize) -> Vec<Line> {
+fn zeroed_pages(n: usize) -> Vec<Page> {
     if n == 0 {
         return Vec::new();
     }
-    let layout = std::alloc::Layout::array::<Line>(n).expect("workspace size");
-    // SAFETY: `layout` is not zero-sized; zeroed memory is `n` valid `Line`s
-    // (`Zeroable`), allocated with the layout `Vec<Line>` frees it with.
+    let layout = std::alloc::Layout::array::<Page>(n).expect("workspace size");
+    // SAFETY: `layout` is not zero-sized; zeroed memory is `n` valid `Page`s
+    // (`Zeroable`), allocated with the layout `Vec<Page>` frees it with.
     unsafe {
-        let p = std::alloc::alloc_zeroed(layout).cast::<Line>();
+        let p = std::alloc::alloc_zeroed(layout).cast::<Page>();
         if p.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -109,10 +122,11 @@ impl Workspace {
     /// The allocation as table entries.
     #[inline]
     fn words(&self) -> &[u32] {
-        bytemuck::cast_slice(&self.lines)
+        bytemuck::cast_slice(&self.pages)
     }
 
-    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy`.
+    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy`: entries,
+    /// bytes for `tag`.
     fn lens(cparams: &CParams) -> (usize, usize, usize, usize) {
         let hash = 1usize << cparams.hash_log;
         let chain = 1usize << cparams.chain_log;
@@ -136,27 +150,29 @@ impl Workspace {
     /// is freed and a zeroed one allocated.
     fn reset(&mut self, cparams: &CParams) {
         let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams);
-        let words = hash_len + chain_len + hash3_len + tag_len.div_ceil(4);
-        debug_assert!((hash_len | chain_len | hash3_len) % 16 == 0);
-        let lines = words.div_ceil(16);
-        if self.lines.capacity() < lines {
+        let whole = |words: usize| words.next_multiple_of(PAGE_WORDS);
+        self.hash_len = hash_len;
+        self.chain_off = whole(hash_len);
+        self.chain_len = chain_len;
+        self.hash3_off = self.chain_off + whole(chain_len);
+        self.hash3_len = hash3_len;
+        self.tag_off = self.hash3_off + whole(hash3_len);
+        self.tag_len = tag_len;
+        let pages = (self.tag_off + whole(tag_len.div_ceil(4))) / PAGE_WORDS;
+        if self.pages.capacity() < pages {
             // ZSTD_cwksp_free before ZSTD_cwksp_create: never both at once.
-            drop(std::mem::take(&mut self.lines));
-            self.lines = zeroed_lines(lines);
+            drop(std::mem::take(&mut self.pages));
+            self.pages = zeroed_pages(pages);
         } else {
-            self.lines.clear();
-            // SAFETY: `lines <= capacity`, and zeroed memory is valid `Line`s
+            self.pages.clear();
+            // SAFETY: `pages <= capacity`, and zeroed memory is valid `Page`s
             // (`Zeroable`). `write_bytes` is glibc's memset, as in
             // `ZSTD_cwksp_clean_tables`; `resize` compiles to a store loop.
             unsafe {
-                self.lines.as_mut_ptr().write_bytes(0, lines);
-                self.lines.set_len(lines);
+                self.pages.as_mut_ptr().write_bytes(0, pages);
+                self.pages.set_len(pages);
             }
         }
-        self.hash_len = hash_len;
-        self.chain_len = chain_len;
-        self.hash3_len = hash3_len;
-        self.tag_len = tag_len;
     }
 
     /// `(hashTable, chainTable, tagTable)`. Unchecked splits: the bounds
@@ -164,16 +180,21 @@ impl Workspace {
     /// registers of its whole hot loop (fast L1 measured 7% slower).
     #[inline]
     pub fn tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u8]) {
-        // SAFETY: `reset` is the only writer of the lengths and sizes `lines`
-        // to hold `hash_len + chain_len + hash3_len + tag_len.div_ceil(4)`
-        // entries.
+        // SAFETY: `reset` is the only writer of the offsets and lengths and
+        // sizes `pages` to hold `tag_off + tag_len.div_ceil(4)` entries, with
+        // `hash_len <= chain_off`, `chain_off + chain_len <= hash3_off <=
+        // tag_off`.
         unsafe {
-            let (hash, rest) = bytemuck::cast_slice_mut::<Line, u32>(&mut self.lines)
-                .split_at_mut_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
-            let tag = rest.get_unchecked_mut(self.hash3_len..);
+            let words = bytemuck::cast_slice_mut::<Page, u32>(&mut self.pages);
+            let (hash, rest) = words.split_at_mut_unchecked(self.chain_off);
+            let (chain, rest) = rest.split_at_mut_unchecked(self.hash3_off - self.chain_off);
+            let tag = rest.get_unchecked_mut(self.tag_off - self.hash3_off..);
             let tag: &mut [u8] = bytemuck::cast_slice_mut(tag);
-            (hash, chain, tag.get_unchecked_mut(..self.tag_len))
+            (
+                hash.get_unchecked_mut(..self.hash_len),
+                chain.get_unchecked_mut(..self.chain_len),
+                tag.get_unchecked_mut(..self.tag_len),
+            )
         }
     }
 
@@ -182,11 +203,13 @@ impl Workspace {
     pub fn tables(&self) -> (&[u32], &[u32], &[u8]) {
         // SAFETY: as in `tables_mut`.
         unsafe {
-            let (hash, rest) = self.words().split_at_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_unchecked(self.chain_len);
-            let tag = rest.get_unchecked(self.hash3_len..);
-            let tag: &[u8] = bytemuck::cast_slice(tag);
-            (hash, chain, tag.get_unchecked(..self.tag_len))
+            let words = self.words();
+            let tag: &[u8] = bytemuck::cast_slice(words.get_unchecked(self.tag_off..));
+            (
+                words.get_unchecked(..self.hash_len),
+                words.get_unchecked(self.chain_off..self.chain_off + self.chain_len),
+                tag.get_unchecked(..self.tag_len),
+            )
         }
     }
 
@@ -195,10 +218,14 @@ impl Workspace {
     pub fn opt_tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u32]) {
         // SAFETY: as in `tables_mut`.
         unsafe {
-            let (hash, rest) = bytemuck::cast_slice_mut::<Line, u32>(&mut self.lines)
-                .split_at_mut_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
-            (hash, chain, rest.get_unchecked_mut(..self.hash3_len))
+            let words = bytemuck::cast_slice_mut::<Page, u32>(&mut self.pages);
+            let (hash, rest) = words.split_at_mut_unchecked(self.chain_off);
+            let (chain, rest) = rest.split_at_mut_unchecked(self.hash3_off - self.chain_off);
+            (
+                hash.get_unchecked_mut(..self.hash_len),
+                chain.get_unchecked_mut(..self.chain_len),
+                rest.get_unchecked_mut(..self.hash3_len),
+            )
         }
     }
 
@@ -208,8 +235,7 @@ impl Workspace {
         // SAFETY: as in `tables_mut`.
         unsafe {
             self.words()
-                .get_unchecked(self.hash_len + self.chain_len..)
-                .get_unchecked(..self.hash3_len)
+                .get_unchecked(self.hash3_off..self.hash3_off + self.hash3_len)
         }
     }
 }
@@ -419,28 +445,43 @@ mod tests {
         assert_eq!(clamp(None, 500_000), 500_000 - 192);
     }
 
-    /// Every table of every strategy starts on a 64-byte boundary, fresh
-    /// and after a reset that reuses a larger allocation.
+    /// Every table of every strategy starts on a page boundary, fresh and
+    /// after a reset that reuses a larger allocation, so every row-finder
+    /// row (`1 << row_log` entries, `row_log` = `BOUNDED(4, search_log, 6)`)
+    /// of `hashTable` and `tagTable` lies within one page.
     #[test]
-    fn tables_are_line_aligned() {
-        let aligned = |ms: &mut MatchState, level: i32| {
+    fn tables_are_page_aligned_and_rows_stay_in_a_page() {
+        let check = |ms: &MatchState, level: i32| {
             let (hash, chain, tag) = ms.ws.tables();
-            let (h, c, t) = (
-                hash.as_ptr() as usize,
-                chain.as_ptr() as usize,
-                tag.as_ptr() as usize,
-            );
-            let h3 = ms.ws.hash3().as_ptr() as usize;
-            for (name, p) in [("hash", h), ("chain", c), ("tag", t), ("hash3", h3)] {
-                assert_eq!(p % 64, 0, "level {level} {name} table at {p:#x}");
+            let h3 = ms.ws.hash3();
+            for (name, p) in [
+                ("hash", hash.as_ptr() as usize),
+                ("chain", chain.as_ptr() as usize),
+                ("tag", tag.as_ptr() as usize),
+                ("hash3", h3.as_ptr() as usize),
+            ] {
+                assert_eq!(p % PAGE, 0, "level {level} {name} table at {p:#x}");
+            }
+            if !tag.is_empty() {
+                let row = 1usize << ms.cparams.search_log.clamp(4, 6);
+                let page = |p: usize| p / PAGE;
+                for first in (0..tag.len()).step_by(row) {
+                    let h = hash[first..first + row].as_ptr_range();
+                    assert_eq!(page(h.start as usize), page(h.end as usize - 1));
+                    let t = tag[first..first + row].as_ptr_range();
+                    assert_eq!(page(t.start as usize), page(t.end as usize - 1));
+                }
             }
         };
         let mut reused = MatchState::new(CParams::for_level(22, 1 << 20), 0);
-        for level in 1..=22 {
-            let cp = CParams::for_level(level, 1 << 20);
-            aligned(&mut MatchState::new(cp, 0), level);
-            reused.reset(cp, 0);
-            aligned(&mut reused, level);
+        // One size per `clevels.h` table: small tables are smaller than a page.
+        for size in [1 << 10, 100 << 10, 200 << 10, 1 << 20] {
+            for level in 1..=22 {
+                let cp = CParams::for_level(level, size);
+                check(&MatchState::new(cp, 0), level);
+                reused.reset(cp, 0);
+                check(&reused, level);
+            }
         }
     }
 }
