@@ -217,7 +217,7 @@ pub fn build_seq_store(
 }
 
 /// `ZSTD_compressBlock_internal`: "don't even attempt compression below a
-/// certain srcSize"; smaller blocks skip both stages and go RAW or RLE.
+/// certain srcSize"; smaller blocks skip both stages and go RAW.
 #[inline]
 pub fn attempts_compression(block_len: usize) -> bool {
     block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1
@@ -300,18 +300,40 @@ fn proven_rep_after(
     Some(rep)
 }
 
-/// `ZSTD_entropyCompressSeqStore` and the block-type decision of
-/// `ZSTD_compressBlock_internal` / `ZSTD_compressSeqStore_singleBlock`:
-/// from `built` (`None` when compression was not attempted) write the
-/// payload into `cbuf`, then append one complete block to `out`. `state` is
-/// committed, with `built.rep`, only when the block is written COMPRESSED.
-/// `is_first_block` disables RLE for the first block of a frame, as
-/// libzstd does for decoders <= 1.4.3.
+/// `ZSTD_entropyCompressSeqStore`: code `sections` of a `block_len`-byte
+/// block into `cbuf` from the committed tables `prev`, returning the state
+/// the block commits if written COMPRESSED, `None` when the payload does not
+/// beat `block_len - ZSTD_minGain`.
+fn entropy_code(
+    sections: Sections,
+    block_len: usize,
+    prev: &BlockState,
+    cparams: &CParams,
+    cbuf: &mut Vec<u8>,
+) -> Option<BlockState> {
+    let Sections { lits, seqs, rep } = sections;
+    cbuf.clear();
+    let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), &prev.huf, cparams);
+    let fse = fse::encode_sequences_section_with(cbuf, seqs, &prev.fse, cparams)?;
+    let max_c_size = block_len - CParams::min_gain(block_len, cparams.strategy);
+    if cbuf.len() >= max_c_size {
+        return None;
+    }
+    debug_assert!(cbuf.len() < ZSTD_BLOCKSIZE_MAX);
+    Some(BlockState { rep, huf, fse })
+}
+
+/// The block-type decision of `ZSTD_compressBlock_internal` /
+/// `ZSTD_compressSeqStore_singleBlock` once compression was attempted:
+/// [`entropy_code`] `sections` into `cbuf`, then append one complete block
+/// to `out`. `state` is committed, with `sections.rep`, only when the block
+/// is written COMPRESSED. `is_first_block` disables RLE for the first block
+/// of a job, as libzstd does for decoders <= 1.4.3.
 #[allow(clippy::too_many_arguments)]
 fn entropy_and_emit(
     src: &[u8],
     block: Range<usize>,
-    built: Option<Sections>,
+    sections: Sections,
     cparams: &CParams,
     is_first_block: bool,
     is_last: bool,
@@ -322,18 +344,7 @@ fn entropy_and_emit(
     debug_assert!(block.len() <= ZSTD_BLOCKSIZE_MAX);
     let block_len = block.len();
     let data = &src[block];
-    let next = built.and_then(|Sections { lits, seqs, rep }| {
-        let prev = state.prev();
-        cbuf.clear();
-        let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), &prev.huf, cparams);
-        let fse = fse::encode_sequences_section_with(cbuf, seqs, &prev.fse, cparams)?;
-        let max_c_size = block_len - CParams::min_gain(block_len, cparams.strategy);
-        if cbuf.len() >= max_c_size {
-            return None;
-        }
-        debug_assert!(cbuf.len() < ZSTD_BLOCKSIZE_MAX);
-        Some(BlockState { rep, huf, fse })
-    });
+    let next = entropy_code(sections, block_len, state.prev(), cparams, cbuf);
     let c_size = if next.is_some() { cbuf.len() } else { 0 };
 
     if !is_first_block && c_size < RLE_MAX_LENGTH && is_rle(data) {
@@ -355,11 +366,12 @@ fn entropy_and_emit(
 
 /// Append `src[block]` to `out` from `built` (the block's sequence store
 /// and the finder's repeat offsets after it, `None` when compression was
-/// not attempted). With the splitter off (`parts` is `None`) this is
-/// `ZSTD_compressBlock_internal`'s entropy stage, one block. With it on,
-/// `ZSTD_compressBlock_splitBlock` after `ZSTD_buildSeqStore`: `parts`
-/// from [`BlockSplitter::derive`], one block when empty, else one per
-/// partition (`ZSTD_compressBlock_splitBlock_internal`), each coded with
+/// not attempted: `ZSTDbss_noCompress`, written RAW without the RLE check
+/// by both block functions). With the splitter off (`parts` is `None`)
+/// this is `ZSTD_compressBlock_internal`'s entropy stage, one block. With
+/// it on, `ZSTD_compressBlock_splitBlock` after `ZSTD_buildSeqStore`:
+/// `parts` from [`BlockSplitter::derive`], one block when empty, else one
+/// per partition (`ZSTD_compressBlock_splitBlock_internal`), each coded with
 /// the repcodes [`resolve_off_codes`] made valid for the decoder and
 /// committing those repcodes. Returns whether every block written is
 /// COMPRESSED.
@@ -376,42 +388,26 @@ fn emit_block(
     cbuf: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> bool {
-    let (built, parts) = match (built, parts) {
-        (built, None) => {
-            let built = built.map(|(store, rep)| Sections::whole(store, rep));
-            return entropy_and_emit(
-                src,
-                block,
-                built,
-                cparams,
-                is_first_block,
-                is_last,
-                state,
-                cbuf,
-                out,
-            ) == BlockKind::Compressed;
-        }
-        // ZSTDbss_noCompress: RAW, without the RLE check.
-        (None, Some(_)) => {
-            write_raw_block(out, &src[block], is_last);
-            return false;
-        }
-        (Some((store, rep)), Some([])) => {
-            return entropy_and_emit(
-                src,
-                block,
-                Some(Sections::whole(store, rep)),
-                cparams,
-                is_first_block,
-                is_last,
-                state,
-                cbuf,
-                out,
-            ) == BlockKind::Compressed;
-        }
-        (Some((store, _)), Some(parts)) => (store, parts),
+    let Some((store, rep)) = built else {
+        write_raw_block(out, &src[block], is_last);
+        return false;
     };
-    let store = built;
+    let parts = match parts {
+        None | Some([]) => {
+            return entropy_and_emit(
+                src,
+                block,
+                Sections::whole(store, rep),
+                cparams,
+                is_first_block,
+                is_last,
+                state,
+                cbuf,
+                out,
+            ) == BlockKind::Compressed;
+        }
+        Some(parts) => parts,
+    };
     let mut d_rep = state.prev().rep;
     let mut c_rep = d_rep;
     let mut start = block.start;
@@ -422,11 +418,11 @@ fn emit_block(
         let kind = entropy_and_emit(
             src,
             start..start + part.src_len,
-            Some(Sections {
+            Sections {
                 lits: &store.lits[part.lits.clone()],
                 seqs: &store.seqs[part.seqs.clone()],
                 rep: d_rep,
-            }),
+            },
             cparams,
             is_first_block,
             is_last && i + 1 == parts.len(),
@@ -565,6 +561,14 @@ impl JobBlocks {
         start..start + size
     }
 
+    /// `isFirstBlock` at `block`: set by every job context's
+    /// `ZSTD_compressBegin` and cleared by its first block; a later ZSTDMT
+    /// job's header flush (`ZSTD_compressContinue` with no input) returns
+    /// before any block, so it holds for the first block of every job.
+    fn is_first(&self, block: &Range<usize>) -> bool {
+        block.start == self.job.start
+    }
+
     /// The block at `start`, from the blocks written so far.
     fn next(&self, src: &[u8], start: usize, presplit: &mut PreSplitter) -> Range<usize> {
         self.block(src, start, self.savings(start, self.gained), presplit)
@@ -641,7 +645,7 @@ pub fn compress_blocks(
             ms,
             src,
             block.clone(),
-            first_job && start == job.start,
+            blocks.is_first(&block),
             last_job && block.end == job.end,
             split,
             state,
@@ -712,7 +716,7 @@ fn compress_blocks_pipelined(
         rep
     });
     loop {
-        let is_first_block = blocks.first_job && block.start == job.start;
+        let is_first_block = blocks.is_first(&block);
         let is_last = last_job && block.end == job.end;
         // ZSTD_deriveBlockSplits runs against the state committed by the
         // previous block, before the next block's finder may start.
