@@ -87,10 +87,10 @@ enum Found {
 ///   disabled and reads `p` itself).
 /// * (I4) `hash_ptr` returns `< 1 << hlog == hash_table.len()`.
 ///
-/// Forced inline so that the AVX2 monomorphs are compiled inside
-/// [`compress_block_avx2`] with its target features; left to the inliner
-/// they allocate the search loop worse (words L1/L2 -1 to -2%).
-#[inline(always)]
+/// Not forced inline: `#[inline(always)]` re-allocates the scalar search
+/// loop with one more stack reload than when the inliner takes it. The
+/// inliner still puts the AVX2 monomorphs into [`compress_block_avx2`]; one
+/// left out of line stays correct and calls the AVX2 count out of line.
 fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
     mc: C,
     ms: &mut MatchState,
