@@ -16,6 +16,7 @@
 //! `ZSTD_cwksp`), so the allocator sees one request per context rather
 //! than three that straddle glibc's dynamic mmap threshold.
 
+use super::opt::OptState;
 use super::params::{CParams, Strategy};
 
 pub struct MatchState {
@@ -37,30 +38,43 @@ pub struct MatchState {
     /// `hashSaltEntropy`: running sum of the row finder's search hashes,
     /// mixed into the next salt by `ZSTD_advanceHashSalt` on a context reset.
     pub hash_salt_entropy: u32,
+    /// `opt`: the optimal parser's statistics and work tables, allocated
+    /// for the opt strategies and kept (not shrunk) across resets.
+    pub opt: Option<Box<OptState>>,
 }
 
 /// The table area of `ZSTD_cwksp`: one zeroed allocation holding
 /// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
 /// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
-/// the hash-chain table for the lazy strategies) and `tagTable`
-/// (`1 << hash_log` bytes, row-based lazy finder only, else empty).
+/// the hash-chain table for the lazy strategies; the binary tree for the
+/// opt strategies), `hashTable3` (`1 << hash_log3` entries, opt strategies
+/// with `min_match == 3` only) and `tagTable` (`1 << hash_log` bytes,
+/// row-based lazy finder only, else empty).
 #[derive(Default)]
 pub struct Workspace {
     words: Vec<u32>,
     hash_len: usize,
     chain_len: usize,
+    hash3_len: usize,
     tag_len: usize,
 }
 
 impl Workspace {
-    /// `(hash, chain, tag)` lengths for `cparams.strategy`.
-    fn lens(cparams: &CParams) -> (usize, usize, usize) {
+    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy`.
+    fn lens(cparams: &CParams) -> (usize, usize, usize, usize) {
         let hash = 1usize << cparams.hash_log;
         let chain = 1usize << cparams.chain_log;
         match cparams.strategy {
-            Strategy::Fast => (hash, 0, 0),
-            Strategy::DFast => (hash, chain, 0),
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, hash),
+            Strategy::Fast => (hash, 0, 0, 0),
+            Strategy::DFast => (hash, chain, 0, 0),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, 0, hash),
+            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+                let hash3 = match cparams.hash_log3() {
+                    0 => 0,
+                    log => 1usize << log,
+                };
+                (hash, chain, hash3, 0)
+            }
         }
     }
 
@@ -68,8 +82,8 @@ impl Workspace {
     /// exactly its used range zeroed (`ZSTD_cwksp_clean_tables`), else it
     /// is freed and a zeroed one allocated.
     fn reset(&mut self, cparams: &CParams) {
-        let (hash_len, chain_len, tag_len) = Self::lens(cparams);
-        let words = hash_len + chain_len + tag_len.div_ceil(4);
+        let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams);
+        let words = hash_len + chain_len + hash3_len + tag_len.div_ceil(4);
         if self.words.capacity() < words {
             // ZSTD_cwksp_free before ZSTD_cwksp_create: never both at once.
             drop(std::mem::take(&mut self.words));
@@ -80,6 +94,7 @@ impl Workspace {
         }
         self.hash_len = hash_len;
         self.chain_len = chain_len;
+        self.hash3_len = hash3_len;
         self.tag_len = tag_len;
     }
 
@@ -89,10 +104,11 @@ impl Workspace {
     #[inline]
     pub fn tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u8]) {
         // SAFETY: `reset` is the only writer of the lengths and sizes `words`
-        // to exactly `hash_len + chain_len + tag_len.div_ceil(4)`.
+        // to exactly `hash_len + chain_len + hash3_len + tag_len.div_ceil(4)`.
         unsafe {
             let (hash, rest) = self.words.split_at_mut_unchecked(self.hash_len);
-            let (chain, tag) = rest.split_at_mut_unchecked(self.chain_len);
+            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
+            let tag = rest.get_unchecked_mut(self.hash3_len..);
             let tag: &mut [u8] = bytemuck::cast_slice_mut(tag);
             (hash, chain, tag.get_unchecked_mut(..self.tag_len))
         }
@@ -104,9 +120,32 @@ impl Workspace {
         // SAFETY: as in `tables_mut`.
         unsafe {
             let (hash, rest) = self.words.split_at_unchecked(self.hash_len);
-            let (chain, tag) = rest.split_at_unchecked(self.chain_len);
+            let (chain, rest) = rest.split_at_unchecked(self.chain_len);
+            let tag = rest.get_unchecked(self.hash3_len..);
             let tag: &[u8] = bytemuck::cast_slice(tag);
             (hash, chain, tag.get_unchecked(..self.tag_len))
+        }
+    }
+
+    /// `(hashTable, chainTable, hashTable3)` of the opt strategies.
+    #[inline]
+    pub fn opt_tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u32]) {
+        // SAFETY: as in `tables_mut`.
+        unsafe {
+            let (hash, rest) = self.words.split_at_mut_unchecked(self.hash_len);
+            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
+            (hash, chain, rest.get_unchecked_mut(..self.hash3_len))
+        }
+    }
+
+    /// `hashTable3`, see [`Workspace::opt_tables_mut`].
+    #[inline]
+    pub fn hash3(&self) -> &[u32] {
+        // SAFETY: as in `tables_mut`.
+        unsafe {
+            self.words
+                .get_unchecked(self.hash_len + self.chain_len..)
+                .get_unchecked(..self.hash3_len)
         }
     }
 }
@@ -122,6 +161,7 @@ impl MatchState {
             window_low: 0,
             hash_salt: 0,
             hash_salt_entropy: 0,
+            opt: None,
         };
         ms.reset(cparams, window_low);
         ms
@@ -149,6 +189,13 @@ impl MatchState {
         self.window_low = window_low;
         self.hash_salt = super::lazy::initial_hash_salt();
         self.hash_salt_entropy = 0;
+        // ZSTD_invalidateMatchState: `opt.litLengthSum = 0` forces the next
+        // opt block to initialize its statistics.
+        if cparams.strategy.is_opt() {
+            self.opt
+                .get_or_insert_with(|| Box::new(OptState::new()))
+                .invalidate();
+        }
     }
 
     /// `(hashTable, chainTable, tagTable)`; borrows the whole state, use

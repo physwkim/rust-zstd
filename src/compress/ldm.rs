@@ -494,7 +494,12 @@ fn fill_fast_tables(ms: &mut MatchState, src: &[u8], end: usize) {
     match ms.cparams.strategy {
         Strategy::Fast => super::fast::fill_hash_table_to(ms, src, end),
         Strategy::DFast => super::dfast::fill_double_hash_table_to(ms, src, end),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => {}
+        Strategy::Greedy
+        | Strategy::Lazy
+        | Strategy::Lazy2
+        | Strategy::BtOpt
+        | Strategy::BtUltra
+        | Strategy::BtUltra2 => {}
     }
 }
 
