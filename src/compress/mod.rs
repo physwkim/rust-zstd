@@ -18,6 +18,7 @@ pub mod fast;
 pub mod lazy;
 pub mod matchstate;
 pub mod params;
+pub mod presplit;
 pub mod seqstore;
 pub mod split;
 
