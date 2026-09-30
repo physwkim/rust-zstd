@@ -257,49 +257,53 @@ impl Compressor {
             self.jobs.resize_with(n_jobs, JobContext::default);
         }
         let pipelined = cfg!(feature = "parallel");
-        if let Some(params) = ldm_params {
-            let mut state = match self.ldm.take() {
-                Some(mut state) => {
-                    state.reset(params, 0);
-                    state
-                }
-                None => LdmState::new(params, 0),
-            };
-            if src.len() <= JOBSIZE_MIN {
-                // ZSTD_CCtx_init_compressStream2: no ZSTDMT up to
-                // ZSTDMT_JOBSIZE_MIN; the single context generates each
-                // block's sequences as it goes.
-                debug_assert_eq!(n_jobs, 1);
-                let ctx = &mut self.jobs[0];
-                compress_job(
-                    src,
-                    cparams,
-                    block_size,
-                    overlap,
-                    jobs[0].clone(),
-                    true,
-                    true,
-                    pipelined,
-                    &mut ctx.ms,
-                    &mut ctx.scratch,
-                    &mut BlockLdm::Internal(&mut state),
-                    out,
-                );
-                self.ldm = Some(state);
-                return;
+        let mut ldm_state = ldm_params.map(|params| match self.ldm.take() {
+            Some(mut state) => {
+                state.reset(params, 0);
+                state
             }
-            // ZSTDMT_serialState_genSequences: every job's sequences from
-            // the one state, in job order, before the jobs run.
-            let max_seqs = job_size / params.min_match_length as usize;
-            for (job, ctx) in jobs.iter().zip(&mut self.jobs) {
-                state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
-            }
-            self.ldm = Some(state);
+            None => LdmState::new(params, 0),
+        });
+        if let (Some(state), true) = (&mut ldm_state, src.len() <= JOBSIZE_MIN) {
+            // ZSTD_CCtx_init_compressStream2: no ZSTDMT up to
+            // ZSTDMT_JOBSIZE_MIN; the single context generates each block's
+            // sequences as it goes.
+            debug_assert_eq!(n_jobs, 1);
+            let ctx = &mut self.jobs[0];
+            compress_job(
+                src,
+                cparams,
+                block_size,
+                overlap,
+                jobs[0].clone(),
+                true,
+                true,
+                pipelined,
+                &mut ctx.ms,
+                &mut ctx.scratch,
+                &mut BlockLdm::Internal(state),
+                out,
+            );
+            self.ldm = ldm_state;
+            return;
         }
+        let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
+        // A job spawned only once its sequences are generated would be taken
+        // by a thread waiting in an earlier job's block join, holding that job
+        // back by a whole job; such jobs compress their blocks serially, as
+        // ZSTDMT's workers do.
+        let blocks_pipelined = pipelined && (n_jobs == 1 || ldm_state.is_none());
         run_jobs(
             &jobs,
             &mut self.jobs[..n_jobs],
             pipelined,
+            // ZSTDMT_serialState_update: every job's sequences from the one
+            // state, in job order.
+            |job, ctx| {
+                if let Some(state) = &mut ldm_state {
+                    state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
+                }
+            },
             |k, job, ctx, out| {
                 let JobContext {
                     ms,
@@ -319,7 +323,7 @@ impl Compressor {
                     job,
                     k == 0,
                     k + 1 == n_jobs,
-                    pipelined,
+                    blocks_pipelined,
                     ms,
                     scratch,
                     &mut ldm,
@@ -328,6 +332,7 @@ impl Compressor {
             },
             out,
         );
+        self.ldm = ldm_state;
     }
 
     /// One frame holding `src`.
@@ -395,43 +400,36 @@ fn compress_job(
 }
 
 /// Run `f` over every job, in job order, appending to `out`; `ctxs[k]` is
-/// job `k`'s context. Job 0 always writes straight into `out`. With the
-/// feature enabled and `parallel`, the remaining jobs run on rayon into
-/// buffers of their own while job 0 runs, and are appended afterwards; the
-/// serial loop hands every job `out`. The job function is the same either
-/// way, so the frame is identical.
-fn run_jobs<F>(
+/// job `k`'s context. `prepare` runs on each job's context, in job order and
+/// one at a time, before the job starts: with the feature enabled and
+/// `parallel`, on the calling task while the earlier jobs run on rayon, as
+/// ZSTDMT serializes its long distance matching across jobs. Job 0 writes
+/// straight into `out`, the others into buffers of their own that are
+/// appended afterwards; the serial loop hands every job `out`. The job
+/// function is the same either way, so the frame is identical.
+fn run_jobs<P, F>(
     jobs: &[Range<usize>],
     ctxs: &mut [JobContext],
     parallel: bool,
+    mut prepare: P,
     f: F,
     out: &mut Vec<u8>,
 ) where
+    P: FnMut(&Range<usize>, &mut JobContext) + Send,
     F: Fn(usize, Range<usize>, &mut JobContext, &mut Vec<u8>) + Sync,
 {
     debug_assert_eq!(jobs.len(), ctxs.len());
     #[cfg(feature = "parallel")]
     if parallel {
-        use rayon::prelude::*;
-        let (Some((first, rest)), Some((first_ctx, rest_ctxs))) =
-            (jobs.split_first(), ctxs.split_first_mut())
-        else {
-            return;
-        };
-        let ((), rest_out) = rayon::join(
-            || f(0, first.clone(), first_ctx, out),
-            || {
-                rest.par_iter()
-                    .zip(rest_ctxs.par_iter_mut())
-                    .enumerate()
-                    .map(|(i, (job, ctx))| {
-                        let mut o = Vec::new();
-                        f(i + 1, job.clone(), ctx, &mut o);
-                        o
-                    })
-                    .collect::<Vec<_>>()
-            },
-        );
+        let mut rest_out = vec![Vec::new(); jobs.len().saturating_sub(1)];
+        let outs = std::iter::once(&mut *out).chain(&mut rest_out);
+        let f = &f;
+        rayon::scope(|s| {
+            for (k, ((job, ctx), o)) in jobs.iter().zip(ctxs).zip(outs).enumerate() {
+                prepare(job, ctx);
+                s.spawn(move |_| f(k, job.clone(), ctx, o));
+            }
+        });
         for o in &rest_out {
             out.extend_from_slice(o);
         }
@@ -439,6 +437,7 @@ fn run_jobs<F>(
     }
     let _ = parallel;
     for (k, (job, ctx)) in jobs.iter().zip(ctxs.iter_mut()).enumerate() {
+        prepare(job, ctx);
         f(k, job.clone(), ctx, out);
     }
 }
@@ -849,9 +848,9 @@ mod tests {
         }
     }
 
-    /// With long distance matching over several jobs, the parallel and the
-    /// serial job loop write the same bytes from the sequences generated in
-    /// job order, and those are the frame's.
+    /// With long distance matching over several jobs, the parallel job loop
+    /// (generating each job's sequences while the earlier jobs run) and the
+    /// serial one write the same bytes, and those are the frame's.
     #[test]
     fn ldm_parallel_and_serial_job_loops_agree() {
         let big = far_repeat(1 << 20, 4 << 20);
@@ -874,10 +873,10 @@ mod tests {
             let jobs = job_ranges(src.len(), job_size);
             let n = jobs.len();
             assert!(n >= min_jobs, "L{level}: {n} jobs");
-            let generate = |ctxs: &mut [JobContext]| {
+            let max_seqs = job_size / ldm.min_match_length as usize;
+            let generate = || {
                 let mut state = LdmState::new(ldm, 0);
-                let max_seqs = job_size / ldm.min_match_length as usize;
-                for (job, ctx) in jobs.iter().zip(ctxs) {
+                move |job: &Range<usize>, ctx: &mut JobContext| {
                     state.generate_sequences(src, job.clone(), max_seqs, &mut ctx.ldm_seqs);
                 }
             };
@@ -905,12 +904,10 @@ mod tests {
                 }
             };
             let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
-            generate(&mut ctxs);
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, f(true), &mut par);
-            generate(&mut ctxs);
+            run_jobs(&jobs, &mut ctxs, true, generate(), f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, f(false), &mut seq);
+            run_jobs(&jobs, &mut ctxs, false, generate(), f(false), &mut seq);
             assert!(par == seq, "L{level}: job outputs differ");
             assert!(compress_with(src, &opts).ends_with(&seq), "L{level}");
         }
@@ -1071,9 +1068,9 @@ mod tests {
             // covers the reset of used contexts.
             let mut ctxs: Vec<JobContext> = (0..n).map(|_| JobContext::default()).collect();
             let mut par = Vec::new();
-            run_jobs(&jobs, &mut ctxs, true, f(true), &mut par);
+            run_jobs(&jobs, &mut ctxs, true, |_, _| {}, f(true), &mut par);
             let mut seq = Vec::new();
-            run_jobs(&jobs, &mut ctxs, false, f(false), &mut seq);
+            run_jobs(&jobs, &mut ctxs, false, |_, _| {}, f(false), &mut seq);
             assert!(par == seq, "level {level}: job outputs differ");
             let frame = compress_with(&data, &opts);
             assert!(
