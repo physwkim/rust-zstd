@@ -118,7 +118,7 @@ binary 1048576 L6   def Lazy       265507 cdee950e3a596f90
 binary 1048576 L7   def Lazy       263877 b049424f65c9f048
 binary 1048576 L8   def Lazy2      262849 4de5b88d26a22953
 binary 1048576 L9   def Lazy2      262710 77eaff6c5d1d14ca
-binary 4194304 L1   def Fast      1468068 4b0d01f6328a42e2
+binary 4194304 L1   def Fast      1467149 35c2df2da1aff8ef
 binary 4194304 L1  512K Fast      1474574 1db8c2c4d955d899
 binary 4194304 L10  def Lazy2     1050511 3a13435fbbd83ac9
 binary 4194304 L10 512K Lazy2     1115854 0cc388a5c3597ed0
@@ -268,7 +268,7 @@ text   1048576 L6   def Lazy       351779 61391fac045ac029
 text   1048576 L7   def Lazy       349657 a463fa298a8fff71
 text   1048576 L8   def Lazy2      348111 d60323ff70d40d5f
 text   1048576 L9   def Lazy2      347808 566ce99f8965ded3
-text   4194304 L1   def Fast      1604742 8141e7ebce9b152d
+text   4194304 L1   def Fast      1604565 081a085de669643e
 text   4194304 L1  512K Fast      1606433 2785bafcef5b0d34
 text   4194304 L10  def Lazy2     1365872 9ae6d172f46a379f
 text   4194304 L10 512K Lazy2     1365733 dd3cc87b9363df47

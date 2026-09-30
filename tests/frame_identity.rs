@@ -3,8 +3,8 @@
 //! levels 1..=15 on prefixes at libzstd's table-row edges (`clevels.h`
 //! picks its row by `(n <= 256 KiB) + (n <= 128 KiB) + (n <= 16 KiB)`), so
 //! every strategy row, including the small-input btlazy2 rows, is reached,
-//! plus a 4 MiB input with default and 512 KiB jobs (several jobs with
-//! overlap). Inputs are generated from fixed seeds, so the gate needs no
+//! plus a 4 MiB input as one job (default options) and in 512 KiB jobs
+//! (several jobs with overlap). Inputs are generated from fixed seeds, so the gate needs no
 //! file outside the repository and both feature builds must match the same
 //! file (serial and parallel agreement). Each frame is also compressed on a
 //! reused `Compressor` and must equal the fresh frame, and must decode

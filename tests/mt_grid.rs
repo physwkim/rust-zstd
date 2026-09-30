@@ -1,7 +1,9 @@
 //! Job grid under multi-threading: rust-zstd with an 8-thread rayon pool
 //! against libzstd 1.5.7 with `nbWorkers = 8`, both at the same
-//! `jobSize` and `overlapLog`. Per cell: compressed size relative to the
-//! same implementation's default options, and encode MB/s (median).
+//! `jobSize` and `overlapLog`; the default-options cell (`def`) is one job
+//! against single-threaded `ZSTD_compress2`. Per cell: compressed size
+//! relative to the same implementation's default options, and encode MB/s
+//! (median).
 //! Ignored by default; run in release under the shared MT lock:
 //!
 //! ```text
@@ -12,8 +14,8 @@
 //! `ZSTD_CORPUS_DIR` overrides the corpus directory, `ZSTD_BENCH_ITERS`
 //! the iterations per cell (default 5). Comma-separated cell filters, each
 //! defaulting to the full grid when unset: `ZSTD_GRID_FILES` (file names),
-//! `ZSTD_GRID_LEVELS`, `ZSTD_GRID_JOBS` (`512K`, `1024K`, `2048K`, `def`, or
-//! bytes) and `ZSTD_GRID_OVERLAPS`. The default-options cell always runs,
+//! `ZSTD_GRID_LEVELS`, `ZSTD_GRID_JOBS` (`512K`, `1024K`, `2048K` or bytes)
+//! and `ZSTD_GRID_OVERLAPS`. The default-options cell always runs,
 //! as the reference of the `rel` columns.
 #![cfg(feature = "parallel")]
 
@@ -25,7 +27,7 @@ use zstd::zstd_safe::CParameter;
 const DEFAULT_CORPUS: &str = "/tmp/claude-1000/-home-stevek-work-rust-zstd/d30c8856-c9ae-4039-8110-94096bb23bce/scratchpad/corpus";
 const FILES: [&str; 3] = ["elf_8M.bin", "rssrc_8M.txt", "words_1M.txt"];
 const LEVELS: [i32; 5] = [1, 3, 5, 7, 11];
-const JOB_SIZES: [Option<usize>; 4] = [Some(512 << 10), Some(1 << 20), Some(2 << 20), None];
+const JOB_SIZES: [usize; 3] = [512 << 10, 1 << 20, 2 << 20];
 const OVERLAP_LOGS: [u8; 4] = [0, 7, 8, 9];
 const THREADS: usize = 8;
 
@@ -37,15 +39,12 @@ fn filter<T: Clone>(var: &str, default: &[T], parse: impl Fn(&str) -> T) -> Vec<
     }
 }
 
-/// A job size as the grid prints it: `def` (None), `<n>K` or bytes.
-fn parse_job(s: &str) -> Option<usize> {
-    if s == "def" {
-        return None;
-    }
-    Some(match s.strip_suffix('K') {
+/// A job size as the grid prints it: `<n>K` or bytes.
+fn parse_job(s: &str) -> usize {
+    match s.strip_suffix('K') {
         Some(k) => k.parse::<usize>().expect("ZSTD_GRID_JOBS") << 10,
         None => s.parse().expect("ZSTD_GRID_JOBS"),
-    })
+    }
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -120,8 +119,7 @@ fn mt_grid() {
             let cells = std::iter::once((None, 0u8)).chain(
                 job_sizes
                     .iter()
-                    .flat_map(|&j| overlap_logs.iter().map(move |&o| (j, o)))
-                    .filter(|&(j, o)| !(j.is_none() && o == 0)),
+                    .flat_map(|&j| overlap_logs.iter().map(move |&o| (Some(j), o))),
             );
             for (job_size, overlap_log) in cells {
                 let opts = CompressOptions {
@@ -137,7 +135,8 @@ fn mt_grid() {
                     "{file} L{level} {job_size:?} ov{overlap_log}: libzstd rejects our frame"
                 );
                 let mut c = zstd::bulk::Compressor::new(level).unwrap();
-                c.set_parameter(CParameter::NbWorkers(THREADS as u32))
+                let workers = if job_size.is_some() { THREADS } else { 0 };
+                c.set_parameter(CParameter::NbWorkers(workers as u32))
                     .unwrap();
                 c.set_parameter(CParameter::JobSize(job_size.unwrap_or(0) as u32))
                     .unwrap();

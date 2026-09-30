@@ -4,8 +4,7 @@
 //! Frames are compared block for block, type and decompressed size of each
 //! in order, in two configurations:
 //! - default options against libzstd's defaults (single-threaded
-//!   `ZSTD_compress2`, or ZSTDMT at its default job size where our default
-//!   cuts the input into several jobs);
+//!   `ZSTD_compress2`);
 //! - `CompressOptions::parallel(level)` against ZSTDMT at 2 MiB jobs and
 //!   overlap log 8.
 //!
@@ -25,7 +24,6 @@ mod common;
 
 use common::frame_blocks;
 use rust_zstd::compress::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
-use rust_zstd::compress::{job_ranges, job_size_for, overlap_size, CParams};
 use rust_zstd::{compress_with, CompressOptions};
 use std::path::PathBuf;
 use zstd::zstd_safe::zstd_sys as sys;
@@ -146,15 +144,6 @@ fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
     let mut skipped = Vec::new();
     for (name, data) in &inputs {
         for level in LEVELS {
-            let cparams = CParams::for_level(level, data.len());
-            let default_job = job_size_for(None, cparams.window_log, overlap_size(&cparams, 0));
-            // Where our default cuts several jobs it is ZSTDMT at the
-            // default job size.
-            let default_mt: &[_] = if job_ranges(data.len(), default_job).len() > 1 {
-                &[(ZSTD_c_nbWorkers, 2)]
-            } else {
-                &[]
-            };
             let parallel_mt: &[_] = &[
                 (ZSTD_c_nbWorkers, 2),
                 (ZSTD_c_jobSize, 2 << 20),
@@ -167,7 +156,7 @@ fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
                         level,
                         ..Default::default()
                     },
-                    default_mt,
+                    &[][..],
                 ),
                 ("parallel", CompressOptions::parallel(level), parallel_mt),
             ];

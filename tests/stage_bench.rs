@@ -56,7 +56,7 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
     let t_pass = Instant::now();
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
     let overlap = overlap_size(&cparams, 0);
-    let jobs = job_ranges(data.len(), job_size_for(None, cparams.window_log, overlap));
+    let jobs = job_ranges(data.len(), job_size_for(None, overlap));
     layout.jobs = jobs.len();
     layout.blocks = 0;
     let mut out = Vec::new();
