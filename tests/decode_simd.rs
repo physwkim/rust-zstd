@@ -62,7 +62,7 @@ fn fallback_and_detected_levels_decode_libzstd_streams_byte_exact_serial_and_mt(
 /// Periodic data with every period from 1 to 80 bytes, so that matches
 /// with offsets below 16, from 16 to 31 (16-byte chunks under the 32-byte
 /// level) and from 32 up (32-byte chunks) all occur, at lengths both
-/// shorter and longer than one chunk.
+/// shorter and longer than one chunk; serial and MT.
 #[test]
 fn every_short_offset_decodes_at_both_levels() {
     let mut data = Vec::new();
@@ -80,12 +80,15 @@ fn every_short_offset_decodes_at_both_levels() {
     for &level in &LEVELS {
         let compressed = zstd_bulk(&data, level);
         for simd in [false, true] {
-            assert!(
-                decode(&compressed, simd).unwrap() == data,
-                "L{} simd={}",
-                level,
-                simd
-            );
+            for min_blocks in [usize::MAX, 1] {
+                assert!(
+                    decode_with(&compressed, simd, min_blocks).unwrap() == data,
+                    "L{} simd={} min_blocks={}",
+                    level,
+                    simd,
+                    min_blocks
+                );
+            }
         }
     }
 }
@@ -94,7 +97,7 @@ fn every_short_offset_decodes_at_both_levels() {
 /// that most matches take a new offset rather than a repeat code and many
 /// blocks' offset tables are dominated by offsets below 29, which selects
 /// the shuffled match copy under AVX2 and the straight-line one of the
-/// portable level (from the first sequence of the frame on).
+/// portable level (from the first sequence of the frame on), serial and MT.
 #[test]
 fn random_short_periods_decode_at_both_levels() {
     let noise = lcg_bytes(1 << 20, 33);
@@ -110,12 +113,15 @@ fn random_short_periods_decode_at_both_levels() {
     for &level in &LEVELS {
         let compressed = zstd_bulk(&data, level);
         for simd in [false, true] {
-            assert!(
-                decode(&compressed, simd).unwrap() == data,
-                "L{} simd={}",
-                level,
-                simd
-            );
+            for min_blocks in [usize::MAX, 1] {
+                assert!(
+                    decode_with(&compressed, simd, min_blocks).unwrap() == data,
+                    "L{} simd={} min_blocks={}",
+                    level,
+                    simd,
+                    min_blocks
+                );
+            }
         }
     }
 }

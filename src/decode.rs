@@ -2427,10 +2427,6 @@ struct FSEScratch {
     offsets: FSETable,
     literal_lengths: FSETable,
     match_lengths: FSETable,
-    /// At least `SHORT_OFFSET_SHARE_MIN` of 256 cells of `offsets` give new
-    /// offsets below 29: set whenever that table is built, kept while
-    /// blocks repeat it.
-    short_offsets: bool,
 }
 
 struct DecoderScratch {
@@ -2451,7 +2447,6 @@ impl DecoderScratch {
                 offsets: FSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-                short_offsets: false,
             },
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
@@ -2464,7 +2459,6 @@ impl DecoderScratch {
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
-        self.fse.short_offsets = false;
         self.huf.table.reset();
     }
 }
@@ -2935,9 +2929,6 @@ fn build_sequence_tables(
             &SEQ_TABLES[t],
         )?;
     }
-    if !matches!(modes.of_mode(), ModeType::Repeat) {
-        scratch.short_offsets = short_offset_share(&scratch.offsets) >= SHORT_OFFSET_SHARE_MIN;
-    }
     Ok(bytes_read)
 }
 
@@ -3033,43 +3024,82 @@ fn seq_error_message(e: SeqError) -> String {
     }
 }
 
-/// Decode every sequence of the block and execute it straight into `out`;
-/// matches may reach back no further than `prefix_start`.
-///
-/// `literals` holds the block's decoded literals followed by exactly
-/// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
-/// plus slack up front so that all copies use fixed-size chunks and may
-/// overshoot; it is truncated to the real length on return.
-#[inline(always)]
-fn decode_and_execute_sequences_body<W: WildCopy>(
-    w: W,
-    seqs: SeqInput<'_>,
+/// A block's sequences, executed into the frame by `execute_with_copies`
+/// with the copies it picks.
+trait BlockSequences {
+    /// Execute the sequences straight into `out`, whose bytes from
+    /// `prefix_start` on are the frame so far: matches reach back no
+    /// further. `out` is grown by the block limit plus slack up front so
+    /// that all copies use fixed-size chunks and may overshoot; it is
+    /// truncated to the real length on return.
+    fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        prefix_start: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String>;
+}
+
+/// Execute `seqs` with the copies for its block, for the fused decoder and
+/// the MT decoder's stage 3 alike: 32-byte ones on the AVX2 level, 16-byte
+/// ones otherwise, and the `ShortOffsets` variants when the block's offsets
+/// table gives many short offsets. Each copy type runs in a function of its
+/// own.
+fn execute_with_copies<S: BlockSequences>(
+    simd: Level,
+    offsets: &FSETable,
+    seqs: S,
     offset_hist: &mut [u32; 3],
     prefix_start: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let base = out.len();
-    // Spare capacity only: the block's bytes are written by the copies in
-    // `exec_sequence`, so zero-filling them first is wasted work.
-    out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
-    // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
-    // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which is
-    // the extent `run_sequences` may write (see its contract).
-    let end = unsafe {
-        run_sequences(
-            w,
+    let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
+    match simd {
+        // SAFETY: fearless_simd makes an `Avx2` only after detecting AVX2
+        // and FMA on this CPU (`Level::new`).
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(w) => unsafe {
+            if short {
+                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix_start, out)
+            } else {
+                execute_avx2(w, seqs, offset_hist, prefix_start, out)
+            }
+        },
+        _ if short => execute_portable(
+            FallbackShortOffsets(Fallback::new()),
             seqs,
             offset_hist,
-            out.as_mut_ptr().add(prefix_start),
-            base - prefix_start,
-        )?
-    };
-    // SAFETY: on success `run_sequences` initialized every byte of
-    // `prefix_start + (base - prefix_start)..prefix_start + end`, and
-    // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length within
-    // the reserved capacity.
-    unsafe { out.set_len(prefix_start + end) };
-    Ok(())
+            prefix_start,
+            out,
+        ),
+        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix_start, out),
+    }
+}
+
+#[inline(never)]
+fn execute_portable<W: WildCopy, S: BlockSequences>(
+    w: W,
+    seqs: S,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    seqs.execute(w, offset_hist, prefix_start, out)
+}
+
+/// `execute_portable` compiled with AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+fn execute_avx2<W: WildCopy, S: BlockSequences>(
+    w: W,
+    seqs: S,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    seqs.execute(w, offset_hist, prefix_start, out)
 }
 
 /// A compressed block's sequences section after its tables, with the
@@ -3082,57 +3112,41 @@ struct SeqInput<'a> {
     literals: &'a [u8],
 }
 
-/// `decode_and_execute_sequences_body` with 16-byte copies.
-#[inline(never)]
-fn decode_and_execute_sequences(
-    w: Fallback,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences` for blocks with many short offsets.
-#[inline(never)]
-fn decode_and_execute_sequences_short(
-    w: FallbackShortOffsets,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences_body` compiled with AVX2, with 32-byte
-/// copies.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline(never)]
-fn decode_and_execute_sequences_avx2(
-    w: Avx2,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
-}
-
-/// `decode_and_execute_sequences_avx2` for blocks with many short offsets.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline(never)]
-fn decode_and_execute_sequences_avx2_short(
-    w: Avx2ShortOffsets,
-    seqs: SeqInput<'_>,
-    offset_hist: &mut [u32; 3],
-    prefix_start: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
+/// Decoding each sequence and executing it at once. `literals` holds the
+/// block's decoded literals followed by exactly `WILDCOPY_OVERLENGTH` bytes
+/// of slack.
+impl BlockSequences for SeqInput<'_> {
+    #[inline(always)]
+    fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        prefix_start: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let base = out.len();
+        // Spare capacity only: the block's bytes are written by the copies
+        // in `exec_sequence`, so zero-filling them first is wasted work.
+        out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+        // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
+        // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which is
+        // the extent `run_sequences` may write (see its contract).
+        let end = unsafe {
+            run_sequences(
+                w,
+                self,
+                offset_hist,
+                out.as_mut_ptr().add(prefix_start),
+                base - prefix_start,
+            )?
+        };
+        // SAFETY: on success `run_sequences` initialized every byte of
+        // `prefix_start + (base - prefix_start)..prefix_start + end`, and
+        // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length
+        // within the reserved capacity.
+        unsafe { out.set_len(prefix_start + end) };
+        Ok(())
+    }
 }
 
 /// Execute the block's sequences into the buffer at `out`, which starts at
@@ -3519,7 +3533,7 @@ impl WildCopy for Fallback {
 }
 
 /// Portable copies for blocks with many short offsets
-/// (`FSEScratch::short_offsets`), whose `offset < 8` and `offset < 16`
+/// (`execute_with_copies`), whose `offset < 8` and `offset < 16`
 /// tests in `copy_match` are unpredictable: the first 16 bytes of a match
 /// take the same straight-line copy at every offset, continued in 8-byte
 /// chunks.
@@ -3571,7 +3585,7 @@ impl WildCopy for Avx2 {
 }
 
 /// AVX2 copies for blocks with many short offsets
-/// (`FSEScratch::short_offsets`), whose `offset >= 32` and `offset >= 16`
+/// (`execute_with_copies`), whose `offset >= 32` and `offset >= 16`
 /// tests in `copy_match` are unpredictable: the first 32 bytes of a match
 /// take one shuffled store at every offset.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -3952,44 +3966,14 @@ fn decompress_block(
             fse: &workspace.fse,
             literals: &workspace.literals_buffer,
         };
-        match simd {
-            // SAFETY: fearless_simd makes an `Avx2` only after detecting
-            // AVX2 and FMA on this CPU (`Level::new`).
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Level::Avx2(w) => unsafe {
-                if workspace.fse.short_offsets {
-                    decode_and_execute_sequences_avx2_short(
-                        Avx2ShortOffsets(w),
-                        seqs,
-                        &mut workspace.offset_hist,
-                        frame_base,
-                        output,
-                    )?
-                } else {
-                    decode_and_execute_sequences_avx2(
-                        w,
-                        seqs,
-                        &mut workspace.offset_hist,
-                        frame_base,
-                        output,
-                    )?
-                }
-            },
-            _ if workspace.fse.short_offsets => decode_and_execute_sequences_short(
-                FallbackShortOffsets(Fallback::new()),
-                seqs,
-                &mut workspace.offset_hist,
-                frame_base,
-                output,
-            )?,
-            _ => decode_and_execute_sequences(
-                Fallback::new(),
-                seqs,
-                &mut workspace.offset_hist,
-                frame_base,
-                output,
-            )?,
-        }
+        execute_with_copies(
+            simd,
+            &workspace.fse.offsets,
+            seqs,
+            &mut workspace.offset_hist,
+            frame_base,
+            output,
+        )?;
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -4454,29 +4438,52 @@ mod parallel {
                     output.extend_from_slice(&slot.literals[..literals_len]);
                     return Ok(());
                 }
-                let base = output.len();
-                output.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
-                // SAFETY: `frame_base <= base`, and the capacity holds
-                // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
-                // the extent `execute_sequences` may write.
-                let (seqs, literals) = (&slot.seqs[..], &slot.literals[..]);
-                let op = base - frame_base;
-                let end = unsafe {
-                    let out = output.as_mut_ptr().add(frame_base);
-                    match simd {
-                        // fearless_simd makes an `Avx2` only after
-                        // detecting AVX2 and FMA on this CPU.
-                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                        Level::Avx2(w) => execute_sequences_avx2(w, seqs, literals, hist, out, op)?,
-                        _ => execute_sequences(Fallback::new(), seqs, literals, hist, out, op)?,
-                    }
+                let seqs = DecodedSeqs {
+                    seqs: &slot.seqs,
+                    literals: &slot.literals,
                 };
-                // SAFETY: on success every byte up to `frame_base + end`
-                // is initialized, within the reserved capacity.
-                unsafe { output.set_len(frame_base + end) };
+                execute_with_copies(simd, &slot.fse.offsets, seqs, hist, frame_base, output)?;
             }
         }
         Ok(())
+    }
+
+    /// A block's sequences as stage 2 decoded them, with its literals
+    /// followed by `WILDCOPY_OVERLENGTH` bytes of slack.
+    struct DecodedSeqs<'a> {
+        seqs: &'a [RawSeq],
+        literals: &'a [u8],
+    }
+
+    impl BlockSequences for DecodedSeqs<'_> {
+        #[inline(always)]
+        fn execute<W: WildCopy>(
+            self,
+            w: W,
+            offset_hist: &mut [u32; 3],
+            prefix_start: usize,
+            out: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let base = out.len();
+            out.reserve(MAX_BLOCK_SIZE as usize + WILDCOPY_OVERLENGTH);
+            // SAFETY: `prefix_start <= base`, and the capacity holds
+            // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, the
+            // extent `execute_sequences` may write.
+            let end = unsafe {
+                execute_sequences(
+                    w,
+                    self.seqs,
+                    self.literals,
+                    offset_hist,
+                    out.as_mut_ptr().add(prefix_start),
+                    base - prefix_start,
+                )?
+            };
+            // SAFETY: on success every byte up to `prefix_start + end` is
+            // initialized, within the reserved capacity.
+            unsafe { out.set_len(prefix_start + end) };
+            Ok(())
+        }
     }
 
     /// Execute decoded sequences from `op` in the buffer at `out` (the
@@ -4487,7 +4494,7 @@ mod parallel {
     /// `out..out + op` is initialized and
     /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
     #[inline(always)]
-    unsafe fn execute_sequences_body<W: WildCopy>(
+    unsafe fn execute_sequences<W: WildCopy>(
         w: W,
         seqs: &[RawSeq],
         literals: &[u8],
@@ -4522,40 +4529,6 @@ mod parallel {
         ptr::copy_nonoverlapping(cur.lit, cur.op, rest);
         *offset_hist = hist.map(|o| o as u32);
         Ok(cur.op as usize + rest - out as usize)
-    }
-
-    /// `execute_sequences_body` with 16-byte copies.
-    ///
-    /// # Safety
-    /// As `execute_sequences_body`.
-    #[inline(never)]
-    unsafe fn execute_sequences(
-        w: Fallback,
-        seqs: &[RawSeq],
-        literals: &[u8],
-        offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-    ) -> Result<usize, String> {
-        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
-    }
-
-    /// `execute_sequences_body` compiled with AVX2, with 32-byte copies.
-    ///
-    /// # Safety
-    /// As `execute_sequences_body`.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    #[inline(never)]
-    unsafe fn execute_sequences_avx2(
-        w: Avx2,
-        seqs: &[RawSeq],
-        literals: &[u8],
-        offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-    ) -> Result<usize, String> {
-        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
     }
 
     /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
@@ -4715,6 +4688,56 @@ mod tests {
         t.build_from_probabilities(8, &probs, codes).unwrap();
         assert_eq!(short_offset_share(&t), scan(&t), "built");
         assert_eq!(short_offset_share(&t), 100 + 60 + 1);
+    }
+
+    /// Fails with the name of the copy type it is executed with.
+    struct CopyProbe;
+
+    impl BlockSequences for CopyProbe {
+        fn execute<W: WildCopy>(
+            self,
+            _: W,
+            _: &mut [u32; 3],
+            _: usize,
+            _: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let name = std::any::type_name::<W>();
+            Err(name.rsplit("::").next().unwrap_or(name).to_string())
+        }
+    }
+
+    /// `execute_with_copies` runs the `ShortOffsets` copies from a share of
+    /// `SHORT_OFFSET_SHARE_MIN` on and the plain ones below it, on the
+    /// portable level and on AVX2.
+    #[test]
+    fn execute_with_copies_follows_offsets_table() {
+        assert_eq!(SHORT_OFFSET_SHARE_MIN, 32);
+        let of = &SEQ_TABLES[1];
+        let codes = Some((of.base, of.bits));
+        let mut levels = vec![(Level::fallback(), "Fallback", "FallbackShortOffsets")];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if let Level::Avx2(w) = Level::new() {
+            levels.push((Level::Avx2(w), "Avx2", "Avx2ShortOffsets"));
+        }
+        let pick = |level, t: &FSETable| {
+            execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, &mut Vec::new())
+                .unwrap_err()
+        };
+        let mut t = FSETable::new(MAX_OFFSET_CODE);
+        for (level, plain, short) in levels {
+            for (share, want) in [(31, plain), (32, short), (0, plain), (256, short)] {
+                let mut probs = vec![0i32; 11];
+                probs[3] = share;
+                probs[10] = 256 - share;
+                t.build_from_probabilities(8, &probs, codes).unwrap();
+                assert_eq!(short_offset_share(&t), share as usize);
+                assert_eq!(pick(level, &t), want, "share {share}");
+            }
+            t.build_rle(3, of.base, of.bits);
+            assert_eq!(pick(level, &t), short, "RLE 3");
+            t.build_rle(10, of.base, of.bits);
+            assert_eq!(pick(level, &t), plain, "RLE 10");
+        }
     }
 
     #[test]
