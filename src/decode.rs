@@ -40,6 +40,9 @@
     dead_code
 )]
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use fearless_simd::Avx2;
+use fearless_simd::{Fallback, Level};
 use std::ptr;
 
 // ============================================================
@@ -114,29 +117,42 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// the current rayon pool when it has more than one thread; the output is
 /// the same either way.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(feature = "parallel")]
-    let min_parallel_blocks = if rayon::current_num_threads() > 1 {
-        parallel::MIN_BLOCKS
-    } else {
-        usize::MAX
-    };
-    #[cfg(not(feature = "parallel"))]
-    let min_parallel_blocks = usize::MAX;
-    decompress_frames(data, min_parallel_blocks)
+    decompress_with_options(data, &DecodeOptions::default())
 }
 
-/// `decompress` with frames of at least `min_blocks` blocks decoded on the
-/// current rayon pool, whatever its size; `usize::MAX` never does. For
-/// testing the multi-threaded path on small inputs.
+/// Decoder paths to force, for testing each of them on any input.
 #[doc(hidden)]
-pub fn decompress_with_min_parallel_blocks(
-    data: &[u8],
-    min_blocks: usize,
-) -> Result<Vec<u8>, String> {
-    decompress_frames(data, min_blocks)
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeOptions {
+    /// Frames of at least this many blocks are decoded on the current rayon
+    /// pool, whatever its size; `usize::MAX` never does.
+    pub min_parallel_blocks: usize,
+    /// Use the SIMD level detected at run time; false forces the portable
+    /// code.
+    pub simd: bool,
 }
 
-fn decompress_frames(data: &[u8], min_parallel_blocks: usize) -> Result<Vec<u8>, String> {
+impl Default for DecodeOptions {
+    /// What `decompress` uses.
+    fn default() -> Self {
+        #[cfg(feature = "parallel")]
+        let min_parallel_blocks = if rayon::current_num_threads() > 1 {
+            parallel::MIN_BLOCKS
+        } else {
+            usize::MAX
+        };
+        #[cfg(not(feature = "parallel"))]
+        let min_parallel_blocks = usize::MAX;
+        DecodeOptions {
+            min_parallel_blocks,
+            simd: true,
+        }
+    }
+}
+
+/// `decompress` with the paths chosen by `opts`.
+#[doc(hidden)]
+pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut scratch: Option<DecoderScratch> = None;
     let mut pos = 0usize;
@@ -173,13 +189,19 @@ fn decompress_frames(data: &[u8], min_parallel_blocks: usize) -> Result<Vec<u8>,
 
         let scratch = scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
+        let simd = if opts.simd {
+            Level::new()
+        } else {
+            Level::fallback()
+        };
         decode_frame(
             &frame_header,
             data,
             &mut pos,
             scratch,
             &mut output,
-            min_parallel_blocks,
+            opts.min_parallel_blocks,
+            simd,
         )?;
     }
 
@@ -2975,12 +2997,10 @@ fn seq_error_message(e: SeqError) -> String {
 /// `WILDCOPY_OVERLENGTH` bytes of slack. `out` is grown by the block limit
 /// plus slack up front so that all copies use fixed-size chunks and may
 /// overshoot; it is truncated to the real length on return.
-#[inline(never)]
-fn decode_and_execute_sequences(
-    num_sequences: u32,
-    bit_stream: &[u8],
-    fse: &FSEScratch,
-    literals: &[u8],
+#[inline(always)]
+fn decode_and_execute_sequences_body<W: WildCopy>(
+    w: W,
+    seqs: SeqInput<'_>,
     offset_hist: &mut [u32; 3],
     prefix_start: usize,
     out: &mut Vec<u8>,
@@ -2994,10 +3014,8 @@ fn decode_and_execute_sequences(
     // the extent `run_sequences` may write (see its contract).
     let end = unsafe {
         run_sequences(
-            num_sequences,
-            bit_stream,
-            fse,
-            literals,
+            w,
+            seqs,
             offset_hist,
             out.as_mut_ptr().add(prefix_start),
             base - prefix_start,
@@ -3011,6 +3029,43 @@ fn decode_and_execute_sequences(
     Ok(())
 }
 
+/// A compressed block's sequences section after its tables, with the
+/// block's literals.
+#[derive(Clone, Copy)]
+struct SeqInput<'a> {
+    num_sequences: u32,
+    bit_stream: &'a [u8],
+    fse: &'a FSEScratch,
+    literals: &'a [u8],
+}
+
+/// `decode_and_execute_sequences_body` with 16-byte copies.
+#[inline(never)]
+fn decode_and_execute_sequences(
+    w: Fallback,
+    seqs: SeqInput<'_>,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
+}
+
+/// `decode_and_execute_sequences_body` compiled with AVX2, with 32-byte
+/// copies.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+fn decode_and_execute_sequences_avx2(
+    w: Avx2,
+    seqs: SeqInput<'_>,
+    offset_hist: &mut [u32; 3],
+    prefix_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    decode_and_execute_sequences_body(w, seqs, offset_hist, prefix_start, out)
+}
+
 /// Execute the block's sequences into the buffer at `out`, which starts at
 /// the frame's first byte; `op` is where this block starts. Returns the
 /// block's end, at most `op + MAX_BLOCK_SIZE`, with every byte of `op..end`
@@ -3020,15 +3075,20 @@ fn decode_and_execute_sequences(
 /// # Safety
 /// `out..out + op` is initialized and
 /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid for writes.
-unsafe fn run_sequences(
-    num_sequences: u32,
-    bit_stream: &[u8],
-    fse: &FSEScratch,
-    literals: &[u8],
+#[inline(always)]
+unsafe fn run_sequences<W: WildCopy>(
+    w: W,
+    seqs: SeqInput<'_>,
     offset_hist: &mut [u32; 3],
     out: *mut u8,
     op: usize,
 ) -> Result<usize, String> {
+    let SeqInput {
+        num_sequences,
+        bit_stream,
+        fse,
+        literals,
+    } = seqs;
     let ll_dt = &fse.literal_lengths.decode[..];
     let of_dt = &fse.offsets.decode[..];
     let ml_dt = &fse.match_lengths.decode[..];
@@ -3085,10 +3145,10 @@ unsafe fn run_sequences(
 
     for _ in 1..num_sequences {
         let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
-        exec_sequence(&mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+        exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     }
     let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
-    exec_sequence(&mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+    exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     let hist = st.hist;
     // Both cursors only ever advance within their slices (see
     // `exec_sequence`), so these differences are in-bounds indexes.
@@ -3230,7 +3290,8 @@ fn decode_sequence(
 /// (ZSTD_execSequenceSplitLitBuffer) and advance `cur`. Both buffers carry
 /// `WILDCOPY_OVERLENGTH` bytes of slack past their limits.
 #[inline(always)]
-fn exec_sequence(
+fn exec_sequence<W: WildCopy>(
+    w: W,
     cur: &mut SeqCursor,
     lim: &SeqLimits,
     ll: usize,
@@ -3263,21 +3324,25 @@ fn exec_sequence(
     // overshoot; the match reads from `o_lit_end - offset` and writes from
     // `o_lit_end`, both ending at most 31 bytes past `o_match_end`. Each
     // fixed-size copy is non-overlapping because `dst - src` is at least
-    // its size (16 with `offset >= 16`, 8 after `overlap_copy8`). The
-    // advanced cursors keep the `SeqCursor` invariant.
+    // its size (`W::WIDTH` or 16 by the offset tests, 8 after
+    // `overlap_copy8`; literals come from another buffer). The advanced
+    // cursors keep the `SeqCursor` invariant.
     unsafe {
         // Literals: nearly always at most 16 bytes.
         copy16(op, lit);
         if ll > 16 {
-            wildcopy(op.add(16), lit.add(16), ll - 16);
+            w.wildcopy(op.add(16), lit.add(16), ll - 16);
         }
         cur.lit = lit.add(ll);
 
         let dst = op.add(ll);
         let src = dst.sub(offset) as *const u8;
-        if offset >= WILDCOPY_VECLEN {
-            // Sequential 16-byte chunks stay correct for overlapping
-            // periodic matches because `dst - src >= 16`.
+        // Sequential chunks stay correct for overlapping periodic matches
+        // while `dst - src` is at least the chunk size.
+        if offset >= W::WIDTH {
+            w.wildcopy(dst, src, ml);
+        } else if offset >= WILDCOPY_VECLEN {
+            // Only for `W::WIDTH > 16`.
             wildcopy(dst, src, ml);
         } else {
             // Copy 8 bytes and spread the offset to at least 8, then
@@ -3319,6 +3384,68 @@ unsafe fn wildcopy(mut dst: *mut u8, mut src: *const u8, len: usize) {
     loop {
         copy16(dst, src);
         copy16(dst.add(16), src.add(16));
+        dst = dst.add(32);
+        src = src.add(32);
+        if dst >= end {
+            break;
+        }
+    }
+}
+
+/// The wide copy of sequence execution at one SIMD level.
+trait WildCopy: Copy {
+    /// Bytes per chunk of `wildcopy`: its least safe `dst - src` for
+    /// overlapping ranges.
+    const WIDTH: usize;
+
+    /// ZSTD_wildcopy(no_overlap) in `WIDTH`-byte chunks, overshooting `len`
+    /// by up to 31 bytes.
+    ///
+    /// # Safety
+    /// `len + 31` bytes readable at `src` and writable at `dst`, and either
+    /// the two ranges are disjoint or `dst - src >= WIDTH`.
+    unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize);
+}
+
+impl WildCopy for Fallback {
+    const WIDTH: usize = 16;
+
+    #[inline(always)]
+    unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize) {
+        wildcopy(dst, src, len)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl WildCopy for Avx2 {
+    const WIDTH: usize = 32;
+
+    #[inline(always)]
+    unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize) {
+        // SAFETY: `self` proves AVX2; the ranges are the caller's.
+        unsafe { wildcopy32(dst, src, len) }
+    }
+}
+
+/// `wildcopy` in 32-byte chunks (one AVX2 load and store each).
+///
+/// # Safety
+/// The CPU supports AVX2; `len + 31` bytes readable at `src` and writable
+/// at `dst`, and either the two ranges are disjoint or `dst - src >= 32`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn wildcopy32(mut dst: *mut u8, mut src: *const u8, len: usize) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    let end = dst.add(len);
+    loop {
+        _mm256_storeu_si256(
+            dst.cast::<__m256i>(),
+            _mm256_loadu_si256(src.cast::<__m256i>()),
+        );
         dst = dst.add(32);
         src = src.add(32);
         if dst >= end {
@@ -3386,6 +3513,7 @@ fn decode_frame(
     scratch: &mut DecoderScratch,
     output: &mut Vec<u8>,
     min_parallel_blocks: usize,
+    simd: Level,
 ) -> Result<(), String> {
     let frame_base = output.len();
 
@@ -3403,14 +3531,14 @@ fn decode_frame(
 
     #[cfg(feature = "parallel")]
     let decoded =
-        parallel::decode_frame_blocks(data, pos, frame_base, output, min_parallel_blocks)?;
+        parallel::decode_frame_blocks(data, pos, frame_base, output, min_parallel_blocks, simd)?;
     #[cfg(not(feature = "parallel"))]
     let decoded = {
         let _ = min_parallel_blocks;
         false
     };
     if !decoded {
-        decode_blocks(data, pos, scratch, frame_base, output)?;
+        decode_blocks(data, pos, scratch, frame_base, output, simd)?;
     }
 
     // Skip the checksum if present; this decoder does not verify it.
@@ -3441,6 +3569,7 @@ fn decode_blocks(
     scratch: &mut DecoderScratch,
     frame_base: usize,
     output: &mut Vec<u8>,
+    simd: Level,
 ) -> Result<(), String> {
     loop {
         let (block, header_len) = parse_block_header(&data[*pos..])?;
@@ -3455,7 +3584,7 @@ fn decode_blocks(
             BlockType::RLE => {
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
-            BlockType::Compressed => decompress_block(content, scratch, frame_base, output)?,
+            BlockType::Compressed => decompress_block(content, scratch, frame_base, output, simd)?,
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
 
@@ -3540,6 +3669,7 @@ fn decompress_block(
     workspace: &mut DecoderScratch,
     frame_base: usize,
     output: &mut Vec<u8>,
+    simd: Level,
 ) -> Result<(), String> {
     let parts = split_block(raw)?;
     decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
@@ -3549,15 +3679,33 @@ fn decompress_block(
 
     if seq_section.num_sequences != 0 {
         let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
-        decode_and_execute_sequences(
-            seq_section.num_sequences,
-            &raw[table_bytes..],
-            &workspace.fse,
-            &workspace.literals_buffer,
-            &mut workspace.offset_hist,
-            frame_base,
-            output,
-        )?;
+        let seqs = SeqInput {
+            num_sequences: seq_section.num_sequences,
+            bit_stream: &raw[table_bytes..],
+            fse: &workspace.fse,
+            literals: &workspace.literals_buffer,
+        };
+        match simd {
+            // SAFETY: fearless_simd makes an `Avx2` only after detecting
+            // AVX2 and FMA on this CPU (`Level::new`).
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Avx2(w) => unsafe {
+                decode_and_execute_sequences_avx2(
+                    w,
+                    seqs,
+                    &mut workspace.offset_hist,
+                    frame_base,
+                    output,
+                )?
+            },
+            _ => decode_and_execute_sequences(
+                Fallback::new(),
+                seqs,
+                &mut workspace.offset_hist,
+                frame_base,
+                output,
+            )?,
+        }
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -3989,6 +4137,7 @@ mod parallel {
         hist: &mut [u32; 3],
         frame_base: usize,
         output: &mut Vec<u8>,
+        simd: Level,
     ) -> Result<(), String> {
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
@@ -4005,14 +4154,17 @@ mod parallel {
                 // SAFETY: `frame_base <= base`, and the capacity holds
                 // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
                 // the extent `execute_sequences` may write.
+                let (seqs, literals) = (&slot.seqs[..], &slot.literals[..]);
+                let op = base - frame_base;
                 let end = unsafe {
-                    execute_sequences(
-                        &slot.seqs,
-                        &slot.literals,
-                        hist,
-                        output.as_mut_ptr().add(frame_base),
-                        base - frame_base,
-                    )?
+                    let out = output.as_mut_ptr().add(frame_base);
+                    match simd {
+                        // fearless_simd makes an `Avx2` only after
+                        // detecting AVX2 and FMA on this CPU.
+                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                        Level::Avx2(w) => execute_sequences_avx2(w, seqs, literals, hist, out, op)?,
+                        _ => execute_sequences(Fallback::new(), seqs, literals, hist, out, op)?,
+                    }
                 };
                 // SAFETY: on success every byte up to `frame_base + end`
                 // is initialized, within the reserved capacity.
@@ -4029,7 +4181,9 @@ mod parallel {
     /// # Safety
     /// `out..out + op` is initialized and
     /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
-    unsafe fn execute_sequences(
+    #[inline(always)]
+    unsafe fn execute_sequences_body<W: WildCopy>(
+        w: W,
         seqs: &[RawSeq],
         literals: &[u8],
         offset_hist: &mut [u32; 3],
@@ -4052,7 +4206,8 @@ mod parallel {
         for s in seqs {
             let ll = s.ll as usize;
             let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence(&mut cur, &lim, ll, s.ml as usize, offset).map_err(seq_error_message)?;
+            exec_sequence(w, &mut cur, &lim, ll, s.ml as usize, offset)
+                .map_err(seq_error_message)?;
         }
         // Last literals; both cursors only advanced within their buffers.
         let rest = lim.lit_limit as usize - cur.lit as usize;
@@ -4064,6 +4219,40 @@ mod parallel {
         Ok(cur.op as usize + rest - out as usize)
     }
 
+    /// `execute_sequences_body` with 16-byte copies.
+    ///
+    /// # Safety
+    /// As `execute_sequences_body`.
+    #[inline(never)]
+    unsafe fn execute_sequences(
+        w: Fallback,
+        seqs: &[RawSeq],
+        literals: &[u8],
+        offset_hist: &mut [u32; 3],
+        out: *mut u8,
+        op: usize,
+    ) -> Result<usize, String> {
+        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
+    }
+
+    /// `execute_sequences_body` compiled with AVX2, with 32-byte copies.
+    ///
+    /// # Safety
+    /// As `execute_sequences_body`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    #[inline(never)]
+    unsafe fn execute_sequences_avx2(
+        w: Avx2,
+        seqs: &[RawSeq],
+        literals: &[u8],
+        offset_hist: &mut [u32; 3],
+        out: *mut u8,
+        op: usize,
+    ) -> Result<usize, String> {
+        execute_sequences_body(w, seqs, literals, offset_hist, out, op)
+    }
+
     /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
     /// current rayon pool. Returns `Ok(false)` without consuming input when
     /// the frame has fewer than `min_blocks` blocks.
@@ -4073,6 +4262,7 @@ mod parallel {
         frame_base: usize,
         output: &mut Vec<u8>,
         min_blocks: usize,
+        simd: Level,
     ) -> Result<bool, String> {
         if min_blocks == usize::MAX {
             return Ok(false);
@@ -4124,7 +4314,7 @@ mod parallel {
                     }
                 }
                 let mut slot = cell.slot.lock().unwrap();
-                execute_block(plan, &mut slot, &mut hist, frame_base, output)?;
+                execute_block(plan, &mut slot, &mut hist, frame_base, output, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
             }

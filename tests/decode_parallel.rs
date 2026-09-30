@@ -8,17 +8,29 @@
 mod common;
 
 use common::{datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS, MIB};
-use rust_zstd::decode::decompress_with_min_parallel_blocks;
+use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use zstd::zstd_safe::zstd_sys as sys;
 
 /// Every frame through the multi-threaded path, however few its blocks.
 fn decode_mt(data: &[u8]) -> Result<Vec<u8>, String> {
-    decompress_with_min_parallel_blocks(data, 1)
+    decompress_with_options(
+        data,
+        &DecodeOptions {
+            min_parallel_blocks: 1,
+            simd: true,
+        },
+    )
 }
 
 /// Every frame through the fused serial path.
 fn decode_serial(data: &[u8]) -> Result<Vec<u8>, String> {
-    decompress_with_min_parallel_blocks(data, usize::MAX)
+    decompress_with_options(
+        data,
+        &DecodeOptions {
+            min_parallel_blocks: usize::MAX,
+            simd: true,
+        },
+    )
 }
 
 fn pool(threads: usize) -> rayon::ThreadPool {
