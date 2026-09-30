@@ -53,7 +53,10 @@ const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
 const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 const MAX_BLOCK_SIZE: u32 = 128 * 1024;
-const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
+/// `ZSTD_MAXWINDOWSIZE_DEFAULT`: libzstd's default decoder limit,
+/// `(1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`, which admits the window log
+/// 27 frames of level 22 and of long distance matching on large inputs.
+const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = (1 << 27) + 1;
 const MAX_MAX_NUM_BITS: u8 = 11;
 const ACC_LOG_OFFSET: u8 = 5;
 
@@ -4366,6 +4369,27 @@ mod tests {
 
         let result = decompress(&frame).unwrap();
         assert_eq!(result, data);
+    }
+
+    /// A frame declaring `window_descriptor` (no content size) and holding
+    /// one raw block of "hi".
+    fn windowed_frame(window_descriptor: u8) -> Vec<u8> {
+        let mut frame = ZSTD_MAGIC.to_le_bytes().to_vec();
+        frame.push(0x00); // no single segment, no content size
+        frame.push(window_descriptor);
+        let bh = 1u32 | (2u32 << 3); // last, raw, 2 bytes
+        frame.extend_from_slice(&bh.to_le_bytes()[..3]);
+        frame.extend_from_slice(b"hi");
+        frame
+    }
+
+    /// libzstd's default limit: a 128 MiB window (exponent 17) decodes,
+    /// the next larger one (mantissa 1, 144 MiB) is refused.
+    #[test]
+    fn test_window_limit_is_zstd_default() {
+        assert_eq!(decompress(&windowed_frame(17 << 3)).unwrap(), b"hi");
+        let err = decompress(&windowed_frame((17 << 3) | 1)).unwrap_err();
+        assert!(err.contains("exceeds maximum allowed"), "{err}");
     }
 
     #[test]
