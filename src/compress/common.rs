@@ -2,6 +2,11 @@
 //! `ZSTD_count` and the unaligned little-endian reads of
 //! `zstd_compress_internal.h` / `mem.h` (libzstd 1.5.7).
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use fearless_simd::Avx2;
+use fearless_simd::{Fallback, Level};
+use std::sync::OnceLock;
+
 /// `HASH_READ_SIZE`: the hash functions read up to 8 bytes.
 pub const HASH_READ_SIZE: usize = 8;
 /// `kSearchStrength`.
@@ -193,6 +198,118 @@ pub unsafe fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
         a += 1;
     }
     a - start
+}
+
+/// The SIMD level of this machine, detected once (`Level::new`).
+pub fn simd_level() -> Level {
+    static LEVEL: OnceLock<Level> = OnceLock::new();
+    *LEVEL.get_or_init(Level::new)
+}
+
+/// [`count`] for one fearless_simd level. A block compressor is
+/// monomorphized over the implementor and compiled with its target
+/// features, so the choice is made once per block, never per call.
+pub trait MatchCount: Copy {
+    /// `ZSTD_count`: as [`count`], same result.
+    ///
+    /// # Safety
+    /// As [`count`]; the witness `self` proves the CPU has the features.
+    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize;
+}
+
+impl MatchCount for Fallback {
+    #[inline(always)]
+    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        count(src, a, b, limit)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl MatchCount for Avx2 {
+    #[inline(always)]
+    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        // SAFETY: `self` proves AVX2; the bounds are the caller's.
+        count_avx2(src, a, b, limit)
+    }
+}
+
+/// [`count`] with a 32-byte loop between C's first 8-byte step and its
+/// 8-byte loop: `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8`, the first
+/// clear bit is the first differing byte. libzstd has no such path; the
+/// length is the same by construction, and a match that ends in the first
+/// 8 bytes costs what it does in [`count`].
+///
+/// # Safety
+/// As [`count`], and the CPU must support AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn count_avx2(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+    debug_assert!(b < a && a <= limit && limit <= src.len());
+    let start = a;
+    let (mut a, mut b) = (a, b);
+    // SAFETY (every read): `b < a` and each read ends at or before `limit
+    // <= src.len()`; the 32-byte loads are unaligned.
+    unsafe {
+        if a + 8 <= limit {
+            let diff = read64(src, b) ^ read64(src, a);
+            if diff != 0 {
+                return (diff.trailing_zeros() >> 3) as usize;
+            }
+            a += 8;
+            b += 8;
+            while a + 32 <= limit {
+                let va = _mm256_loadu_si256(src.as_ptr().add(a).cast::<__m256i>());
+                let vb = _mm256_loadu_si256(src.as_ptr().add(b).cast::<__m256i>());
+                let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32;
+                if eq != u32::MAX {
+                    return a + (!eq).trailing_zeros() as usize - start;
+                }
+                a += 32;
+                b += 32;
+            }
+            while a + 8 <= limit {
+                let diff = read64(src, b) ^ read64(src, a);
+                if diff != 0 {
+                    return a + (diff.trailing_zeros() >> 3) as usize - start;
+                }
+                a += 8;
+                b += 8;
+            }
+        }
+        if a + 4 <= limit && read32(src, b) == read32(src, a) {
+            a += 4;
+            b += 4;
+        }
+        if a + 2 <= limit && read16(src, b) == read16(src, a) {
+            a += 2;
+            b += 2;
+        }
+        if a < limit && byte(src, b) == byte(src, a) {
+            a += 1;
+        }
+    }
+    a - start
+}
+
+/// `ZSTD_count` at `level`: the per-call dispatch of [`MatchCount`], for
+/// callers that are not monomorphized over the level.
+///
+/// # Safety
+/// As [`count`].
+#[inline]
+pub unsafe fn count_with(level: Level, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    match level {
+        // SAFETY: fearless_simd constructs the witness only after detecting
+        // AVX2 on this CPU.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(w) => w.count(src, a, b, limit),
+        _ => count(src, a, b, limit),
+    }
 }
 
 /// Block-finder test harness shared by the fast and double-fast tests:
@@ -457,6 +574,50 @@ mod tests {
         assert_eq!(h8, ((v64.wrapping_mul(0xCF1BBCDCB7A56463)) >> 47) as usize);
         // mls 3 falls into the 4-byte arm
         assert_eq!(h3, h4);
+    }
+
+    /// Every [`MatchCount`] level of this CPU and [`count_with`] agree with
+    /// [`count`] for every match length, alignment and `limit` across the
+    /// 8- and 32-byte step boundaries.
+    #[test]
+    fn count_levels_match_scalar() {
+        let mut levels = vec![Level::fallback()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: detected just above.
+            levels.push(Level::Avx2(unsafe { Avx2::new_unchecked() }));
+        }
+        let base: Vec<u8> = (0..300u32).map(|i| (i * 131 + 7) as u8).collect();
+        for off in [1usize, 3, 8, 31, 32, 33, 100] {
+            for n in [
+                0usize, 1, 7, 8, 9, 15, 16, 31, 32, 33, 39, 40, 41, 63, 64, 65, 72, 100, 150,
+            ] {
+                let a = 140;
+                let mut src = base.clone();
+                for i in 0..n.min(src.len() - a) {
+                    src[a + i] = src[a - off + i];
+                }
+                if a + n < src.len() {
+                    src[a + n] = src[a - off + n].wrapping_add(1);
+                }
+                for limit in a..=src.len() {
+                    // SAFETY: `a - off < a <= limit <= src.len()`.
+                    let want = unsafe { count(&src, a, a - off, limit) };
+                    assert_eq!(want, n.min(limit - a), "off={off} n={n} limit={limit}");
+                    for &level in &levels {
+                        // SAFETY: as above.
+                        let got = unsafe { count_with(level, &src, a, a - off, limit) };
+                        assert_eq!(got, want, "{level:?} off={off} n={n} limit={limit}");
+                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                        if let Level::Avx2(w) = level {
+                            // SAFETY: as above; `w` was built after detection.
+                            let got = unsafe { w.count(&src, a, a - off, limit) };
+                            assert_eq!(got, want, "avx2 off={off} n={n} limit={limit}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
