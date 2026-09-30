@@ -90,6 +90,36 @@ fn every_short_offset_decodes_at_both_levels() {
     }
 }
 
+/// Runs of random periods from 1 to 80, each opened by fresh bytes, so
+/// that most matches take a new offset rather than a repeat code and many
+/// blocks' offset tables are dominated by offsets below 29, which selects
+/// the shuffled match copy under AVX2 (from the first sequence of the
+/// frame on).
+#[test]
+fn random_short_periods_decode_at_both_levels() {
+    let noise = lcg_bytes(1 << 20, 33);
+    let mut data = Vec::new();
+    let mut pos = 0;
+    while data.len() < 256 * 1024 {
+        let period = 1 + usize::from(noise[pos]) % 80;
+        let len = period + 1 + usize::from(noise[pos + 1]) % 96;
+        let unit = &noise[pos + 2..pos + 2 + period];
+        data.extend((0..len).map(|i| unit[i % period]));
+        pos += 2 + period;
+    }
+    for &level in &LEVELS {
+        let compressed = zstd_bulk(&data, level);
+        for simd in [false, true] {
+            assert!(
+                decode(&compressed, simd).unwrap() == data,
+                "L{} simd={}",
+                level,
+                simd
+            );
+        }
+    }
+}
+
 /// Byte corruptions: the two levels agree on `Err` vs `Ok`, and on the
 /// output when both succeed.
 #[test]
