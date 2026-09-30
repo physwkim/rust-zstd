@@ -44,11 +44,13 @@ use std::sync::{
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
-/// `ZSTDMT_JOBSIZE_MAX` (64-bit): upper bound of an explicit job size.
-pub const JOBSIZE_MAX: usize = 1 << 30;
-/// `ZSTDMT_JOBLOG_MAX` (64-bit): upper bound of the job size log that
-/// sizes the overlap under long distance matching.
-const JOBLOG_MAX: u32 = 30;
+/// `ZSTDMT_JOBSIZE_MAX`: upper bound of an explicit job size, 1 GiB, or
+/// 512 MiB where `size_t` is 32 bits.
+pub const JOBSIZE_MAX: usize = if MEM_32BITS { 512 << 20 } else { 1 << 30 };
+/// `ZSTDMT_JOBLOG_MAX`: upper bound of the job size log that sizes the
+/// overlap under long distance matching, 30, or 29 where `size_t` is 32
+/// bits.
+const JOBLOG_MAX: u32 = if MEM_32BITS { 29 } else { 30 };
 
 /// Options for [`Compressor`] and [`compress_with`].
 #[derive(Clone, Debug)]
@@ -62,7 +64,8 @@ pub struct CompressOptions {
     /// the input as one job, as single-threaded `ZSTD_compress2`
     /// (`ZSTD_c_nbWorkers` 0) does. An explicit size selects ZSTDMT: the
     /// input is cut into jobs of that many bytes, clamped to
-    /// `[JOBSIZE_MIN, JOBSIZE_MAX]` (512 KiB to 1 GiB) and raised to the
+    /// `[JOBSIZE_MIN, JOBSIZE_MAX]` (512 KiB to 1 GiB, or to 512 MiB where
+    /// `usize` is 32 bits) and raised to the
     /// overlap size (`ZSTDMT_initCStream_internal`); each job is compressed
     /// independently and, with the `parallel` feature, on its own rayon
     /// task. The frame never depends on the thread count, and is the same
@@ -84,7 +87,8 @@ pub struct CompressOptions {
     /// so `9` is the full window. Values above 9 panic (libzstd rejects
     /// them with `parameter_outOfBound`). With long distance matching the
     /// fraction is of `min(window, 1 << (job_log - 2))` instead, with
-    /// `job_log = min(max(21, cycleLog + 3), 30)`, and `1` no longer means
+    /// `job_log = min(max(21, cycleLog + 3), 30)` (29 where `usize` is 32
+    /// bits), and `1` no longer means
     /// no overlap (`ZSTDMT_computeOverlapSize`).
     pub overlap_log: u8,
     /// `ZSTD_c_enableLongDistanceMatching`: find matches up to a window
@@ -874,6 +878,26 @@ mod tests {
         cp
     }
 
+    /// An explicit job size clamps at `ZSTD_c_jobSize`'s upper bound,
+    /// `ZSTDMT_JOBSIZE_MAX` for this target, and `ZSTDMT_JOBLOG_MAX` is its
+    /// log.
+    #[test]
+    fn job_bounds_match_libzstd() {
+        use crate::compress::common::testutil::c_bounds;
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::ZSTD_c_jobSize;
+
+        let max = c_bounds(ZSTD_c_jobSize).1 as usize;
+        for (requested, clamped) in [
+            (max - 1, max - 1),
+            (max, max),
+            (max + 1, max),
+            (usize::MAX, max),
+        ] {
+            assert_eq!(job_size_for(Some(requested), 0), clamped, "{requested}");
+        }
+        assert_eq!(1 << JOBLOG_MAX, max);
+    }
+
     #[test]
     fn job_sizing() {
         // explicit: clamped to [JOBSIZE_MIN, JOBSIZE_MAX], otherwise used as is
@@ -917,7 +941,7 @@ mod tests {
     /// With long distance matching the overlap of explicit jobs is
     /// `1 << (min(window_log, job_log - 2) - (9 - overlap_log))`, nonzero
     /// even for overlap_log 1, with `job_log = min(max(21, cycleLog + 3),
-    /// 30)` whatever the window (`ZSTDMT_computeOverlapSize`,
+    /// JOBLOG_MAX)` whatever the window (`ZSTDMT_computeOverlapSize`,
     /// `ZSTDMT_computeTargetJobLog`).
     #[test]
     fn overlap_with_ldm() {
@@ -928,11 +952,15 @@ mod tests {
         assert_eq!(overlap_size(&cp, 6, true), 1 << 16);
         assert_eq!(overlap_size(&cp, 0, true), 1 << 16);
         assert_eq!(overlap_size(&cp, 1, true), 1 << 11);
-        // cycleLog 18 + 3 is still 21; then 22, 27, and 31 capped to 30.
+        // cycleLog 18 + 3 is still 21; then 22, 27, and 31 capped to
+        // JOBLOG_MAX.
         assert_eq!(overlap_size(&logs(27, 18), 9, true), 1 << 19);
         assert_eq!(overlap_size(&logs(27, 19), 9, true), 1 << 20);
         assert_eq!(overlap_size(&logs(27, 24), 9, true), 1 << 25);
-        assert_eq!(overlap_size(&logs(31, 28), 9, true), 1 << 28);
+        assert_eq!(
+            overlap_size(&logs(ZSTD_WINDOWLOG_MAX, 28), 9, true),
+            1 << (JOBLOG_MAX - 2)
+        );
         // A window below job_log - 2 is the base.
         let small = logs(17, 13);
         assert_eq!(overlap_size(&small, 9, true), 1 << 17);
