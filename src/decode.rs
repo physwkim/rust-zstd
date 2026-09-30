@@ -40,6 +40,7 @@
     dead_code
 )]
 
+use crate::constants::ZSTD_WINDOWLOG_MAX;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -51,7 +52,6 @@ use std::ptr;
 
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
-const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 /// `ZSTD_MAXWINDOWSIZE_DEFAULT`: libzstd's default decoder limit,
 /// `(1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`, which admits the window log
@@ -2534,7 +2534,11 @@ impl FrameHeader {
             let exp = self.window_descriptor >> 3;
             let mantissa = self.window_descriptor & 0x7;
 
-            let window_log = 10 + u64::from(exp);
+            let window_log = 10 + u32::from(exp);
+            // frameParameter_windowTooLarge of ZSTD_getFrameHeader
+            if window_log > ZSTD_WINDOWLOG_MAX {
+                return Err(format!("Window log {} too large", window_log));
+            }
             let window_base = 1u64 << window_log;
             let window_add = (window_base / 8) * u64::from(mantissa);
 
@@ -2542,8 +2546,6 @@ impl FrameHeader {
 
             if window_size < MIN_WINDOW_SIZE {
                 Err(format!("Window size {} too small", window_size))
-            } else if window_size >= MAX_WINDOW_SIZE {
-                Err(format!("Window size {} too big", window_size))
             } else {
                 Ok(window_size)
             }
@@ -4703,6 +4705,31 @@ mod tests {
         assert_eq!(decompress(&windowed_frame(17 << 3)).unwrap(), b"hi");
         let err = decompress(&windowed_frame((17 << 3) | 1)).unwrap_err();
         assert!(err.contains("exceeds maximum allowed"), "{err}");
+    }
+
+    /// The frame header refuses a window log exactly where libzstd's
+    /// `ZSTD_getFrameHeader` does: above `ZSTD_WINDOWLOG_MAX`, the upper
+    /// bound of `ZSTD_d_windowLogMax`, for this target.
+    #[test]
+    fn window_log_bounds_match_libzstd() {
+        use zstd::zstd_safe::{self, zstd_sys as sys};
+
+        // SAFETY: reads no memory of ours.
+        let bounds =
+            unsafe { sys::ZSTD_dParam_getBounds(sys::ZSTD_dParameter::ZSTD_d_windowLogMax) };
+        assert_eq!(bounds.error, 0);
+        assert_eq!(bounds.upperBound, ZSTD_WINDOWLOG_MAX as i32);
+        for descriptor in 0..=u8::MAX {
+            let frame = windowed_frame(descriptor);
+            let Ok((header, _)) = parse_frame_header(&frame) else {
+                panic!("descriptor {descriptor:#x}: header refused");
+            };
+            assert_eq!(
+                header.window_size().is_ok(),
+                zstd_safe::get_frame_content_size(&frame).is_ok(),
+                "descriptor {descriptor:#x}"
+            );
+        }
     }
 
     #[test]
