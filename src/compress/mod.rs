@@ -110,7 +110,9 @@ pub struct CompressOptions {
     /// overlap changes (see `overlap_log`).
     pub ldm: ParamSwitch,
     /// `ZSTD_c_ldmHashLog`: `0` derives it (window log minus hash rate
-    /// log, within `6..=30`), else `6..=30`.
+    /// log, within `6..=30`), else `6..=30`. A hash rate log above the
+    /// window log derives 6, where libzstd's unsigned subtraction wraps
+    /// and derives 30 (an 8 GiB table).
     pub ldm_hash_log: u32,
     /// `ZSTD_c_ldmMinMatch`: `0` derives it (64, 32 for `btultra` and up),
     /// else `4..=4096`.
