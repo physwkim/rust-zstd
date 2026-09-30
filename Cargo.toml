@@ -2,7 +2,7 @@
 name = "rust-zstd"
 version = "0.1.0"
 edition = "2021"
-description = "Pure Rust Zstandard codec — compress + decompress, zero external dependencies"
+description = "Pure Rust Zstandard codec (compress and decompress), no C or FFI; depends on fearless_simd and bytemuck, plus rayon under the default parallel feature"
 license = "BSD-3-Clause AND MIT"
 repository = "https://github.com/physwkim/rust-zstd"
 readme = "README.md"

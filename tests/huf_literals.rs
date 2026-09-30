@@ -26,6 +26,7 @@ fn strategy(n: u32) -> Strategy {
         3 => Strategy::Greedy,
         4 => Strategy::Lazy,
         5 => Strategy::Lazy2,
+        6 => Strategy::BtLazy2,
         7 => Strategy::BtOpt,
         8 => Strategy::BtUltra,
         9 => Strategy::BtUltra2,

@@ -1,3 +1,8 @@
+mod common;
+
+use common::{datasets, MIB};
+use zstd::zstd_safe::zstd_sys as sys;
+
 #[test]
 fn compression_ratios_by_level() {
     let patterns: Vec<(&str, Vec<u8>)> = vec![
@@ -16,7 +21,7 @@ fn compression_ratios_by_level() {
 
     for (name, data) in &patterns {
         eprintln!("\n{} ({} bytes):", name, data.len());
-        for level in [0, 1, 3, 7, 11] {
+        for level in [0, 1, 3, 7, 11, 13, 14, 15] {
             let compressed = rust_zstd::compress(data, level);
             let decompressed = rust_zstd::decompress(&compressed)
                 .unwrap_or_else(|e| panic!("{} level {} decompress: {}", name, level, e));
@@ -30,6 +35,77 @@ fn compression_ratios_by_level() {
                 compressed.len(),
                 ratio
             );
+        }
+    }
+}
+
+/// libzstd single-threaded frame at `level` with both block splitters off
+/// (`ZSTD_c_blockSplitterLevel` = 1, `ZSTD_c_splitAfterSequences` =
+/// `ZSTD_ps_disable`).
+fn zstd_nosplit(data: &[u8], level: i32) -> Vec<u8> {
+    unsafe {
+        let cctx = sys::ZSTD_createCCtx();
+        let set = |p, v| {
+            let r = sys::ZSTD_CCtx_setParameter(cctx, p, v);
+            assert_eq!(sys::ZSTD_isError(r), 0, "set parameter {:?}", p);
+        };
+        set(sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level);
+        set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam20, 1);
+        set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam13, 2);
+        let mut out = vec![0u8; sys::ZSTD_compressBound(data.len())];
+        let n = sys::ZSTD_compress2(
+            cctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            data.as_ptr().cast(),
+            data.len(),
+        );
+        assert_eq!(sys::ZSTD_isError(n), 0);
+        sys::ZSTD_freeCCtx(cctx);
+        out.truncate(n);
+        out
+    }
+}
+
+/// Levels 13-15 on inputs above 256 KiB run btlazy2 in both codecs, so the
+/// sequences and therefore the frame sizes are the same, by default (the
+/// pre-splitter at `splitLevels[btlazy2]`, no post-sequence splitter below
+/// btopt) and with both splitters off: no tolerance.
+#[test]
+fn btlazy2_sizes_equal_libzstd() {
+    for ds in datasets() {
+        if !matches!(ds.name, "rust_src_8m" | "elf_8m" | "words_1m") {
+            continue;
+        }
+        let data = &ds.data[..ds.data.len().min(MIB)];
+        for level in [13, 14, 15] {
+            let ours = rust_zstd::compress(data, level);
+            let ours_nosplit = rust_zstd::compress_with(
+                data,
+                &rust_zstd::CompressOptions {
+                    level,
+                    block_splitter_level: 1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                rust_zstd::decompress(&ours).as_deref(),
+                Ok(data),
+                "{} level {level}",
+                ds.name
+            );
+            let c = zstd_nosplit(data, level);
+            let c_default = zstd::bulk::compress(data, level).unwrap();
+            eprintln!(
+                "{} level {level}: ours {} no-split {}, libzstd {} no-split {}",
+                ds.name,
+                ours.len(),
+                ours_nosplit.len(),
+                c_default.len(),
+                c.len()
+            );
+            assert_eq!(ours.len(), c_default.len(), "{} level {level}", ds.name);
+            assert_eq!(ours_nosplit.len(), c.len(), "{} level {level}", ds.name);
         }
     }
 }

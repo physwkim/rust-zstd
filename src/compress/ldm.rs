@@ -566,6 +566,7 @@ fn fill_fast_tables(ms: &mut MatchState, src: &[u8], end: usize) {
         Strategy::Greedy
         | Strategy::Lazy
         | Strategy::Lazy2
+        | Strategy::BtLazy2
         | Strategy::BtOpt
         | Strategy::BtUltra
         | Strategy::BtUltra2 => {}

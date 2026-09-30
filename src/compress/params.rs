@@ -6,10 +6,8 @@
 
 /// Match-finder strategy. Numeric values follow `ZSTD_strategy`.
 ///
-/// libzstd's `ZSTD_btlazy2` is not ported: levels whose table row selects
-/// it keep that row's numeric parameters but run with `Lazy2`, exactly as
-/// libzstd built with `ZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR` cascades it in
-/// `ZSTD_adjustCParams_internal`.
+/// Every `ZSTD_strategy` is ported; a level's table row selects the
+/// strategy it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Strategy {
     Fast = 1,
@@ -17,6 +15,7 @@ pub enum Strategy {
     Greedy = 3,
     Lazy = 4,
     Lazy2 = 5,
+    BtLazy2 = 6,
     BtOpt = 7,
     BtUltra = 8,
     BtUltra2 = 9,
@@ -32,7 +31,7 @@ impl Strategy {
             | Strategy::Greedy
             | Strategy::Lazy
             | Strategy::Lazy2 => 0,
-            Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => 1,
+            Strategy::BtLazy2 | Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => 1,
         }
     }
 
@@ -43,14 +42,15 @@ impl Strategy {
             | Strategy::DFast
             | Strategy::Greedy
             | Strategy::Lazy
-            | Strategy::Lazy2 => false,
+            | Strategy::Lazy2
+            | Strategy::BtLazy2 => false,
             Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => true,
         }
     }
 }
 
-/// `ZSTD_ParamSwitch_e`: a feature switch whose `Auto` setting libzstd
-/// resolves from the compression parameters.
+/// `ZSTD_ParamSwitch_e`: a feature left to libzstd's default for the
+/// parameters (`Auto`), or forced on or off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParamSwitch {
     #[default]
@@ -106,7 +106,8 @@ impl Strat {
             Strat::DFast => Strategy::DFast,
             Strat::Greedy => Strategy::Greedy,
             Strat::Lazy => Strategy::Lazy,
-            Strat::Lazy2 | Strat::BtLazy2 => Strategy::Lazy2,
+            Strat::Lazy2 => Strategy::Lazy2,
+            Strat::BtLazy2 => Strategy::BtLazy2,
             Strat::BtOpt => Strategy::BtOpt,
             Strat::BtUltra => Strategy::BtUltra,
             Strat::BtUltra2 => Strategy::BtUltra2,
@@ -286,7 +287,7 @@ impl CParams {
         {
             // dictSize == 0: ZSTD_dictAndWindowLog() returns windowLog unchanged.
             let dict_and_window_log = self.window_log;
-            // ZSTD_cycleLog(), on the cascaded strategy.
+            // ZSTD_cycleLog(): the binary tree holds two entries per position.
             let cycle_log = self.chain_log - self.strategy.bt_scale();
             if self.hash_log > dict_and_window_log + 1 {
                 self.hash_log = dict_and_window_log + 1;
@@ -317,6 +318,7 @@ impl CParams {
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => true,
             Strategy::Fast
             | Strategy::DFast
+            | Strategy::BtLazy2
             | Strategy::BtOpt
             | Strategy::BtUltra
             | Strategy::BtUltra2 => false,
@@ -378,14 +380,23 @@ mod tests {
     }
 
     #[test]
-    fn btlazy2_cascades_to_lazy2() {
-        for level in 13..=15 {
-            let cp = CParams::for_level(level, 8 << 20);
-            assert_eq!(cp.strategy, Strategy::Lazy2, "level {level}");
-        }
-        // btScale is that of the cascaded strategy: no chain_log shrink for
-        // chainLog 23 against windowLog 22 at level 15.
-        assert_eq!(CParams::for_level(15, 8 << 20).chain_log, 22);
+    fn btlazy2_rows_select_btlazy2_with_cycle_log() {
+        // Level 13, > 256 KiB row: (22, 22, 22, 4, 5, 32, btlazy2).
+        let cp = CParams::for_level(13, 8 << 20);
+        assert_eq!(cp.strategy, Strategy::BtLazy2);
+        assert_eq!((cp.window_log, cp.chain_log, cp.hash_log), (22, 22, 22));
+        // 100 KB, level 12 of the <= 128 KiB row: (17, 18, 17, 7, 4, 12,
+        // btlazy2), windowLog 17; cycleLog = chainLog - 1 = 17 fits.
+        let cp = CParams::for_level(12, 100_000);
+        assert_eq!(cp.strategy, Strategy::BtLazy2);
+        assert_eq!((cp.window_log, cp.chain_log), (17, 18));
+        // 20 KB: windowLog 15, so the tree (cycleLog 17) shrinks by 2.
+        let cp = CParams::for_level(12, 20_000);
+        assert_eq!((cp.window_log, cp.chain_log, cp.hash_log), (15, 16, 16));
+        // Lazy2 (level 10: chainLog 16) has no btScale: capped at windowLog.
+        let cp = CParams::for_level(10, 20_000);
+        assert_eq!(cp.strategy, Strategy::Lazy2);
+        assert_eq!(cp.chain_log, 15);
     }
 
     #[test]

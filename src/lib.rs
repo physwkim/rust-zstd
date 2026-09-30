@@ -8,5 +8,7 @@ pub mod decode;
 pub mod fse;
 pub mod huf;
 
-pub use compress::{compress, compress_to_vec, compress_with, CompressOptions, Compressor};
+pub use compress::{
+    compress, compress_to_vec, compress_with, CompressOptions, Compressor, ParamSwitch,
+};
 pub use decode::decompress;

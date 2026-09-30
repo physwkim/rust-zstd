@@ -46,10 +46,11 @@ pub struct MatchState {
 /// The table area of `ZSTD_cwksp`: one zeroed allocation holding
 /// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
 /// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
-/// the hash-chain table for the lazy strategies; the binary tree for the
-/// opt strategies), `hashTable3` (`1 << hash_log3` entries, opt strategies
-/// with `min_match == 3` only) and `tagTable` (`1 << hash_log` bytes,
-/// row-based lazy finder only, else empty).
+/// the hash-chain table for the lazy strategies; the binary tree, two
+/// entries per node, for `BtLazy2` and the opt strategies), `hashTable3`
+/// (`1 << hash_log3` entries, opt strategies with `min_match == 3` only)
+/// and `tagTable` (`1 << hash_log` bytes, row-based lazy finder only, else
+/// empty).
 #[derive(Default)]
 pub struct Workspace {
     words: Vec<u32>,
@@ -68,6 +69,7 @@ impl Workspace {
             Strategy::Fast => (hash, 0, 0, 0),
             Strategy::DFast => (hash, chain, 0, 0),
             Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, 0, hash),
+            Strategy::BtLazy2 => (hash, chain, 0, 0),
             Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
                 let hash3 = match cparams.hash_log3() {
                     0 => 0,

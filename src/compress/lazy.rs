@@ -132,13 +132,13 @@ fn row_log_of(cp: &CParams) -> u32 {
     cp.search_log.clamp(4, 6)
 }
 
-/// Lazy depth of a strategy: greedy 0, lazy 1, lazy2 2.
+/// Lazy depth of a strategy: greedy 0, lazy 1, lazy2 and btlazy2 2.
 #[inline]
 fn depth_of(strategy: Strategy) -> u32 {
     match strategy {
         Strategy::Greedy => 0,
         Strategy::Lazy => 1,
-        Strategy::Lazy2 => 2,
+        Strategy::Lazy2 | Strategy::BtLazy2 => 2,
         Strategy::Fast
         | Strategy::DFast
         | Strategy::BtOpt
@@ -286,6 +286,336 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
             nb_attempts -= 1;
         }
         ml
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary-tree match finder (`ZSTD_BtFindBestMatch`, btlazy2).
+// ---------------------------------------------------------------------------
+
+/// `ZSTD_DUBT_UNSORTED_MARK`: the second slot of a node that was inserted
+/// by [`BtSearch::update_dubt`] but not yet sorted into the tree. No real
+/// candidate is ever `1`: candidates are `> window_low >= 1`.
+const DUBT_UNSORTED_MARK: usize = 1;
+
+/// `search_binaryTree`: a "delayed update binary tree" in the chain table,
+/// two entries per position (`bt[2 * (idx & btMask)]` the smaller child,
+/// `+ 1` the larger one; `btLog = chainLog - 1`). Positions are appended
+/// unsorted as a hash chain and sorted lazily when a search reaches them.
+#[derive(Clone, Copy)]
+struct BtSearch<M, const MLS: u32> {
+    /// The [`MatchCount`] level of the block loop.
+    count: M,
+    /// The block's tree constants.
+    p: BtParams,
+}
+
+/// C's `dummy32`: the slot a descent writes once it ran past `btLow`.
+const BT_DUMMY: usize = usize::MAX;
+
+/// The per-block constants of the tree functions.
+#[derive(Clone, Copy)]
+struct BtParams {
+    /// `btMask = (1 << (chainLog - 1)) - 1`.
+    bt_mask: usize,
+    /// `window.lowLimit` (`ms.window_low`).
+    window_valid: usize,
+    /// `1 << windowLog`.
+    max_distance: usize,
+}
+
+impl BtParams {
+    fn of(ms: &MatchState) -> Self {
+        BtParams {
+            bt_mask: (1usize << (ms.cparams.chain_log - 1)) - 1,
+            window_valid: ms.window_low,
+            max_distance: 1usize << ms.cparams.window_log,
+        }
+    }
+
+    /// `curr - windowValid > maxDistance ? curr - maxDistance :
+    /// windowValid`, i.e. [`MatchState::lowest_prefix_index`].
+    #[inline(always)]
+    fn window_low(self, curr: usize) -> usize {
+        if curr > self.window_valid + self.max_distance {
+            curr - self.max_distance
+        } else {
+            self.window_valid
+        }
+    }
+}
+
+impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
+    /// `ZSTD_updateDUBT`: append `[next_to_update, ip)` to their hash
+    /// chains, each marked unsorted.
+    ///
+    /// # Safety
+    /// `ip + HASH_READ_SIZE <= src.len()`; the tables have the sizes of
+    /// [`assert_block_bounds`].
+    #[inline(always)]
+    unsafe fn update_dubt(ms: &mut MatchState, src: &[u8], ip: usize) {
+        let hash_log = ms.cparams.hash_log;
+        let bt_mask = BtParams::of(ms).bt_mask;
+        let (hash_table, bt, _) = ms.ws.tables_mut();
+        // `h < 1 << hash_log` and `2 * (idx & bt_mask) + 1 < 1 << chain_log`;
+        // every hashed position is `< ip`.
+        for idx in ms.next_to_update..ip {
+            let h = hash_salted::<MLS>(src, idx, hash_log, 0) as usize;
+            let match_index = tget(hash_table, h);
+            tset(hash_table, h, idx);
+            let node = 2 * (idx & bt_mask);
+            tset(bt, node, match_index);
+            tset(bt, node + 1, DUBT_UNSORTED_MARK);
+        }
+        ms.next_to_update = ip;
+    }
+
+    /// `ZSTD_insertDUBT1` (`ZSTD_noDict`): sort the unsorted node `curr`
+    /// into the tree, comparing at most `nb_compares` candidates and not
+    /// descending past `bt_low`.
+    ///
+    /// # Safety
+    /// `curr < iend <= src.len()`; `bt.len() == 2 * (p.bt_mask + 1)`.
+    #[inline(always)]
+    unsafe fn insert_dubt1(
+        self,
+        bt: &mut [u32],
+        src: &[u8],
+        curr: usize,
+        iend: usize,
+        mut nb_compares: u32,
+        bt_low: usize,
+    ) {
+        let p = self.p;
+        let bt_mask = p.bt_mask;
+        let ip = curr;
+        let mut common_smaller = 0usize;
+        let mut common_larger = 0usize;
+        let mut smaller_ptr = 2 * (curr & bt_mask);
+        let mut larger_ptr = smaller_ptr + 1;
+        // The node is unsorted: its first slot links to the next candidate,
+        // its second (the unsorted mark's chain) is already saved.
+        let mut match_index = tget(bt, smaller_ptr);
+        let window_low = p.window_low(curr);
+        debug_assert!(window_low < curr);
+
+        // C: `matchIndex > windowLow`; every tree link points below the node
+        // holding it, so `match_index < curr` holds and the check only turns
+        // a misused state into a miss.
+        while nb_compares > 0 && candidate_valid(match_index, window_low + 1, curr) {
+            let next = 2 * (match_index & bt_mask);
+            let mut match_length = common_smaller.min(common_larger);
+            // `match_index + match_length < ip + match_length < iend`: the
+            // common lengths are `< iend - ip` (a match reaching `iend`
+            // breaks below).
+            match_length +=
+                self.count
+                    .count(src, ip + match_length, match_index + match_length, iend);
+            if ip + match_length == iend {
+                // equal: no way to know if inf or sup
+                break;
+            }
+            if byte(src, match_index + match_length) < byte(src, ip + match_length) {
+                // match is smaller than current
+                tset(bt, smaller_ptr, match_index);
+                common_smaller = match_length;
+                if match_index <= bt_low {
+                    smaller_ptr = BT_DUMMY;
+                    break;
+                }
+                smaller_ptr = next + 1;
+                match_index = tget(bt, next + 1);
+            } else {
+                // match is larger than current
+                tset(bt, larger_ptr, match_index);
+                common_larger = match_length;
+                if match_index <= bt_low {
+                    larger_ptr = BT_DUMMY;
+                    break;
+                }
+                larger_ptr = next;
+                match_index = tget(bt, next);
+            }
+            nb_compares -= 1;
+        }
+        if smaller_ptr != BT_DUMMY {
+            tset(bt, smaller_ptr, 0);
+        }
+        if larger_ptr != BT_DUMMY {
+            tset(bt, larger_ptr, 0);
+        }
+    }
+
+    /// `ZSTD_DUBT_findBestMatch` (`ZSTD_noDict`).
+    ///
+    /// # Safety
+    /// `ip + HASH_READ_SIZE <= iend <= src.len()`; the tables have the
+    /// sizes of [`assert_block_bounds`].
+    #[inline(always)]
+    unsafe fn find_best_match(
+        self,
+        ms: &mut MatchState,
+        src: &[u8],
+        ip: usize,
+        iend: usize,
+        off_base: &mut u32,
+    ) -> usize {
+        let cp = ms.cparams;
+        let p = self.p;
+        let bt_mask = p.bt_mask;
+        let curr = ip;
+        let window_low = p.window_low(curr);
+        debug_assert!(window_low < curr);
+        let bt_low = curr.saturating_sub(bt_mask);
+        let unsort_limit = bt_low.max(window_low);
+        let mut nb_compares = 1u32 << cp.search_log;
+        let mut nb_candidates = nb_compares;
+        let mut previous_candidate = 0usize;
+
+        let (hash_table, bt, _) = ms.ws.tables_mut();
+        let h = hash_salted::<MLS>(src, ip, cp.hash_log, 0) as usize;
+        let mut match_index = tget(hash_table, h);
+
+        // reach end of unsorted candidates list; the chain of unsorted marks
+        // becomes a reversed chain back to the head. C tests `matchIndex >
+        // unsortLimit` only; hash and tree entries are always `< curr`, and
+        // the upper bound keeps the positions `insert_dubt1` reads inside
+        // `src` for a misused state too.
+        let mut node = 2 * (match_index & bt_mask);
+        while candidate_valid(match_index, unsort_limit + 1, curr)
+            && tget(bt, node + 1) == DUBT_UNSORTED_MARK
+            && nb_candidates > 1
+        {
+            tset(bt, node + 1, previous_candidate);
+            previous_candidate = match_index;
+            match_index = tget(bt, node);
+            node = 2 * (match_index & bt_mask);
+            nb_candidates -= 1;
+        }
+
+        // nullify last candidate if it's still unsorted
+        if candidate_valid(match_index, unsort_limit + 1, curr)
+            && tget(bt, node + 1) == DUBT_UNSORTED_MARK
+        {
+            tset(bt, node, 0);
+            tset(bt, node + 1, 0);
+        }
+
+        // batch sort stacked candidates
+        match_index = previous_candidate;
+        while match_index != 0 {
+            let next_candidate = tget(bt, 2 * (match_index & bt_mask) + 1);
+            // Every stacked candidate passed `candidate_valid(.., curr)`
+            // above: `match_index < ip < iend`.
+            self.insert_dubt1(bt, src, match_index, iend, nb_candidates, unsort_limit);
+            match_index = next_candidate;
+            nb_candidates += 1;
+        }
+
+        // find longest match
+        let mut common_smaller = 0usize;
+        let mut common_larger = 0usize;
+        let mut smaller_ptr = 2 * (curr & bt_mask);
+        let mut larger_ptr = smaller_ptr + 1;
+        let mut match_end_idx = curr + 8 + 1;
+        let mut best_length = 0usize;
+
+        match_index = tget(hash_table, h);
+        tset(hash_table, h, curr);
+
+        // As in `insert_dubt1`: C tests `matchIndex > windowLow` only.
+        while nb_compares > 0 && candidate_valid(match_index, window_low + 1, curr) {
+            let next = 2 * (match_index & bt_mask);
+            let mut match_length = common_smaller.min(common_larger);
+            // `match_index + match_length < ip + match_length < iend`, as in
+            // `insert_dubt1`.
+            match_length +=
+                self.count
+                    .count(src, ip + match_length, match_index + match_length, iend);
+            if match_length > best_length {
+                if match_length > match_end_idx - match_index {
+                    match_end_idx = match_index + match_length;
+                }
+                if (4 * (match_length - best_length)) as i32
+                    > highbit32((curr - match_index + 1) as u32) as i32
+                        - highbit32(*off_base) as i32
+                {
+                    best_length = match_length;
+                    *off_base = offset_to_offbase((curr - match_index) as u32);
+                }
+                if ip + match_length == iend {
+                    // equal: no way to know if inf or sup
+                    break;
+                }
+            }
+            if byte(src, match_index + match_length) < byte(src, ip + match_length) {
+                // match is smaller than current
+                tset(bt, smaller_ptr, match_index);
+                common_smaller = match_length;
+                if match_index <= bt_low {
+                    smaller_ptr = BT_DUMMY;
+                    break;
+                }
+                smaller_ptr = next + 1;
+                match_index = tget(bt, next + 1);
+            } else {
+                // match is larger than current
+                tset(bt, larger_ptr, match_index);
+                common_larger = match_length;
+                if match_index <= bt_low {
+                    larger_ptr = BT_DUMMY;
+                    break;
+                }
+                larger_ptr = next;
+                match_index = tget(bt, next);
+            }
+            nb_compares -= 1;
+        }
+        if smaller_ptr != BT_DUMMY {
+            tset(bt, smaller_ptr, 0);
+        }
+        if larger_ptr != BT_DUMMY {
+            tset(bt, larger_ptr, 0);
+        }
+
+        // skip repetitive patterns
+        ms.next_to_update = match_end_idx - 8;
+        best_length
+    }
+}
+
+impl<M: MatchCount, const MLS: u32> Search for BtSearch<M, MLS> {
+    const ILIMIT_MARGIN: usize = 8;
+
+    #[inline(always)]
+    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        self.count.count(src, a, b, limit)
+    }
+
+    #[inline(always)]
+    fn refill(&mut self, _ms: &mut MatchState, _src: &[u8], _ilimit: usize) {}
+
+    /// `ZSTD_BtFindBestMatch` (`ZSTD_noDict`); the tree ignores lazy
+    /// skipping, as in C.
+    #[inline(always)]
+    fn search_max(
+        &mut self,
+        ms: &mut MatchState,
+        src: &[u8],
+        ip: usize,
+        iend: usize,
+        off_base: &mut u32,
+        _lazy_skipping: bool,
+    ) -> usize {
+        if ip < ms.next_to_update {
+            return 0; // skipped area
+        }
+        // SAFETY: `ip < ilimit` with `ilimit + 8 <= iend <= src.len()`;
+        // table sizes asserted per block ([`assert_block_bounds`]).
+        unsafe {
+            Self::update_dubt(ms, src, ip);
+            self.find_best_match(ms, src, ip, iend, off_base)
+        }
     }
 }
 
@@ -1132,19 +1462,25 @@ fn lazy_generic<S: Search>(
 // Dispatch.
 // ---------------------------------------------------------------------------
 
-/// `searchMethod_e` (without the binary tree, which belongs to `zstd_opt`).
+/// `searchMethod_e`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchMethod {
     /// `search_hashChain`.
     HashChain,
     /// `search_rowHash`.
     RowHash,
+    /// `search_binaryTree`, the only method of `BtLazy2`.
+    BinaryTree,
 }
 
-/// `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto, cparams)`: the row finder
-/// for greedy/lazy/lazy2 with `windowLog > 14`, the hash chain otherwise.
+/// The method `ZSTD_selectBlockCompressor` runs: the binary tree for
+/// btlazy2; for greedy/lazy/lazy2 `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto,
+/// cparams)`, the row finder with `windowLog > 14` and the hash chain
+/// otherwise.
 pub fn default_search_method(cp: &CParams) -> SearchMethod {
-    if cp.row_match_finder_supported() && cp.window_log > 14 {
+    if cp.strategy == Strategy::BtLazy2 {
+        SearchMethod::BinaryTree
+    } else if cp.row_match_finder_supported() && cp.window_log > 14 {
         SearchMethod::RowHash
     } else {
         SearchMethod::HashChain
@@ -1285,7 +1621,84 @@ fn hc_block(
     }
 }
 
-/// `ZSTD_compressBlock_greedy/lazy/lazy2[_row]` for the strategy in
+/// The binary-tree block loop specialised on `mls`
+/// (`ZSTD_compressBlock_btlazy2`) for one [`MatchCount`] level.
+#[inline(always)]
+fn bt_block<M: MatchCount>(
+    count: M,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    let p = BtParams::of(ms);
+    match mls_of(&ms.cparams) {
+        4 => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 4> { count, p },
+        ),
+        5 => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 5> { count, p },
+        ),
+        _ => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 6> { count, p },
+        ),
+    }
+}
+
+/// [`bt_block`] with the scalar `ZSTD_count`.
+#[inline(never)]
+fn bt_block_scalar(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    bt_block(Fallback::new(), ms, src, block, rep, out, depth)
+}
+
+/// [`bt_block`] compiled with AVX2 enabled, using the AVX2 match count.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, which `count` attests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn bt_block_avx2(
+    count: Avx2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    bt_block(count, ms, src, block, rep, out, depth)
+}
+
+/// `ZSTD_compressBlock_greedy/lazy/lazy2[_row]/btlazy2` for the strategy in
 /// `ms.cparams`, with the match finder of [`default_search_method`] and the
 /// SIMD level detected on this machine. Sequences go to `out`, `rep` is
 /// updated for the next block; returns the anchor of the trailing literals.
@@ -1314,7 +1727,7 @@ fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMe
     );
     assert_eq!(hash_table.len(), 1usize << cp.hash_log, "hash_table size");
     match method {
-        SearchMethod::HashChain => {
+        SearchMethod::HashChain | SearchMethod::BinaryTree => {
             assert_eq!(
                 chain_table.len(),
                 1usize << cp.chain_log,
@@ -1335,7 +1748,7 @@ fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMe
 
 /// [`compress_block`] with an explicit match finder and SIMD level. Every
 /// combination produces the same sequences for the same method; the level
-/// only selects the tag-compare kernel.
+/// only selects the tag-compare and match-count kernels.
 pub fn compress_block_with(
     ms: &mut MatchState,
     src: &[u8],
@@ -1349,8 +1762,13 @@ pub fn compress_block_with(
     assert_block_bounds(ms, src, block.end, method);
     match method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
-        // SAFETY (all three): fearless_simd constructs a witness only after
-        // detecting its feature set on this CPU.
+        // SAFETY (all four unsafe arms): fearless_simd constructs a witness
+        // only after detecting its feature set on this CPU.
+        SearchMethod::BinaryTree => match level {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Avx2(w) => unsafe { bt_block_avx2(w, ms, src, block, rep, out, depth) },
+            _ => bt_block_scalar(ms, src, block, rep, out, depth),
+        },
         SearchMethod::RowHash => match level {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Level::Sse4_2(w) => unsafe { row_block_sse(w, ms, src, block, rep, out, depth) },
@@ -1369,9 +1787,10 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     load_prefix_with(ms, src, range, default_search_method(&ms.cparams))
 }
 
-/// `ZSTD_loadDictionaryContent`, lazy arm: insert every position of `range`
-/// up to `end - HASH_READ_SIZE` (`ZSTD_insertAndFindFirstIndex` /
-/// `ZSTD_row_update` at `iend - HASH_READ_SIZE`) and set `next_to_update =
+/// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms: insert every
+/// position of `range` up to `end - HASH_READ_SIZE`
+/// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
+/// at `iend - HASH_READ_SIZE`) and set `next_to_update =
 /// end`. Expects the tables of a fresh [`MatchState`] (C zeroes the tag table
 /// here; `MatchState::new` already did). The hash width is `BOUNDED(4,
 /// minMatch, 6)` as in the block loop, where C's chain loader passes
@@ -1389,7 +1808,7 @@ pub fn load_prefix_with(
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
-        // SAFETY (both finders): `target + HASH_READ_SIZE == end <= src.len()`
+        // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.len()`
         // and the table sizes were asserted above.
         match method {
             SearchMethod::HashChain => {
@@ -1429,6 +1848,9 @@ pub fn load_prefix_with(
                     _ => go!(6, 6),
                 }
             }
+            // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
+            // the dictionary table fully sorted".
+            SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
         }
     }
     ms.next_to_update = end;
@@ -1500,7 +1922,11 @@ mod tests {
         (nseqs, nlits)
     }
 
-    const METHODS: [SearchMethod; 2] = [SearchMethod::HashChain, SearchMethod::RowHash];
+    const METHODS: [SearchMethod; 3] = [
+        SearchMethod::HashChain,
+        SearchMethod::RowHash,
+        SearchMethod::BinaryTree,
+    ];
 
     fn run_m(src: &[u8], cp: CParams, block_size: usize, method: SearchMethod) -> (usize, usize) {
         run_blocks(src, cp, 1, 0, block_size, [1, 4, 8], method)
@@ -1659,7 +2085,7 @@ mod tests {
     /// Sequences, literals, final repcodes and anchors of every block.
     fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
         let mut ms = MatchState::new(cp, 1);
-        collect_on(&mut ms, src, block_size, SearchMethod::RowHash, level)
+        collect_on(&mut ms, src, block_size, default_search_method(&cp), level)
     }
 
     /// Every block of `src` on `ms` as prepared by the caller: all sequences
@@ -1735,12 +2161,14 @@ mod tests {
         let mut srcs = crate_sources();
         srcs.extend_from_slice(&current_exe(300_000));
         // Cover every rowLog (searchLog clamped to 4..6), not only the level
-        // table's.
+        // table's; levels 13 and 15 run the tree (AVX2 match count).
         for (level_no, block, search_log) in [
             (5, ZSTD_BLOCKSIZE_MAX, 3),
             (7, 5000, 5),
             (9, ZSTD_BLOCKSIZE_MAX, 6),
             (11, 40_000, 4),
+            (13, ZSTD_BLOCKSIZE_MAX, 4),
+            (15, 5000, 6),
         ] {
             let mut cp = CParams::for_level(level_no, srcs.len());
             cp.search_log = search_log;
@@ -1849,6 +2277,94 @@ mod tests {
             let cp = CParams::for_level(level, srcs.len());
             let (nseqs, nlits) = run(&srcs, cp, ZSTD_BLOCKSIZE_MAX);
             assert!(nseqs > 0 && nlits < srcs.len() / 2, "level {level}");
+        }
+    }
+
+    fn run_bt(src: &[u8], cp: CParams, block_size: usize) -> (usize, usize) {
+        run_blocks(
+            src,
+            cp,
+            1,
+            0,
+            block_size,
+            [1, 4, 8],
+            SearchMethod::BinaryTree,
+        )
+    }
+
+    #[test]
+    fn default_search_method_of_btlazy2_is_the_tree() {
+        for (level, len) in [(13, 8 << 20), (15, 8 << 20), (11, 100_000), (9, 10_000)] {
+            let cp = CParams::for_level(level, len);
+            assert_eq!(cp.strategy, Strategy::BtLazy2, "level {level} len {len}");
+            assert_eq!(default_search_method(&cp), SearchMethod::BinaryTree);
+        }
+    }
+
+    #[test]
+    fn levels_13_to_15_reconstruct() {
+        let srcs = crate_sources();
+        let exe = current_exe(3 << 17);
+        for level in 13..=15 {
+            for src in [&srcs, &exe] {
+                let cp = CParams::for_level(level, src.len());
+                assert_eq!(cp.strategy, Strategy::BtLazy2);
+                let (nseqs, nlits) = run_bt(src, cp, ZSTD_BLOCKSIZE_MAX);
+                assert!(nseqs > 0 && nlits < src.len() / 2, "level {level}");
+            }
+        }
+    }
+
+    /// Every `mls`, search depths from two compares (`ZSTD_SEARCHLOG_MIN`:
+    /// the unsorted walk stops after one candidate and nullifies the next)
+    /// to 512, and short blocks so that searches reach `iend` and the tree
+    /// is left half sorted.
+    #[test]
+    fn bt_all_mls_and_search_logs_reconstruct() {
+        let text = text_corpus();
+        let srcs = crate_sources();
+        for mls in [4, 5, 6] {
+            for search_log in [1u32, 2, 4, 9] {
+                let mut cp = lazy_params(13, text.len(), Strategy::BtLazy2, mls);
+                cp.search_log = search_log;
+                run_bt(&text, cp, ZSTD_BLOCKSIZE_MAX);
+                run_bt(&text, cp, 777);
+                let mut cp = lazy_params(13, srcs.len(), Strategy::BtLazy2, mls);
+                cp.search_log = search_log;
+                run_bt(&srcs, cp, ZSTD_BLOCKSIZE_MAX);
+            }
+        }
+    }
+
+    /// A tree much smaller than the input (`btLow > 0`: descents stop at
+    /// the oldest node still in the tree) and a window smaller than the
+    /// tree (`windowLow` above `btLow`), on repetitive and binary data.
+    #[test]
+    fn bt_small_tree_and_small_window_reconstruct() {
+        let text = text_corpus();
+        let exe = current_exe(1 << 20);
+        for src in [&text, &exe] {
+            for (window_log, chain_log) in [(22, 7), (22, 12), (10, 16), (12, 12)] {
+                let mut cp = lazy_params(13, src.len(), Strategy::BtLazy2, 5);
+                cp.window_log = window_log;
+                cp.chain_log = chain_log;
+                run_bt(src, cp, ZSTD_BLOCKSIZE_MAX);
+            }
+        }
+        run_bt(
+            &vec![0u8; 300_000],
+            CParams::for_level(13, 300_000),
+            ZSTD_BLOCKSIZE_MAX,
+        );
+    }
+
+    #[test]
+    fn bt_tiny_inputs() {
+        for n in 0..48usize {
+            let src: Vec<u8> = (0..n).map(|i| (i % 5) as u8).collect();
+            let cp = lazy_params(13, src.len().max(1), Strategy::BtLazy2, 5);
+            run_bt(&src, cp, ZSTD_BLOCKSIZE_MAX);
+            run_bt(&src, cp, 7);
         }
     }
 

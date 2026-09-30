@@ -4,7 +4,8 @@
 //! fresh one, and whenever the two bounds prove a block compressed
 //! (`sum < block_len - ZSTD_minGain`) the block must come out compressed.
 //! The blocks come from a replica of the driver's job and block loop whose
-//! output is checked against `compress_with`.
+//! output is checked against `compress_with` with the pre-splitter off
+//! (`block_splitter_level` 1), since the replica cuts 128 KiB blocks.
 //!
 //! The corpus sweep is ignored by default; run it in release:
 //!
@@ -80,7 +81,7 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     let cparams = CParams::for_level(level, data.len());
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
     let overlap = overlap_size(&cparams, 0, false);
-    let jobs = job_ranges(data.len(), job_size_for(None, &cparams, false, overlap));
+    let jobs = job_ranges(data.len(), job_size_for(None, overlap));
     let fresh = BlockState::initial();
     let mut out = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
@@ -167,6 +168,7 @@ fn check(data: &[u8], level: i32, name: &str) -> Tally {
         data,
         &CompressOptions {
             level,
+            block_splitter_level: 1,
             ..CompressOptions::default()
         },
     );
