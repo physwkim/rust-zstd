@@ -79,8 +79,8 @@ fn stages(
 fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     let cparams = CParams::for_level(level, data.len());
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
-    let overlap = overlap_size(&cparams, 0);
-    let jobs = job_ranges(data.len(), job_size_for(None, cparams.window_log, overlap));
+    let overlap = overlap_size(&cparams, 0, false);
+    let jobs = job_ranges(data.len(), job_size_for(None, &cparams, false, overlap));
     let fresh = BlockState::initial();
     let mut out = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
