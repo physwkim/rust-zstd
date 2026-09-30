@@ -2110,6 +2110,7 @@ struct BlockHeader {
 // Literals Section
 // ============================================================
 
+#[derive(Clone, Copy)]
 enum LiteralsSectionType {
     Raw,
     RLE,
@@ -2117,6 +2118,7 @@ enum LiteralsSectionType {
     Treeless,
 }
 
+#[derive(Clone, Copy)]
 struct LiteralsSection {
     regenerated_size: u32,
     compressed_size: Option<u32>,
@@ -2252,6 +2254,7 @@ impl LiteralsSection {
 #[derive(Copy, Clone)]
 struct CompressionModes(u8);
 
+#[derive(Clone, Copy)]
 enum ModeType {
     Predefined,
     RLE,
@@ -2280,6 +2283,7 @@ impl CompressionModes {
     }
 }
 
+#[derive(Clone, Copy)]
 struct SequencesHeader {
     num_sequences: u32,
     modes: Option<CompressionModes>,
@@ -2783,6 +2787,66 @@ const WILDCOPY_OVERLENGTH: usize = 32;
 /// (libzstd WILDCOPY_VECLEN).
 const WILDCOPY_VECLEN: usize = 16;
 
+/// Parameters of one of the three sequence code tables.
+struct SeqTableKind {
+    max_log: u8,
+    max_code: u8,
+    default_log: u8,
+    default_distribution: &'static [i32],
+    base: &'static [u32],
+    bits: &'static [u8],
+    name: &'static str,
+}
+
+/// LL, OF, ML: the order of their descriptions in a sequences section.
+const SEQ_TABLES: [SeqTableKind; 3] = [
+    SeqTableKind {
+        max_log: LL_MAX_LOG,
+        max_code: MAX_LITERAL_LENGTH_CODE,
+        default_log: LL_DEFAULT_ACC_LOG,
+        default_distribution: &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
+        base: &LL_BASE,
+        bits: &LL_BITS,
+        name: "LL",
+    },
+    SeqTableKind {
+        max_log: OF_MAX_LOG,
+        max_code: MAX_OFFSET_CODE,
+        default_log: OF_DEFAULT_ACC_LOG,
+        default_distribution: &OFFSET_DEFAULT_DISTRIBUTION,
+        base: &OF_BASE,
+        bits: &OF_BITS,
+        name: "OF",
+    },
+    SeqTableKind {
+        max_log: ML_MAX_LOG,
+        max_code: MAX_MATCH_LENGTH_CODE,
+        default_log: ML_DEFAULT_ACC_LOG,
+        default_distribution: &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
+        base: &ML_BASE,
+        bits: &ML_BITS,
+        name: "ML",
+    },
+];
+
+impl CompressionModes {
+    /// Modes of the LL, OF and ML tables, in `SEQ_TABLES` order.
+    fn all(self) -> [ModeType; 3] {
+        [self.ll_mode(), self.of_mode(), self.ml_mode()]
+    }
+}
+
+impl FSEScratch {
+    /// The table for `SEQ_TABLES[t]`.
+    fn table_mut(&mut self, t: usize) -> &mut FSETable {
+        match t {
+            0 => &mut self.literal_lengths,
+            1 => &mut self.offsets,
+            _ => &mut self.match_lengths,
+        }
+    }
+}
+
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
 fn build_sequence_tables(
@@ -2795,76 +2859,42 @@ fn build_sequence_tables(
         .ok_or_else(|| "Missing compression mode".to_string())?;
 
     let mut bytes_read = 0;
-    bytes_read += build_sequence_table(
-        modes.ll_mode(),
-        &source[bytes_read..],
-        &mut scratch.literal_lengths,
-        LL_MAX_LOG,
-        MAX_LITERAL_LENGTH_CODE,
-        LL_DEFAULT_ACC_LOG,
-        &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
-        &LL_BASE,
-        &LL_BITS,
-        "LL",
-    )?;
-    bytes_read += build_sequence_table(
-        modes.of_mode(),
-        &source[bytes_read..],
-        &mut scratch.offsets,
-        OF_MAX_LOG,
-        MAX_OFFSET_CODE,
-        OF_DEFAULT_ACC_LOG,
-        &OFFSET_DEFAULT_DISTRIBUTION,
-        &OF_BASE,
-        &OF_BITS,
-        "OF",
-    )?;
-    bytes_read += build_sequence_table(
-        modes.ml_mode(),
-        &source[bytes_read..],
-        &mut scratch.match_lengths,
-        ML_MAX_LOG,
-        MAX_MATCH_LENGTH_CODE,
-        ML_DEFAULT_ACC_LOG,
-        &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
-        &ML_BASE,
-        &ML_BITS,
-        "ML",
-    )?;
+    for (t, mode) in modes.all().into_iter().enumerate() {
+        bytes_read += build_sequence_table(
+            mode,
+            &source[bytes_read..],
+            scratch.table_mut(t),
+            &SEQ_TABLES[t],
+        )?;
+    }
     Ok(bytes_read)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_sequence_table(
     mode: ModeType,
     source: &[u8],
     table: &mut FSETable,
-    max_log: u8,
-    max_code: u8,
-    default_log: u8,
-    default_distribution: &[i32],
-    base: &[u32],
-    bits: &[u8],
-    name: &str,
+    kind: &SeqTableKind,
 ) -> Result<usize, String> {
+    let codes = Some((kind.base, kind.bits));
     match mode {
-        ModeType::FSECompressed => table.build_decoder(source, max_log, Some((base, bits))),
+        ModeType::FSECompressed => table.build_decoder(source, kind.max_log, codes),
         ModeType::RLE => {
             let Some(&code) = source.first() else {
-                return Err(format!("Missing byte for RLE {} table", name));
+                return Err(format!("Missing byte for RLE {} table", kind.name));
             };
-            if code > max_code {
-                return Err(format!("RLE {} code {} exceeds max", name, code));
+            if code > kind.max_code {
+                return Err(format!("RLE {} code {} exceeds max", kind.name, code));
             }
-            table.build_rle(code, base, bits);
+            table.build_rle(code, kind.base, kind.bits);
             Ok(1)
         }
         ModeType::Predefined => {
             if !table.predefined {
                 table.build_from_probabilities(
-                    default_log,
-                    default_distribution,
-                    Some((base, bits)),
+                    kind.default_log,
+                    kind.default_distribution,
+                    codes,
                 )?;
                 table.predefined = true;
             }
@@ -2872,7 +2902,10 @@ fn build_sequence_table(
         }
         ModeType::Repeat => {
             if table.decode.is_empty() {
-                return Err(format!("Repeat mode without a previous {} table", name));
+                return Err(format!(
+                    "Repeat mode without a previous {} table",
+                    kind.name
+                ));
             }
             Ok(0)
         }
@@ -3371,13 +3404,21 @@ fn decode_frame(
     Ok(())
 }
 
-fn decompress_block(
-    raw: &[u8],
-    workspace: &mut DecoderScratch,
-    frame_base: usize,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    let content_size = raw.len() as u32;
+/// A compressed block's sections, located from their headers
+/// (ZSTD_decodeLiteralsBlock's and ZSTD_decodeSeqHeaders' size parsing).
+#[derive(Clone, Copy)]
+struct BlockParts<'a> {
+    literals: LiteralsSection,
+    /// The literals section after its header: the raw bytes, the RLE byte,
+    /// or the Huffman tree description followed by the streams.
+    literals_src: &'a [u8],
+    sequences: SequencesHeader,
+    /// Everything after the sequences header: the FSE table descriptions,
+    /// then the sequence bitstream.
+    sequences_src: &'a [u8],
+}
+
+fn split_block(raw: &[u8]) -> Result<BlockParts<'_>, String> {
     let mut section = LiteralsSection::new();
     let bytes_in_literals_header = section.parse_from_header(raw)?;
     let raw = &raw[bytes_in_literals_header as usize..];
@@ -3399,40 +3440,50 @@ fn decompress_block(
         ));
     }
 
-    let raw_literals = &raw[..upper_limit_for_literals];
-
-    workspace.literals_buffer.clear();
-    let bytes_used_in_literals_section = decode_literals(
-        &section,
-        &mut workspace.huf,
-        raw_literals,
-        &mut workspace.literals_buffer,
-    )?;
-    assert!(
-        section.regenerated_size == workspace.literals_buffer.len() as u32,
-        "Wrong number of literals: {}, Should have been: {}",
-        workspace.literals_buffer.len(),
-        section.regenerated_size
-    );
-    assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
-    let literals_len = workspace.literals_buffer.len();
-    workspace
-        .literals_buffer
-        .resize(literals_len + WILDCOPY_OVERLENGTH, 0);
-
+    let literals_src = &raw[..upper_limit_for_literals];
     let raw = &raw[upper_limit_for_literals..];
 
-    let mut seq_section = SequencesHeader::new();
-    let bytes_in_sequence_header = seq_section.parse_from_header(raw)?;
-    let raw = &raw[bytes_in_sequence_header as usize..];
+    let mut sequences = SequencesHeader::new();
+    let bytes_in_sequence_header = sequences.parse_from_header(raw)?;
+    Ok(BlockParts {
+        literals: section,
+        literals_src,
+        sequences,
+        sequences_src: &raw[bytes_in_sequence_header as usize..],
+    })
+}
 
+/// Decode the block's literals into `target` (cleared first) and append
+/// `WILDCOPY_OVERLENGTH` bytes of slack.
+fn decode_block_literals(
+    parts: &BlockParts<'_>,
+    huf: &mut HuffmanScratch,
+    target: &mut Vec<u8>,
+) -> Result<(), String> {
+    target.clear();
+    let used = decode_literals(&parts.literals, huf, parts.literals_src, target)?;
     assert!(
-        u32::from(bytes_in_literals_header)
-            + bytes_used_in_literals_section
-            + u32::from(bytes_in_sequence_header)
-            + raw.len() as u32
-            == content_size
+        parts.literals.regenerated_size == target.len() as u32,
+        "Wrong number of literals: {}, Should have been: {}",
+        target.len(),
+        parts.literals.regenerated_size
     );
+    assert!(used as usize == parts.literals_src.len());
+    target.resize(target.len() + WILDCOPY_OVERLENGTH, 0);
+    Ok(())
+}
+
+fn decompress_block(
+    raw: &[u8],
+    workspace: &mut DecoderScratch,
+    frame_base: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    let parts = split_block(raw)?;
+    decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
+    let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
+    let seq_section = parts.sequences;
+    let raw = parts.sequences_src;
 
     if seq_section.num_sequences != 0 {
         let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
