@@ -4,11 +4,13 @@
 //! picks its row by `(n <= 256 KiB) + (n <= 128 KiB) + (n <= 16 KiB)`), so
 //! every strategy row, including the small-input btlazy2 rows, is reached,
 //! plus a 4 MiB input as one job (default options) and in 512 KiB jobs
-//! (several jobs with overlap). Inputs are generated from fixed seeds, so the gate needs no
-//! file outside the repository and both feature builds must match the same
-//! file (serial and parallel agreement). Each frame is also compressed on a
-//! reused `Compressor` and must equal the fresh frame, and must decode
-//! through our decoder and libzstd.
+//! (several jobs with overlap), both also with a content checksum, those
+//! frames compared with libzstd's (`ZSTD_c_checksumFlag` 1, and for the
+//! jobs `ZSTD_c_nbWorkers` 2). Inputs are generated from fixed seeds, so the
+//! gate needs no file outside the repository and both feature builds must
+//! match the same file (serial and parallel agreement). Each frame is also
+//! compressed on a reused `Compressor` and must equal the fresh frame, and
+//! must decode through our decoder and libzstd.
 //!
 //! Ignored by default (release build recommended):
 //!
@@ -20,6 +22,8 @@
 //! On a mismatch the differing rows are printed with their strategy so an
 //! intended change can be classified; after review, regenerate the file with
 //! `ZSTD_BLESS=1` and commit it with the change that caused it.
+
+mod common;
 
 use rust_zstd::compress::{CParams, CompressOptions, Compressor};
 use std::collections::BTreeMap;
@@ -142,14 +146,17 @@ fn compute() -> BTreeMap<String, String> {
     let mut rows = BTreeMap::new();
     for (name, data) in &inputs {
         for level in LEVELS {
-            let mut cases: Vec<(usize, Option<usize>)> =
-                EDGE_SIZES.iter().map(|&n| (n, None)).collect();
-            cases.push((LARGE, None));
-            cases.push((LARGE, Some(512 << 10)));
-            for (n, job_size) in cases {
+            let mut cases: Vec<(usize, Option<usize>, bool)> =
+                EDGE_SIZES.iter().map(|&n| (n, None, false)).collect();
+            for checksum in [false, true] {
+                cases.push((LARGE, None, checksum));
+                cases.push((LARGE, Some(512 << 10), checksum));
+            }
+            for (n, job_size, checksum) in cases {
                 let src = &data[..n];
                 let opts = CompressOptions {
                     level,
+                    checksum,
                     job_size,
                     ..CompressOptions::default()
                 };
@@ -168,8 +175,21 @@ fn compute() -> BTreeMap<String, String> {
                     zstd::bulk::decompress(&frame, n).unwrap() == src,
                     "{name} {n} L{level}: libzstd"
                 );
+                if checksum {
+                    use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::*;
+                    let mut params =
+                        vec![(ZSTD_c_compressionLevel, level), (ZSTD_c_checksumFlag, 1)];
+                    if let Some(j) = job_size {
+                        params.extend([(ZSTD_c_nbWorkers, 2), (ZSTD_c_jobSize, j as i32)]);
+                    }
+                    assert!(
+                        common::c_compress2(src, &params) == frame,
+                        "{name} {n} L{level} checksum: frame differs from libzstd"
+                    );
+                }
                 let strategy = CParams::for_level(level, n).strategy;
                 let job = job_size.map_or("def".to_string(), |j| format!("{}K", j >> 10));
+                let job = if checksum { job + "+c" } else { job };
                 rows.insert(
                     format!("{name:<6} {n:>7} L{level:<2} {job:>4}"),
                     format!(
