@@ -112,14 +112,15 @@ impl CompressOptions {
     /// into several jobs, so the `parallel` feature can compress them
     /// concurrently; the frame still does not depend on the thread count.
     ///
-    /// Measured on 8 threads against the default options (`tests/mt_grid.rs`,
-    /// median of four runs) on the 8 MiB ELF and Rust-source corpus files:
-    /// the size cost is at most 0.17% at levels 1 to 7 and 0.55% at level
-    /// 11 (ELF), and the speedup (ELF / source) is 1.14x / 1.03x at level 1,
-    /// 1.85x / 2.48x at 3, 1.74x / 2.27x at 5, 2.01x / 2.14x at 7 and
-    /// 2.29x / 1.92x at 11. A 1 MiB input is one job under either option,
-    /// so its frame and speed are unchanged. Reproduce with four runs of
-    /// the following and the per-cell median of `rs MB/s`:
+    /// Measured on 8 threads against the default options, one job
+    /// (`tests/mt_grid.rs`, median of four runs), on the 8 MiB ELF and
+    /// Rust-source corpus files: the size cost (ELF / source) is 0.02% /
+    /// 0.75% at level 1, -0.02% / 0.28% at 3, 0.04% / 0.05% at 5, 0.20% /
+    /// 0.07% at 7 and 0.58% / 0.08% at 11, and the speedup is 3.14x /
+    /// 2.68x at level 1, 2.18x / 2.17x at 3, 1.82x / 2.51x at 5, 1.86x /
+    /// 2.27x at 7 and 1.81x / 1.64x at 11. An input of at most 2 MiB is one
+    /// job under either option. Reproduce with four runs of the following
+    /// and the per-cell median of `rs MB/s`:
     ///
     /// ```text
     /// ZSTD_BENCH_ITERS=11 ZSTD_GRID_JOBS=2048K ZSTD_GRID_OVERLAPS=8 \
