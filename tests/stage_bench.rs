@@ -21,7 +21,8 @@
 use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{
-    compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions, Compressor,
+    compress_with, job_prefix, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
+    Compressor,
 };
 use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
 use rust_zstd::{fse, huf};
@@ -61,16 +62,12 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
     for (k, job) in jobs.iter().enumerate() {
         let first_job = k == 0;
         let last_job = k + 1 == jobs.len();
-        let origin = if first_job {
-            job.start
-        } else {
-            job.start.saturating_sub(overlap)
-        };
+        let prefix = job_prefix(job, first_job, overlap);
         let t = Instant::now();
-        let mut ms = MatchState::new(cparams, origin);
+        let mut ms = MatchState::new(cparams, prefix.start);
         let mut prev = BlockState::initial();
         if !first_job {
-            block::load_prefix(&mut ms, data, origin..job.start);
+            block::load_prefix(&mut ms, data, prefix);
             prev.invalidate_rep_codes();
         }
         st.block += t.elapsed();

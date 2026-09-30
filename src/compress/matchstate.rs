@@ -585,10 +585,11 @@ impl EnteredBlock {
     }
 }
 
-/// The indexed suffix of a raw-content prefix inside the window, its
-/// overflow check done. Only [`MatchState::enter_prefix`] makes one, and
-/// the strategies' `load_prefix` take it, so no prefix reaches the tables
-/// without entering the window first.
+/// The indexed suffix of a raw-content prefix inside the window, more
+/// than [`HASH_READ_SIZE`] positions, its overflow check done and
+/// `next_to_update` at its start. Only [`MatchState::enter_prefix`] makes
+/// one, and the strategies' `load_prefix` take it, so no prefix reaches the
+/// tables without entering the window first.
 #[derive(Debug)]
 pub struct EnteredPrefix(Range<usize>);
 
@@ -763,20 +764,22 @@ impl MatchState {
         EnteredBlock(positions)
     }
 
-    /// `ZSTD_loadDictionaryContent`'s window step for the raw-content
-    /// prefix at `prefix`: the window covers all of it, see
-    /// `MatchState::enter`. Only the last
-    /// `1 << min(max(hashLog + 3, chainLog + 1), 31)` positions are to be
-    /// indexed ("larger than we can reasonably index in our tables"), and
-    /// they get the overflow check when more than [`HASH_READ_SIZE`].
-    /// Returns them.
-    pub fn enter_prefix(&mut self, prefix: Range<usize>) -> EnteredPrefix {
+    /// `ZSTD_loadDictionaryContent` up to its table fill, for the
+    /// raw-content prefix at `prefix`: the window covers all of it (see
+    /// `MatchState::enter`), and `next_to_update` is the first of the
+    /// positions to index, the last
+    /// `1 << min(max(hashLog + 3, chainLog + 1), 31)` ("larger than we can
+    /// reasonably index in our tables"). At most [`HASH_READ_SIZE`] of them
+    /// are left unindexed (`None`, no overflow check and no table write);
+    /// more get the overflow check and are returned.
+    pub fn enter_prefix(&mut self, prefix: Range<usize>) -> Option<EnteredPrefix> {
         let cp = &self.cparams;
         let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
         let indexed = prefix.start.max(prefix.end.saturating_sub(max_dict_size))..prefix.end;
-        let checked = (indexed.len() > HASH_READ_SIZE).then(|| indexed.clone());
-        self.enter(prefix, checked);
-        EnteredPrefix(indexed)
+        let long = indexed.len() > HASH_READ_SIZE;
+        self.enter(prefix, long.then(|| indexed.clone()));
+        self.next_to_update = self.index(indexed.start);
+        long.then_some(EnteredPrefix(indexed))
     }
 
     /// The indices of an entered prefix's suffix to index.

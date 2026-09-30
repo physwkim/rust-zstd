@@ -486,8 +486,7 @@ pub mod testutil {
         rep: [u32; 3],
     ) -> Stats {
         let mut ms = MatchState::new(cp, origin);
-        if job_start > origin {
-            let prefix = ms.enter_prefix(origin..job_start);
+        if let Some(prefix) = ms.enter_prefix(origin..job_start) {
             let view = ms.view(src);
             (f.load_prefix)(&mut ms, view, prefix);
         }

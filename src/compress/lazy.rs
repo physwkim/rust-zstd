@@ -1754,8 +1754,8 @@ pub fn compress_block_with(
 }
 
 /// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms, for the finder
-/// `ms.search_method`: insert every
-/// position of `range` up to `end - HASH_READ_SIZE`
+/// `ms.search_method`: insert every position of the entered prefix from
+/// `ms.next_to_update` (its start) up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
 /// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
 /// finder's tag table is zeroed first, as C does here. The hash width is
@@ -1763,58 +1763,47 @@ pub fn compress_block_with(
 /// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
 /// level table produces.
 pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
-    let range = ms.prefix_indices(prefix);
-    let end = range.end;
+    let end = ms.prefix_indices(prefix).end;
     assert_block_bounds(ms, src, end);
-    let start = ms.next_to_update.max(range.start).max(ms.window_low());
-    if end >= start + HASH_READ_SIZE {
-        let target = end - HASH_READ_SIZE;
-        ms.next_to_update = start;
-        // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
-        // and the table sizes were asserted above.
-        match ms.search_method {
-            SearchMethod::HashChain => {
-                match mls_of(&ms.cparams) {
-                    4 => unsafe {
-                        HcSearch::<4>::insert_and_find_first_index(ms, src, target, false)
-                    },
-                    5 => unsafe {
-                        HcSearch::<5>::insert_and_find_first_index(ms, src, target, false)
-                    },
-                    _ => unsafe {
-                        HcSearch::<6>::insert_and_find_first_index(ms, src, target, false)
-                    },
+    let target = end - HASH_READ_SIZE;
+    // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
+    // and the table sizes were asserted above.
+    match ms.search_method {
+        SearchMethod::HashChain => {
+            match mls_of(&ms.cparams) {
+                4 => unsafe { HcSearch::<4>::insert_and_find_first_index(ms, src, target, false) },
+                5 => unsafe { HcSearch::<5>::insert_and_find_first_index(ms, src, target, false) },
+                _ => unsafe { HcSearch::<6>::insert_and_find_first_index(ms, src, target, false) },
+            };
+        }
+        SearchMethod::RowHash => {
+            ms.ws.tables_mut().2.fill(0);
+            macro_rules! go {
+                ($mls:literal, $row_log:literal) => {
+                    unsafe {
+                        let mut next_to_update = ms.next_to_update;
+                        let mut t = RowTables::of(ms);
+                        RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
+                            .update_internal(&mut t, &mut next_to_update, src, target, false);
+                        ms.next_to_update = next_to_update;
+                    }
                 };
             }
-            SearchMethod::RowHash => {
-                ms.ws.tables_mut().2.fill(0);
-                macro_rules! go {
-                    ($mls:literal, $row_log:literal) => {
-                        unsafe {
-                            let mut next_to_update = ms.next_to_update;
-                            let mut t = RowTables::of(ms);
-                            RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
-                                .update_internal(&mut t, &mut next_to_update, src, target, false);
-                            ms.next_to_update = next_to_update;
-                        }
-                    };
-                }
-                match (mls_of(&ms.cparams), row_log_of(&ms.cparams)) {
-                    (4, 4) => go!(4, 4),
-                    (4, 5) => go!(4, 5),
-                    (4, _) => go!(4, 6),
-                    (5, 4) => go!(5, 4),
-                    (5, 5) => go!(5, 5),
-                    (5, _) => go!(5, 6),
-                    (_, 4) => go!(6, 4),
-                    (_, 5) => go!(6, 5),
-                    _ => go!(6, 6),
-                }
+            match (mls_of(&ms.cparams), row_log_of(&ms.cparams)) {
+                (4, 4) => go!(4, 4),
+                (4, 5) => go!(4, 5),
+                (4, _) => go!(4, 6),
+                (5, 4) => go!(5, 4),
+                (5, 5) => go!(5, 5),
+                (5, _) => go!(5, 6),
+                (_, 4) => go!(6, 4),
+                (_, 5) => go!(6, 5),
+                _ => go!(6, 6),
             }
-            // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
-            // the dictionary table fully sorted".
-            SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
         }
+        // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
+        // the dictionary table fully sorted".
+        SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
     }
     ms.next_to_update = end;
 }
@@ -1847,8 +1836,7 @@ mod tests {
         method: SearchMethod,
     ) -> (usize, usize) {
         let mut ms = MatchState::new_for(cp, origin, method);
-        if job_start > origin {
-            let prefix = ms.enter_prefix(origin..job_start);
+        if let Some(prefix) = ms.enter_prefix(origin..job_start) {
             let view = ms.view(src);
             load_prefix(&mut ms, view, prefix);
             assert_eq!(ms.next_to_update, ms.index(job_start));

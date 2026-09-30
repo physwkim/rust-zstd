@@ -422,15 +422,14 @@ fn fill_double_hash_table_from(ms: &mut MatchState, src: Src, start: usize, end:
     }
 }
 
-/// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`:
-/// insert every third position of `src[range]` from `ms.next_to_update`
-/// into both tables, then set `next_to_update = range.end`.
+/// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`
+/// for an entered prefix: insert every third position from
+/// `ms.next_to_update` (its start) into both tables, then set
+/// `next_to_update` to its end.
 pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
-    let range = ms.prefix_indices(prefix);
-    let end = range.end;
+    let end = ms.prefix_indices(prefix).end;
     assert!(end <= src.end());
-    let start = ms.next_to_update.max(range.start);
-    fill_double_hash_table_from(ms, src, start, end);
+    fill_double_hash_table_from(ms, src, ms.next_to_update, end);
     ms.next_to_update = end;
 }
 

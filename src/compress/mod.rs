@@ -501,22 +501,18 @@ fn compress_job(
     out: &mut Vec<u8>,
 ) {
     // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
-    let origin = if first_job {
-        job.start
-    } else {
-        job.start.saturating_sub(overlap)
-    };
+    let prefix = job_prefix(&job, first_job, overlap);
     let mut ms = match ms_slot.take() {
         Some(mut ms) => {
-            ms.reset(cparams, origin);
+            ms.reset(cparams, prefix.start);
             ms
         }
-        None => MatchState::new(cparams, origin),
+        None => MatchState::new(cparams, prefix.start),
     };
     ms.set_correct_frequently(frequently);
     let mut initial = BlockState::initial();
     if !first_job {
-        block::load_prefix(&mut ms, data, origin..job.start);
+        block::load_prefix(&mut ms, data, prefix);
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
@@ -755,6 +751,24 @@ pub fn job_ranges(len: usize, job_size: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// The raw-content prefix of `job` (ZSTDMT's `job->prefix`), where its
+/// window starts: the `overlap` bytes before it, none for the first job,
+/// and none under 8 bytes, which `ZSTD_compress_insertDictionary` ignores
+/// (`dictSize < 8`) before `ZSTD_loadDictionaryContent` would put them in
+/// the window.
+pub fn job_prefix(job: &Range<usize>, first_job: bool, overlap: usize) -> Range<usize> {
+    let start = if first_job {
+        job.start
+    } else {
+        job.start.saturating_sub(overlap)
+    };
+    if job.start - start < 8 {
+        job.start..job.start
+    } else {
+        start..job.start
+    }
+}
+
 /// `ZSTDMT_computeOverlapSize`: `overlap_log` as `ZSTD_c_overlapLog` (see
 /// [`CompressOptions::overlap_log`]); without long distance matching the
 /// result is `0` or `1 << (window_log - (9 - overlap_log))`, with it
@@ -907,6 +921,64 @@ mod tests {
         for level in [1, 3, 7] {
             let c = compress(&data, level);
             assert_eq!(crate::decompress(&c).unwrap(), data, "level {level}");
+        }
+    }
+
+    /// A job's prefix: none for the first job or under 8 bytes, else the
+    /// overlap, cut at the input start.
+    #[test]
+    fn job_prefix_boundaries() {
+        let job = 100..200;
+        assert_eq!(job_prefix(&job, true, 64), 100..100);
+        assert_eq!(job_prefix(&job, false, 0), 100..100);
+        assert_eq!(job_prefix(&job, false, 7), 100..100);
+        assert_eq!(job_prefix(&job, false, 8), 92..100);
+        assert_eq!(job_prefix(&job, false, 9), 91..100);
+        assert_eq!(job_prefix(&job, false, 1000), 0..100);
+        assert_eq!(job_prefix(&(7..20), false, 1000), 7..7);
+        assert_eq!(job_prefix(&(8..20), false, 1000), 0..8);
+    }
+
+    /// `ZSTD_compress_insertDictionary` ignores a raw-content prefix under 8
+    /// bytes: the job's window starts at the job, so it writes the blocks it
+    /// writes without an overlap. The job repeats its 7-byte prefix, which a
+    /// window starting there would reach.
+    #[test]
+    fn job_ignores_a_prefix_under_8_bytes() {
+        let mut data = noise(7, 5);
+        for _ in 0..300 {
+            data.extend_from_within(..7);
+        }
+        data.extend_from_slice(&text(8 << 10));
+        let job = 7..data.len();
+        for level in [1, 3, 5, 7, 13, 16] {
+            let opts = CompressOptions {
+                level,
+                ..Default::default()
+            };
+            let cparams = CParams::for_level(level, data.len());
+            let run = |overlap: usize| {
+                let mut ctx = Context::default();
+                let mut out = Vec::new();
+                compress_job(
+                    &data,
+                    cparams,
+                    false,
+                    block_sizing(&opts, &cparams, true, 0),
+                    overlap,
+                    job.clone(),
+                    false,
+                    true,
+                    false,
+                    false,
+                    &mut ctx.ms,
+                    &mut ctx.scratch,
+                    &mut BlockLdm::Off,
+                    &mut out,
+                );
+                out
+            };
+            assert!(run(7) == run(0), "L{level}");
         }
     }
 

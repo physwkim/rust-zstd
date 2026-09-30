@@ -19,7 +19,7 @@ use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH}
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::seqstore::Seq;
 use rust_zstd::compress::{
-    compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
+    compress_with, job_prefix, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
 };
 use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
 use rust_zstd::fse::{self, sequences_section_bound, FseState};
@@ -85,15 +85,11 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     for (k, job) in jobs.iter().enumerate() {
         let first_job = k == 0;
         let last_job = k + 1 == jobs.len();
-        let origin = if first_job {
-            job.start
-        } else {
-            job.start.saturating_sub(overlap)
-        };
-        let mut ms = MatchState::new(cparams, origin);
+        let prefix = job_prefix(job, first_job, overlap);
+        let mut ms = MatchState::new(cparams, prefix.start);
         let mut prev = BlockState::initial();
         if !first_job {
-            block::load_prefix(&mut ms, data, origin..job.start);
+            block::load_prefix(&mut ms, data, prefix);
             prev.invalidate_rep_codes();
         }
         let mut scratch = BlockScratch::new(block_size);

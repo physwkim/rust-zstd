@@ -148,14 +148,17 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
     out.extend_from_slice(compressed);
 }
 
-/// `ZSTD_loadDictionaryContent` for a raw-content prefix: `data[range]`
-/// enters the window ([`MatchState::enter_prefix`]) and its indexed suffix
-/// goes into the strategy's tables before the first block of a job;
-/// matches may still reach the whole prefix, which `window_low` keeps
-/// valid. `range` is in positions of `data`, starting at the window's
-/// origin.
+/// `ZSTD_loadDictionaryContent` for a job's raw-content prefix
+/// ([`super::job_prefix`]): `data[range]` enters the window
+/// ([`MatchState::enter_prefix`]) and its indexed suffix, unless
+/// `HASH_READ_SIZE` bytes or less, goes into the strategy's tables before
+/// the first block of the job; matches may still reach the whole prefix,
+/// which `window_low` keeps valid. `range` is in positions of `data`,
+/// starting at the window's origin.
 pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
-    let prefix = ms.enter_prefix(range);
+    let Some(prefix) = ms.enter_prefix(range) else {
+        return;
+    };
     let src = ms.view(data);
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, prefix),
@@ -875,6 +878,43 @@ fn compress_blocks_pipelined(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::common::HASH_READ_SIZE;
+    use crate::compress::lazy::SearchMethod;
+
+    /// `ZSTD_loadDictionaryContent` leaves a prefix of `HASH_READ_SIZE`
+    /// bytes or less unindexed, `nextToUpdate` at its start and the row
+    /// finder's tags not even cleared; one byte more goes to the table fill
+    /// (which for fast and dfast inserts nothing yet) and `nextToUpdate`
+    /// moves to its end. Every strategy and lazy finder.
+    #[test]
+    fn prefix_of_hash_read_size_bytes_is_not_indexed() {
+        let data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
+        let finders = [
+            (1, SearchMethod::HashChain),
+            (3, SearchMethod::HashChain),
+            (5, SearchMethod::HashChain),
+            (5, SearchMethod::RowHash),
+            (13, SearchMethod::BinaryTree),
+            (16, SearchMethod::BinaryTree),
+        ];
+        for (level, method) in finders {
+            for len in [HASH_READ_SIZE, HASH_READ_SIZE + 1] {
+                let name = format!("L{level} {method:?}, {len} bytes");
+                let mut ms = MatchState::new_for(CParams::for_level(level, 1 << 20), 0, method);
+                ms.tables_mut().2.fill(0xa5);
+                load_prefix(&mut ms, &data, 0..len);
+                let (hash, chain, tag) = ms.tables();
+                let untouched =
+                    hash.iter().chain(chain).all(|&e| e == 0) && tag.iter().all(|&t| t == 0xa5);
+                if len <= HASH_READ_SIZE {
+                    assert!(untouched, "{name}: tables written");
+                    assert_eq!(ms.next_to_update, ms.index(0), "{name}");
+                } else {
+                    assert_eq!(ms.next_to_update, ms.index(len), "{name}");
+                }
+            }
+        }
+    }
 
     /// A prefix longer than `1 << max(hashLog + 3, chainLog + 1)` is indexed
     /// only over that suffix; one byte shorter is indexed whole.
