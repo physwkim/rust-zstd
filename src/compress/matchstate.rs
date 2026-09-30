@@ -11,7 +11,7 @@
 //! Indices continue from one input of a context to the next, as after
 //! `ZSTD_resetCCtx_internal` with `ZSTDirp_continue`: a context's first
 //! window starts at [`WINDOW_START_INDEX`], and each later one (the next
-//! frame of a reused `Compressor`, the next job on a job's context) starts
+//! frame of a reused `Compressor`, the next job on a pooled context) starts
 //! at the index where the previous input ended (`ZSTD_window_clear`). What
 //! earlier inputs stored stays in the tables, all of it below the new
 //! `window_low`, where every finder takes an entry for a miss as it takes
