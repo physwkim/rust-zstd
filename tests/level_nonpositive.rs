@@ -1,14 +1,6 @@
 //! Levels `<= 0` as libzstd reads them (`ZSTD_getCParams_internal`): `0`
 //! is `ZSTD_CLEVEL_DEFAULT`, a negative level is row 0's fast strategy with
 //! `targetLength = -level`. Whole frames must equal libzstd's.
-//!
-//! Until job 0 indexes its first byte at `ZSTD_WINDOW_START_INDEX`, our
-//! search starts one byte later than libzstd's and never references
-//! `data[0]`. The inputs are chosen so that this cannot change a sequence:
-//! the text starts with two bytes that never recur and matches every few
-//! bytes, so dfast (step 1) and fast at level -1 (step 2) visit every
-//! position from the third on in both; random input has no matches at any
-//! step.
 
 mod common;
 

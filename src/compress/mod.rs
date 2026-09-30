@@ -285,9 +285,9 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
 /// appended to `out`, on `ctx`'s state reset for this job. Job 0 starts
-/// from `repStartValue` with `window_low = 1`; a later job indexes
-/// `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on the
-/// raw-content prefix), starts with invalidated repeat offsets and no
+/// from `repStartValue` with its first byte as the window start; a later
+/// job's window starts `overlap` bytes before it, and the job indexes that
+/// prefix (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
 /// obtained from the previous job. `sizing` cuts the job into blocks;
 /// `split` runs every block through the post-sequence splitter.
@@ -305,21 +305,22 @@ fn compress_job(
     ctx: &mut JobContext,
     out: &mut Vec<u8>,
 ) {
-    let window_low = if first_job {
-        1
+    // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
+    let origin = if first_job {
+        job.start
     } else {
-        job.start.saturating_sub(overlap).max(1)
+        job.start.saturating_sub(overlap)
     };
     let mut ms = match ctx.ms.take() {
         Some(mut ms) => {
-            ms.reset(cparams, window_low);
+            ms.reset(cparams, origin);
             ms
         }
-        None => MatchState::new(cparams, window_low),
+        None => MatchState::new(cparams, origin),
     };
     let mut initial = BlockState::initial();
     if !first_job {
-        block::load_prefix(&mut ms, data, window_low..job.start);
+        block::load_prefix(&mut ms, data, origin..job.start);
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);

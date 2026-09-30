@@ -5,9 +5,8 @@
 //! (`ZSTD_initStats_ultra`). The match finder is `bt_get_all_matches` in
 //! [`bt`].
 //!
-//! Positions follow the [`MatchState`] convention (absolute indices into
-//! `src`, `window_low >= 1`); the block loop starts like the lazy one, see
-//! [`lazy`](super::lazy).
+//! Positions are the indices [`MatchState`] assigns, libzstd's
+//! `window.base`-relative ones.
 //!
 //! Literals are always entropy-coded for these strategies
 //! (`ZSTD_resolveLiteralsCompression` disables them only for negative
@@ -23,7 +22,7 @@
 //! (C keeps them in `ms->opt`, outside the block state too).
 
 use super::bt::{self, assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
-use super::common::{simd_level, HASH_READ_SIZE};
+use super::common::{simd_level, Src, HASH_READ_SIZE};
 use super::matchstate::MatchState;
 use super::params::Strategy;
 use super::seqstore::{update_rep, SeqStore};
@@ -364,7 +363,7 @@ type GetAllMatches = unsafe fn(
     &mut [Match; ZSTD_OPT_SIZE],
     &mut MatchState,
     &mut usize,
-    &[u8],
+    Src,
     usize,
     usize,
     &[u32; 3],
@@ -381,7 +380,7 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -414,7 +413,7 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
-    src: &[u8],
+    src: Src,
     ip: usize,
     i_high_limit: usize,
     rep: &[u32; 3],
@@ -463,7 +462,7 @@ fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
 /// repeat-offset history on entry and is updated on exit.
 pub fn compress_block(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -487,7 +486,7 @@ pub fn compress_block(
             // prefix, no ldm preprocessing.
             if state.stats.lit_length_sum == 0 // first block
                 && out.seqs.is_empty() // no ldm
-                && block.start <= ms.window_low // start of frame, nothing loaded nor skipped
+                && block.start == ms.window_low // start of frame, nothing loaded nor skipped
                 && block.len() > ZSTD_PREDEF_THRESHOLD
             {
                 init_stats_ultra(
@@ -523,7 +522,7 @@ pub fn compress_block(
 fn init_stats_ultra(
     ms: &mut MatchState,
     state: &mut OptState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &[u32; 3],
     out: &mut SeqStore,
@@ -561,7 +560,7 @@ fn init_stats_ultra(
 fn opt_generic<const OPT_LEVEL: u32>(
     ms: &mut MatchState,
     state: &mut OptState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -575,7 +574,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let istart = block.start;
     let iend = block.end;
     let mut anchor = istart;
-    // Below `istart + 1` the loop condition is false anyway (`ip >= 1`).
+    // Below `istart + 1` the loop condition is false anyway.
     let ilimit = iend.saturating_sub(8);
     let cp = ms.cparams;
 
@@ -586,11 +585,10 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let mut last_stretch = Optimal::default();
 
     // init
-    stats.rescale_freqs::<OPT_LEVEL>(&src[block.clone()]);
-    // C: `ip += (ip == prefixStart)` with ip starting at the block start;
-    // here positions below `window_low` do not exist (block 0).
+    stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end));
+    // C: `ip += (ip == prefixStart)`
     let prefix_lowest = ms.window_low;
-    let mut ip = istart.max(prefix_lowest);
+    let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
     }
@@ -601,7 +599,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             // find first match
             let litlen = (ip - anchor) as u32;
             let ll0 = (litlen == 0) as u32;
-            // SAFETY: `ip + 8 < iend <= src.len()`, `ip >= window_low`, the
+            // SAFETY: `ip + 8 < iend <= src.end()`, `ip >= window_low`, the
             // tables passed `assert_opt_bounds` in `compress_block`.
             let nb_matches = unsafe {
                 get_all_matches(
@@ -689,7 +687,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     {
                         let litlen = opt[c - 1].litlen + 1;
                         let price = opt[c - 1].price
-                            + stats.lit_price::<OPT_LEVEL>(src[ip + c - 1])
+                            + stats.lit_price::<OPT_LEVEL>(src.at(ip + c - 1))
                             + stats.ll_inc_price::<OPT_LEVEL>(litlen);
                         debug_assert!(price < 1_000_000_000); // overflow check
                         if price <= opt[c].price {
@@ -705,10 +703,10 @@ fn opt_generic<const OPT_LEVEL: u32>(
                                 // check next position, in case it would be
                                 // cheaper
                                 let with1literal = prev_match.price
-                                    + stats.lit_price::<OPT_LEVEL>(src[ip + c])
+                                    + stats.lit_price::<OPT_LEVEL>(src.at(ip + c))
                                     + stats.ll_inc_price::<OPT_LEVEL>(1);
                                 let with_more_literals = price
-                                    + stats.lit_price::<OPT_LEVEL>(src[ip + c])
+                                    + stats.lit_price::<OPT_LEVEL>(src.at(ip + c))
                                     + stats.ll_inc_price::<OPT_LEVEL>(litlen + 1);
                                 if with1literal < with_more_literals
                                     && with1literal < opt[c + 1].price
@@ -923,7 +921,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             }
 
             debug_assert!(anchor + llen <= iend);
-            stats.update_stats(&src[anchor..anchor + llen], off_base, mlen);
+            stats.update_stats(src.slice(anchor, anchor + llen), off_base, mlen);
             out.store_seq(src, anchor, llen, iend, off_base, mlen as usize);
             anchor += advance;
             ip = anchor;
@@ -995,7 +993,7 @@ mod tests {
         for strategy in [Strategy::BtOpt, Strategy::BtUltra, Strategy::BtUltra2] {
             for min_match in 3..=7 {
                 let cp = cparams(strategy, min_match, data.len());
-                let s = roundtrip_blocks(&OPT, &data, cp, 1 << 17, 1, [1, 4, 8]);
+                let s = roundtrip_blocks(&OPT, &data, cp, 1 << 17, [1, 4, 8]);
                 assert!(s.seqs > 1000, "{strategy:?} mm{min_match}: {s:?}");
                 assert!(s.cross_block_matches > 0, "{strategy:?} mm{min_match}");
                 let s = roundtrip_job(&OPT, &data, cp, 1 << 17, 5000, 200 << 10, [1, 4, 8]);
@@ -1020,7 +1018,7 @@ mod tests {
         for strategy in [Strategy::BtOpt, Strategy::BtUltra2] {
             let mut cp = cparams(strategy, 3, data.len());
             cp.window_log = 17;
-            roundtrip_blocks(&OPT, &data, cp, 1 << 17, 1, [1, 4, 8]);
+            roundtrip_blocks(&OPT, &data, cp, 1 << 17, [1, 4, 8]);
         }
     }
 
@@ -1044,21 +1042,22 @@ mod tests {
             .chain((3..=6).map(|mm| (letters.clone(), mm)))
         {
             let cp = cparams(Strategy::BtUltra2, min_match, data.len());
-            let mut ms = MatchState::new(cp, 1);
+            let mut ms = MatchState::new(cp, 0);
+            let (view, block) = (ms.view(&data), ms.index(0)..ms.index(data.len()));
             let mut state = ms.opt.take().unwrap();
             let mut out = SeqStore::new();
             let get_all_matches = select_get_all_matches(cp.min_match, simd_level());
             init_stats_ultra(
                 &mut ms,
                 &mut state,
-                &data,
-                0..data.len(),
+                view,
+                block,
                 &[1, 4, 8],
                 &mut out,
                 get_all_matches,
             );
             assert!(out.seqs.is_empty() && out.lits.is_empty());
-            assert_eq!(ms.next_to_update, 1, "mm{min_match}");
+            assert_eq!(ms.next_to_update, ms.index(0), "mm{min_match}");
             assert!(state.stats.lit_length_sum > 0, "mm{min_match}");
             let (hash, _, hash3) = ms.ws.opt_tables_mut();
             assert!(hash.iter().all(|&e| e == 0), "mm{min_match}: hash");

@@ -87,15 +87,15 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     for (k, job) in jobs.iter().enumerate() {
         let first_job = k == 0;
         let last_job = k + 1 == jobs.len();
-        let window_low = if first_job {
-            1
+        let origin = if first_job {
+            job.start
         } else {
-            job.start.saturating_sub(overlap).max(1)
+            job.start.saturating_sub(overlap)
         };
-        let mut ms = MatchState::new(cparams, window_low);
+        let mut ms = MatchState::new(cparams, origin);
         let mut prev = BlockState::initial();
         if !first_job {
-            block::load_prefix(&mut ms, data, window_low..job.start);
+            block::load_prefix(&mut ms, data, origin..job.start);
             prev.invalidate_rep_codes();
         }
         let mut scratch = BlockScratch::new(block_size);

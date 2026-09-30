@@ -5,17 +5,13 @@
 //! chosen like `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto)`: rows whenever
 //! the strategy supports them and `window_log > 14`.
 //!
-//! Positions follow the [`MatchState`](super::matchstate) convention: absolute
-//! indices into `src`, `window_low >= 1`, table entry `0` means empty. libzstd
-//! indexes the same data from `ZSTD_WINDOW_START_INDEX = 1`, so a Rust
-//! position `p` corresponds to the C index `p + 1`; the only observable
-//! difference is that the first byte of a stream can never be the start of a
-//! match here (its position would be `0`), and that the block loop therefore
-//! begins one byte later than C on block 0 (`ip = max(istart, window_low)`
-//! followed by C's own `ip += (dictAndPrefixLength == 0)` skip).
+//! Positions are the indices [`MatchState`](super::matchstate) assigns,
+//! libzstd's `window.base`-relative ones: table entry `0` means empty and
+//! `1` is [`DUBT_UNSORTED_MARK`], both below `window_low`.
 
 use super::common::{
-    byte, candidate_valid, count, read32, read64, tget, tset, MatchCount, HASH_READ_SIZE,
+    byte, candidate_valid, count, prefetch, read32, read64, tget, tset, MatchCount, Src,
+    HASH_READ_SIZE,
 };
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
@@ -48,7 +44,7 @@ const K_LAZY_SKIPPING_STEP: usize = 8;
 // ---------------------------------------------------------------------------
 // Small helpers. Unchecked reads follow `compress/common.rs`: every call site
 // states the bound that makes it sound. Inside a block those bounds rest on
-// `block.end <= src.len()` and the table sizes, both asserted once per block
+// `block.end <= src.end()` and the table sizes, both asserted once per block
 // in [`compress_block_with`] / [`load_prefix_with`], plus the loop limits
 // (`ip < ilimit`, `ilimit + ILIMIT_MARGIN <= iend`, `ILIMIT_MARGIN >= 8`).
 // ---------------------------------------------------------------------------
@@ -70,11 +66,11 @@ const PRIME6: u64 = 227718039650203;
 /// `< 1 << hbits`.
 ///
 /// # Safety
-/// `pos + HASH_READ_SIZE <= src.len()` (`MLS >= 5` reads 8 bytes).
+/// `pos + HASH_READ_SIZE <= src.end()` (`MLS >= 5` reads 8 bytes).
 #[inline(always)]
-unsafe fn hash_salted<const MLS: u32>(src: &[u8], pos: usize, hbits: u32, salt: u64) -> u32 {
+unsafe fn hash_salted<const MLS: u32>(src: Src, pos: usize, hbits: u32, salt: u64) -> u32 {
     debug_assert!((1..=32).contains(&hbits));
-    debug_assert!(pos + HASH_READ_SIZE <= src.len());
+    debug_assert!(pos + HASH_READ_SIZE <= src.end());
     match MLS {
         4 => (read32(src, pos).wrapping_mul(PRIME4) ^ (salt as u32)) >> (32 - hbits),
         5 => (((read64(src, pos) << 24).wrapping_mul(PRIME5) ^ salt) >> (64 - hbits)) as u32,
@@ -162,20 +158,20 @@ trait Search {
     /// # Safety
     /// As [`count`].
     #[inline(always)]
-    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    unsafe fn count(&self, src: Src, a: usize, b: usize, limit: usize) -> usize {
         count(src, a, b, limit)
     }
 
     /// Work done at block start and whenever lazy skipping ends
     /// (`ZSTD_row_fillHashCache` for the row finder; nothing for chains).
-    fn refill(&mut self, ms: &mut MatchState, src: &[u8], ilimit: usize);
+    fn refill(&mut self, ms: &mut MatchState, src: Src, ilimit: usize);
 
     /// `ZSTD_searchMax`: longest match at `ip` (limit `iend`), at least 4 to
     /// count; `off_base` receives its `OFFSET_TO_OFFBASE` when one is found.
     fn search_max(
         &mut self,
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         iend: usize,
         off_base: &mut u32,
@@ -193,12 +189,12 @@ impl<const MLS: u32> HcSearch<MLS> {
     /// `ip`'s hash.
     ///
     /// # Safety
-    /// `ip + HASH_READ_SIZE <= src.len()`; `hash_table` and `chain_table`
+    /// `ip + HASH_READ_SIZE <= src.end()`; `hash_table` and `chain_table`
     /// hold `1 << hash_log` and `1 << chain_log` entries.
     #[inline(always)]
     unsafe fn insert_and_find_first_index(
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         lazy_skipping: bool,
     ) -> u32 {
@@ -230,14 +226,14 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
     const ILIMIT_MARGIN: usize = 8;
 
     #[inline(always)]
-    fn refill(&mut self, _ms: &mut MatchState, _src: &[u8], _ilimit: usize) {}
+    fn refill(&mut self, _ms: &mut MatchState, _src: Src, _ilimit: usize) {}
 
     /// `ZSTD_HcFindBestMatch` (`ZSTD_noDict`).
     #[inline(always)]
     fn search_max(
         &mut self,
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         iend: usize,
         off_base: &mut u32,
@@ -252,7 +248,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
         let mut ml = 4 - 1;
 
         // SAFETY: `ip < ilimit` with `ilimit + ILIMIT_MARGIN <= iend <=
-        // src.len()`, `ILIMIT_MARGIN == HASH_READ_SIZE`; table sizes
+        // src.end()`, `ILIMIT_MARGIN == HASH_READ_SIZE`; table sizes
         // asserted per block ([`assert_block_bounds`]).
         let mut match_index =
             unsafe { Self::insert_and_find_first_index(ms, src, ip, lazy_skipping) } as usize;
@@ -261,13 +257,13 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
         // into the same compare so that a stale table entry is a miss, not
         // an out-of-bounds read.
         while candidate_valid(match_index, low_limit, curr) && nb_attempts > 0 {
-            // SAFETY: `match_index < ip` and `ip + ml < iend <= src.len()`
+            // SAFETY: `match_index < ip` and `ip + ml < iend <= src.end()`
             // (`ml` starts at 3 with `ip + 8 <= iend`, and a match reaching
             // `iend` ends the loop), so the reads at `+ ml - 3` and the
             // count stay inside `src`.
             let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
             if better {
-                // SAFETY: `match_index < ip <= iend <= src.len()`.
+                // SAFETY: `match_index < ip <= iend <= src.end()`.
                 let current_ml = unsafe { Search::count(self, src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
@@ -295,7 +291,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
 
 /// `ZSTD_DUBT_UNSORTED_MARK`: the second slot of a node that was inserted
 /// by [`BtSearch::update_dubt`] but not yet sorted into the tree. No real
-/// candidate is ever `1`: candidates are `> window_low >= 1`.
+/// candidate is ever `1`: candidates are `> window_low >= WINDOW_START_INDEX`.
 const DUBT_UNSORTED_MARK: usize = 1;
 
 /// `search_binaryTree`: a "delayed update binary tree" in the chain table,
@@ -350,10 +346,10 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
     /// chains, each marked unsorted.
     ///
     /// # Safety
-    /// `ip + HASH_READ_SIZE <= src.len()`; the tables have the sizes of
+    /// `ip + HASH_READ_SIZE <= src.end()`; the tables have the sizes of
     /// [`assert_block_bounds`].
     #[inline(always)]
-    unsafe fn update_dubt(ms: &mut MatchState, src: &[u8], ip: usize) {
+    unsafe fn update_dubt(ms: &mut MatchState, src: Src, ip: usize) {
         let hash_log = ms.cparams.hash_log;
         let bt_mask = BtParams::of(ms).bt_mask;
         let (hash_table, bt, _) = ms.ws.tables_mut();
@@ -375,12 +371,12 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
     /// descending past `bt_low`.
     ///
     /// # Safety
-    /// `curr < iend <= src.len()`; `bt.len() == 2 * (p.bt_mask + 1)`.
+    /// `curr < iend <= src.end()`; `bt.len() == 2 * (p.bt_mask + 1)`.
     #[inline(always)]
     unsafe fn insert_dubt1(
         self,
         bt: &mut [u32],
-        src: &[u8],
+        src: Src,
         curr: usize,
         iend: usize,
         mut nb_compares: u32,
@@ -449,13 +445,13 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
     /// `ZSTD_DUBT_findBestMatch` (`ZSTD_noDict`).
     ///
     /// # Safety
-    /// `ip + HASH_READ_SIZE <= iend <= src.len()`; the tables have the
+    /// `ip + HASH_READ_SIZE <= iend <= src.end()`; the tables have the
     /// sizes of [`assert_block_bounds`].
     #[inline(always)]
     unsafe fn find_best_match(
         self,
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         iend: usize,
         off_base: &mut u32,
@@ -588,12 +584,12 @@ impl<M: MatchCount, const MLS: u32> Search for BtSearch<M, MLS> {
     const ILIMIT_MARGIN: usize = 8;
 
     #[inline(always)]
-    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    unsafe fn count(&self, src: Src, a: usize, b: usize, limit: usize) -> usize {
         self.count.count(src, a, b, limit)
     }
 
     #[inline(always)]
-    fn refill(&mut self, _ms: &mut MatchState, _src: &[u8], _ilimit: usize) {}
+    fn refill(&mut self, _ms: &mut MatchState, _src: Src, _ilimit: usize) {}
 
     /// `ZSTD_BtFindBestMatch` (`ZSTD_noDict`); the tree ignores lazy
     /// skipping, as in C.
@@ -601,7 +597,7 @@ impl<M: MatchCount, const MLS: u32> Search for BtSearch<M, MLS> {
     fn search_max(
         &mut self,
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         iend: usize,
         off_base: &mut u32,
@@ -610,7 +606,7 @@ impl<M: MatchCount, const MLS: u32> Search for BtSearch<M, MLS> {
         if ip < ms.next_to_update {
             return 0; // skipped area
         }
-        // SAFETY: `ip < ilimit` with `ilimit + 8 <= iend <= src.len()`;
+        // SAFETY: `ip < ilimit` with `ilimit + 8 <= iend <= src.end()`;
         // table sizes asserted per block ([`assert_block_bounds`]).
         unsafe {
             Self::update_dubt(ms, src, ip);
@@ -663,7 +659,8 @@ fn swar_match_mask<const ROW_LOG: u32>(row: &[u8], tag: u8, head: u32) -> u64 {
     loop {
         // SAFETY: `i + 8 <= row.len()` (asserted above, `i` steps down by 8
         // from `len - 8`).
-        let mut chunk = unsafe { read64(row, i) } ^ splat;
+        let mut chunk =
+            unsafe { u64::from_le_bytes(*(row.as_ptr().add(i) as *const [u8; 8])) } ^ splat;
         chunk = ((chunk | X80).wrapping_sub(X01) | chunk) & X80; // byte MSB set iff byte != tag
         matches <<= CHUNK;
         matches |= chunk.wrapping_mul(EXTRACT_MAGIC) >> (64 - CHUNK);
@@ -867,7 +864,7 @@ mod arm {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 impl MatchCount for Sse4_2 {
     #[inline(always)]
-    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    unsafe fn count(self, src: Src, a: usize, b: usize, limit: usize) -> usize {
         count(src, a, b, limit)
     }
 }
@@ -875,7 +872,7 @@ impl MatchCount for Sse4_2 {
 #[cfg(target_arch = "aarch64")]
 impl MatchCount for Neon {
     #[inline(always)]
-    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    unsafe fn count(self, src: Src, a: usize, b: usize, limit: usize) -> usize {
         count(src, a, b, limit)
     }
 }
@@ -939,9 +936,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// the tag and hash tables, and `+ ROW_ENTRIES` stays `<=` it.
     ///
     /// # Safety
-    /// `pos + HASH_READ_SIZE <= src.len()`.
+    /// `pos + HASH_READ_SIZE <= src.end()`.
     #[inline(always)]
-    unsafe fn hash(hash_log: u32, hash_salt: u64, src: &[u8], pos: usize) -> u32 {
+    unsafe fn hash(hash_log: u32, hash_salt: u64, src: Src, pos: usize) -> u32 {
         let hbits = hash_log - ROW_LOG + ROW_HASH_TAG_BITS;
         hash_salted::<MLS>(src, pos, hbits, hash_salt)
     }
@@ -986,9 +983,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// (and prefetch the rows of) `idx..idx+8`, not beyond `i_limit`.
     ///
     /// # Safety
-    /// `i_limit + HASH_READ_SIZE <= src.len()`.
+    /// `i_limit + HASH_READ_SIZE <= src.end()`.
     #[inline(always)]
-    unsafe fn fill_hash_cache(&mut self, t: &RowTables, src: &[u8], idx: usize, i_limit: usize) {
+    unsafe fn fill_hash_cache(&mut self, t: &RowTables, src: Src, idx: usize, i_limit: usize) {
         let max_elems = if idx > i_limit { 0 } else { i_limit - idx + 1 };
         let lim = idx + ROW_HASH_CACHE_SIZE.min(max_elems);
         for i in idx..lim {
@@ -1007,9 +1004,9 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// by the hash of `idx + 8` and prefetch that row.
     ///
     /// # Safety
-    /// `idx + ROW_HASH_CACHE_SIZE + HASH_READ_SIZE <= src.len()`.
+    /// `idx + ROW_HASH_CACHE_SIZE + HASH_READ_SIZE <= src.end()`.
     #[inline(always)]
-    unsafe fn next_cached_hash(&mut self, t: &RowTables, src: &[u8], idx: usize) -> u32 {
+    unsafe fn next_cached_hash(&mut self, t: &RowTables, src: Src, idx: usize) -> u32 {
         let new_hash = Self::hash(t.hash_log, t.hash_salt, src, idx + ROW_HASH_CACHE_SIZE);
         Self::prefetch_row(
             t.hash,
@@ -1024,13 +1021,13 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// `ZSTD_row_update_internalImpl`: insert `start..end`.
     ///
     /// # Safety
-    /// `end + HASH_READ_SIZE <= src.len()`, plus `end + ROW_HASH_CACHE_SIZE`
+    /// `end + HASH_READ_SIZE <= src.end()`, plus `end + ROW_HASH_CACHE_SIZE`
     /// in place of `end` when `use_cache`; tables of `1 << hash_log` entries.
     #[inline(always)]
     unsafe fn update_impl(
         &mut self,
         t: &mut RowTables,
-        src: &[u8],
+        src: Src,
         start: usize,
         end: usize,
         use_cache: bool,
@@ -1054,14 +1051,14 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     /// `next_to_update = ip`.
     ///
     /// # Safety
-    /// `ip + HASH_READ_SIZE <= src.len()`, plus `ip + ROW_HASH_CACHE_SIZE`
+    /// `ip + HASH_READ_SIZE <= src.end()`, plus `ip + ROW_HASH_CACHE_SIZE`
     /// in place of `ip` when `use_cache`; tables of `1 << hash_log` entries.
     #[inline(always)]
     unsafe fn update_internal(
         &mut self,
         t: &mut RowTables,
         next_to_update: &mut usize,
-        src: &[u8],
+        src: Src,
         ip: usize,
         use_cache: bool,
     ) {
@@ -1090,15 +1087,15 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
     const ILIMIT_MARGIN: usize = 8 + ROW_HASH_CACHE_SIZE;
 
     #[inline(always)]
-    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    unsafe fn count(&self, src: Src, a: usize, b: usize, limit: usize) -> usize {
         self.mask.count(src, a, b, limit)
     }
 
     #[inline(always)]
-    fn refill(&mut self, ms: &mut MatchState, src: &[u8], ilimit: usize) {
+    fn refill(&mut self, ms: &mut MatchState, src: Src, ilimit: usize) {
         let next_to_update = ms.next_to_update;
         let t = RowTables::of(ms);
-        // SAFETY: `ilimit + ILIMIT_MARGIN <= iend <= src.len()` with
+        // SAFETY: `ilimit + ILIMIT_MARGIN <= iend <= src.end()` with
         // `ILIMIT_MARGIN >= HASH_READ_SIZE`.
         unsafe { self.fill_hash_cache(&t, src, next_to_update, ilimit) }
     }
@@ -1108,7 +1105,7 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
     fn search_max(
         &mut self,
         ms: &mut MatchState,
-        src: &[u8],
+        src: Src,
         ip: usize,
         iend: usize,
         off_base: &mut u32,
@@ -1133,7 +1130,7 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
 
         // Update the hashTable and tagTable up to (but not including) ip
         // SAFETY: `ip < ilimit` and `ilimit + 8 + ROW_HASH_CACHE_SIZE <=
-        // iend <= src.len()`, so every hashed position (`<= ip + 8`) has 8
+        // iend <= src.end()`, so every hashed position (`<= ip + 8`) has 8
         // readable bytes; tables are `1 << hash_log` long (asserted per
         // block).
         let hash = unsafe {
@@ -1174,7 +1171,7 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
             if !candidate_valid(match_index, low_limit, curr) {
                 break;
             }
-            prefetch_l1(src, match_index);
+            prefetch(src, match_index);
             // SAFETY: at most `nb_attempts <= ROW_ENTRIES <= 64` candidates
             // are stored, so `num_matches < match_buffer.len()`.
             unsafe { *self.match_buffer.get_unchecked_mut(num_matches) = match_index as u32 };
@@ -1199,12 +1196,12 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
             debug_assert!(match_index < curr && match_index >= low_limit);
             // read 4B starting from (match + ml + 1 - sizeof(U32))
             // SAFETY: `low_limit <= match_index < ip` (candidate_valid above)
-            // and `ip + ml < iend <= src.len()` (`ml` starts at 3 with `ip +
+            // and `ip + ml < iend <= src.end()` (`ml` starts at 3 with `ip +
             // 16 <= iend`; a match reaching `iend` ends the loop), so the
             // reads at `+ ml - 3` and the count stay inside `src`.
             let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
             if better {
-                // SAFETY: `match_index < ip <= iend <= src.len()`.
+                // SAFETY: `match_index < ip <= iend <= src.end()`.
                 let current_ml = unsafe { Search::count(self, src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
@@ -1229,7 +1226,7 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
 #[inline(always)]
 fn lazy_generic<S: Search>(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1239,7 +1236,7 @@ fn lazy_generic<S: Search>(
     let istart = block.start;
     let iend = block.end;
     let mut anchor = istart;
-    // Below `istart + 1` the loop conditions are false anyway (`ip >= 1`).
+    // Below `istart + 1` the loop conditions are false anyway.
     let ilimit = iend.saturating_sub(S::ILIMIT_MARGIN);
     let prefix_lowest = ms.window_low;
 
@@ -1248,9 +1245,8 @@ fn lazy_generic<S: Search>(
     let mut offset_saved1 = 0u32;
     let mut offset_saved2 = 0u32;
 
-    // C: `ip += (dictAndPrefixLength == 0)` with ip starting at the prefix
-    // start; here positions below `window_low` do not exist (block 0).
-    let mut ip = istart.max(prefix_lowest);
+    // C: `ip += (dictAndPrefixLength == 0)`
+    let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
     }
@@ -1272,12 +1268,11 @@ fn lazy_generic<S: Search>(
     search.refill(ms, src, ilimit);
 
     // SAFETY, for every unchecked read below: `ip <= ilimit` implies `ip +
-    // ILIMIT_MARGIN <= iend <= src.len()` with `ILIMIT_MARGIN >= 8` (when
-    // `ilimit` saturated to 0 no `ip >= 1` passes the tests), so 4-byte reads
-    // at `<= ip + 1` and counts starting `<= ip + 5` stay inside `src`. A rep
-    // offset is `> 0` and `<= ip - window_low` (clamped by `max_rep` above,
-    // or the distance to a candidate `>= low_limit >= window_low >= 1`, and
-    // `ip` only grows), so `ip - offset >= 1`.
+    // ILIMIT_MARGIN <= iend <= src.end()` with `ILIMIT_MARGIN >= 8`, so
+    // 4-byte reads at `<= ip + 1` and counts starting `<= ip + 5` stay inside
+    // `src`. A rep offset is `> 0` and `<= ip - window_low` (clamped by
+    // `max_rep` above, or the distance to a candidate `>= low_limit >=
+    // window_low`, and `ip` only grows), so `ip - offset >= src.lo()`.
     while ip < ilimit {
         let mut match_length = 0usize;
         let mut off_base = REPCODE1_TO_OFFBASE;
@@ -1399,8 +1394,8 @@ fn lazy_generic<S: Search>(
             // catch up
             if offbase_is_offset(off_base) {
                 let offset = offbase_to_offset(off_base) as usize;
-                // SAFETY: `1 <= start - 1 - offset < start - 1 < ip < iend <=
-                // src.len()` (`start > anchor >= 0`, `prefix_lowest >= 1`).
+                // SAFETY: `src.lo() <= prefix_lowest <= start - 1 - offset <
+                // start - 1 < ip < iend <= src.end()`.
                 while start > anchor
                     && start - offset > prefix_lowest
                     && unsafe { byte(src, start - 1) == byte(src, start - 1 - offset) }
@@ -1499,7 +1494,7 @@ fn detected_level() -> Level {
 fn row_block<M: TagMask + MatchCount>(
     mask: M,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1535,7 +1530,7 @@ fn row_block<M: TagMask + MatchCount>(
 #[inline(never)]
 fn row_block_scalar(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1555,7 +1550,7 @@ fn row_block_scalar(
 unsafe fn row_block_sse(
     mask: Sse4_2,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1575,7 +1570,7 @@ unsafe fn row_block_sse(
 unsafe fn row_block_avx2(
     mask: Avx2,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1595,7 +1590,7 @@ unsafe fn row_block_avx2(
 unsafe fn row_block_neon(
     mask: Neon,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1608,7 +1603,7 @@ unsafe fn row_block_neon(
 #[inline(never)]
 fn hc_block(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1627,7 +1622,7 @@ fn hc_block(
 fn bt_block<M: MatchCount>(
     count: M,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1669,7 +1664,7 @@ fn bt_block<M: MatchCount>(
 #[inline(never)]
 fn bt_block_scalar(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1689,7 +1684,7 @@ fn bt_block_scalar(
 unsafe fn bt_block_avx2(
     count: Avx2,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1704,7 +1699,7 @@ unsafe fn bt_block_avx2(
 /// updated for the next block; returns the anchor of the trailing literals.
 pub fn compress_block(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1717,13 +1712,13 @@ pub fn compress_block(
 /// block (or prefix) ends inside `src`, the tables have the sizes
 /// [`MatchState::new`] gives them, and a row hash fits in 32 bits
 /// (`ZSTD_adjustCParams_internal` caps `hashLog` at `rowLog + 24`).
-fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMethod) {
+fn assert_block_bounds(ms: &MatchState, src: Src, end: usize, method: SearchMethod) {
     let cp = &ms.cparams;
     let (hash_table, chain_table, tag_table) = ms.tables();
     assert!(
-        end <= src.len(),
-        "block end {end} past src.len() {}",
-        src.len()
+        end <= src.end(),
+        "block end {end} past src.end() {}",
+        src.end()
     );
     assert_eq!(hash_table.len(), 1usize << cp.hash_log, "hash_table size");
     match method {
@@ -1751,7 +1746,7 @@ fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMe
 /// only selects the tag-compare and match-count kernels.
 pub fn compress_block_with(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -1783,7 +1778,7 @@ pub fn compress_block_with(
 
 /// `ZSTD_loadDictionaryContent`, lazy arm, for the finder of
 /// [`default_search_method`]: see [`load_prefix_with`].
-pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     load_prefix_with(ms, src, range, default_search_method(&ms.cparams))
 }
 
@@ -1796,19 +1791,14 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
 /// minMatch, 6)` as in the block loop, where C's chain loader passes
 /// `minMatch` itself; they differ only for `minMatch == 7`, which no level
 /// table produces.
-pub fn load_prefix_with(
-    ms: &mut MatchState,
-    src: &[u8],
-    range: Range<usize>,
-    method: SearchMethod,
-) {
+pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, method: SearchMethod) {
     let end = range.end;
     assert_block_bounds(ms, src, end, method);
     let start = ms.next_to_update.max(range.start).max(ms.window_low);
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
-        // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.len()`
+        // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
         // and the table sizes were asserted above.
         match method {
             SearchMethod::HashChain => {
@@ -1858,6 +1848,7 @@ pub fn load_prefix_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::common::testutil::run_block;
     use super::*;
     use crate::compress::params::CParams;
     use crate::constants::ZSTD_BLOCKSIZE_MAX;
@@ -1870,21 +1861,23 @@ mod tests {
     }
 
     /// Compress `src[job_start..]` block by block on a state whose window
-    /// starts at `window_low`, loading `[window_low, job_start)` as prefix,
-    /// and check that every block reconstructs byte-exactly.
+    /// starts at `origin`, loading `[origin, job_start)` as prefix, and
+    /// check that every block reconstructs byte-exactly.
     fn run_blocks(
         src: &[u8],
         cp: CParams,
-        window_low: usize,
+        origin: usize,
         job_start: usize,
         block_size: usize,
         rep0: [u32; 3],
         method: SearchMethod,
     ) -> (usize, usize) {
-        let mut ms = MatchState::new(cp, window_low);
-        if job_start > window_low {
-            load_prefix_with(&mut ms, src, window_low..job_start, method);
-            assert_eq!(ms.next_to_update, job_start);
+        let mut ms = MatchState::new(cp, origin);
+        let view = ms.view(src);
+        if job_start > origin {
+            let range = ms.index(origin)..ms.index(job_start);
+            load_prefix_with(&mut ms, view, range, method);
+            assert_eq!(ms.next_to_update, ms.index(job_start));
         }
         let mut rep = rep0;
         let mut store = SeqStore::new();
@@ -1894,15 +1887,17 @@ mod tests {
             let end = (start + block_size).min(src.len());
             store.clear();
             let rep_in = rep;
+            let block = ms.index(start)..ms.index(end);
             let anchor = compress_block_with(
                 &mut ms,
-                src,
-                start..end,
+                view,
+                block,
                 &mut rep,
                 &mut store,
                 method,
                 Level::fallback(),
             );
+            let anchor = ms.pos(anchor);
             assert!(anchor >= start && anchor <= end);
             store.lits.extend_from_slice(&src[anchor..end]);
             let total: usize = store
@@ -1914,7 +1909,7 @@ mod tests {
             assert_eq!(total, end - start, "block {start}..{end}");
             let got = store.reconstruct(&src[..start], rep_in);
             assert_eq!(got, &src[start..end], "block {start}..{end} {cp:?}");
-            assert!(ms.next_to_update <= end);
+            assert!(ms.next_to_update <= ms.index(end));
             nseqs += store.seqs.len();
             nlits += store.lits.len();
             start = end;
@@ -1929,7 +1924,7 @@ mod tests {
     ];
 
     fn run_m(src: &[u8], cp: CParams, block_size: usize, method: SearchMethod) -> (usize, usize) {
-        run_blocks(src, cp, 1, 0, block_size, [1, 4, 8], method)
+        run_blocks(src, cp, 0, 0, block_size, [1, 4, 8], method)
     }
 
     /// Both finders from a fresh state; returns the hash-chain statistics.
@@ -2084,7 +2079,7 @@ mod tests {
 
     /// Sequences, literals, final repcodes and anchors of every block.
     fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
-        let mut ms = MatchState::new(cp, 1);
+        let mut ms = MatchState::new(cp, 0);
         collect_on(&mut ms, src, block_size, default_search_method(&cp), level)
     }
 
@@ -2100,12 +2095,14 @@ mod tests {
         let mut rep = [1u32, 4, 8];
         let mut all = SeqStore::new();
         let mut store = SeqStore::new();
+        let view = ms.view(src);
         let mut start = 0;
         while start < src.len() {
             let end = (start + block_size).min(src.len());
             store.clear();
-            let anchor =
-                compress_block_with(ms, src, start..end, &mut rep, &mut store, method, level);
+            let block = ms.index(start)..ms.index(end);
+            let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, method, level);
+            let anchor = ms.pos(anchor);
             all.seqs.extend_from_slice(&store.seqs);
             all.lits.extend_from_slice(&store.lits);
             all.lits.extend_from_slice(&src[anchor..end]);
@@ -2134,11 +2131,11 @@ mod tests {
         for m in METHODS {
             for (first, cp_first, second, cp_second) in [(&a, cp_a, &b, cp_b), (&b, cp_b, &a, cp_a)]
             {
-                let mut reused = MatchState::new(cp_first, 1);
+                let mut reused = MatchState::new(cp_first, 0);
                 collect_on(&mut reused, first, 40_000, m, level);
                 assert!(reused.tables().0.iter().any(|&e| e != 0));
-                reused.reset(cp_second, 1);
-                let mut fresh = MatchState::new(cp_second, 1);
+                reused.reset(cp_second, 0);
+                let mut fresh = MatchState::new(cp_second, 0);
                 assert!(reused.tables() == fresh.tables());
                 assert_eq!(reused.next_to_update, fresh.next_to_update);
                 assert_eq!(reused.window_low, fresh.window_low);
@@ -2284,7 +2281,7 @@ mod tests {
         run_blocks(
             src,
             cp,
-            1,
+            0,
             0,
             block_size,
             [1, 4, 8],
@@ -2402,10 +2399,17 @@ mod tests {
     fn rep_disabled_at_block_start_is_restored() {
         let src = vec![7u8; 4000];
         let cp = CParams::for_level(5, src.len());
-        let mut ms = MatchState::new(cp, 1);
+        let mut ms = MatchState::new(cp, 0);
         let mut store = SeqStore::new();
         let mut rep = [100u32, 4, 8];
-        let anchor = compress_block(&mut ms, &src, 0..src.len(), &mut rep, &mut store);
+        let anchor = run_block(
+            compress_block,
+            &mut ms,
+            &src,
+            0..src.len(),
+            &mut rep,
+            &mut store,
+        );
         store.lits.extend_from_slice(&src[anchor..]);
         assert_eq!(store.reconstruct(&[], [100, 4, 8]), src);
         assert_eq!(rep[1], 100);
@@ -2422,9 +2426,9 @@ mod tests {
         // SAFETY: `0 + 8 <= src.len()`.
         let (h4, h5, h6) = unsafe {
             (
-                hash_salted::<4>(src, 0, 20, 0),
-                hash_salted::<5>(src, 0, 20, 0) as u64,
-                hash_salted::<6>(src, 0, 20, 0) as u64,
+                hash_salted::<4>(Src::new(src, 0, 0), 0, 20, 0),
+                hash_salted::<5>(Src::new(src, 0, 0), 0, 20, 0) as u64,
+                hash_salted::<6>(Src::new(src, 0, 0), 0, 20, 0) as u64,
             )
         };
         // ZSTD_hash4Ptr: (readLE32 * 2654435761) >> (32 - 20)

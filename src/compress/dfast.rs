@@ -9,8 +9,8 @@
 //! [`super::fast`].
 
 use super::common::{
-    byte, candidate_valid, hash_ptr, prefetch_unbounded, read32, read64, simd_level, tget, tset,
-    MatchCount, HASH_READ_SIZE, K_SEARCH_STRENGTH,
+    byte, candidate_valid, hash_ptr, prefetch, read32, read64, simd_level, tget, tset, MatchCount,
+    Src, HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
 use super::matchstate::MatchState;
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
@@ -40,9 +40,9 @@ enum Found {
 ///
 /// * (I1) ip-derived positions: inside the search loop
 ///   `ip < ip1 <= ilimit = iend - 8`, so 8-byte reads at `ip`, `ip1` and
-///   the 4-byte read at `ip + 1` end before `iend <= src.len()`; after a
+///   the 4-byte read at `ip + 1` end before `iend <= src.end()`; after a
 ///   match the reads at `curr + 2`, `ip - 2`, `ip - 1` and `ip` are guarded
-///   by `ip <= ilimit` (`curr + 4 <= ip`). `ip - 1 >= prefix_lowest >= 1`.
+///   by `ip <= ilimit` (`curr + 4 <= ip`). `ip - 1 >= prefix_lowest >= src.lo()`.
 /// * (I2) candidates: a table entry is used only when
 ///   `prefix_lowest_index <= idx < ip` (`idxl1`: `< ip1`), see
 ///   [`candidate_valid`].
@@ -54,7 +54,7 @@ enum Found {
 fn compress_block_generic<const MLS: u32, C: MatchCount>(
     mc: C,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -63,7 +63,7 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
     let hbits_s = ms.cparams.chain_log;
     let istart = block.start;
     let iend = block.end;
-    assert!(istart <= iend && iend <= src.len());
+    assert!(istart <= iend && iend <= src.end());
     assert!((1..=32).contains(&hbits_l) && (1..=32).contains(&hbits_s));
     // presumes that, if there is a dictionary, it must be using Attach mode
     let prefix_lowest_index = ms.lowest_prefix_index(iend);
@@ -72,8 +72,8 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
 
     let mut anchor = istart;
-    // init: ip += ((ip - prefixLowest) == 0), after the block-0 clamp of fast.rs.
-    let mut ip = istart.max(prefix_lowest);
+    // init: ip += ((ip - prefixLowest) == 0)
+    let mut ip = istart;
     ip += (ip == prefix_lowest) as usize;
 
     let mut offset_1 = rep[0];
@@ -210,8 +210,8 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
                 }
 
                 if ip1 >= next_step {
-                    prefetch_unbounded(src, ip1 + 64);
-                    prefetch_unbounded(src, ip1 + 128);
+                    prefetch(src, ip1 + 64);
+                    prefetch(src, ip1 + 128);
                     step += 1;
                     next_step += K_STEP_INCR;
                 }
@@ -325,7 +325,7 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
 /// `ZSTD_compressBlock_doubleFast`. Contract as [`super::fast::compress_block`].
 pub fn compress_block(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -343,7 +343,7 @@ pub fn compress_block(
 #[inline(never)]
 fn compress_block_scalar(
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -362,7 +362,7 @@ fn compress_block_scalar(
 unsafe fn compress_block_avx2(
     mc: Avx2,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -374,7 +374,7 @@ unsafe fn compress_block_avx2(
 fn compress_block_level<C: MatchCount>(
     mc: C,
     ms: &mut MatchState,
-    src: &[u8],
+    src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
@@ -388,17 +388,12 @@ fn compress_block_level<C: MatchCount>(
 }
 
 /// `ZSTD_fillDoubleHashTableForCCtx(ms, end, ZSTD_dtlm_fast)`.
-fn fill_double_hash_table<const MLS: u32>(
-    ms: &mut MatchState,
-    src: &[u8],
-    start: usize,
-    end: usize,
-) {
+fn fill_double_hash_table<const MLS: u32>(ms: &mut MatchState, src: Src, start: usize, end: usize) {
     const FAST_HASH_FILL_STEP: usize = 3;
     let hbits_l = ms.cparams.hash_log;
     let hbits_s = ms.cparams.chain_log;
     assert!((1..=32).contains(&hbits_l) && (1..=32).contains(&hbits_s));
-    assert!(end <= src.len());
+    assert!(end <= src.end());
     let (hash_long, hash_small, _) = ms.ws.tables_mut();
     assert_eq!(hash_long.len(), 1usize << hbits_l);
     assert_eq!(hash_small.len(), 1usize << hbits_s);
@@ -407,7 +402,7 @@ fn fill_double_hash_table<const MLS: u32>(
     // with iend = end - HASH_READ_SIZE. Only i == 0 is loaded for
     // ZSTD_dtlm_fast: both tables get every fastHashFillStep position.
     while ip + FAST_HASH_FILL_STEP - 1 + HASH_READ_SIZE <= end {
-        // SAFETY: ip + 10 <= end <= src.len(); hashes < their table sizes.
+        // SAFETY: ip + 10 <= end <= src.end(); hashes < their table sizes.
         unsafe {
             tset(hash_small, hash_ptr::<MLS>(src, ip, hbits_s), ip);
             tset(hash_long, hash_ptr::<8>(src, ip, hbits_l), ip);
@@ -419,11 +414,10 @@ fn fill_double_hash_table<const MLS: u32>(
 /// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`:
 /// insert every third position of `src[range]` from `ms.next_to_update`
 /// into both tables, then set `next_to_update = range.end`.
-pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     let end = range.end;
-    assert!(end <= src.len());
+    assert!(end <= src.end());
     let start = ms.next_to_update.max(range.start);
-    debug_assert!(start >= 1, "position 0 is the empty-entry sentinel");
     match ms.cparams.min_match {
         5 => fill_double_hash_table::<5>(ms, src, start, end),
         6 => fill_double_hash_table::<6>(ms, src, start, end),
@@ -455,7 +449,6 @@ mod tests {
                 &data,
                 CParams::for_level(level, data.len()),
                 1 << 17,
-                1,
                 [1, 4, 8],
             );
             assert!(
@@ -473,7 +466,6 @@ mod tests {
             &data,
             CParams::for_level(3, data.len()),
             1 << 17,
-            1,
             [1, 4, 8],
         );
         assert!(stats.cross_block_matches > 0);
@@ -483,17 +475,9 @@ mod tests {
     fn job_start_with_overlap_prefix_and_zero_reps() {
         let data = synthetic_text(600_000, 7);
         let cp = CParams::for_level(3, data.len());
-        let window_low = 200_001;
-        let job_start = window_low + (1 << 16);
-        let stats = roundtrip_job(
-            &finder(),
-            &data,
-            cp,
-            1 << 17,
-            window_low,
-            job_start,
-            [0, 0, 0],
-        );
+        let origin = 200_000;
+        let job_start = origin + (1 << 16);
+        let stats = roundtrip_job(&finder(), &data, cp, 1 << 17, origin, job_start, [0, 0, 0]);
         assert!(
             stats.prefix_matches > 0,
             "no match referenced the loaded prefix"
@@ -511,7 +495,6 @@ mod tests {
                     data,
                     CParams::for_level(level, len),
                     1 << 17,
-                    1,
                     [1, 4, 8],
                 );
             }
@@ -531,7 +514,7 @@ mod tests {
                 target_length: 0,
                 strategy: Strategy::DFast,
             };
-            let stats = roundtrip_blocks(&finder(), &data, cp, 1 << 17, 1, [1, 4, 8]);
+            let stats = roundtrip_blocks(&finder(), &data, cp, 1 << 17, [1, 4, 8]);
             assert!(stats.seqs > 100, "mls {min_match}");
         }
     }
@@ -548,18 +531,25 @@ mod tests {
             target_length: 0,
             strategy: Strategy::DFast,
         };
-        roundtrip_blocks(&finder(), &data, cp, 1 << 10, 1, [1, 4, 8]);
-        roundtrip_blocks(&finder(), &data, cp, 1000, 1, [1, 4, 8]);
+        roundtrip_blocks(&finder(), &data, cp, 1 << 10, [1, 4, 8]);
+        roundtrip_blocks(&finder(), &data, cp, 1000, [1, 4, 8]);
     }
 
     #[test]
     fn rep_disabled_at_block_start_is_restored() {
         let src = vec![7u8; 4000];
         let cp = CParams::for_level(3, src.len());
-        let mut ms = MatchState::new(cp, 1);
+        let mut ms = MatchState::new(cp, 0);
         let mut store = SeqStore::new();
         let mut rep = [100u32, 4, 8];
-        let anchor = compress_block(&mut ms, &src, 0..src.len(), &mut rep, &mut store);
+        let anchor = run_block(
+            compress_block,
+            &mut ms,
+            &src,
+            0..src.len(),
+            &mut rep,
+            &mut store,
+        );
         store.lits.extend_from_slice(&src[anchor..]);
         assert_eq!(store.reconstruct(&[], [100, 4, 8]), src);
         assert_eq!(rep[1], 100);
@@ -572,14 +562,28 @@ mod tests {
     fn stale_table_entries_beyond_the_input_are_ignored() {
         let long = synthetic_text(300_000, 9);
         let cp = CParams::for_level(3, long.len());
-        let mut ms = MatchState::new(cp, 1);
+        let mut ms = MatchState::new(cp, 0);
         let mut store = SeqStore::new();
         let mut rep = [1u32, 4, 8];
-        compress_block(&mut ms, &long, 0..long.len(), &mut rep, &mut store);
+        run_block(
+            compress_block,
+            &mut ms,
+            &long,
+            0..long.len(),
+            &mut rep,
+            &mut store,
+        );
         let short = &long[..20_000];
         store.clear();
         let mut rep = [1u32, 4, 8];
-        let anchor = compress_block(&mut ms, short, 0..short.len(), &mut rep, &mut store);
+        let anchor = run_block(
+            compress_block,
+            &mut ms,
+            short,
+            0..short.len(),
+            &mut rep,
+            &mut store,
+        );
         store.lits.extend_from_slice(&short[anchor..]);
         assert_eq!(store.reconstruct(&[], [1, 4, 8]), short);
     }

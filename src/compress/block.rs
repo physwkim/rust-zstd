@@ -147,14 +147,17 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 }
 
 /// `ZSTD_loadDictionaryContent` for a raw-content prefix: index
-/// `src[range]` into the strategy's tables before the first block of a job.
+/// `data[range]` into the strategy's tables before the first block of a job.
 /// Only the last `1 << min(max(hashLog + 3, chainLog + 1), 31)` bytes are
 /// indexed ("larger than we can reasonably index in our tables"); matches
 /// may still reach the whole prefix, which `window_low` keeps valid.
-pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
+/// `range` is in positions of `data`, starting at the window's origin.
+pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
     let cp = &ms.cparams;
     let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
-    let range = range.start.max(range.end.saturating_sub(max_dict_size))..range.end;
+    let src = ms.view(data);
+    let range =
+        ms.index(range.start.max(range.end.saturating_sub(max_dict_size)))..ms.index(range.end);
     match ms.cparams.strategy {
         Strategy::Fast => fast::load_prefix(ms, src, range),
         Strategy::DFast => dfast::load_prefix(ms, src, range),
@@ -177,21 +180,25 @@ fn limit_update_after_long_match(ms: &mut MatchState, curr: usize) {
 }
 
 /// `ZSTD_buildSeqStore` for a block worth compressing: reset `store`, apply
-/// the nextToUpdate clamp, run the strategy's block compressor and store the
-/// trailing literals (`ZSTD_storeLastLiterals`). `rep` holds the committed
-/// repeat offsets on entry and the block's candidates on return.
+/// the nextToUpdate clamp, run the strategy's block compressor on the
+/// indices of positions `block` of `data`, and store the trailing literals
+/// (`ZSTD_storeLastLiterals`). `rep` holds the committed repeat offsets on
+/// entry and the block's candidates on return.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
 #[inline(never)]
 pub fn build_seq_store(
     ms: &mut MatchState,
-    src: &[u8],
+    data: &[u8],
     block: Range<usize>,
     rep: &mut [u32; 3],
     store: &mut SeqStore,
 ) {
     store.clear();
+    let src = ms.view(data);
+    let block_len = block.len();
+    let block = ms.index(block.start)..ms.index(block.end);
     limit_update_after_long_match(ms, block.start);
     let anchor = match ms.cparams.strategy {
         Strategy::Fast => fast::compress_block(ms, src, block.clone(), rep, store),
@@ -204,7 +211,7 @@ pub fn build_seq_store(
         }
     };
     // ZSTD_storeLastLiterals
-    store.lits.extend_from_slice(&src[anchor..block.end]);
+    store.lits.extend_from_slice(src.slice(anchor, block.end));
     debug_assert_eq!(
         store.lits.len()
             + store
@@ -212,7 +219,7 @@ pub fn build_seq_store(
                 .iter()
                 .map(|s| s.match_len() as usize)
                 .sum::<usize>(),
-        block.len()
+        block_len
     );
 }
 
@@ -834,10 +841,11 @@ mod tests {
             })
             .collect();
         let lowest = |len: usize| {
-            let mut ms = MatchState::new(cp, 1);
-            load_prefix(&mut ms, &src, src.len() - len..src.len());
+            let origin = src.len() - len;
+            let mut ms = MatchState::new(cp, origin);
+            load_prefix(&mut ms, &src, origin..src.len());
             let (hash, _, _) = ms.tables();
-            hash.iter().filter(|&&e| e != 0).min().copied().unwrap() as usize
+            ms.pos(hash.iter().filter(|&&e| e != 0).min().copied().unwrap() as usize)
         };
         assert!(lowest(cap + 1000) >= src.len() - cap);
         assert!(lowest(cap) >= src.len() - cap);
@@ -988,7 +996,7 @@ mod tests {
     #[test]
     fn limit_update_after_long_match_boundaries() {
         let cp = CParams::for_level(5, 1 << 20);
-        let mut ms = MatchState::new(cp, 1);
+        let mut ms = MatchState::new(cp, 0);
         // Backlog of exactly 384: untouched.
         ms.next_to_update = 1000;
         limit_update_after_long_match(&mut ms, 1384);

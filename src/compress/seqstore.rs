@@ -8,6 +8,7 @@
 //! `rep[0] - 1`); the match finders emit exactly what the decoder expects, so
 //! this store never reinterprets them.
 
+use super::common::Src;
 use crate::constants::ZSTD_MINMATCH;
 
 /// `ZSTD_REP_NUM`: number of repeat offsets.
@@ -153,11 +154,12 @@ impl SeqStore {
     /// 16 bytes at a time (`ZSTD_copy16` + `ZSTD_wildcopy`, over-reading and
     /// over-writing up to `WILDCOPY_OVERLENGTH` bytes), later ones
     /// byte-exact (`ZSTD_safecopyLiterals`). `match_len >= ZSTD_MINMATCH`,
-    /// `off_base >= 1`, `anchor + lit_len <= lit_limit <= src.len()`.
+    /// `off_base >= 1`, `src.lo() <= anchor`, `anchor + lit_len <= lit_limit <=
+    /// src.end()`.
     #[inline(always)]
     pub fn store_seq(
         &mut self,
-        src: &[u8],
+        src: Src,
         anchor: usize,
         lit_len: usize,
         lit_limit: usize,
@@ -166,20 +168,22 @@ impl SeqStore {
     ) {
         debug_assert!(off_base >= 1);
         debug_assert!(match_len >= ZSTD_MINMATCH);
-        debug_assert!(anchor + lit_len <= lit_limit && lit_limit <= src.len());
+        debug_assert!(
+            src.lo() <= anchor && anchor + lit_len <= lit_limit && lit_limit <= src.end()
+        );
         let len = self.lits.len();
         let lit_end = anchor + lit_len;
         // Common case we can use wildcopy: the reads end before `lit_end +
-        // WILDCOPY_OVERLENGTH <= src.len()`, the writes before `len +
+        // WILDCOPY_OVERLENGTH <= src.end()`, the writes before `len +
         // lit_len + WILDCOPY_OVERLENGTH <= capacity` (a store from
         // `with_capacity` always has that room).
-        if lit_end + WILDCOPY_OVERLENGTH <= lit_limit.min(src.len())
+        if lit_end + WILDCOPY_OVERLENGTH <= lit_limit.min(src.end())
             && self.lits.capacity() - len >= lit_len + WILDCOPY_OVERLENGTH
         {
             // SAFETY: the bounds just tested; `src` and `lits` are distinct
             // allocations.
             unsafe {
-                let mut ip = src.as_ptr().add(anchor);
+                let mut ip = src.ptr(anchor);
                 let mut op = self.lits.as_mut_ptr().add(len);
                 copy16(op, ip);
                 if lit_len > 16 {
@@ -220,9 +224,10 @@ impl SeqStore {
     /// `with_capacity` needs; kept out of the match finders' loops.
     #[cold]
     #[inline(never)]
-    fn store_literals_safe(&mut self, src: &[u8], anchor: usize, lit_len: usize) {
+    fn store_literals_safe(&mut self, src: Src, anchor: usize, lit_len: usize) {
         self.lits.reserve(lit_len + WILDCOPY_OVERLENGTH);
-        self.lits.extend_from_slice(&src[anchor..anchor + lit_len]);
+        self.lits
+            .extend_from_slice(src.slice(anchor, anchor + lit_len));
     }
 
     /// `ZSTD_resetSeqStore`.
@@ -288,7 +293,8 @@ mod tests {
         // "abcabcabc" + "xyz": (ll=3, raw offset 3, ml=6) then literals.
         let src = b"abcabcabcxyz";
         let mut st = SeqStore::new();
-        st.store_seq(src, 0, 3, src.len(), offset_to_offbase(3), 6);
+        let view = Src::new(src, 0, 0);
+        st.store_seq(view, 0, 3, view.end(), offset_to_offbase(3), 6);
         st.lits.extend_from_slice(b"xyz");
         assert_eq!(st.reconstruct(&[], [1, 4, 8]), src);
 
@@ -298,19 +304,33 @@ mod tests {
         let mut st = SeqStore::new();
         let mut rep = [1u32, 4, 8];
         // "AB" + repcode 2 (rep[1] == 4), ml 3: reaches into history -> "89A"
-        st.store_seq(b"AB", 0, 2, b"AB".len(), REPCODE2_TO_OFFBASE, 3);
+        st.store_seq(
+            Src::new(b"AB", 0, 0),
+            0,
+            2,
+            b"AB".len(),
+            REPCODE2_TO_OFFBASE,
+            3,
+        );
         update_rep(&mut rep, REPCODE2_TO_OFFBASE, false);
         assert_eq!(rep, [4, 1, 8]);
         // ll == 0, repcode 1 -> rep[1] == 1: "AAA" (offset 4 would give "B89")
-        st.store_seq(b"", 0, 0, b"".len(), REPCODE1_TO_OFFBASE, 3);
+        st.store_seq(Src::new(b"", 0, 0), 0, 0, b"".len(), REPCODE1_TO_OFFBASE, 3);
         update_rep(&mut rep, REPCODE1_TO_OFFBASE, true);
         assert_eq!(rep, [1, 4, 8]);
         // "C" + repcode 3 (rep[2] == 8): "B89"
-        st.store_seq(b"C", 0, 1, b"C".len(), REPCODE3_TO_OFFBASE, 3);
+        st.store_seq(
+            Src::new(b"C", 0, 0),
+            0,
+            1,
+            b"C".len(),
+            REPCODE3_TO_OFFBASE,
+            3,
+        );
         update_rep(&mut rep, REPCODE3_TO_OFFBASE, false);
         assert_eq!(rep, [8, 1, 4]);
         // ll == 0, repcode 3 -> rep[0] - 1 == 7: "AAAC" (offset 4 would give "CB89")
-        st.store_seq(b"", 0, 0, b"".len(), REPCODE3_TO_OFFBASE, 4);
+        st.store_seq(Src::new(b"", 0, 0), 0, 0, b"".len(), REPCODE3_TO_OFFBASE, 4);
         update_rep(&mut rep, REPCODE3_TO_OFFBASE, true);
         assert_eq!(rep, [7, 8, 1]);
         let out = st.reconstruct(hist, [1, 4, 8]);
