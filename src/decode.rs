@@ -112,8 +112,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 
 /// Decompress a zstd-compressed byte slice, returning the uncompressed data.
 ///
-/// Supports one or more concatenated zstd frames. Skippable frames are skipped.
-/// Dictionary frames are not supported.
+/// Supports any number of concatenated zstd frames. Skippable frames are
+/// skipped. Every input byte must belong to a frame: an empty input decodes
+/// to nothing, and bytes after the last frame are an error. Dictionary
+/// frames are not supported.
 ///
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
@@ -163,11 +165,13 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
     let mut scratch: Option<DecoderScratch> = None;
     let mut pos = 0usize;
 
-    while pos < data.len() {
+    // ZSTD_decompressMultiFrame: a frame starts wherever at least
+    // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left over.
+    while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
         let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
             Ok(parsed) => parsed,
-            Err(e) => {
-                if let Some(skip_len) = e.skip_frame_length() {
+            Err(e) => match e.skip_frame_length() {
+                Some(skip_len) => {
                     let end = pos
                         .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
                         .and_then(|p| p.checked_add(skip_len as usize))
@@ -176,12 +180,8 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
                     pos = end;
                     continue;
                 }
-                // If we already have output and hit an error, it might just be trailing data
-                if !output.is_empty() {
-                    break;
-                }
-                return Err(format!("Frame header error: {}", e));
-            }
+                None => return Err(format!("Frame header error: {}", e)),
+            },
         };
         pos += header_len;
 
@@ -201,6 +201,12 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             opts.min_parallel_blocks,
             simd,
         )?;
+    }
+    if pos != data.len() {
+        return Err(format!(
+            "Input not entirely consumed: {} bytes left, too few for a frame",
+            data.len() - pos
+        ));
     }
 
     Ok(output)
@@ -2525,6 +2531,10 @@ impl std::fmt::Display for FrameDecoderError {
 
 /// Magic number plus Frame_Size of a skippable frame.
 const SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
+
+/// ZSTD_startingInputLength: magic number plus Frame_Header_Descriptor, the
+/// fewest bytes ZSTD_decompressMultiFrame takes for another frame.
+const FRAME_HEADER_PREFIX_LEN: usize = 5;
 
 fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderError> {
     let magic_num = src

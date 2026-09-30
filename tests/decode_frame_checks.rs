@@ -168,3 +168,95 @@ fn content_checksum_is_verified() {
     g[at] ^= 0x01;
     check("two frames: second checksum flipped", &g, false);
 }
+
+const MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Single-segment frame of one raw block holding `content`.
+fn raw_frame(content: &[u8]) -> Vec<u8> {
+    assert!(content.len() < 256);
+    let mut f = MAGIC.to_vec();
+    f.extend_from_slice(&[0x20, content.len() as u8]);
+    f.extend_from_slice(&(1 | (content.len() as u32) << 3).to_le_bytes()[..3]);
+    f.extend_from_slice(content);
+    f
+}
+
+/// Skippable frame whose Frame_Size field says `size`, with `payload`.
+fn skippable(size: u32, payload: &[u8]) -> Vec<u8> {
+    let mut f = 0x184D_2A53u32.to_le_bytes().to_vec();
+    f.extend_from_slice(&size.to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// ZSTD_decompressMultiFrame takes frames while at least 5 bytes
+/// (ZSTD_startingInputLength) remain and fails on any byte left over:
+/// after a frame, whether it decoded to bytes or to none, garbage, a
+/// truncated frame or a truncated skippable frame is an error, as is an
+/// input of 1 to 4 bytes.
+#[test]
+fn every_input_byte_belongs_to_a_frame() {
+    let hello = raw_frame(b"hello");
+    let tails: Vec<(&str, Vec<u8>, bool)> = vec![
+        ("nothing", vec![], true),
+        ("an empty frame", raw_frame(b""), true),
+        ("an empty skippable frame", skippable(0, &[]), true),
+        ("1 byte", vec![1], false),
+        ("4 bytes", vec![1, 2, 3, 4], false),
+        ("5 bytes", vec![1, 2, 3, 4, 5], false),
+        ("10 bytes", b"garbage!!!".to_vec(), false),
+        ("a zstd magic number", MAGIC.to_vec(), false),
+        (
+            "a magic number and descriptor",
+            [&MAGIC[..], &[0x20]].concat(),
+            false,
+        ),
+        ("a truncated frame", hello[..10].to_vec(), false),
+        (
+            "5 bytes of a skippable frame",
+            skippable(16, &[])[..5].to_vec(),
+            false,
+        ),
+        (
+            "7 bytes of a skippable frame",
+            skippable(16, &[])[..7].to_vec(),
+            false,
+        ),
+        (
+            "a skippable frame short of its size",
+            skippable(4, &[1, 2, 3]),
+            false,
+        ),
+        ("a skippable frame and 1 byte", skippable(1, &[9, 7]), false),
+    ];
+    let leads: Vec<(&str, Vec<u8>)> = vec![
+        ("nothing", vec![]),
+        ("a frame", hello.clone()),
+        ("an empty frame", raw_frame(b"")),
+        ("a skippable frame", skippable(3, &[1, 2, 3])),
+        (
+            "a multi-block frame",
+            zstd::bulk::compress(&text(1 << 20), 3).unwrap(),
+        ),
+    ];
+    for (lead_name, lead) in &leads {
+        for (tail_name, tail, accept) in &tails {
+            if lead.is_empty() && tail.is_empty() {
+                continue;
+            }
+            let f = [&lead[..], &tail[..]].concat();
+            check(&format!("{lead_name} then {tail_name}"), &f, *accept);
+        }
+    }
+    for n in 1..hello.len() {
+        check(&format!("first {n} bytes of a frame"), &hello[..n], false);
+    }
+
+    // An empty input decodes to nothing in one shot. (The zstd crate's
+    // streaming reader reports an incomplete frame instead.)
+    assert_eq!(
+        zstd::bulk::decompress(&[], CAPACITY).unwrap(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(rust_zstd::decompress(&[]).unwrap(), Vec::<u8>::new());
+}
