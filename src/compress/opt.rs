@@ -717,6 +717,8 @@ fn opt_generic<const OPT_LEVEL: u32>(
         matches,
         opt,
     } = state;
+    let matches: &mut [Match; ZSTD_OPT_SIZE] = matches;
+    let opt: &mut [Optimal; ZSTD_OPT_SIZE] = opt;
     let istart = block.start;
     let iend = block.end;
     let mut anchor = istart;
