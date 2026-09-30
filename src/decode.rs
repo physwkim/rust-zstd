@@ -53,10 +53,6 @@ use std::ptr;
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
 const MAX_BLOCK_SIZE: u32 = 128 * 1024;
-/// `ZSTD_MAXWINDOWSIZE_DEFAULT`: libzstd's default decoder limit,
-/// `(1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`, which admits the window log
-/// 27 frames of level 22 and of long distance matching on large inputs.
-const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = (1 << 27) + 1;
 /// Largest Huffman table log, and so weight, the decoder takes (libzstd
 /// HUF_TABLELOG_MAX): the format caps the log at 11, libzstd's decoder at 12.
 const HUF_TABLELOG_MAX: u32 = 12;
@@ -121,6 +117,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
 /// the same either way.
+///
+/// The output grows as needed, as one-shot `ZSTD_decompressDCtx` into an
+/// ample buffer does, so that is the reference for which frames decode:
+/// libzstd's verdict on some malformed blocks depends on its buffer size.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
@@ -3755,13 +3755,10 @@ fn decode_frame(
     min_parallel_blocks: usize,
     simd: Level,
 ) -> Result<(), String> {
+    // Any window the header takes: one-shot ZSTD_decompressDCtx checks
+    // `maxWindowSize` only when streaming, and this decoder keeps no window
+    // buffer, so the window's one use is to bound the blocks.
     let window_size = header.window_size()?;
-    if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-        return Err(format!(
-            "Window size {} exceeds maximum allowed {}",
-            window_size, MAXIMUM_ALLOWED_WINDOW_SIZE
-        ));
-    }
     // Block_Maximum_Size (fParams.blockSizeMax), the bound `split_block`
     // puts on every compressed block and its literals, and
     // `execute_with_copies`, through `decoded_block_max`, on what the block
@@ -3772,8 +3769,11 @@ fn decode_frame(
     if let Some(fcs) = header.frame_content_size() {
         // Room for the whole frame plus what a compressed block may write
         // past its start, so that no block has to grow the buffer (and
-        // move everything decoded).
-        let want = usize::try_from(fcs)
+        // move everything decoded). A content size past what the blocks
+        // can decode to fails the size check below, so it gets no room
+        // beyond that.
+        let content = fcs.min(blocks_decoded_bound(&data[*pos..], block_size_max));
+        let want = usize::try_from(content)
             .ok()
             .and_then(|n| n.checked_add(DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH))
             .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
@@ -3819,6 +3819,29 @@ fn decode_frame(
         }
     }
     Ok(())
+}
+
+/// The most the blocks at the start of `data` decode to: the sum of each
+/// raw block's content, RLE block's size and compressed block's
+/// `decoded_block_max`, up to the last block or up to the first one the
+/// input does not hold, where decoding fails.
+fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
+    let mut rest = data;
+    let mut bound = 0u64;
+    while let Ok((block, header_len)) = parse_block_header(rest) {
+        let Some(next) = rest.get(header_len + block.content_size as usize..) else {
+            break;
+        };
+        rest = next;
+        bound = bound.saturating_add(match block.block_type {
+            BlockType::Compressed => decoded_block_max(block_size_max) as u64,
+            _ => u64::from(block.decompressed_size),
+        });
+        if block.last_block {
+            break;
+        }
+    }
+    bound
 }
 
 /// The serial block loop of `decode_frame`: decode every block of the
@@ -5124,13 +5147,28 @@ mod tests {
         frame
     }
 
-    /// libzstd's default limit: a 128 MiB window (exponent 17) decodes,
-    /// the next larger one (mantissa 1, 144 MiB) is refused.
+    /// One-shot libzstd refuses a window only above `ZSTD_WINDOWLOG_MAX`
+    /// (its default limit, window log 27, binds streaming alone): window
+    /// logs 27, 28, 31 and 32, at the smallest and largest mantissa, decode
+    /// exactly where `zstd::bulk` does.
     #[test]
-    fn test_window_limit_is_zstd_default() {
-        assert_eq!(decompress(&windowed_frame(17 << 3)).unwrap(), b"hi");
-        let err = decompress(&windowed_frame((17 << 3) | 1)).unwrap_err();
-        assert!(err.contains("exceeds maximum allowed"), "{err}");
+    fn test_window_limit_is_one_shot_zstd() {
+        for window_log in [27, 28, 31, 32] {
+            for mantissa in [0, 7] {
+                let frame = windowed_frame((window_log - 10) << 3 | mantissa);
+                let want = zstd::bulk::decompress(&frame, 16).ok();
+                assert_eq!(
+                    want.is_some(),
+                    u32::from(window_log) <= ZSTD_WINDOWLOG_MAX,
+                    "window log {window_log}"
+                );
+                assert_eq!(
+                    decompress(&frame).ok(),
+                    want,
+                    "window log {window_log} mantissa {mantissa}"
+                );
+            }
+        }
     }
 
     /// The frame header refuses a window log exactly where libzstd's
