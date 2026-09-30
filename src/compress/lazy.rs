@@ -59,8 +59,9 @@ fn highbit32(v: u32) -> u32 {
 const PRIME4: u32 = 2654435761;
 const PRIME5: u64 = 889523592379;
 const PRIME6: u64 = 227718039650203;
+const PRIME7: u64 = 58295818150454627;
 
-/// `ZSTD_hashPtrSalted(src + pos, hbits, mls, salt)` for `mls` 4..=6 and
+/// `ZSTD_hashPtrSalted(src + pos, hbits, mls, salt)` for `mls` 4..=7 and
 /// `hbits <= 32` (`ZSTD_hashPtr` is the same with `salt == 0`). `mls == 4`
 /// only uses the low 32 bits of the salt, like C. The result is
 /// `< 1 << hbits`.
@@ -75,7 +76,8 @@ unsafe fn hash_salted<const MLS: u32>(src: Src, pos: usize, hbits: u32, salt: u6
         4 => (read32(src, pos).wrapping_mul(PRIME4) ^ (salt as u32)) >> (32 - hbits),
         5 => (((read64(src, pos) << 24).wrapping_mul(PRIME5) ^ salt) >> (64 - hbits)) as u32,
         6 => (((read64(src, pos) << 16).wrapping_mul(PRIME6) ^ salt) >> (64 - hbits)) as u32,
-        _ => unreachable!("mls is clamped to 4..=6"),
+        7 => (((read64(src, pos) << 8).wrapping_mul(PRIME7) ^ salt) >> (64 - hbits)) as u32,
+        _ => unreachable!("mls is 4..=7"),
     }
 }
 
@@ -1758,10 +1760,7 @@ pub fn compress_block_with(
 /// `ms.next_to_update` (its start) up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
 /// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
-/// finder's tag table is zeroed first, as C does here. The hash width is
-/// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
-/// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
-/// level table produces.
+/// finder's tag table is zeroed first, as C does here.
 pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
     let end = ms.prefix_indices(prefix).end;
     assert_block_bounds(ms, src, end);
@@ -1769,11 +1768,15 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
     // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
     // and the table sizes were asserted above.
     match ms.search_method {
+        // `ZSTD_insertAndFindFirstIndex` hashes `minMatch` bytes, unbounded
+        // like `ZSTD_updateTree`: at 7, where the searches hash 6, libzstd
+        // never matches the prefix.
         SearchMethod::HashChain => {
-            match mls_of(&ms.cparams) {
-                4 => unsafe { HcSearch::<4>::insert_and_find_first_index(ms, src, target, false) },
+            match ms.cparams.min_match {
                 5 => unsafe { HcSearch::<5>::insert_and_find_first_index(ms, src, target, false) },
-                _ => unsafe { HcSearch::<6>::insert_and_find_first_index(ms, src, target, false) },
+                6 => unsafe { HcSearch::<6>::insert_and_find_first_index(ms, src, target, false) },
+                7 => unsafe { HcSearch::<7>::insert_and_find_first_index(ms, src, target, false) },
+                _ => unsafe { HcSearch::<4>::insert_and_find_first_index(ms, src, target, false) },
             };
         }
         SearchMethod::RowHash => {
@@ -2282,6 +2285,34 @@ mod tests {
         }
     }
 
+    /// libzstd's prefix loaders hash `minMatch` bytes, the hash-chain and
+    /// binary-tree searches `BOUNDED(4, minMatch, 6)`: at minMatch 7 an
+    /// input repeating a random prefix finds no match on those finders, as
+    /// libzstd 1.5.7 does, while the row finder (`MIN(minMatch, 6)` on both
+    /// sides) matches it; at minMatch 6 every finder does.
+    #[test]
+    fn prefix_loaders_hash_min_match_bytes() {
+        let mut rng = XorShift(7);
+        let prefix: Vec<u8> = (0..50_000).map(|_| rng.next() as u8).collect();
+        let src = [&prefix[..], &prefix[..]].concat();
+        let finders = [
+            (Strategy::Greedy, SearchMethod::HashChain),
+            (Strategy::Lazy, SearchMethod::HashChain),
+            (Strategy::Lazy2, SearchMethod::HashChain),
+            (Strategy::Lazy2, SearchMethod::RowHash),
+            (Strategy::BtLazy2, SearchMethod::BinaryTree),
+        ];
+        for (strategy, method) in finders {
+            for mls in [6, 7] {
+                let cp = lazy_params(9, src.len(), strategy, mls);
+                let job = prefix.len();
+                let (nseqs, _) = run_blocks(&src, cp, 0, job, ZSTD_BLOCKSIZE_MAX, [0; 3], method);
+                let matched = mls == 6 || method == SearchMethod::RowHash;
+                assert_eq!(nseqs > 0, matched, "{strategy:?} {method:?} minMatch {mls}");
+            }
+        }
+    }
+
     fn run_bt(src: &[u8], cp: CParams, block_size: usize) -> (usize, usize) {
         run_blocks(
             src,
@@ -2429,11 +2460,12 @@ mod tests {
         assert_ne!(advance_hash_salt(0, 0), 0);
         let src = b"abcdefghijklmnop";
         // SAFETY: `0 + 8 <= src.len()`.
-        let (h4, h5, h6) = unsafe {
+        let (h4, h5, h6, h7) = unsafe {
             (
                 hash_salted::<4>(Src::new(src, 0, 0), 0, 20, 0),
                 hash_salted::<5>(Src::new(src, 0, 0), 0, 20, 0) as u64,
                 hash_salted::<6>(Src::new(src, 0, 0), 0, 20, 0) as u64,
+                hash_salted::<7>(Src::new(src, 0, 0), 0, 20, 0) as u64,
             )
         };
         // ZSTD_hash4Ptr: (readLE32 * 2654435761) >> (32 - 20)
@@ -2442,5 +2474,6 @@ mod tests {
         let u = u64::from_le_bytes(src[..8].try_into().unwrap());
         assert_eq!(h5, (u << 24).wrapping_mul(PRIME5) >> 44);
         assert_eq!(h6, (u << 16).wrapping_mul(PRIME6) >> 44);
+        assert_eq!(h7, (u << 8).wrapping_mul(PRIME7) >> 44);
     }
 }
