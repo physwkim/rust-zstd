@@ -14,7 +14,9 @@
 //! begins one byte later than C on block 0 (`ip = max(istart, window_low)`
 //! followed by C's own `ip += (dictAndPrefixLength == 0)` skip).
 
-use super::common::{byte, candidate_valid, count, read32, read64, tget, tset, HASH_READ_SIZE};
+use super::common::{
+    byte, candidate_valid, count, read32, read64, tget, tset, MatchCount, HASH_READ_SIZE,
+};
 use super::matchstate::MatchState;
 use super::params::{CParams, Strategy};
 use super::seqstore::{
@@ -151,6 +153,15 @@ trait Search {
     /// for the row finder.
     const ILIMIT_MARGIN: usize;
 
+    /// `ZSTD_count` for this finder's SIMD level.
+    ///
+    /// # Safety
+    /// As [`count`].
+    #[inline(always)]
+    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        count(src, a, b, limit)
+    }
+
     /// Work done at block start and whenever lazy skipping ends
     /// (`ZSTD_row_fillHashCache` for the row finder; nothing for chains).
     fn refill(&mut self, ms: &mut MatchState, src: &[u8], ilimit: usize);
@@ -253,7 +264,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
             let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
             if better {
                 // SAFETY: `match_index < ip <= iend <= src.len()`.
-                let current_ml = unsafe { count(src, ip, match_index, iend) };
+                let current_ml = unsafe { Search::count(self, src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
                     *off_base = offset_to_offbase((curr - match_index) as u32);
@@ -517,6 +528,24 @@ mod arm {
     }
 }
 
+// The row finder's SSE4.2 and NEON levels count with the scalar
+// `ZSTD_count`; common.rs has a wider count only for AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl MatchCount for Sse4_2 {
+    #[inline(always)]
+    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        count(src, a, b, limit)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl MatchCount for Neon {
+    #[inline(always)]
+    unsafe fn count(self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        count(src, a, b, limit)
+    }
+}
+
 /// `search_rowHash`: rows of `1 << ROW_LOG` hash-table entries selected by
 /// the high hash bits, each with a one-byte tag per entry and the row head
 /// in the tag row's byte 0.
@@ -721,8 +750,15 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> RowSearch<M, MLS, ROW_LOG> 
     }
 }
 
-impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS, ROW_LOG> {
+impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
+    for RowSearch<M, MLS, ROW_LOG>
+{
     const ILIMIT_MARGIN: usize = 8 + ROW_HASH_CACHE_SIZE;
+
+    #[inline(always)]
+    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        self.mask.count(src, a, b, limit)
+    }
 
     #[inline(always)]
     fn refill(&mut self, ms: &mut MatchState, src: &[u8], ilimit: usize) {
@@ -835,7 +871,7 @@ impl<M: TagMask, const MLS: u32, const ROW_LOG: u32> Search for RowSearch<M, MLS
             let better = unsafe { read32(src, match_index + ml - 3) == read32(src, ip + ml - 3) };
             if better {
                 // SAFETY: `match_index < ip <= iend <= src.len()`.
-                let current_ml = unsafe { count(src, ip, match_index, iend) };
+                let current_ml = unsafe { Search::count(self, src, ip, match_index, iend) };
                 if current_ml > ml {
                     ml = current_ml;
                     *off_base = offset_to_offbase((curr - match_index) as u32);
@@ -921,7 +957,7 @@ fn lazy_generic<S: Search>(
         if rep_hit {
             // SAFETY: see the loop header.
             match_length =
-                unsafe { count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) } + 4;
+                unsafe { search.count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) } + 4;
             if depth == 0 {
                 rep_at_depth0 = true; // goto _storeSequence
             }
@@ -958,7 +994,8 @@ fn lazy_generic<S: Search>(
                     if rep_hit {
                         // SAFETY: see the loop header.
                         let ml_rep =
-                            unsafe { count(src, ip + 4, ip + 4 - offset_1 as usize, iend) } + 4;
+                            unsafe { search.count(src, ip + 4, ip + 4 - offset_1 as usize, iend) }
+                                + 4;
                         let gain2 = (ml_rep * 3) as i32;
                         let gain1 = (match_length * 3) as i32 - highbit32(off_base) as i32 + 1;
                         if ml_rep >= 4 && gain2 > gain1 {
@@ -990,8 +1027,9 @@ fn lazy_generic<S: Search>(
                             && unsafe { read32(src, ip) == read32(src, ip - offset_1 as usize) };
                         if rep_hit {
                             // SAFETY: see the loop header.
-                            let ml_rep =
-                                unsafe { count(src, ip + 4, ip + 4 - offset_1 as usize, iend) } + 4;
+                            let ml_rep = unsafe {
+                                search.count(src, ip + 4, ip + 4 - offset_1 as usize, iend)
+                            } + 4;
                             let gain2 = (ml_rep * 4) as i32;
                             let gain1 = (match_length * 4) as i32 - highbit32(off_base) as i32 + 1;
                             if ml_rep >= 4 && gain2 > gain1 {
@@ -1059,7 +1097,8 @@ fn lazy_generic<S: Search>(
             && offset_2 > 0
             && unsafe { read32(src, ip) == read32(src, ip - offset_2 as usize) }
         {
-            let match_length = unsafe { count(src, ip + 4, ip + 4 - offset_2 as usize, iend) } + 4;
+            let match_length =
+                unsafe { search.count(src, ip + 4, ip + 4 - offset_2 as usize, iend) } + 4;
             std::mem::swap(&mut offset_1, &mut offset_2); // swap repcodes
             out.store_seq(src, anchor, 0, iend, REPCODE1_TO_OFFBASE, match_length);
             ip += match_length;
@@ -1117,7 +1156,7 @@ fn detected_level() -> Level {
 /// The row-finder block loop for one tag-mask implementation, specialised on
 /// `mls` and `rowLog` like C's `ZSTD_FOR_EACH_MLS_ROWLOG` templates.
 #[inline(always)]
-fn row_block<M: TagMask>(
+fn row_block<M: TagMask + MatchCount>(
     mask: M,
     ms: &mut MatchState,
     src: &[u8],
