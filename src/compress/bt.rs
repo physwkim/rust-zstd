@@ -11,7 +11,7 @@
 //! Positions follow the [`MatchState`] convention: absolute indices into
 //! `src`, `window_low >= 1`, table entry `0` means empty.
 //!
-//! [`bt_get_all_matches`] is the optimal parser's finder
+//! `bt_get_all_matches` is the optimal parser's finder
 //! (`ZSTD_btGetAllMatches`): it inserts the position and collects every
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
@@ -540,7 +540,7 @@ pub fn load_prefix(ms: &mut MatchState, src: &[u8], range: Range<usize>) {
     ms.next_to_update = range.end;
 }
 
-/// `ZSTD_updateTree(ms, ip, iend)`: [`update_tree_internal`] with the hash
+/// `ZSTD_updateTree(ms, ip, iend)`: `update_tree_internal` with the hash
 /// width `minMatch` (as C passes it, not bounded to `3..=6`), e.g.
 /// `ZSTD_loadDictionaryContent`'s `ZSTD_updateTree(ms, iend - 8, iend)`
 /// that sorts a prefix into the tree before a job's first block.

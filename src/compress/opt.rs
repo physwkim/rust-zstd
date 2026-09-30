@@ -2,8 +2,8 @@
 //! (`ZSTD_compressBlock_opt_generic`, no-dictionary mode, no LDM) with its
 //! price model (`ZSTD_rescaleFreqs`, `ZSTD_setBasePrices`,
 //! `ZSTD_updateStats`) and btultra2's first-block statistics pass
-//! (`ZSTD_initStats_ultra`). The match finder is
-//! [`bt_get_all_matches`](super::bt::bt_get_all_matches).
+//! (`ZSTD_initStats_ultra`). The match finder is `bt_get_all_matches` in
+//! [`bt`].
 //!
 //! Positions follow the [`MatchState`] convention (absolute indices into
 //! `src`, `window_low >= 1`); the block loop starts like the lazy one, see
