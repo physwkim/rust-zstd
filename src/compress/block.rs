@@ -650,8 +650,8 @@ impl JobBlocks {
 
 /// `ZSTD_compress_frameChunk` over one job: `src[job]` in blocks sized by
 /// `sizing`, appended to `out`, each through the post-sequence splitter
-/// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N+1's match
-/// finding runs on rayon next to block N's entropy stage and emission
+/// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N's entropy
+/// stage and emission run on rayon next to block N+1's match finding
 /// whenever every block N is written as is [proven](proven_rep_after) to
 /// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
 /// the decoder will hold, and N+1's size is fixed without N's compressed
@@ -817,7 +817,10 @@ fn compress_blocks_pipelined(
             let mut rep_following = rep_next;
             let cur_store = &mut *cur;
             let state = &mut *state;
-            let (compressed, ()) = rayon::join(
+            // The match state stays on this thread, whose caches hold its
+            // tables; block N's entropy stage is the part a thief takes.
+            let ((), compressed) = rayon::join(
+                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
                 || {
                     emit_block(
                         src,
@@ -832,7 +835,6 @@ fn compress_blocks_pipelined(
                         out,
                     )
                 },
-                || build_seq_store(ms, src, following.clone(), &mut rep_following, nxt, ldm),
             );
             // The proof is what made block N+1 start from the decoder's
             // offsets, with the size the written block N gives it.
