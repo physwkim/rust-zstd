@@ -92,7 +92,14 @@ impl CompressOptions {
     /// 11 (ELF), and the speedup (ELF / source) is 1.14x / 1.03x at level 1,
     /// 1.85x / 2.48x at 3, 1.74x / 2.27x at 5, 2.01x / 2.14x at 7 and
     /// 2.29x / 1.92x at 11. A 1 MiB input is one job under either option,
-    /// so its frame and speed are unchanged.
+    /// so its frame and speed are unchanged. Reproduce with four runs of
+    /// the following and the per-cell median of `rs MB/s`:
+    ///
+    /// ```text
+    /// ZSTD_BENCH_ITERS=11 ZSTD_GRID_JOBS=2048K ZSTD_GRID_OVERLAPS=8 \
+    ///   flock /tmp/claude-1000/zstd-mtbench.lock taskset -c 4,6,7,8,10,12,14,15 \
+    ///   cargo test --release --offline --test mt_grid -- --ignored --nocapture
+    /// ```
     pub fn parallel(level: i32) -> Self {
         Self {
             level,

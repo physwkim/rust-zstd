@@ -10,7 +10,11 @@
 //! ```
 //!
 //! `ZSTD_CORPUS_DIR` overrides the corpus directory, `ZSTD_BENCH_ITERS`
-//! the iterations per cell (default 5).
+//! the iterations per cell (default 5). Comma-separated cell filters, each
+//! defaulting to the full grid when unset: `ZSTD_GRID_FILES` (file names),
+//! `ZSTD_GRID_LEVELS`, `ZSTD_GRID_JOBS` (`512K`, `1024K`, `2048K`, `def`, or
+//! bytes) and `ZSTD_GRID_OVERLAPS`. The default-options cell always runs,
+//! as the reference of the `rel` columns.
 #![cfg(feature = "parallel")]
 
 use rust_zstd::compress::{CompressOptions, Compressor};
@@ -24,6 +28,25 @@ const LEVELS: [i32; 5] = [1, 3, 5, 7, 11];
 const JOB_SIZES: [Option<usize>; 4] = [Some(512 << 10), Some(1 << 20), Some(2 << 20), None];
 const OVERLAP_LOGS: [u8; 4] = [0, 7, 8, 9];
 const THREADS: usize = 8;
+
+/// The comma-separated `var`, parsed by `parse`, or `default` when unset.
+fn filter<T: Clone>(var: &str, default: &[T], parse: impl Fn(&str) -> T) -> Vec<T> {
+    match std::env::var(var) {
+        Ok(v) => v.split(',').map(|x| parse(x.trim())).collect(),
+        Err(_) => default.to_vec(),
+    }
+}
+
+/// A job size as the grid prints it: `def` (None), `<n>K` or bytes.
+fn parse_job(s: &str) -> Option<usize> {
+    if s == "def" {
+        return None;
+    }
+    Some(match s.strip_suffix('K') {
+        Some(k) => k.parse::<usize>().expect("ZSTD_GRID_JOBS") << 10,
+        None => s.parse().expect("ZSTD_GRID_JOBS"),
+    })
+}
 
 fn median(mut v: Vec<Duration>) -> Duration {
     v.sort();
@@ -51,6 +74,16 @@ fn mt_grid() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    let files = filter("ZSTD_GRID_FILES", &FILES.map(String::from), |x| {
+        x.to_string()
+    });
+    let levels = filter("ZSTD_GRID_LEVELS", &LEVELS, |x| {
+        x.parse().expect("ZSTD_GRID_LEVELS")
+    });
+    let job_sizes = filter("ZSTD_GRID_JOBS", &JOB_SIZES, parse_job);
+    let overlap_logs = filter("ZSTD_GRID_OVERLAPS", &OVERLAP_LOGS, |x| {
+        x.parse().expect("ZSTD_GRID_OVERLAPS")
+    });
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(THREADS)
         .build()
@@ -70,7 +103,7 @@ fn mt_grid() {
         "rs/C sz",
         "rs/C sp"
     );
-    for file in FILES {
+    for file in &files {
         let path = dir.join(file);
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -80,14 +113,14 @@ fn mt_grid() {
             }
         };
         let mbs = |d: Duration| data.len() as f64 / (1 << 20) as f64 / d.as_secs_f64();
-        for level in LEVELS {
+        for &level in &levels {
             let mut rs_default = 0usize;
             let mut c_default = 0usize;
             // Default options first so every other cell has its reference.
             let cells = std::iter::once((None, 0u8)).chain(
-                JOB_SIZES
+                job_sizes
                     .iter()
-                    .flat_map(|&j| OVERLAP_LOGS.iter().map(move |&o| (j, o)))
+                    .flat_map(|&j| overlap_logs.iter().map(move |&o| (j, o)))
                     .filter(|&(j, o)| !(j.is_none() && o == 0)),
             );
             for (job_size, overlap_log) in cells {
