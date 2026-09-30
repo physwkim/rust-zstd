@@ -743,19 +743,31 @@ fn fse_decompress_weights(
 
 /// Single-symbol table cell (libzstd HUF_DEltX1).
 #[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
 struct HuffmanEntry {
     symbol: u8,
     num_bits: u8,
 }
 
+// SAFETY: two `u8` fields under `repr(C)`: no padding, and every bit
+// pattern is a valid cell.
+unsafe impl bytemuck::Zeroable for HuffmanEntry {}
+unsafe impl bytemuck::Pod for HuffmanEntry {}
+
 /// Double-symbol table cell (libzstd HUF_DEltX2): `sequence` holds one or
 /// two symbols little-endian, `length` how many.
 #[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
 struct HufEntryX2 {
     sequence: u16,
     nb_bits: u8,
     length: u8,
 }
+
+// SAFETY: a `u16` and two `u8` fields under `repr(C)`: no padding, and every
+// bit pattern is a valid cell.
+unsafe impl bytemuck::Zeroable for HufEntryX2 {}
+unsafe impl bytemuck::Pod for HufEntryX2 {}
 
 /// Table log of every decoding table (libzstd HUF_DECODER_FAST_TABLELOG):
 /// single-symbol tables are scaled up to it so that the 4-stream fast
@@ -986,13 +998,11 @@ impl HuffmanTable {
         }
 
         // Fill the table one weight at a time, so that the run length is a
-        // constant of each loop and the common short runs are unrolled.
+        // constant of each loop, writing each symbol's cells four to a word
+        // (HUF_DEltX1_set4) over the table's bytes.
         self.decode
             .resize(1 << HUF_FAST_TABLE_LOG, HuffmanEntry::default());
-        let dt = self
-            .decode
-            .first_chunk_mut::<{ 1 << HUF_FAST_TABLE_LOG }>()
-            .unwrap();
+        let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut self.decode[..]);
         let mut symbol = rank_stats[0] as usize;
         let mut u = 0usize;
         for w in 1..=max_bits as usize {
@@ -1000,44 +1010,39 @@ impl HuffmanTable {
             let length = 1usize << (w - 1 + rescale as usize);
             let num_bits = (max_bits + 1 - w as u32) as u8;
             let syms = &self.sorted[symbol..symbol + count];
-            let entry = |s: u8| HuffmanEntry {
-                symbol: s,
-                num_bits,
-            };
+            let d4 = |s: u8| u64::from(u16::from_le_bytes([s, num_bits])) * 0x0001_0001_0001_0001;
+            let run = &mut cells[2 * u..2 * (u + count * length)];
             match length {
                 1 => {
-                    for &s in syms {
-                        dt[u] = entry(s);
-                        u += 1;
+                    for (c, &s) in run.as_chunks_mut::<2>().0.iter_mut().zip(syms) {
+                        *c = (d4(s) as u16).to_le_bytes();
                     }
                 }
                 2 => {
-                    for &s in syms {
-                        dt[u..u + 2].copy_from_slice(&[entry(s); 2]);
-                        u += 2;
+                    for (c, &s) in run.as_chunks_mut::<4>().0.iter_mut().zip(syms) {
+                        *c = (d4(s) as u32).to_le_bytes();
                     }
                 }
                 4 => {
-                    for &s in syms {
-                        dt[u..u + 4].copy_from_slice(&[entry(s); 4]);
-                        u += 4;
+                    for (c, &s) in run.as_chunks_mut::<8>().0.iter_mut().zip(syms) {
+                        *c = d4(s).to_le_bytes();
                     }
                 }
                 8 => {
-                    for &s in syms {
-                        dt[u..u + 8].copy_from_slice(&[entry(s); 8]);
-                        u += 8;
+                    for (c, &s) in run.as_chunks_mut::<16>().0.iter_mut().zip(syms) {
+                        *c = bytemuck::cast([d4(s).to_le_bytes(); 2]);
                     }
                 }
                 _ => {
-                    for &s in syms {
-                        for run in dt[u..u + length].as_chunks_mut::<16>().0 {
-                            run.copy_from_slice(&[entry(s); 16]);
+                    for (r, &s) in run.chunks_exact_mut(2 * length).zip(syms) {
+                        let d16: [u8; 32] = bytemuck::cast([d4(s).to_le_bytes(); 4]);
+                        for c in r.as_chunks_mut::<32>().0 {
+                            *c = d16;
                         }
-                        u += length;
                     }
                 }
             }
+            u += count * length;
             symbol += count;
         }
     }
@@ -1166,28 +1171,32 @@ fn huf_fill_x2_for_weight(
     level: u8,
 ) {
     let length = 1usize << (target_log - nb_bits);
-    let cell = |symbol: u8| huf_build_x2(symbol, nb_bits, base_seq, level);
-    let runs = dt[..symbols.len() * length].chunks_exact_mut(length);
+    let cell =
+        |symbol: u8| -> [u8; 4] { bytemuck::cast(huf_build_x2(symbol, nb_bits, base_seq, level)) };
+    // HUF_buildDEltX2U64: the cell twice in a word.
+    let cell2 = |symbol: u8| -> [u8; 8] { bytemuck::cast([cell(symbol); 2]) };
+    let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut dt[..symbols.len() * length]);
     match length {
         1 => {
-            for (run, &symbol) in runs.zip(symbols) {
-                run[0] = cell(symbol);
+            for (c, &symbol) in cells.as_chunks_mut::<4>().0.iter_mut().zip(symbols) {
+                *c = cell(symbol);
             }
         }
         2 => {
-            for (run, &symbol) in runs.zip(symbols) {
-                run.copy_from_slice(&[cell(symbol); 2]);
+            for (c, &symbol) in cells.as_chunks_mut::<8>().0.iter_mut().zip(symbols) {
+                *c = cell2(symbol);
             }
         }
         4 => {
-            for (run, &symbol) in runs.zip(symbols) {
-                run.copy_from_slice(&[cell(symbol); 4]);
+            for (c, &symbol) in cells.as_chunks_mut::<16>().0.iter_mut().zip(symbols) {
+                *c = bytemuck::cast([cell2(symbol); 2]);
             }
         }
         _ => {
-            for (run, &symbol) in runs.zip(symbols) {
-                for eight in run.as_chunks_mut::<8>().0 {
-                    eight.copy_from_slice(&[cell(symbol); 8]);
+            for (run, &symbol) in cells.chunks_exact_mut(4 * length).zip(symbols) {
+                let c8: [u8; 32] = bytemuck::cast([cell2(symbol); 4]);
+                for c in run.as_chunks_mut::<32>().0 {
+                    *c = c8;
                 }
             }
         }
@@ -1213,14 +1222,20 @@ fn huf_fill_x2_level2(
     if min_weight > 1 {
         // Whole runs of 2, 4 or 8 cells as in libzstd; the cells written
         // past `skip` are overwritten by the second symbols below.
-        let cell = huf_build_x2(base_seq, consumed_bits, 0, 1);
+        let cell: [u8; 4] = bytemuck::cast(huf_build_x2(base_seq, consumed_bits, 0, 1));
+        let cell2: [u8; 8] = bytemuck::cast([cell; 2]);
         let skip = rank_val[min_weight] as usize;
-        match dt.len() {
-            2 => dt.copy_from_slice(&[cell; 2]),
-            4 => dt.copy_from_slice(&[cell; 4]),
+        let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut dt[..]);
+        match cells.len() / 4 {
+            2 => cells.copy_from_slice(&cell2),
+            4 => cells.copy_from_slice(&bytemuck::cast::<_, [u8; 16]>([cell2; 2])),
             _ => {
-                for eight in dt[..skip.next_multiple_of(8)].as_chunks_mut::<8>().0 {
-                    eight.copy_from_slice(&[cell; 8]);
+                let c8: [u8; 32] = bytemuck::cast([cell2; 4]);
+                for c in cells[..4 * skip.next_multiple_of(8)]
+                    .as_chunks_mut::<32>()
+                    .0
+                {
+                    *c = c8;
                 }
             }
         }
