@@ -29,8 +29,6 @@ mod common;
 use rust_zstd::compress::{CompressOptions, Compressor, ParamSwitch};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching};
-use zstd::zstd_safe::zstd_sys as sys;
 
 /// `CASES` of `overflow_frequent.c`: level, long distance matching
 /// enabled (else `Auto`), job size in MiB (0: one job), input MiB.
@@ -225,10 +223,15 @@ fn frequent_correction_matches_libzstd_long_windows() {
 }
 
 /// Stock libzstd's frames (single-threaded `ZSTD_compress2`) of an input
-/// past `ZSTD_CURRENT_MAX`, which our decoder reads back.
+/// past `ZSTD_CURRENT_MAX`, which our decoder reads back. A 4.5 GiB input
+/// does not fit a 32-bit address space.
+#[cfg(target_pointer_width = "64")]
 #[test]
 #[ignore]
 fn input_over_4_gib_matches_libzstd() {
+    use sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching};
+    use zstd::zstd_safe::zstd_sys as sys;
+
     let data = input(4608 << 20);
     for (level, ldm) in [(1, false), (3, false), (3, true)] {
         let mut cx = Compressor::new(CompressOptions {
