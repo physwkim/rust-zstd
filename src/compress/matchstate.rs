@@ -38,7 +38,7 @@
 use std::ops::Range;
 
 use super::common::Src;
-use super::lazy::DUBT_UNSORTED_MARK;
+use super::lazy::{default_search_method, SearchMethod, DUBT_UNSORTED_MARK};
 use super::opt::OptState;
 use super::params::{CParams, Strategy};
 
@@ -292,41 +292,71 @@ pub struct MatchState {
     /// `opt`: the optimal parser's statistics and work tables, allocated
     /// for the opt strategies and kept (not shrunk) across resets.
     pub opt: Option<Box<OptState>>,
+    /// The lazy match finder the tables are sized for (`useRowMatchFinder`
+    /// resolved): [`MatchState::new`] and [`MatchState::reset`] take
+    /// [`default_search_method`], [`MatchState::new_for`] and
+    /// [`MatchState::reset_for`] a given one. Meaningful for the lazy
+    /// strategies only.
+    pub search_method: SearchMethod,
 }
 
-/// The table area of `ZSTD_cwksp`: one allocation holding
-/// `hashTable` (`1 << hash_log` entries, every strategy), `chainTable`
-/// (`1 << chain_log` entries; empty for `Fast`; `hashSmall` for `DFast`;
-/// the hash-chain table for the lazy strategies; the binary tree, two
+/// The table area of `ZSTD_cwksp`: one allocation holding `hashTable`
+/// (`1 << hash_log` entries, every strategy), `chainTable` (`1 << chain_log`
+/// entries; empty for `Fast` and the row-based lazy finder, as
+/// `ZSTD_allocateChainTable` allocates none there; `hashSmall` for `DFast`;
+/// the hash-chain table of the other lazy finders; the binary tree, two
 /// entries per node, for `BtLazy2` and the opt strategies), `hashTable3`
 /// (`1 << hash_log3` entries, opt strategies with `min_match == 3` only)
 /// and `tagTable` (`1 << hash_log` bytes, row-based lazy finder only, else
-/// empty).
+/// empty), in that order.
 ///
-/// The first three are the index tables. `words[..valid]` is known to hold
-/// only values below the owner's window end (`0`, `1` or indices of inputs
-/// it has indexed; `ZSTD_cwksp`'s `tableValidEnd`), which after
-/// `ZSTD_window_clear` are all misses: index tables laid over those words
-/// need no zeroing.
+/// Every table starts on a 4 KiB page boundary: the allocation is of
+/// `Page`s and each table fills whole pages. A row of the row finder
+/// (`1 << row_log` entries at a multiple of its size, at most 256 bytes of
+/// `hashTable` and 64 of `tagTable`) therefore never crosses a page or a
+/// cache line. `ZSTD_cwksp` only guarantees 64-byte alignment
+/// (`ZSTD_CWKSP_ALIGNMENT_BYTES`); where its tables land within a page
+/// depends on the sizes of the objects reserved before them.
+///
+/// The first three are the index tables; they and the padding between
+/// them, which every reset zeroes, make up the index area. `words[..valid]`
+/// is known to hold only values below the owner's window end (`0`, `1` or
+/// indices of inputs it has indexed; `ZSTD_cwksp`'s `tableValidEnd`), which
+/// after `ZSTD_window_clear` are all misses: index tables laid over those
+/// words need no zeroing.
 #[derive(Default)]
 pub struct Workspace {
-    words: Vec<u32>,
-    hash_len: usize,
-    chain_len: usize,
-    hash3_len: usize,
-    tag_len: usize,
+    pages: Vec<Page>,
+    layout: Layout,
     valid: usize,
 }
 
-impl Workspace {
-    /// `(hash, chain, hash3, tag)` lengths for `cparams.strategy`.
-    fn lens(cparams: &CParams) -> (usize, usize, usize, usize) {
+/// Where the tables of [`Workspace`] lie, in words from the start of the
+/// allocation.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Layout {
+    hash_len: usize,
+    chain_off: usize,
+    chain_len: usize,
+    hash3_off: usize,
+    hash3_len: usize,
+    tag_off: usize,
+    tag_len: usize,
+}
+
+impl Layout {
+    /// The tables for `cparams.strategy` and, for the lazy strategies, the
+    /// finder `method`, each on its own pages.
+    fn of(cparams: &CParams, method: SearchMethod) -> Self {
         let hash = 1usize << cparams.hash_log;
         let chain = 1usize << cparams.chain_log;
-        match cparams.strategy {
+        let (hash_len, chain_len, hash3_len, tag_len) = match cparams.strategy {
             Strategy::Fast => (hash, 0, 0, 0),
             Strategy::DFast => (hash, chain, 0, 0),
-            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => (hash, chain, 0, hash),
+            Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 => match method {
+                SearchMethod::RowHash => (hash, 0, 0, hash),
+                SearchMethod::HashChain | SearchMethod::BinaryTree => (hash, chain, 0, 0),
+            },
             Strategy::BtLazy2 => (hash, chain, 0, 0),
             Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
                 let hash3 = match cparams.hash_log3() {
@@ -335,69 +365,140 @@ impl Workspace {
                 };
                 (hash, chain, hash3, 0)
             }
+        };
+        let chain_off = whole_pages(hash_len);
+        let hash3_off = chain_off + whole_pages(chain_len);
+        Self {
+            hash_len,
+            chain_off,
+            chain_len,
+            hash3_off,
+            hash3_len,
+            tag_off: hash3_off + whole_pages(hash3_len),
+            tag_len,
         }
     }
 
-    /// Words the tables for `cparams` take.
-    fn words_for(cparams: &CParams) -> usize {
-        let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams);
-        hash_len + chain_len + hash3_len + tag_len.div_ceil(4)
+    /// The end of the index area.
+    fn index_end(&self) -> usize {
+        self.hash3_off + self.hash3_len
     }
 
-    /// Whether the tables for `cparams` fit the allocation (not
+    /// Words the tables take, a whole number of pages.
+    fn words(&self) -> usize {
+        self.tag_off + whole_pages(self.tag_len.div_ceil(4))
+    }
+}
+
+/// The page size tables are aligned to.
+const PAGE: usize = 4096;
+
+/// `u32` entries per [`PAGE`] bytes.
+const PAGE_WORDS: usize = PAGE / 4;
+
+/// `words` rounded up to whole pages.
+fn whole_pages(words: usize) -> usize {
+    words.next_multiple_of(PAGE_WORDS)
+}
+
+/// One page of table entries: the allocation unit of [`Workspace`].
+#[derive(Clone, Copy)]
+#[repr(C, align(4096))]
+struct Page([u32; PAGE_WORDS]);
+
+// SAFETY: 1024 `u32`s are 4096 bytes, the alignment, so `Page` has no
+// padding and every bit pattern is valid.
+unsafe impl bytemuck::Zeroable for Page {}
+unsafe impl bytemuck::Pod for Page {}
+
+/// `n` zeroed `Page`s through `alloc_zeroed` (as `vec![0u32; n]` does), so
+/// fresh tables stay untouched zero pages.
+fn zeroed_pages(n: usize) -> Vec<Page> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<Page>(n).expect("workspace size");
+    // SAFETY: `layout` is not zero-sized; zeroed memory is `n` valid `Page`s
+    // (`Zeroable`), allocated with the layout `Vec<Page>` frees it with.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<Page>();
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(p, n, n)
+    }
+}
+
+impl Workspace {
+    /// The allocation as table entries.
+    #[inline]
+    fn words(&self) -> &[u32] {
+        bytemuck::cast_slice(&self.pages)
+    }
+
+    /// The allocation as table entries.
+    #[inline]
+    fn words_mut(&mut self) -> &mut [u32] {
+        bytemuck::cast_slice_mut(&mut self.pages)
+    }
+
+    /// Whether the tables for `cparams` and `method` fit the allocation (not
     /// `workspaceTooSmall`).
-    fn fits(&self, cparams: &CParams) -> bool {
-        Self::words_for(cparams) <= self.words.len()
+    fn fits(&self, cparams: &CParams, method: SearchMethod) -> bool {
+        Layout::of(cparams, method).words() <= self.pages.len() * PAGE_WORDS
     }
 
-    /// Lay the tables for `cparams` out (`ZSTD_reset_matchState` with
-    /// `ZSTDcrp_makeClean`). Tables that do not fit get a new zeroed
-    /// allocation (`ZSTD_cwksp_create`; the owner resets its indices);
-    /// otherwise `index_reset` forgets every word
-    /// (`ZSTD_cwksp_mark_tables_dirty`), and the index tables' words past
-    /// `valid` are zeroed (`ZSTD_cwksp_clean_tables`). The tag table is
-    /// never zeroed here: `ZSTD_cwksp_reserve_aligned_init_once` only
-    /// zeroes new memory.
-    fn reset(&mut self, cparams: &CParams, index_reset: bool) {
-        let (hash_len, chain_len, hash3_len, tag_len) = Self::lens(cparams);
-        let index_end = hash_len + chain_len + hash3_len;
-        let words = Self::words_for(cparams);
-        if self.words.len() < words {
+    /// Lay the tables for `cparams` and `method` out
+    /// (`ZSTD_reset_matchState` with `ZSTDcrp_makeClean`). Tables that do
+    /// not fit get a new zeroed allocation (`ZSTD_cwksp_create`; the owner
+    /// resets its indices); otherwise `index_reset` forgets every word
+    /// (`ZSTD_cwksp_mark_tables_dirty`), and the index area's words past
+    /// `valid` are zeroed (`ZSTD_cwksp_clean_tables`), as is the padding
+    /// between the index tables. The tag table is never zeroed here:
+    /// `ZSTD_cwksp_reserve_aligned_init_once` only zeroes new memory.
+    fn reset(&mut self, cparams: &CParams, method: SearchMethod, index_reset: bool) {
+        let layout = Layout::of(cparams, method);
+        let index_end = layout.index_end();
+        let pages = layout.words() / PAGE_WORDS;
+        if self.pages.len() < pages {
             debug_assert!(index_reset);
             // ZSTD_cwksp_free before ZSTD_cwksp_create: never both at once.
-            drop(std::mem::take(&mut self.words));
-            self.words = vec![0; words];
-            self.valid = words;
+            drop(std::mem::take(&mut self.pages));
+            self.pages = zeroed_pages(pages);
+            self.valid = pages * PAGE_WORDS;
         } else if index_reset {
             self.valid = 0;
         }
-        if self.valid < index_end {
-            self.words[self.valid..index_end].fill(0);
+        let valid = self.valid;
+        let words = self.words_mut();
+        if valid < index_end {
+            words[valid..index_end].fill(0);
         }
-        // Tags are no indices: past the index tables nothing is vouched for
+        // Padding holds no table, so no correction reduces it: zero it here
+        // and it stays below every window end.
+        words[layout.hash_len..layout.chain_off].fill(0);
+        words[layout.chain_off + layout.chain_len..layout.hash3_off].fill(0);
+        // Tags are no indices: past the index area nothing is vouched for
         // any more, as a buffer reserved below `tableValidEnd` lowers it.
-        self.valid = if tag_len > 0 {
+        self.valid = if layout.tag_len > 0 {
             index_end
         } else {
             self.valid.max(index_end)
         };
-        self.hash_len = hash_len;
-        self.chain_len = chain_len;
-        self.hash3_len = hash3_len;
-        self.tag_len = tag_len;
+        self.layout = layout;
     }
 
     /// `ZSTD_reduceIndex` between `ZSTD_cwksp_mark_tables_dirty` and
     /// `ZSTD_cwksp_mark_tables_clean`: [`reduce_table`] on `hashTable`,
     /// `chainTable` (keeping btlazy2's unsorted marks with `preserve_mark`)
-    /// and `hashTable3`. Words past them keep indices from before the
-    /// correction, so they are no longer vouched for.
+    /// and `hashTable3`. Words past the index area keep indices from before
+    /// the correction, so they are no longer vouched for.
     fn reduce(&mut self, correction: u32, preserve_mark: bool) {
         let (hash, chain, hash3) = self.opt_tables_mut();
         reduce_table(hash, correction, false);
         reduce_table(chain, correction, preserve_mark);
         reduce_table(hash3, correction, false);
-        self.valid = self.hash_len + self.chain_len + self.hash3_len;
+        self.valid = self.layout.index_end();
     }
 
     /// `(hashTable, chainTable, tagTable)`. Unchecked splits: the bounds
@@ -405,49 +506,65 @@ impl Workspace {
     /// registers of its whole hot loop (fast L1 measured 7% slower).
     #[inline]
     pub fn tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u8]) {
-        // SAFETY: `reset` is the only writer of the lengths and keeps
-        // `words.len() >= hash_len + chain_len + hash3_len + tag_len.div_ceil(4)`.
+        let l = self.layout;
+        // SAFETY: `reset` is the only writer of `layout` and sizes `pages`
+        // to hold `l.words()` entries, with `l.hash_len <= l.chain_off`,
+        // `l.chain_off + l.chain_len <= l.hash3_off <= l.tag_off`.
         unsafe {
-            let (hash, rest) = self.words.split_at_mut_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
-            let tag = rest.get_unchecked_mut(self.hash3_len..);
+            let words = self.words_mut();
+            let (hash, rest) = words.split_at_mut_unchecked(l.chain_off);
+            let (chain, rest) = rest.split_at_mut_unchecked(l.hash3_off - l.chain_off);
+            let tag = rest.get_unchecked_mut(l.tag_off - l.hash3_off..);
             let tag: &mut [u8] = bytemuck::cast_slice_mut(tag);
-            (hash, chain, tag.get_unchecked_mut(..self.tag_len))
+            (
+                hash.get_unchecked_mut(..l.hash_len),
+                chain.get_unchecked_mut(..l.chain_len),
+                tag.get_unchecked_mut(..l.tag_len),
+            )
         }
     }
 
     /// `(hashTable, chainTable, tagTable)`, see [`Workspace::tables_mut`].
     #[inline]
     pub fn tables(&self) -> (&[u32], &[u32], &[u8]) {
+        let l = self.layout;
         // SAFETY: as in `tables_mut`.
         unsafe {
-            let (hash, rest) = self.words.split_at_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_unchecked(self.chain_len);
-            let tag = rest.get_unchecked(self.hash3_len..);
-            let tag: &[u8] = bytemuck::cast_slice(tag);
-            (hash, chain, tag.get_unchecked(..self.tag_len))
+            let words = self.words();
+            let tag: &[u8] = bytemuck::cast_slice(words.get_unchecked(l.tag_off..));
+            (
+                words.get_unchecked(..l.hash_len),
+                words.get_unchecked(l.chain_off..l.chain_off + l.chain_len),
+                tag.get_unchecked(..l.tag_len),
+            )
         }
     }
 
     /// `(hashTable, chainTable, hashTable3)` of the opt strategies.
     #[inline]
     pub fn opt_tables_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [u32]) {
+        let l = self.layout;
         // SAFETY: as in `tables_mut`.
         unsafe {
-            let (hash, rest) = self.words.split_at_mut_unchecked(self.hash_len);
-            let (chain, rest) = rest.split_at_mut_unchecked(self.chain_len);
-            (hash, chain, rest.get_unchecked_mut(..self.hash3_len))
+            let words = self.words_mut();
+            let (hash, rest) = words.split_at_mut_unchecked(l.chain_off);
+            let (chain, rest) = rest.split_at_mut_unchecked(l.hash3_off - l.chain_off);
+            (
+                hash.get_unchecked_mut(..l.hash_len),
+                chain.get_unchecked_mut(..l.chain_len),
+                rest.get_unchecked_mut(..l.hash3_len),
+            )
         }
     }
 
     /// `hashTable3`, see [`Workspace::opt_tables_mut`].
     #[inline]
     pub fn hash3(&self) -> &[u32] {
+        let l = self.layout;
         // SAFETY: as in `tables_mut`.
         unsafe {
-            self.words
-                .get_unchecked(self.hash_len + self.chain_len..)
-                .get_unchecked(..self.hash3_len)
+            self.words()
+                .get_unchecked(l.hash3_off..l.hash3_off + l.hash3_len)
         }
     }
 }
@@ -473,6 +590,11 @@ impl MatchState {
     /// position `origin`, index [`WINDOW_START_INDEX`]: the first use of a
     /// context, see [`MatchState::reset`].
     pub fn new(cparams: CParams, origin: usize) -> Self {
+        Self::new_for(cparams, origin, default_search_method(&cparams))
+    }
+
+    /// [`MatchState::new`] with tables for the lazy finder `method`.
+    pub fn new_for(cparams: CParams, origin: usize, method: SearchMethod) -> Self {
         let mut ms = Self {
             cparams,
             ws: Workspace::default(),
@@ -481,8 +603,9 @@ impl MatchState {
             hash_salt: 0,
             hash_salt_entropy: 0,
             opt: None,
+            search_method: method,
         };
-        ms.reset(cparams, origin);
+        ms.reset_for(cparams, origin, method);
         ms
     }
 
@@ -493,7 +616,9 @@ impl MatchState {
     /// Indices restart at [`WINDOW_START_INDEX`] (`ZSTDirp_reset`:
     /// `ZSTD_window_init`, every table word zeroed) when the tables for
     /// `cparams` outgrow the allocation (`workspaceTooSmall`; a new one is
-    /// made) or the previous input ended too close to [`CURRENT_MAX`]
+    /// made; the lazy finder's tables count, so switching between the row
+    /// finder and the hash chain lays out and checks the other finder's
+    /// tables) or the previous input ended too close to [`CURRENT_MAX`]
     /// (`ZSTD_indexTooCloseToMax`). Otherwise they continue
     /// (`ZSTDirp_continue`): `ZSTD_window_clear` puts position `origin` at
     /// the index where the previous input ended and makes it the window's
@@ -515,8 +640,14 @@ impl MatchState {
     /// The overflow correction knob ([`MatchState::set_correct_frequently`])
     /// is a property of the context and survives the reset.
     pub fn reset(&mut self, cparams: CParams, origin: usize) {
-        let index_reset = !self.ws.fits(&cparams) || self.window.too_close_to_max();
-        self.ws.reset(&cparams, index_reset);
+        self.reset_for(cparams, origin, default_search_method(&cparams))
+    }
+
+    /// [`MatchState::reset`] with tables for the lazy finder `method`.
+    pub fn reset_for(&mut self, cparams: CParams, origin: usize, method: SearchMethod) {
+        let index_reset = !self.ws.fits(&cparams, method) || self.window.too_close_to_max();
+        self.ws.reset(&cparams, method, index_reset);
+        self.search_method = method;
         if index_reset {
             self.window = Window::new(origin, self.window.correct_frequently());
         } else {
@@ -857,36 +988,120 @@ mod tests {
 
     /// `tableValidEnd`: index tables laid over words that held indices are
     /// not zeroed, whatever table held them; words past the reduced tables
-    /// of a correction, words that held tags, and every word after an
-    /// index reset are.
+    /// of a correction, words that held tags, padding between index tables
+    /// and every word after an index reset are.
     #[test]
     fn workspace_zeroes_only_words_it_cannot_vouch_for() {
+        const HC: SearchMethod = SearchMethod::HashChain;
         let big = table_params(Strategy::DFast, 12, 12);
         let small = table_params(Strategy::Fast, 10, 0);
         let rows = table_params(Strategy::Lazy, 11, 11);
+        let padded = table_params(Strategy::DFast, 9, 9);
         let mut ws = Workspace::default();
-        ws.reset(&big, true);
-        assert_eq!(ws.words.len(), 8192);
-        ws.words.fill(7);
-        ws.reset(&small, false);
-        ws.reset(&big, false);
-        assert!(ws.words.iter().all(|&w| w == 7));
+        ws.reset(&big, HC, true);
+        assert_eq!(ws.words().len(), 8192);
+        ws.words_mut().fill(7);
+        ws.reset(&small, HC, false);
+        ws.reset(&big, HC, false);
+        assert!(ws.words().iter().all(|&w| w == 7));
         // The correction reduces the small tables only.
-        ws.reset(&small, false);
+        ws.reset(&small, HC, false);
         ws.reduce(5, false);
-        ws.reset(&big, false);
-        assert!(ws.words[..1024].iter().all(|&w| w == 2));
-        assert!(ws.words[1024..].iter().all(|&w| w == 0));
-        // Index tables 4096 words, tags 512 words after them.
-        ws.words.fill(7);
-        ws.reset(&rows, false);
+        ws.reset(&big, HC, false);
+        assert!(ws.words()[..1024].iter().all(|&w| w == 2));
+        assert!(ws.words()[1024..].iter().all(|&w| w == 0));
+        // The row finder's index area is its 2048-word hash table (no
+        // chain table), its tags follow on the next page.
+        ws.words_mut().fill(7);
+        ws.reset(&rows, SearchMethod::RowHash, false);
         ws.tables_mut().2.fill(9);
-        ws.reset(&big, false);
-        assert!(ws.words[..4096].iter().all(|&w| w == 7));
-        assert!(ws.words[4096..].iter().all(|&w| w == 0));
-        ws.words.fill(7);
-        ws.reset(&small, true);
-        assert!(ws.words[..1024].iter().all(|&w| w == 0));
-        assert!(ws.words[1024..].iter().all(|&w| w == 7));
+        ws.reset(&big, HC, false);
+        assert!(ws.words()[..2048].iter().all(|&w| w == 7));
+        assert!(ws.words()[2048..].iter().all(|&w| w == 0));
+        // Two 512-word tables, each padded to a page.
+        ws.words_mut().fill(7);
+        ws.reset(&padded, HC, false);
+        let w = ws.words();
+        assert!(w[..512].iter().chain(&w[1024..1536]).all(|&w| w == 7));
+        assert!(w[512..1024].iter().chain(&w[1536..2048]).all(|&w| w == 0));
+        ws.words_mut().fill(7);
+        ws.reset(&small, HC, true);
+        assert!(ws.words()[..1024].iter().all(|&w| w == 0));
+        assert!(ws.words()[1024..].iter().all(|&w| w == 7));
+    }
+
+    /// Every table of every strategy starts on a page boundary, fresh and
+    /// after a reset that reuses a larger allocation, so every row-finder
+    /// row (`1 << row_log` entries, `row_log` = `BOUNDED(4, search_log, 6)`)
+    /// of `hashTable` and `tagTable` lies within one page.
+    #[test]
+    fn tables_are_page_aligned_and_rows_stay_in_a_page() {
+        let check = |ms: &MatchState, level: i32| {
+            let (hash, chain, tag) = ms.ws.tables();
+            let h3 = ms.ws.hash3();
+            for (name, p) in [
+                ("hash", hash.as_ptr() as usize),
+                ("chain", chain.as_ptr() as usize),
+                ("tag", tag.as_ptr() as usize),
+                ("hash3", h3.as_ptr() as usize),
+            ] {
+                assert_eq!(p % PAGE, 0, "level {level} {name} table at {p:#x}");
+            }
+            if !tag.is_empty() {
+                let row = 1usize << ms.cparams.search_log.clamp(4, 6);
+                let page = |p: usize| p / PAGE;
+                for first in (0..tag.len()).step_by(row) {
+                    let h = hash[first..first + row].as_ptr_range();
+                    assert_eq!(page(h.start as usize), page(h.end as usize - 1));
+                    let t = tag[first..first + row].as_ptr_range();
+                    assert_eq!(page(t.start as usize), page(t.end as usize - 1));
+                }
+            }
+        };
+        let mut reused = MatchState::new(CParams::for_level(22, 1 << 20), 0);
+        // One size per `clevels.h` table: small tables are smaller than a page.
+        for size in [1 << 10, 100 << 10, 200 << 10, 1 << 20] {
+            for level in 1..=22 {
+                let cp = CParams::for_level(level, size);
+                check(&MatchState::new(cp, 0), level);
+                reused.reset(cp, 0);
+                check(&reused, level);
+            }
+        }
+    }
+
+    /// `ZSTD_allocateChainTable`: the row finder gets a tag table and no
+    /// chain table, the hash chain a chain table and no tag table, whichever
+    /// finder the state held before.
+    #[test]
+    fn lazy_tables_follow_the_search_method() {
+        let lens = |ms: &MatchState| {
+            let (hash, chain, tag) = ms.tables();
+            (hash.len(), chain.len(), tag.len())
+        };
+        // 1 KiB inputs get windowLog <= 14, where the hash chain is the default.
+        for size in [1 << 10, 1 << 20] {
+            for level in 3..=15 {
+                let cp = CParams::for_level(level, size);
+                if !cp.row_match_finder_supported() {
+                    continue;
+                }
+                let (hash, chain) = (1 << cp.hash_log, 1 << cp.chain_log);
+                let row = (hash, 0, hash);
+                let hc = (hash, chain, 0);
+                let default = MatchState::new(cp, 0);
+                let expect = match default.search_method {
+                    SearchMethod::RowHash => row,
+                    _ => hc,
+                };
+                assert_eq!(lens(&default), expect, "level {level} size {size}");
+                let mut ms = MatchState::new_for(cp, 0, SearchMethod::RowHash);
+                assert_eq!(lens(&ms), row);
+                ms.reset_for(cp, 0, SearchMethod::HashChain);
+                assert_eq!(lens(&ms), hc);
+                ms.reset_for(cp, 0, SearchMethod::RowHash);
+                assert_eq!(lens(&ms), row);
+            }
+        }
     }
 }

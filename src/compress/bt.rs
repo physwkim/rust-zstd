@@ -533,6 +533,7 @@ pub fn update_tree(ms: &mut MatchState, src: Src, ip: usize, iend: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::lazy::SearchMethod;
     use crate::compress::params::{CParams, Strategy};
 
     fn xorshift_text(len: usize, alphabet: u8) -> Vec<u8> {
@@ -548,7 +549,7 @@ mod tests {
     }
 
     /// Parameters with a chain table of `1 << chain_log` entries (the lazy
-    /// strategies allocate one).
+    /// strategies allocate one for the tree and the hash chain).
     fn tree_params(chain_log: u32, search_log: u32, min_match: u32) -> CParams {
         CParams {
             window_log: 20,
@@ -579,7 +580,7 @@ mod tests {
         for (alphabet, min_match) in [(2u8, 4u32), (4, 5), (26, 6), (3, 3)] {
             let src = xorshift_text(20_000, alphabet);
             let cp = tree_params(16, 6, min_match);
-            let mut ms = MatchState::new(cp, 0);
+            let mut ms = MatchState::new_for(cp, 0, SearchMethod::BinaryTree);
             let v = ms.view(&src);
             let end = v.end();
             update_tree(&mut ms, v, end - 8, end);
@@ -617,7 +618,7 @@ mod tests {
         src[1000..3000].fill(b'z');
         src[3000] = b'a';
         let cp = tree_params(16, 6, 4);
-        let mut ms = MatchState::new(cp, 0);
+        let mut ms = MatchState::new_for(cp, 0, SearchMethod::BinaryTree);
         let v = ms.view(&src);
         let end = v.end();
         let p1001 = ms.index(1001);
@@ -643,7 +644,7 @@ mod tests {
         let copy: Vec<u8> = src[a..a + 1000].to_vec();
         src[b..b + 1000].copy_from_slice(&copy);
         let cp = tree_params(16, 6, 4);
-        let mut ms = MatchState::new(cp, 0);
+        let mut ms = MatchState::new_for(cp, 0, SearchMethod::BinaryTree);
         let v = ms.view(&src);
         let end = v.end();
         let b = ms.index(b);
@@ -662,7 +663,7 @@ mod tests {
     #[should_panic(expected = "closer than HASH_READ_SIZE")]
     fn update_tree_rejects_target_near_end() {
         let src = xorshift_text(100, 4);
-        let mut ms = MatchState::new(tree_params(10, 4, 4), 0);
+        let mut ms = MatchState::new_for(tree_params(10, 4, 4), 0, SearchMethod::BinaryTree);
         let v = ms.view(&src);
         let (ip, end) = (ms.index(95), ms.index(100));
         update_tree(&mut ms, v, ip, end);

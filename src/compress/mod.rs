@@ -240,7 +240,7 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 }
 
 /// A reusable `ZSTD_CCtx`: the options plus ZSTDMT's pool of contexts
-/// ([`ContextPool`]), which every job, a single-threaded frame's one job
+/// (`ContextPool`), which every job, a single-threaded frame's one job
 /// included, runs on, and which is kept across calls. A context's match
 /// state is reset for each job like `ZSTD_resetCCtx_internal`: indices
 /// continue from its previous input and its tables are kept, see

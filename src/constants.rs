@@ -67,7 +67,7 @@ pub const ML_BASE: [u32; MAX_ML + 1] = [
     0x403, 0x803, 0x1003, 0x2003, 0x4003, 0x8003, 0x10003,
 ];
 
-/// Extra bits for each offset code. offset_code = OF_bits[code].
+/// Extra bits for each offset code. `offset_code = OF_bits[code]`.
 pub const OF_BITS: [u8; MAX_OFF + 1] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31,

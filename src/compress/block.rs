@@ -497,7 +497,7 @@ fn emit_block(
 /// Compress `src[block]` (at most `ZSTD_BLOCKSIZE_MAX` bytes) and append it,
 /// as one block or, with `split`, as the blocks the post-sequence splitter
 /// cuts it into, to `out`: [`build_seq_store`] from the committed repeat
-/// offsets, then [`emit_block`].
+/// offsets, then `emit_block`.
 #[allow(clippy::too_many_arguments)]
 pub fn compress_block(
     ms: &mut MatchState,
@@ -658,7 +658,7 @@ impl JobBlocks {
 /// `sizing`, appended to `out`, each through the post-sequence splitter
 /// when `split`, with long distance matches from `ldm`. With `pipelined` (parallel feature only) block N's entropy
 /// stage and emission run on rayon next to block N+1's match finding
-/// whenever every block N is written as is [proven](proven_rep_after) to
+/// whenever every block N is written as is proven (`proven_rep_after`) to
 /// be COMPRESSED, so that the repeat offsets N+1 starts from are the ones
 /// the decoder will hold, and N+1's size is fixed without N's compressed
 /// size; otherwise N's entropy stage runs first and N+1 starts from the

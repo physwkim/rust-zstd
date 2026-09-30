@@ -504,13 +504,13 @@ mod tests {
         for len in [0usize, 1, 7, 8, 9, 100, (1 << 17) + 1] {
             let data = &text[..len];
             for level in [3, 4] {
-                roundtrip_blocks(
-                    &finder(),
-                    data,
-                    CParams::for_level(level, len),
-                    1 << 17,
-                    [1, 4, 8],
-                );
+                // Level 4 is greedy at some sizes: keep its table sizes but
+                // give the finder the dfast tables it runs on.
+                let cp = CParams {
+                    strategy: Strategy::DFast,
+                    ..CParams::for_level(level, len)
+                };
+                roundtrip_blocks(&finder(), data, cp, 1 << 17, [1, 4, 8]);
             }
         }
     }

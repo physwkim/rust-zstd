@@ -3,7 +3,7 @@
 //! price model (`ZSTD_rescaleFreqs`, `ZSTD_setBasePrices`,
 //! `ZSTD_updateStats`) and btultra2's first-block statistics pass
 //! (`ZSTD_initStats_ultra`). The match finder is `bt_get_all_matches` in
-//! [`bt`].
+//! [`bt`](super::bt).
 //!
 //! Positions are the indices [`MatchState`] assigns, libzstd's
 //! `window.base`-relative ones.

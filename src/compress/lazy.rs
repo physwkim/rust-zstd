@@ -7,7 +7,7 @@
 //!
 //! Positions are the indices [`MatchState`](super::matchstate) assigns,
 //! libzstd's `window.base`-relative ones: table entry `0` means empty and
-//! `1` is [`DUBT_UNSORTED_MARK`], both below `window_low`.
+//! `1` is `DUBT_UNSORTED_MARK`, both below `window_low`.
 
 use super::common::{
     byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,
@@ -45,7 +45,7 @@ const K_LAZY_SKIPPING_STEP: usize = 8;
 // Small helpers. Unchecked reads follow `compress/common.rs`: every call site
 // states the bound that makes it sound. Inside a block those bounds rest on
 // `block.end <= src.end()` and the table sizes, both asserted once per block
-// in [`compress_block_with`] / [`load_prefix_with`], plus the loop limits
+// in [`compress_block_with`] / [`load_prefix`], plus the loop limits
 // (`ip < ilimit`, `ilimit + ILIMIT_MARGIN <= iend`, `ILIMIT_MARGIN >= 8`).
 // ---------------------------------------------------------------------------
 
@@ -1672,8 +1672,8 @@ unsafe fn bt_block_avx2(
 }
 
 /// `ZSTD_compressBlock_greedy/lazy/lazy2[_row]/btlazy2` for the strategy in
-/// `ms.cparams`, with the match finder of [`default_search_method`] and the
-/// SIMD level detected on this machine. Sequences go to `out`, `rep` is
+/// `ms.cparams`, with the match finder `ms.search_method` and the SIMD level
+/// detected on this machine. Sequences go to `out`, `rep` is
 /// updated for the next block; returns the anchor of the trailing literals.
 pub fn compress_block(
     ms: &mut MatchState,
@@ -1682,15 +1682,14 @@ pub fn compress_block(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
-    let method = default_search_method(&ms.cparams);
-    compress_block_with(ms, src, block, rep, out, method, detected_level())
+    compress_block_with(ms, src, block, rep, out, detected_level())
 }
 
 /// The per-block facts every unchecked access in this module rests on: the
 /// block (or prefix) ends inside `src`, the tables have the sizes
 /// [`MatchState::new`] gives them, and a row hash fits in 32 bits
 /// (`ZSTD_adjustCParams_internal` caps `hashLog` at `rowLog + 24`).
-fn assert_block_bounds(ms: &MatchState, src: Src, end: usize, method: SearchMethod) {
+fn assert_block_bounds(ms: &MatchState, src: Src, end: usize) {
     let cp = &ms.cparams;
     let (hash_table, chain_table, tag_table) = ms.tables();
     assert!(
@@ -1699,7 +1698,7 @@ fn assert_block_bounds(ms: &MatchState, src: Src, end: usize, method: SearchMeth
         src.end()
     );
     assert_eq!(hash_table.len(), 1usize << cp.hash_log, "hash_table size");
-    match method {
+    match ms.search_method {
         SearchMethod::HashChain | SearchMethod::BinaryTree => {
             assert_eq!(
                 chain_table.len(),
@@ -1728,13 +1727,12 @@ pub fn compress_block_with(
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
-    method: SearchMethod,
     level: Level,
 ) -> usize {
     let block = block.range();
     let depth = depth_of(ms.cparams.strategy);
-    assert_block_bounds(ms, src, block.end, method);
-    match method {
+    assert_block_bounds(ms, src, block.end);
+    match ms.search_method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
         // SAFETY (all four unsafe arms): fearless_simd constructs a witness
         // only after detecting its feature set on this CPU.
@@ -1755,13 +1753,8 @@ pub fn compress_block_with(
     }
 }
 
-/// `ZSTD_loadDictionaryContent`, lazy arm, for the finder of
-/// [`default_search_method`]: see [`load_prefix_with`].
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
-    load_prefix_with(ms, src, range, default_search_method(&ms.cparams))
-}
-
-/// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms: insert every
+/// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms, for the finder
+/// `ms.search_method`: insert every
 /// position of `range` up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
 /// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
@@ -1769,16 +1762,16 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
 /// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
 /// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
 /// level table produces.
-pub fn load_prefix_with(ms: &mut MatchState, src: Src, range: Range<usize>, method: SearchMethod) {
+pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
     let end = range.end;
-    assert_block_bounds(ms, src, end, method);
+    assert_block_bounds(ms, src, end);
     let start = ms.next_to_update.max(range.start).max(ms.window_low());
     if end >= start + HASH_READ_SIZE {
         let target = end - HASH_READ_SIZE;
         ms.next_to_update = start;
         // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
         // and the table sizes were asserted above.
-        match method {
+        match ms.search_method {
             SearchMethod::HashChain => {
                 match mls_of(&ms.cparams) {
                     4 => unsafe {
@@ -1852,11 +1845,11 @@ mod tests {
         rep0: [u32; 3],
         method: SearchMethod,
     ) -> (usize, usize) {
-        let mut ms = MatchState::new(cp, origin);
+        let mut ms = MatchState::new_for(cp, origin, method);
         let view = ms.view(src);
         if job_start > origin {
             let range = ms.index(origin)..ms.index(job_start);
-            load_prefix_with(&mut ms, view, range, method);
+            load_prefix(&mut ms, view, range);
             assert_eq!(ms.next_to_update, ms.index(job_start));
         }
         let mut rep = rep0;
@@ -1874,7 +1867,6 @@ mod tests {
                 block,
                 &mut rep,
                 &mut store,
-                method,
                 Level::fallback(),
             );
             let anchor = ms.pos(anchor);
@@ -2060,7 +2052,7 @@ mod tests {
     /// Sequences, literals, final repcodes and anchors of every block.
     fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
         let mut ms = MatchState::new(cp, 0);
-        collect_on(&mut ms, src, block_size, default_search_method(&cp), level)
+        collect_on(&mut ms, src, block_size, level)
     }
 
     /// Every block of `src` on `ms` as prepared by the caller: all sequences
@@ -2069,7 +2061,6 @@ mod tests {
         ms: &mut MatchState,
         src: &[u8],
         block_size: usize,
-        method: SearchMethod,
         level: Level,
     ) -> (SeqStore, [u32; 3]) {
         let mut rep = [1u32, 4, 8];
@@ -2080,7 +2071,7 @@ mod tests {
             let end = (start + block_size).min(src.len());
             store.clear();
             let (view, block) = ms.start_block(src, start..end);
-            let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, method, level);
+            let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, level);
             let anchor = ms.pos(anchor);
             all.seqs.extend_from_slice(&store.seqs);
             all.lits.extend_from_slice(&store.lits);
@@ -2088,6 +2079,45 @@ mod tests {
             start = end;
         }
         (all, rep)
+    }
+
+    /// One context reused across row-finder and hash-chain levels, where
+    /// the tag table and the chain table take each other's words, gives
+    /// the sequences of a fresh context at every step.
+    #[test]
+    fn reset_across_row_and_chain_levels_matches_fresh_context() {
+        let big = crate_sources();
+        let big = &big[..big.len().min(600_000)];
+        let small = current_exe(12_000);
+        let row = CParams::for_level(11, big.len());
+        let chain = CParams::for_level(7, small.len());
+        assert_eq!(default_search_method(&row), SearchMethod::RowHash);
+        assert_eq!(default_search_method(&chain), SearchMethod::HashChain);
+        let level = Level::new();
+        let mut reused = MatchState::new(row, 0);
+        let steps: [(&[u8], CParams, Option<SearchMethod>); 5] = [
+            (big, row, None),
+            (&small, chain, None),
+            (big, row, None),
+            // The row level's tables with the hash chain, then the row
+            // finder again: its tags over the chain table's words.
+            (big, row, Some(SearchMethod::HashChain)),
+            (big, row, None),
+        ];
+        for (k, &(data, cp, method)) in steps.iter().enumerate() {
+            let method = method.unwrap_or(default_search_method(&cp));
+            if k > 0 {
+                reused.reset_for(cp, 0, method);
+            }
+            assert_eq!(reused.search_method, method);
+            let mut fresh = MatchState::new_for(cp, 0, method);
+            let (r_store, r_rep) = collect_on(&mut reused, data, 40_000, level);
+            let (f_store, f_rep) = collect_on(&mut fresh, data, 40_000, level);
+            assert_eq!(r_store.seqs, f_store.seqs, "step {k} {method:?}");
+            assert_eq!(r_store.lits, f_store.lits, "step {k}");
+            assert_eq!(r_rep, f_rep, "step {k}");
+            assert!(r_store.seqs.len() > 100, "step {k}");
+        }
     }
 
     /// `MatchState::reset` on a context that compressed something else, with
@@ -2111,10 +2141,10 @@ mod tests {
             for (first, cp_first, second, cp_second, continues) in
                 [(&a, cp_a, &b, cp_b, true), (&b, cp_b, &a, cp_a, false)]
             {
-                let mut reused = MatchState::new(cp_first, 0);
-                collect_on(&mut reused, first, 40_000, m, level);
-                reused.reset(cp_second, 0);
-                let mut fresh = MatchState::new(cp_second, 0);
+                let mut reused = MatchState::new_for(cp_first, 0, m);
+                collect_on(&mut reused, first, 40_000, level);
+                reused.reset_for(cp_second, 0, m);
+                let mut fresh = MatchState::new_for(cp_second, 0, m);
                 if continues {
                     assert_eq!(reused.window_low(), WINDOW_START_INDEX + first.len());
                     assert!(reused.tables().0.iter().any(|&e| e != 0));
@@ -2126,8 +2156,8 @@ mod tests {
                 // Only the reused context's second reset advanced its salt.
                 assert_ne!(reused.hash_salt, fresh.hash_salt);
                 assert_eq!(reused.cparams, fresh.cparams);
-                let (r_store, r_rep) = collect_on(&mut reused, second, 40_000, m, level);
-                let (f_store, f_rep) = collect_on(&mut fresh, second, 40_000, m, level);
+                let (r_store, r_rep) = collect_on(&mut reused, second, 40_000, level);
+                let (f_store, f_rep) = collect_on(&mut fresh, second, 40_000, level);
                 assert_eq!(r_store.seqs, f_store.seqs, "{m:?} {cp_second:?}");
                 assert_eq!(r_store.lits, f_store.lits);
                 assert_eq!(r_rep, f_rep);
