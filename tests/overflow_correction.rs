@@ -13,15 +13,24 @@
 //! matching there); 136 MiB with long distance matching enabled, which
 //! raises the window log to 27.
 //!
-//! Ignored by default; release build:
+//! `input_over_4_gib_matches_libzstd` compresses 4.5 GiB, which stock
+//! libzstd corrects once its indices pass 3500 MiB, at levels 1 and 3 and
+//! level 3 with long distance matching.
+//!
+//! Ignored by default; release build (the 4.5 GiB test needs about 12 GB
+//! of memory):
 //!
 //! ```text
 //! cargo test --release --test overflow_correction -- --ignored
 //! ```
 
+mod common;
+
 use rust_zstd::compress::{CompressOptions, Compressor, ParamSwitch};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching};
+use zstd::zstd_safe::zstd_sys as sys;
 
 /// `CASES` of `overflow_frequent.c`: level, long distance matching
 /// enabled (else `Auto`), job size in MiB (0: one job), input MiB.
@@ -213,4 +222,34 @@ fn frequent_correction_matches_libzstd_20_mib() {
 fn frequent_correction_matches_libzstd_long_windows() {
     let cases: Vec<Case> = CASES.into_iter().filter(|c| c.3 > 20).collect();
     check(&cases);
+}
+
+/// Stock libzstd's frames (single-threaded `ZSTD_compress2`) of an input
+/// past `ZSTD_CURRENT_MAX`, which our decoder reads back.
+#[test]
+#[ignore]
+fn input_over_4_gib_matches_libzstd() {
+    let data = input(4608 << 20);
+    for (level, ldm) in [(1, false), (3, false), (3, true)] {
+        let mut cx = Compressor::new(CompressOptions {
+            level,
+            ldm: if ldm {
+                ParamSwitch::Enable
+            } else {
+                ParamSwitch::Auto
+            },
+            ..CompressOptions::default()
+        });
+        let frame = cx.compress_to_vec(&data);
+        let (ms, lds) = cx.overflow_corrections();
+        let name = format!("L{level} ldm {ldm}");
+        eprintln!("{name}: {} bytes, corrections {ms} + {lds}", frame.len());
+        assert_eq!((ms, lds), (1, ldm as u32), "{name}: corrections");
+        let mut params = vec![(ZSTD_c_compressionLevel, level)];
+        if ldm {
+            params.push((ZSTD_c_enableLongDistanceMatching, 1));
+        }
+        assert!(common::c_compress2(&data, &params) == frame, "{name}");
+        assert!(rust_zstd::decompress(&frame).unwrap() == data, "{name}");
+    }
 }

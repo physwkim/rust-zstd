@@ -46,9 +46,6 @@ pub const JOBSIZE_MAX: usize = 1 << 30;
 const JOBLOG_MAX: u32 = 30;
 
 /// Options for [`Compressor`] and [`compress_with`].
-///
-/// Inputs must be smaller than 4 GiB: match positions are `u32` indices into
-/// the input, and [`Compressor::compress`] asserts the limit.
 #[derive(Clone, Debug)]
 pub struct CompressOptions {
     /// Compression level, `ZSTD_c_compressionLevel`, as libzstd reads it:
@@ -286,10 +283,6 @@ impl Compressor {
 
     /// Append one frame holding `src` to `out`.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        assert!(
-            src.len() < u32::MAX as usize,
-            "inputs of 4 GiB or more are not supported (match indices are u32)"
-        );
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();

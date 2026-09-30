@@ -32,7 +32,8 @@ pub const WINDOW_START_INDEX: usize = 2;
 
 /// `ZSTD_CURRENT_MAX` (64-bit): the highest index a block, or a long
 /// distance matching chunk, may end at without its window being corrected
-/// first. It leaves room for a 512 MiB job below 4 GiB.
+/// first. The `ZSTD_CHUNKSIZE_MAX` (596 MiB) indices above it exceed any
+/// block or chunk.
 pub const CURRENT_MAX: usize = 3500 << 20;
 
 /// `ZSTD_window_t` without a dictionary (`lowLimit == dictLimit`, no
