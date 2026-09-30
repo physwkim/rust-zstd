@@ -129,6 +129,7 @@ fn c_frame(data: &[u8], level: i32, split: i32) -> Vec<u8> {
     }
 }
 
+/// Our frame as one job, with the pre-splitter off like [`c_frame`].
 fn ours(data: &[u8], level: i32, split_after_sequences: ParamSwitch) -> Vec<u8> {
     compress_with(
         data,
@@ -136,6 +137,7 @@ fn ours(data: &[u8], level: i32, split_after_sequences: ParamSwitch) -> Vec<u8> 
             level,
             job_size: Some(1 << 30),
             split_after_sequences,
+            block_splitter_level: 1,
             ..Default::default()
         },
     )

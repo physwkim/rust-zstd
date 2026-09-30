@@ -24,7 +24,7 @@ pub mod split;
 
 use crate::constants::*;
 use block::{
-    write_raw_block, write_rle_block, BlockScratch, BlockState, CommittedBlockState,
+    write_raw_block, write_rle_block, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
 use matchstate::MatchState;
@@ -62,6 +62,13 @@ pub struct CompressOptions {
     /// `min(overlap, job start)` bytes of history from the previous job, see
     /// `overlap_log`. The job size is raised to the overlap size when it is
     /// smaller (`ZSTDMT_initCStream_internal`).
+    ///
+    /// An explicit size, or an input of several jobs, also selects
+    /// ZSTDMT's block sizing for inputs above `JOBSIZE_MIN` (below it
+    /// libzstd does not start ZSTDMT): each job is fed in 512 KiB chunks
+    /// that no block crosses and that bound the pre-split blocks of
+    /// `block_splitter_level`. A single job of the default size is sized
+    /// like single-threaded `ZSTD_compress2`, one chunk.
     pub job_size: Option<usize>,
     /// `ZSTD_c_overlapLog`, `0..=9`: the history a job indexes from before
     /// its start, as a fraction of the window. `0` selects
@@ -77,6 +84,17 @@ pub struct CompressOptions {
     /// no ported strategy reaches `btopt` yet, so `Auto` leaves blocks
     /// whole.
     pub split_after_sequences: ParamSwitch,
+    /// `ZSTD_c_blockSplitterLevel`, `0..=6`: before match finding, end a
+    /// full 128 KiB block early where its byte statistics change
+    /// (`ZSTD_splitBlock`). `0` (the default) picks the heuristic by
+    /// strategy as libzstd does: `Fast` compares the block's borders,
+    /// `DFast`, `Greedy`/`Lazy` and `Lazy2` compare 8 KiB chunks sampled
+    /// every 43, 11 and 5 bytes. `1` disables it; `2` selects the borders
+    /// and `3..=6` chunks sampled every 43, 11, 5 and 1 bytes. A block is
+    /// split only once its job has saved 3 bytes, so the first block of
+    /// every job is whole. Values above 6 panic (libzstd rejects them
+    /// with `parameter_outOfBound`).
+    pub block_splitter_level: u8,
 }
 
 impl Default for CompressOptions {
@@ -86,6 +104,7 @@ impl Default for CompressOptions {
             job_size: None,
             overlap_log: 0,
             split_after_sequences: ParamSwitch::Auto,
+            block_splitter_level: 0,
         }
     }
 }
@@ -170,7 +189,9 @@ impl Compressor {
         );
         let cparams = CParams::for_level(self.opts.level, src.len());
         out.reserve(src.len() + 64);
+        let header_start = out.len();
         write_frame_header(out, src.len() as u64, cparams.window_log);
+        let header_len = out.len() - header_start;
 
         if src.is_empty() {
             write_raw_block(out, &[], true);
@@ -198,6 +219,8 @@ impl Compressor {
         let split = split::block_splitter_enabled(self.opts.split_after_sequences, &cparams);
         let jobs = job_ranges(src.len(), job_size);
         let n_jobs = jobs.len();
+        let mt = multithreaded(&self.opts, src.len(), n_jobs);
+        let sizing = block_sizing(&self.opts, &cparams, mt, header_len);
         if self.jobs.len() < n_jobs {
             self.jobs.resize_with(n_jobs, JobContext::default);
         }
@@ -209,7 +232,7 @@ impl Compressor {
                 compress_job(
                     src,
                     cparams,
-                    block_size,
+                    sizing,
                     overlap,
                     job,
                     k == 0,
@@ -232,6 +255,35 @@ impl Compressor {
     }
 }
 
+/// Whether libzstd would compress through ZSTDMT: `ZSTD_compressStream2`
+/// runs it only for inputs above `ZSTDMT_JOBSIZE_MIN`, and a job size (set,
+/// or several default jobs) is a ZSTDMT parameter.
+fn multithreaded(opts: &CompressOptions, len: usize, n_jobs: usize) -> bool {
+    len > JOBSIZE_MIN && (opts.job_size.is_some() || n_jobs > 1)
+}
+
+/// [`BlockSizing`] for `opts`: `blockSizeMax` from the window, the
+/// pre-splitter level by strategy, and ZSTDMT's `4 * ZSTD_BLOCKSIZE_MAX`
+/// chunks when `mt`.
+fn block_sizing(
+    opts: &CompressOptions,
+    cparams: &CParams,
+    mt: bool,
+    header_len: usize,
+) -> BlockSizing {
+    BlockSizing {
+        // blockSizeMax = MIN(ZSTD_BLOCKSIZE_MAX, 1 << windowLog)
+        block_size_max: ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log),
+        split_level: presplit::split_level(opts.block_splitter_level, cparams.strategy),
+        chunk_size: if mt {
+            4 * ZSTD_BLOCKSIZE_MAX
+        } else {
+            usize::MAX
+        },
+        header_len,
+    }
+}
+
 /// Upper bound on the blocks a job of `len` bytes produces: every block
 /// RAW with its header.
 fn job_bound(len: usize, block_size: usize) -> usize {
@@ -244,13 +296,13 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 /// `overlap` bytes before its start (`ZSTD_loadDictionaryContent` on the
 /// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
-/// obtained from the previous job. `split` runs every block through the
-/// post-sequence splitter.
+/// obtained from the previous job. `sizing` cuts the job into blocks;
+/// `split` runs every block through the post-sequence splitter.
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
     cparams: CParams,
-    block_size: usize,
+    sizing: BlockSizing,
     overlap: usize,
     job: Range<usize>,
     first_job: bool,
@@ -278,13 +330,13 @@ fn compress_job(
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
-    ctx.scratch.reserve(block_size);
-    out.reserve(job_bound(job.len(), block_size));
+    ctx.scratch.reserve(sizing.block_size_max);
+    out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
         &mut ms,
         data,
         job,
-        block_size,
+        sizing,
         first_job,
         last_job,
         split,
@@ -653,19 +705,20 @@ mod tests {
                 ..Default::default()
             };
             let cparams = CParams::for_level(level, data.len());
-            let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
             let overlap = overlap_size(&cparams, opts.overlap_log);
             let job_size = job_size_for(opts.job_size, cparams.window_log, overlap);
             let jobs = job_ranges(data.len(), job_size);
             assert!(jobs.len() >= 5, "level {level}: {} jobs", jobs.len());
             let n = jobs.len();
+            let mt = multithreaded(&opts, data.len(), n);
+            let sizing = block_sizing(&opts, &cparams, mt, header_len(&data, &cparams));
             let src = data.as_slice();
             let f = |pipelined: bool| {
                 move |k: usize, job: Range<usize>, ctx: &mut JobContext, out: &mut Vec<u8>| {
                     compress_job(
                         src,
                         cparams,
-                        block_size,
+                        sizing,
                         overlap,
                         job,
                         k == 0,
@@ -694,19 +747,30 @@ mod tests {
         }
     }
 
-    /// One job through `compress_job`, pipelined or serial, with the block
-    /// splitter on or off.
+    /// The frame header length of `data` with `cparams`.
+    fn header_len(data: &[u8], cparams: &CParams) -> usize {
+        let mut header = Vec::new();
+        write_frame_header(&mut header, data.len() as u64, cparams.window_log);
+        header.len()
+    }
+
+    /// `data` as job 0 and the last through `compress_job`, pipelined or
+    /// serial, with the post-sequence splitter on or off, the pre-splitter
+    /// by strategy, and single-threaded or (`mt`) ZSTDMT block sizing.
     #[cfg(feature = "parallel")]
-    fn one_job(data: &[u8], level: i32, split: bool, pipelined: bool) -> Vec<u8> {
+    fn one_job(data: &[u8], level: i32, split: bool, pipelined: bool, mt: bool) -> Vec<u8> {
+        let opts = CompressOptions {
+            level,
+            ..Default::default()
+        };
         let cparams = CParams::for_level(level, data.len());
-        let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
+        let sizing = block_sizing(&opts, &cparams, mt, header_len(data, &cparams));
         let overlap = overlap_size(&cparams, 0);
         let mut ctx = JobContext::default();
         let mut out = Vec::new();
         let job = 0..data.len();
         compress_job(
-            data, cparams, block_size, overlap, job, true, true, split, pipelined, &mut ctx,
-            &mut out,
+            data, cparams, sizing, overlap, job, true, true, split, pipelined, &mut ctx, &mut out,
         );
         out
     }
@@ -715,7 +779,10 @@ mod tests {
     /// text (the proof holds and blocks overlap), on random data (every
     /// block RAW, the proof fails) and with a RAW and an RLE block between
     /// compressed ones (the next block must start from the committed, not
-    /// the finder's, repeat offsets).
+    /// the finder's, repeat offsets). The pre-splitter is on, so block
+    /// N+1's size is fixed from the least savings of a COMPRESSED block N;
+    /// `mixed` also runs in ZSTDMT's 512 KiB chunks, where job 0 owes the
+    /// frame header from its second chunk on.
     #[cfg(feature = "parallel")]
     #[test]
     fn pipelined_block_loop_matches_serial() {
@@ -733,8 +800,8 @@ mod tests {
                 ("mixed", &mixed),
             ] {
                 let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
-                let serial = one_job(data, level, false, false);
-                let piped = one_job(data, level, false, true);
+                let serial = one_job(data, level, false, false, false);
+                let piped = one_job(data, level, false, true, false);
                 assert!(piped == serial, "{name} L{level}: pipelined != serial");
                 let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
                 if name != "random" {
@@ -749,7 +816,38 @@ mod tests {
                 );
                 assert!(frame.ends_with(&serial), "{name} L{level}: frame != job");
                 assert_eq!(&crate::decompress(&frame).unwrap(), data, "{name} L{level}");
+                if name == "mixed" {
+                    let unsplit = data.len().div_ceil(ZSTD_BLOCKSIZE_MAX);
+                    assert!(
+                        count_blocks(&frame) > unsplit,
+                        "{name} L{level}: no pre-split"
+                    );
+                }
             }
+            let serial = one_job(&mixed, level, false, false, true);
+            let piped = one_job(&mixed, level, false, true, true);
+            assert!(
+                piped == serial,
+                "mixed L{level}: ZSTDMT pipelined != serial"
+            );
+            let frame = compress_with(
+                &mixed,
+                &CompressOptions {
+                    level,
+                    job_size: Some(2 << 20),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                frame.ends_with(&serial),
+                "mixed L{level}: ZSTDMT frame != job"
+            );
+            assert_eq!(crate::decompress(&frame).unwrap(), mixed, "mixed L{level}");
+            let unsplit = mixed.len().div_ceil(ZSTD_BLOCKSIZE_MAX);
+            assert!(
+                count_blocks(&frame) > unsplit,
+                "mixed L{level}: no pre-split"
+            );
         }
     }
 
@@ -797,8 +895,8 @@ mod tests {
                 ("mixed", &mixed),
             ] {
                 let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
-                let serial = one_job(data, level, true, false);
-                let piped = one_job(data, level, true, true);
+                let serial = one_job(data, level, true, false, false);
+                let piped = one_job(data, level, true, true, false);
                 assert!(piped == serial, "{name} L{level}: pipelined != serial");
                 let overlapped = block::PIPELINE_OVERLAPPED.load(Relaxed) - before;
                 if name != "random" {
@@ -815,13 +913,19 @@ mod tests {
                 let theirs = zstd::stream::decode_all(&frame[..]).unwrap();
                 assert_eq!(&theirs, data, "{name} L{level}");
                 if name == "sources" {
-                    let whole = compress_with(data, &opts(ParamSwitch::Disable));
-                    assert!(whole == compress_with(data, &opts(ParamSwitch::Auto)));
+                    // The post-sequence splitter against 128 KiB blocks.
+                    let unsplit = |split_after_sequences| CompressOptions {
+                        block_splitter_level: 1,
+                        ..opts(split_after_sequences)
+                    };
+                    let split = compress_with(data, &unsplit(ParamSwitch::Enable));
+                    let whole = compress_with(data, &unsplit(ParamSwitch::Disable));
+                    assert!(whole == compress_with(data, &unsplit(ParamSwitch::Auto)));
                     assert!(
-                        count_blocks(&frame) > count_blocks(&whole),
+                        count_blocks(&split) > count_blocks(&whole),
                         "{name} L{level}: no block split"
                     );
-                    assert!(frame.len() < whole.len(), "{name} L{level}");
+                    assert!(split.len() < whole.len(), "{name} L{level}");
                 }
             }
         }

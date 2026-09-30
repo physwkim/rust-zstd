@@ -14,6 +14,9 @@
 //!
 //! `ZSTD_CORPUS_DIR` overrides the corpus directory, `ZSTD_BENCH_ITERS` the
 //! number of iterations per cell (default 5, odd values keep the median exact).
+//!
+//! The replica cuts 128 KiB blocks, so both compressors run with the
+//! pre-splitter off (`block_splitter_level` 1, `ZSTD_c_blockSplitterLevel` 1).
 
 use rust_zstd::compress::block::{
     self, BlockScratch, BlockState, MIN_CBLOCK_SIZE, RLE_MAX_LENGTH, ZSTD_BLOCKHEADERSIZE,
@@ -26,6 +29,7 @@ use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
 use rust_zstd::{fse, huf};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use zstd::zstd_safe::zstd_sys as sys;
 
 const DEFAULT_CORPUS: &str = "/tmp/claude-1000/-home-stevek-work-rust-zstd/d30c8856-c9ae-4039-8110-94096bb23bce/scratchpad/corpus";
 const FILES: [&str; 3] = ["elf_8M.bin", "rssrc_8M.txt", "words_1M.txt"];
@@ -130,6 +134,55 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
     out
 }
 
+/// libzstd through one reused `ZSTD_CCtx` (`ZSTD_compress2`) at `level`,
+/// with the pre-splitter off like the replica.
+struct CZstd(*mut sys::ZSTD_CCtx);
+
+impl CZstd {
+    fn new(level: i32) -> Self {
+        // SAFETY: the context is owned by the returned value.
+        unsafe {
+            let cctx = sys::ZSTD_createCCtx();
+            for (param, value) in [
+                (sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+                // ZSTD_c_blockSplitterLevel 1: no pre-splitting.
+                (sys::ZSTD_cParameter::ZSTD_c_experimentalParam20, 1),
+            ] {
+                let r = sys::ZSTD_CCtx_setParameter(cctx, param, value);
+                assert_eq!(sys::ZSTD_isError(r), 0, "set parameter {param:?}");
+            }
+            Self(cctx)
+        }
+    }
+
+    fn compress(&mut self, data: &[u8]) -> Vec<u8> {
+        // SAFETY: `out` has capacity for ZSTD_compressBound bytes and only
+        // the written prefix is exposed.
+        unsafe {
+            let mut out = Vec::<u8>::with_capacity(sys::ZSTD_compressBound(data.len()));
+            let n = sys::ZSTD_compress2(
+                self.0,
+                out.as_mut_ptr().cast(),
+                out.capacity(),
+                data.as_ptr().cast(),
+                data.len(),
+            );
+            assert_eq!(sys::ZSTD_isError(n), 0);
+            out.set_len(n);
+            out
+        }
+    }
+}
+
+impl Drop for CZstd {
+    fn drop(&mut self) {
+        // SAFETY: created by ZSTD_createCCtx and freed once.
+        unsafe {
+            sys::ZSTD_freeCCtx(self.0);
+        }
+    }
+}
+
 fn median(mut v: Vec<Duration>) -> Duration {
     v.sort();
     v[v.len() / 2]
@@ -167,11 +220,12 @@ fn stage_split() {
         for level in LEVELS {
             let opts = CompressOptions {
                 level,
+                block_splitter_level: 1,
                 ..CompressOptions::default()
             };
             let cparams = CParams::for_level(level, data.len());
             let mut cx = Compressor::new(opts.clone());
-            let mut czstd = zstd::bulk::Compressor::new(level).unwrap();
+            let mut czstd = CZstd::new(level);
             let mut frame = Vec::new();
             let mut c_frame = Vec::new();
             let mut e2e = Vec::with_capacity(iters);
@@ -192,7 +246,7 @@ fn stage_split() {
                     "{file} L{level}: reused Compressor diverged from compress_with"
                 );
                 let t = Instant::now();
-                c_frame = czstd.compress(&data).unwrap();
+                c_frame = czstd.compress(&data);
                 c_e2e.push(t.elapsed());
                 let mut st = Stages::default();
                 let blocks = stage_pass(&data, cparams, &mut st, &mut layout);

@@ -4,7 +4,8 @@
 //! fresh one, and whenever the two bounds prove a block compressed
 //! (`sum < block_len - ZSTD_minGain`) the block must come out compressed.
 //! The blocks come from a replica of the driver's job and block loop whose
-//! output is checked against `compress_with`.
+//! output is checked against `compress_with` with the pre-splitter off
+//! (`block_splitter_level` 1), since the replica cuts 128 KiB blocks.
 //!
 //! The corpus sweep is ignored by default; run it in release:
 //!
@@ -160,6 +161,7 @@ fn check(data: &[u8], level: i32, name: &str) -> Tally {
         data,
         &CompressOptions {
             level,
+            block_splitter_level: 1,
             ..CompressOptions::default()
         },
     );
