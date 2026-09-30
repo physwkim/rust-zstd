@@ -298,7 +298,13 @@ const DUBT_UNSORTED_MARK: usize = 1;
 /// two entries per position (`bt[2 * (idx & btMask)]` the smaller child,
 /// `+ 1` the larger one; `btLog = chainLog - 1`). Positions are appended
 /// unsorted as a hash chain and sorted lazily when a search reaches them.
-struct BtSearch<const MLS: u32>;
+#[derive(Clone, Copy)]
+struct BtSearch<M, const MLS: u32> {
+    /// The [`MatchCount`] level of the block loop.
+    count: M,
+    /// The block's tree constants.
+    p: BtParams,
+}
 
 /// C's `dummy32`: the slot a descent writes once it ran past `btLow`.
 const BT_DUMMY: usize = usize::MAX;
@@ -335,7 +341,7 @@ impl BtParams {
     }
 }
 
-impl<const MLS: u32> BtSearch<MLS> {
+impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
     /// `ZSTD_updateDUBT`: append `[next_to_update, ip)` to their hash
     /// chains, each marked unsorted.
     ///
@@ -368,7 +374,7 @@ impl<const MLS: u32> BtSearch<MLS> {
     /// `curr < iend <= src.len()`; `bt.len() == 2 * (p.bt_mask + 1)`.
     #[inline(always)]
     unsafe fn insert_dubt1(
-        p: BtParams,
+        self,
         bt: &mut [u32],
         src: &[u8],
         curr: usize,
@@ -376,6 +382,7 @@ impl<const MLS: u32> BtSearch<MLS> {
         mut nb_compares: u32,
         bt_low: usize,
     ) {
+        let p = self.p;
         let bt_mask = p.bt_mask;
         let ip = curr;
         let mut common_smaller = 0usize;
@@ -397,7 +404,9 @@ impl<const MLS: u32> BtSearch<MLS> {
             // `match_index + match_length < ip + match_length < iend`: the
             // common lengths are `< iend - ip` (a match reaching `iend`
             // breaks below).
-            match_length += count(src, ip + match_length, match_index + match_length, iend);
+            match_length +=
+                self.count
+                    .count(src, ip + match_length, match_index + match_length, iend);
             if ip + match_length == iend {
                 // equal: no way to know if inf or sup
                 break;
@@ -440,6 +449,7 @@ impl<const MLS: u32> BtSearch<MLS> {
     /// sizes of [`assert_block_bounds`].
     #[inline(always)]
     unsafe fn find_best_match(
+        self,
         ms: &mut MatchState,
         src: &[u8],
         ip: usize,
@@ -447,7 +457,7 @@ impl<const MLS: u32> BtSearch<MLS> {
         off_base: &mut u32,
     ) -> usize {
         let cp = ms.cparams;
-        let p = BtParams::of(ms);
+        let p = self.p;
         let bt_mask = p.bt_mask;
         let curr = ip;
         let window_low = p.window_low(curr);
@@ -493,7 +503,7 @@ impl<const MLS: u32> BtSearch<MLS> {
             let next_candidate = tget(bt, 2 * (match_index & bt_mask) + 1);
             // Every stacked candidate passed `candidate_valid(.., curr)`
             // above: `match_index < ip < iend`.
-            Self::insert_dubt1(p, bt, src, match_index, iend, nb_candidates, unsort_limit);
+            self.insert_dubt1(bt, src, match_index, iend, nb_candidates, unsort_limit);
             match_index = next_candidate;
             nb_candidates += 1;
         }
@@ -515,7 +525,9 @@ impl<const MLS: u32> BtSearch<MLS> {
             let mut match_length = common_smaller.min(common_larger);
             // `match_index + match_length < ip + match_length < iend`, as in
             // `insert_dubt1`.
-            match_length += count(src, ip + match_length, match_index + match_length, iend);
+            match_length +=
+                self.count
+                    .count(src, ip + match_length, match_index + match_length, iend);
             if match_length > best_length {
                 if match_length > match_end_idx - match_index {
                     match_end_idx = match_index + match_length;
@@ -568,8 +580,13 @@ impl<const MLS: u32> BtSearch<MLS> {
     }
 }
 
-impl<const MLS: u32> Search for BtSearch<MLS> {
+impl<M: MatchCount, const MLS: u32> Search for BtSearch<M, MLS> {
     const ILIMIT_MARGIN: usize = 8;
+
+    #[inline(always)]
+    unsafe fn count(&self, src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+        self.count.count(src, a, b, limit)
+    }
 
     #[inline(always)]
     fn refill(&mut self, _ms: &mut MatchState, _src: &[u8], _ilimit: usize) {}
@@ -593,7 +610,7 @@ impl<const MLS: u32> Search for BtSearch<MLS> {
         // table sizes asserted per block ([`assert_block_bounds`]).
         unsafe {
             Self::update_dubt(ms, src, ip);
-            Self::find_best_match(ms, src, ip, iend, off_base)
+            self.find_best_match(ms, src, ip, iend, off_base)
         }
     }
 }
@@ -1601,9 +1618,10 @@ fn hc_block(
 }
 
 /// The binary-tree block loop specialised on `mls`
-/// (`ZSTD_compressBlock_btlazy2`).
-#[inline(never)]
-fn bt_block(
+/// (`ZSTD_compressBlock_btlazy2`) for one [`MatchCount`] level.
+#[inline(always)]
+fn bt_block<M: MatchCount>(
+    count: M,
     ms: &mut MatchState,
     src: &[u8],
     block: Range<usize>,
@@ -1611,11 +1629,69 @@ fn bt_block(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
+    let p = BtParams::of(ms);
     match mls_of(&ms.cparams) {
-        4 => lazy_generic(ms, src, block, rep, out, depth, BtSearch::<4>),
-        5 => lazy_generic(ms, src, block, rep, out, depth, BtSearch::<5>),
-        _ => lazy_generic(ms, src, block, rep, out, depth, BtSearch::<6>),
+        4 => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 4> { count, p },
+        ),
+        5 => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 5> { count, p },
+        ),
+        _ => lazy_generic(
+            ms,
+            src,
+            block,
+            rep,
+            out,
+            depth,
+            BtSearch::<M, 6> { count, p },
+        ),
     }
+}
+
+/// [`bt_block`] with the scalar `ZSTD_count`.
+#[inline(never)]
+fn bt_block_scalar(
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    bt_block(Fallback::new(), ms, src, block, rep, out, depth)
+}
+
+/// [`bt_block`] compiled with AVX2 enabled, using the AVX2 match count.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, which `count` attests.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn bt_block_avx2(
+    count: Avx2,
+    ms: &mut MatchState,
+    src: &[u8],
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+) -> usize {
+    bt_block(count, ms, src, block, rep, out, depth)
 }
 
 /// `ZSTD_compressBlock_greedy/lazy/lazy2[_row]/btlazy2` for the strategy in
@@ -1668,7 +1744,7 @@ fn assert_block_bounds(ms: &MatchState, src: &[u8], end: usize, method: SearchMe
 
 /// [`compress_block`] with an explicit match finder and SIMD level. Every
 /// combination produces the same sequences for the same method; the level
-/// only selects the tag-compare kernel.
+/// only selects the tag-compare and match-count kernels.
 pub fn compress_block_with(
     ms: &mut MatchState,
     src: &[u8],
@@ -1682,9 +1758,13 @@ pub fn compress_block_with(
     assert_block_bounds(ms, src, block.end, method);
     match method {
         SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
-        SearchMethod::BinaryTree => bt_block(ms, src, block, rep, out, depth),
-        // SAFETY (all three): fearless_simd constructs a witness only after
-        // detecting its feature set on this CPU.
+        // SAFETY (all four unsafe arms): fearless_simd constructs a witness
+        // only after detecting its feature set on this CPU.
+        SearchMethod::BinaryTree => match level {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Level::Avx2(w) => unsafe { bt_block_avx2(w, ms, src, block, rep, out, depth) },
+            _ => bt_block_scalar(ms, src, block, rep, out, depth),
+        },
         SearchMethod::RowHash => match level {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Level::Sse4_2(w) => unsafe { row_block_sse(w, ms, src, block, rep, out, depth) },
@@ -2001,7 +2081,7 @@ mod tests {
     /// Sequences, literals, final repcodes and anchors of every block.
     fn collect(src: &[u8], cp: CParams, block_size: usize, level: Level) -> (SeqStore, [u32; 3]) {
         let mut ms = MatchState::new(cp, 1);
-        collect_on(&mut ms, src, block_size, SearchMethod::RowHash, level)
+        collect_on(&mut ms, src, block_size, default_search_method(&cp), level)
     }
 
     /// Every block of `src` on `ms` as prepared by the caller: all sequences
@@ -2077,12 +2157,14 @@ mod tests {
         let mut srcs = crate_sources();
         srcs.extend_from_slice(&current_exe(300_000));
         // Cover every rowLog (searchLog clamped to 4..6), not only the level
-        // table's.
+        // table's; levels 13 and 15 run the tree (AVX2 match count).
         for (level_no, block, search_log) in [
             (5, ZSTD_BLOCKSIZE_MAX, 3),
             (7, 5000, 5),
             (9, ZSTD_BLOCKSIZE_MAX, 6),
             (11, 40_000, 4),
+            (13, ZSTD_BLOCKSIZE_MAX, 4),
+            (15, 5000, 6),
         ] {
             let mut cp = CParams::for_level(level_no, srcs.len());
             cp.search_log = search_log;
