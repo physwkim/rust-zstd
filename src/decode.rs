@@ -2261,6 +2261,17 @@ enum ModeType {
 }
 
 impl CompressionModes {
+    /// The Symbol_Compression_Modes byte, whose Reserved bits 1-0 must be
+    /// zero (ZSTD_decodeSeqHeaders' corruption_detected).
+    fn new(byte: u8) -> Result<Self, String> {
+        if byte & 3 != 0 {
+            return Err(format!(
+                "Symbol compression modes {byte:#04x}: reserved bits set"
+            ));
+        }
+        Ok(Self(byte))
+    }
+
     fn decode_mode(m: u8) -> ModeType {
         match m {
             0 => ModeType::Predefined,
@@ -2314,7 +2325,7 @@ impl SequencesHeader {
                     ));
                 }
                 self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes(source[1]));
+                self.modes = Some(CompressionModes::new(source[1])?);
                 bytes_read += 2;
             }
             128..=254 => {
@@ -2333,7 +2344,7 @@ impl SequencesHeader {
                             source.len()
                         ));
                     }
-                    self.modes = Some(CompressionModes(source[2]));
+                    self.modes = Some(CompressionModes::new(source[2])?);
                     bytes_read += 1;
                 }
             }
@@ -2345,7 +2356,7 @@ impl SequencesHeader {
                     ));
                 }
                 self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
-                self.modes = Some(CompressionModes(source[3]));
+                self.modes = Some(CompressionModes::new(source[3])?);
                 bytes_read += 4;
             }
         }
@@ -2565,6 +2576,14 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         FrameDecoderError::new("Error reading frame descriptor: truncated".into())
     })?);
     pos += 1;
+    // ZSTD_getFrameHeader_advanced: bit 3 is reserved and must be zero
+    // (frameParameter_unsupported); bit 4, unused, is ignored.
+    if desc.0 & 0x08 != 0 {
+        return Err(FrameDecoderError::new(format!(
+            "Frame header descriptor {:#04x}: reserved bit set",
+            desc.0
+        )));
+    }
 
     let mut frame_header = FrameHeader {
         descriptor: FrameDescriptor(desc.0),
