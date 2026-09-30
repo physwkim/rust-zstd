@@ -15,13 +15,11 @@
 //!
 //! `ZSTD_CORPUS_DIR` overrides the corpus directory.
 
-use rust_zstd::compress::block::{
-    self, BlockScratch, BlockState, MIN_CBLOCK_SIZE, RLE_MAX_LENGTH, ZSTD_BLOCKHEADERSIZE,
-};
+use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::seqstore::Seq;
 use rust_zstd::compress::{
-    compress_with, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
+    compress_with, job_prefix, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
 };
 use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
 use rust_zstd::fse::{self, sequences_section_bound, FseState};
@@ -87,15 +85,11 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     for (k, job) in jobs.iter().enumerate() {
         let first_job = k == 0;
         let last_job = k + 1 == jobs.len();
-        let origin = if first_job {
-            job.start
-        } else {
-            job.start.saturating_sub(overlap)
-        };
-        let mut ms = MatchState::new(cparams, origin);
+        let prefix = job_prefix(job, first_job, overlap);
+        let mut ms = MatchState::new(cparams, prefix.start);
         let mut prev = BlockState::initial();
         if !first_job {
-            block::load_prefix(&mut ms, data, origin..job.start);
+            block::load_prefix(&mut ms, data, prefix);
             prev.invalidate_rep_codes();
         }
         let mut scratch = BlockScratch::new(block_size);
@@ -107,18 +101,18 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
             let is_last = last_job && end == job.end;
             let what = format!("{name} L{level} block @{start}");
             let mut next = None;
-            // block.rs: `block_len < MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 + 1` -> RAW
-            if block_len > MIN_CBLOCK_SIZE + ZSTD_BLOCKHEADERSIZE + 1 {
+            let entered = ms.enter_block(start..end);
+            let built = block::build_seq_store(
+                &mut ms,
+                data,
+                entered,
+                prev.rep,
+                &mut scratch.store,
+                &mut block::BlockLdm::Off,
+            );
+            // None below 7 bytes (RAW)
+            if let Some(rep) = built {
                 tally.blocks += 1;
-                let mut rep = prev.rep;
-                block::build_seq_store(
-                    &mut ms,
-                    data,
-                    start..end,
-                    &mut rep,
-                    &mut scratch.store,
-                    &mut block::BlockLdm::Off,
-                );
                 let store = &scratch.store;
                 let proven = literals_section_bound(store.lits.len())
                     + sequences_section_bound(&store.seqs)

@@ -14,7 +14,7 @@ use super::common::{
     byte, candidate_valid, hash_ptr, prefetch, read32, simd_level, tget, tset, MatchCount, Src,
     HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
@@ -463,14 +463,13 @@ fn fill_hash_table_from(ms: &mut MatchState, src: Src, start: usize, end: usize)
     }
 }
 
-/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)`: insert
-/// every third position of `src[range]` from `ms.next_to_update` into the
-/// hash table, then set `next_to_update = range.end`.
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
-    let end = range.end;
+/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_fast, ZSTD_tfp_forCCtx)` for an
+/// entered prefix: insert every third position from `ms.next_to_update`
+/// (its start) into the hash table, then set `next_to_update` to its end.
+pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
+    let end = ms.prefix_indices(prefix).end;
     assert!(end <= src.end());
-    let start = ms.next_to_update.max(range.start);
-    fill_hash_table_from(ms, src, start, end);
+    fill_hash_table_from(ms, src, ms.next_to_update, end);
     ms.next_to_update = end;
 }
 
@@ -622,23 +621,25 @@ mod tests {
         assert_eq!(rep[2], 8);
     }
 
-    /// A table entry pointing past the current position (a MatchState
-    /// reused on a shorter input) must be a miss, never a read past `src`.
+    /// A table entry pointing past the current position (tables carried
+    /// over from a longer input) must be a miss, never a read past `src`.
     #[test]
     fn stale_table_entries_beyond_the_input_are_ignored() {
         let long = synthetic_text(300_000, 9);
         let cp = CParams::for_level(1, long.len());
-        let mut ms = MatchState::new(cp, 0);
+        let mut stale = MatchState::new(cp, 0);
         let mut store = SeqStore::new();
         let mut rep = [1u32, 4, 8];
         run_block(
             compress_block,
-            &mut ms,
+            &mut stale,
             &long,
             0..long.len(),
             &mut rep,
             &mut store,
         );
+        let mut ms = MatchState::new(cp, 0);
+        ms.ws = stale.ws;
         let short = &long[..20_000];
         store.clear();
         let mut rep = [1u32, 4, 8];

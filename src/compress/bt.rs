@@ -16,10 +16,9 @@
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
 use super::common::{byte, read32, tget, MatchCount, Src, HASH_READ_SIZE};
-use super::matchstate::MatchState;
+use super::matchstate::{EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, repcode_to_offbase, ZSTD_REP_NUM};
 use fearless_simd::Fallback;
-use std::ops::Range;
 
 /// `ZSTD_OPT_NUM`: positions of one optimal-parser series.
 pub const ZSTD_OPT_NUM: usize = 1 << 12;
@@ -485,24 +484,14 @@ pub(crate) fn assert_opt_bounds(ms: &MatchState, src: Src, end: usize) {
     assert_eq!(ms.ws.hash3().len(), want, "hash_table3 size");
 }
 
-/// `ZSTD_loadDictionaryContent`, binary-tree arm, for a raw-content prefix
-/// `src[range]` (already cut to the table-sized suffix): `nextToUpdate` at
-/// the prefix start, then, unless the prefix is at most `HASH_READ_SIZE`
-/// bytes, `ZSTD_updateTree(ms, end - HASH_READ_SIZE, end)` and
+/// `ZSTD_loadDictionaryContent`, binary-tree arm, for an entered prefix
+/// (more than `HASH_READ_SIZE` bytes, `nextToUpdate` at its start):
+/// `ZSTD_updateTree(ms, end - HASH_READ_SIZE, end)` and
 /// `nextToUpdate = end`.
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
-    assert!(
-        range.start >= ms.window_low(),
-        "prefix start {} below window_low {}",
-        range.start,
-        ms.window_low()
-    );
-    ms.next_to_update = range.start;
-    if range.len() <= HASH_READ_SIZE {
-        return;
-    }
-    update_tree(ms, src, range.end - HASH_READ_SIZE, range.end);
-    ms.next_to_update = range.end;
+pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
+    let end = ms.prefix_indices(prefix).end;
+    update_tree(ms, src, end - HASH_READ_SIZE, end);
+    ms.next_to_update = end;
 }
 
 /// `ZSTD_updateTree(ms, ip, iend)`: `update_tree_internal` with the hash

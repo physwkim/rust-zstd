@@ -393,7 +393,7 @@ pub unsafe fn count_with(level: Level, src: Src, a: usize, b: usize, limit: usiz
 #[cfg(test)]
 pub mod testutil {
     use super::Src;
-    use crate::compress::matchstate::{Block, MatchState};
+    use crate::compress::matchstate::{Block, EnteredPrefix, MatchState};
     use crate::compress::params::CParams;
     use crate::compress::seqstore::{SeqStore, ZSTD_REP_NUM};
     use std::ops::Range;
@@ -420,7 +420,7 @@ pub mod testutil {
     }
 
     pub type BlockFn = fn(&mut MatchState, Src, Block, &mut [u32; 3], &mut SeqStore) -> usize;
-    pub type PrefixFn = fn(&mut MatchState, Src, Range<usize>);
+    pub type PrefixFn = fn(&mut MatchState, Src, EnteredPrefix);
 
     /// Run the finder `f` on positions `block` of `data`, returning the
     /// anchor position.
@@ -432,7 +432,8 @@ pub mod testutil {
         rep: &mut [u32; 3],
         store: &mut SeqStore,
     ) -> usize {
-        let (src, block) = ms.start_block(data, block);
+        let entered = ms.enter_block(block);
+        let (src, block) = ms.start_block(data, entered);
         let anchor = f(ms, src, block, rep, store);
         ms.pos(anchor)
     }
@@ -485,9 +486,9 @@ pub mod testutil {
         rep: [u32; 3],
     ) -> Stats {
         let mut ms = MatchState::new(cp, origin);
-        if job_start > origin {
-            let (view, range) = (ms.view(src), ms.index(origin)..ms.index(job_start));
-            (f.load_prefix)(&mut ms, view, range);
+        if let Some(prefix) = ms.enter_prefix(origin..job_start) {
+            let view = ms.view(src);
+            (f.load_prefix)(&mut ms, view, prefix);
         }
         let mut rep = rep;
         let mut store = SeqStore::new();

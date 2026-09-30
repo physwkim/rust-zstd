@@ -13,7 +13,7 @@ use super::common::{
     byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,
     Src, HASH_READ_SIZE,
 };
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::seqstore::{
     offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
@@ -59,8 +59,9 @@ fn highbit32(v: u32) -> u32 {
 const PRIME4: u32 = 2654435761;
 const PRIME5: u64 = 889523592379;
 const PRIME6: u64 = 227718039650203;
+const PRIME7: u64 = 58295818150454627;
 
-/// `ZSTD_hashPtrSalted(src + pos, hbits, mls, salt)` for `mls` 4..=6 and
+/// `ZSTD_hashPtrSalted(src + pos, hbits, mls, salt)` for `mls` 4..=7 and
 /// `hbits <= 32` (`ZSTD_hashPtr` is the same with `salt == 0`). `mls == 4`
 /// only uses the low 32 bits of the salt, like C. The result is
 /// `< 1 << hbits`.
@@ -75,7 +76,8 @@ unsafe fn hash_salted<const MLS: u32>(src: Src, pos: usize, hbits: u32, salt: u6
         4 => (read32(src, pos).wrapping_mul(PRIME4) ^ (salt as u32)) >> (32 - hbits),
         5 => (((read64(src, pos) << 24).wrapping_mul(PRIME5) ^ salt) >> (64 - hbits)) as u32,
         6 => (((read64(src, pos) << 16).wrapping_mul(PRIME6) ^ salt) >> (64 - hbits)) as u32,
-        _ => unreachable!("mls is clamped to 4..=6"),
+        7 => (((read64(src, pos) << 8).wrapping_mul(PRIME7) ^ salt) >> (64 - hbits)) as u32,
+        _ => unreachable!("mls is 4..=7"),
     }
 }
 
@@ -1754,66 +1756,57 @@ pub fn compress_block_with(
 }
 
 /// `ZSTD_loadDictionaryContent`, lazy and btlazy2 arms, for the finder
-/// `ms.search_method`: insert every
-/// position of `range` up to `end - HASH_READ_SIZE`
+/// `ms.search_method`: insert every position of the entered prefix from
+/// `ms.next_to_update` (its start) up to `end - HASH_READ_SIZE`
 /// (`ZSTD_insertAndFindFirstIndex` / `ZSTD_row_update` / `ZSTD_updateTree`
 /// at `iend - HASH_READ_SIZE`) and set `next_to_update = end`. The row
-/// finder's tag table is zeroed first, as C does here. The hash width is
-/// `BOUNDED(4, minMatch, 6)` as in the block loop, where C's chain loader
-/// passes `minMatch` itself; they differ only for `minMatch == 7`, which no
-/// level table produces.
-pub fn load_prefix(ms: &mut MatchState, src: Src, range: Range<usize>) {
-    let end = range.end;
+/// finder's tag table is zeroed first, as C does here.
+pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
+    let end = ms.prefix_indices(prefix).end;
     assert_block_bounds(ms, src, end);
-    let start = ms.next_to_update.max(range.start).max(ms.window_low());
-    if end >= start + HASH_READ_SIZE {
-        let target = end - HASH_READ_SIZE;
-        ms.next_to_update = start;
-        // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
-        // and the table sizes were asserted above.
-        match ms.search_method {
-            SearchMethod::HashChain => {
-                match mls_of(&ms.cparams) {
-                    4 => unsafe {
-                        HcSearch::<4>::insert_and_find_first_index(ms, src, target, false)
-                    },
-                    5 => unsafe {
-                        HcSearch::<5>::insert_and_find_first_index(ms, src, target, false)
-                    },
-                    _ => unsafe {
-                        HcSearch::<6>::insert_and_find_first_index(ms, src, target, false)
-                    },
+    let target = end - HASH_READ_SIZE;
+    // SAFETY (every finder): `target + HASH_READ_SIZE == end <= src.end()`
+    // and the table sizes were asserted above.
+    match ms.search_method {
+        // `ZSTD_insertAndFindFirstIndex` hashes `minMatch` bytes, unbounded
+        // like `ZSTD_updateTree`: at 7, where the searches hash 6, libzstd
+        // never matches the prefix.
+        SearchMethod::HashChain => {
+            match ms.cparams.min_match {
+                5 => unsafe { HcSearch::<5>::insert_and_find_first_index(ms, src, target, false) },
+                6 => unsafe { HcSearch::<6>::insert_and_find_first_index(ms, src, target, false) },
+                7 => unsafe { HcSearch::<7>::insert_and_find_first_index(ms, src, target, false) },
+                _ => unsafe { HcSearch::<4>::insert_and_find_first_index(ms, src, target, false) },
+            };
+        }
+        SearchMethod::RowHash => {
+            ms.ws.tables_mut().2.fill(0);
+            macro_rules! go {
+                ($mls:literal, $row_log:literal) => {
+                    unsafe {
+                        let mut next_to_update = ms.next_to_update;
+                        let mut t = RowTables::of(ms);
+                        RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
+                            .update_internal(&mut t, &mut next_to_update, src, target, false);
+                        ms.next_to_update = next_to_update;
+                    }
                 };
             }
-            SearchMethod::RowHash => {
-                ms.ws.tables_mut().2.fill(0);
-                macro_rules! go {
-                    ($mls:literal, $row_log:literal) => {
-                        unsafe {
-                            let mut next_to_update = ms.next_to_update;
-                            let mut t = RowTables::of(ms);
-                            RowSearch::<Fallback, $mls, $row_log>::new(Fallback::new())
-                                .update_internal(&mut t, &mut next_to_update, src, target, false);
-                            ms.next_to_update = next_to_update;
-                        }
-                    };
-                }
-                match (mls_of(&ms.cparams), row_log_of(&ms.cparams)) {
-                    (4, 4) => go!(4, 4),
-                    (4, 5) => go!(4, 5),
-                    (4, _) => go!(4, 6),
-                    (5, 4) => go!(5, 4),
-                    (5, 5) => go!(5, 5),
-                    (5, _) => go!(5, 6),
-                    (_, 4) => go!(6, 4),
-                    (_, 5) => go!(6, 5),
-                    _ => go!(6, 6),
-                }
+            match (mls_of(&ms.cparams), row_log_of(&ms.cparams)) {
+                (4, 4) => go!(4, 4),
+                (4, 5) => go!(4, 5),
+                (4, _) => go!(4, 6),
+                (5, 4) => go!(5, 4),
+                (5, 5) => go!(5, 5),
+                (5, _) => go!(5, 6),
+                (_, 4) => go!(6, 4),
+                (_, 5) => go!(6, 5),
+                _ => go!(6, 6),
             }
-            // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
-            // the dictionary table fully sorted".
-            SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
         }
+        // `ZSTD_updateTree(ms, iend - HASH_READ_SIZE, iend)`: "we want
+        // the dictionary table fully sorted".
+        SearchMethod::BinaryTree => super::bt::update_tree(ms, src, target, end),
     }
     ms.next_to_update = end;
 }
@@ -1846,10 +1839,9 @@ mod tests {
         method: SearchMethod,
     ) -> (usize, usize) {
         let mut ms = MatchState::new_for(cp, origin, method);
-        let view = ms.view(src);
-        if job_start > origin {
-            let range = ms.index(origin)..ms.index(job_start);
-            load_prefix(&mut ms, view, range);
+        if let Some(prefix) = ms.enter_prefix(origin..job_start) {
+            let view = ms.view(src);
+            load_prefix(&mut ms, view, prefix);
             assert_eq!(ms.next_to_update, ms.index(job_start));
         }
         let mut rep = rep0;
@@ -1860,7 +1852,8 @@ mod tests {
             let end = (start + block_size).min(src.len());
             store.clear();
             let rep_in = rep;
-            let (view, block) = ms.start_block(src, start..end);
+            let entered = ms.enter_block(start..end);
+            let (view, block) = ms.start_block(src, entered);
             let anchor = compress_block_with(
                 &mut ms,
                 view,
@@ -2070,7 +2063,8 @@ mod tests {
         while start < src.len() {
             let end = (start + block_size).min(src.len());
             store.clear();
-            let (view, block) = ms.start_block(src, start..end);
+            let entered = ms.enter_block(start..end);
+            let (view, block) = ms.start_block(src, entered);
             let anchor = compress_block_with(ms, view, block, &mut rep, &mut store, level);
             let anchor = ms.pos(anchor);
             all.seqs.extend_from_slice(&store.seqs);
@@ -2291,6 +2285,34 @@ mod tests {
         }
     }
 
+    /// libzstd's prefix loaders hash `minMatch` bytes, the hash-chain and
+    /// binary-tree searches `BOUNDED(4, minMatch, 6)`: at minMatch 7 an
+    /// input repeating a random prefix finds no match on those finders, as
+    /// libzstd 1.5.7 does, while the row finder (`MIN(minMatch, 6)` on both
+    /// sides) matches it; at minMatch 6 every finder does.
+    #[test]
+    fn prefix_loaders_hash_min_match_bytes() {
+        let mut rng = XorShift(7);
+        let prefix: Vec<u8> = (0..50_000).map(|_| rng.next() as u8).collect();
+        let src = [&prefix[..], &prefix[..]].concat();
+        let finders = [
+            (Strategy::Greedy, SearchMethod::HashChain),
+            (Strategy::Lazy, SearchMethod::HashChain),
+            (Strategy::Lazy2, SearchMethod::HashChain),
+            (Strategy::Lazy2, SearchMethod::RowHash),
+            (Strategy::BtLazy2, SearchMethod::BinaryTree),
+        ];
+        for (strategy, method) in finders {
+            for mls in [6, 7] {
+                let cp = lazy_params(9, src.len(), strategy, mls);
+                let job = prefix.len();
+                let (nseqs, _) = run_blocks(&src, cp, 0, job, ZSTD_BLOCKSIZE_MAX, [0; 3], method);
+                let matched = mls == 6 || method == SearchMethod::RowHash;
+                assert_eq!(nseqs > 0, matched, "{strategy:?} {method:?} minMatch {mls}");
+            }
+        }
+    }
+
     fn run_bt(src: &[u8], cp: CParams, block_size: usize) -> (usize, usize) {
         run_blocks(
             src,
@@ -2438,11 +2460,12 @@ mod tests {
         assert_ne!(advance_hash_salt(0, 0), 0);
         let src = b"abcdefghijklmnop";
         // SAFETY: `0 + 8 <= src.len()`.
-        let (h4, h5, h6) = unsafe {
+        let (h4, h5, h6, h7) = unsafe {
             (
                 hash_salted::<4>(Src::new(src, 0, 0), 0, 20, 0),
                 hash_salted::<5>(Src::new(src, 0, 0), 0, 20, 0) as u64,
                 hash_salted::<6>(Src::new(src, 0, 0), 0, 20, 0) as u64,
+                hash_salted::<7>(Src::new(src, 0, 0), 0, 20, 0) as u64,
             )
         };
         // ZSTD_hash4Ptr: (readLE32 * 2654435761) >> (32 - 20)
@@ -2451,5 +2474,6 @@ mod tests {
         let u = u64::from_le_bytes(src[..8].try_into().unwrap());
         assert_eq!(h5, (u << 24).wrapping_mul(PRIME5) >> 44);
         assert_eq!(h6, (u << 16).wrapping_mul(PRIME6) >> 44);
+        assert_eq!(h7, (u << 8).wrapping_mul(PRIME7) >> 44);
     }
 }
