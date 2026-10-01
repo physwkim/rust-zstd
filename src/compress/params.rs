@@ -1,8 +1,7 @@
 //! Compression parameters.
 //!
 //! Port of `ZSTD_defaultCParameters` (clevels.h), `ZSTD_getCParams_internal`
-//! and `ZSTD_adjustCParams_internal` (zstd_compress.c) for the
-//! no-dictionary case (`dictSize == 0`, `ZSTD_cpm_noAttachDict`).
+//! and `ZSTD_adjustCParams_internal` (zstd_compress.c).
 
 use crate::constants::{ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX};
 
@@ -61,6 +60,22 @@ pub enum ParamSwitch {
     Disable,
 }
 
+/// `ZSTD_CParamMode_e`: how [`CParams::for_level_with`] and
+/// [`CParams::adjust_with`] count a dictionary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CParamMode {
+    /// `ZSTD_cpm_noAttachDict` (and `ZSTD_cpm_unknown`, which selects and
+    /// adjusts the same way): the dictionary is loaded into the context's
+    /// tables, so its size counts with the input's.
+    NoAttachDict,
+    /// `ZSTD_cpm_attachDict`: the dictionary keeps tables of its own; the
+    /// parameters are for the input alone.
+    AttachDict,
+    /// `ZSTD_cpm_createCDict`: the parameters of a dictionary's own tables,
+    /// for inputs of unknown size assumed small.
+    CreateCDict,
+}
+
 /// `ZSTD_compressionParameters`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CParams {
@@ -81,6 +96,8 @@ pub const ZSTD_CLEVEL_DEFAULT: i32 = 3;
 pub const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 const ZSTD_TARGETLENGTH_MAX: i32 = 1 << 17;
 const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
+/// `ZSTD_SHORT_CACHE_TAG_BITS`.
+const ZSTD_SHORT_CACHE_TAG_BITS: u32 = 8;
 /// `ZSTD_HASHLOG3_MAX`: the largest 3-byte hash table, see
 /// [`CParams::hash_log3`].
 pub const ZSTD_HASHLOG3_MAX: u32 = 17;
@@ -231,14 +248,59 @@ fn highbit32(v: u32) -> u32 {
     31 - v.leading_zeros()
 }
 
+/// `ZSTD_dictAndWindowLog`: a window log large enough for the hash and
+/// chain tables to reference the dictionary and the window, since the
+/// whole dictionary is valid while one byte of it is within the window.
+fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
+    let max_window_size = 1u64 << ZSTD_WINDOWLOG_MAX;
+    // No dictionary ==> No change
+    if dict_size == 0 {
+        return window_log;
+    }
+    let window_size = 1u64 << window_log;
+    let dict_and_window_size = dict_size + window_size;
+    if window_size >= dict_size.saturating_add(src_size) {
+        // Window size large enough already
+        window_log
+    } else if dict_and_window_size >= max_window_size {
+        // Larger than max window log
+        ZSTD_WINDOWLOG_MAX
+    } else {
+        highbit32(dict_and_window_size as u32 - 1) + 1
+    }
+}
+
 impl CParams {
-    /// `ZSTD_getCParams_internal(level, src_size, 0, ZSTD_cpm_noAttachDict)`:
-    /// pick the table row by `src_size` (`ZSTD_getCParamRowSize`) and level,
-    /// then refine with [`CParams::adjust`]. `level == 0` selects
-    /// [`ZSTD_CLEVEL_DEFAULT`]; negative levels use row 0 with
-    /// `target_length = -level` (acceleration factor).
+    /// `ZSTD_getCParams_internal(level, src_size, 0, ZSTD_cpm_noAttachDict)`,
+    /// see [`CParams::for_level_with`].
     pub fn for_level(level: i32, src_size: usize) -> CParams {
-        let r_size = src_size as u64;
+        CParams::for_level_with(level, Some(src_size as u64), 0, CParamMode::NoAttachDict)
+    }
+
+    /// `ZSTD_getCParams_internal(level, src_size, dict_size, mode)`: pick the
+    /// table row by the input and dictionary sizes (`ZSTD_getCParamRowSize`)
+    /// and the level, then refine with [`CParams::adjust_with`]. `None` is
+    /// an input of unknown size (`ZSTD_CONTENTSIZE_UNKNOWN`). `level == 0`
+    /// selects [`ZSTD_CLEVEL_DEFAULT`]; negative levels use row 0 with
+    /// `target_length = -level` (acceleration factor).
+    pub fn for_level_with(
+        level: i32,
+        src_size: Option<u64>,
+        dict_size: usize,
+        mode: CParamMode,
+    ) -> CParams {
+        // ZSTD_getCParamRowSize
+        let row_dict = match mode {
+            CParamMode::AttachDict => 0,
+            CParamMode::NoAttachDict | CParamMode::CreateCDict => dict_size as u64,
+        };
+        let r_size = match src_size {
+            Some(size) => size.saturating_add(row_dict),
+            None if row_dict == 0 => u64::MAX,
+            // An unknown input with a dictionary is assumed to be 499 bytes
+            // (C adds 500 to ZSTD_CONTENTSIZE_UNKNOWN, -1).
+            None => row_dict + 499,
+        };
         let table_id = (r_size <= 256 << 10) as usize
             + (r_size <= 128 << 10) as usize
             + (r_size <= 16 << 10) as usize;
@@ -264,18 +326,53 @@ impl CParams {
             let clamped = level.max(-ZSTD_TARGETLENGTH_MAX);
             cp.target_length = (-clamped) as u32;
         }
-        cp.adjust(src_size)
+        cp.adjust_with(src_size, dict_size, mode)
     }
 
     /// `ZSTD_adjustCParams_internal(cp, src_size, 0, ZSTD_cpm_noAttachDict,
-    /// ZSTD_ps_auto)`: shrink window/hash/chain logs for small inputs.
-    pub fn adjust(mut self, src_size: usize) -> CParams {
-        let src_size = src_size as u64;
+    /// ZSTD_ps_auto)`, see [`CParams::adjust_with`].
+    pub fn adjust(self, src_size: usize) -> CParams {
+        self.adjust_with(Some(src_size as u64), 0, CParamMode::NoAttachDict)
+    }
+
+    /// `ZSTD_adjustCParams_internal(cp, src_size, dict_size, mode,
+    /// ZSTD_ps_auto)`: shrink window/hash/chain logs to what the input and
+    /// the dictionary need (`None` is an input of unknown size). The
+    /// hash and chain logs shrink only for a known input, to cover the
+    /// dictionary and the window (`ZSTD_dictAndWindowLog`).
+    pub fn adjust_with(
+        mut self,
+        src_size: Option<u64>,
+        dict_size: usize,
+        mode: CParamMode,
+    ) -> CParams {
+        // minSrcSize: (1 << 9) + 1
+        const MIN_SRC_SIZE: u64 = 513;
         let max_window_resize: u64 = 1 << (ZSTD_WINDOWLOG_MAX - 1);
+        let mut src_size = src_size;
+        let mut dict_size = dict_size as u64;
+        match mode {
+            // If we don't know the source size, don't make any assumptions
+            // about it. We will already have selected smaller parameters if
+            // a dictionary is in use.
+            CParamMode::NoAttachDict => {}
+            // Assume a small source size when creating a dictionary with an
+            // unknown source size.
+            CParamMode::CreateCDict => {
+                if dict_size != 0 && src_size.is_none() {
+                    src_size = Some(MIN_SRC_SIZE);
+                }
+            }
+            // Dictionary has its own dedicated parameters which have already
+            // been selected. We are selecting parameters for only the source.
+            CParamMode::AttachDict => dict_size = 0,
+        }
 
         // resize windowLog if input is small enough, to use less memory
-        if src_size <= max_window_resize {
-            let t_size = src_size as u32;
+        if let Some(src) =
+            src_size.filter(|&s| s <= max_window_resize && dict_size <= max_window_resize)
+        {
+            let t_size = (src + dict_size) as u32;
             let hash_size_min = 1u32 << ZSTD_HASHLOG_MIN;
             let src_log = if t_size < hash_size_min {
                 ZSTD_HASHLOG_MIN
@@ -286,9 +383,8 @@ impl CParams {
                 self.window_log = src_log;
             }
         }
-        {
-            // dictSize == 0: ZSTD_dictAndWindowLog() returns windowLog unchanged.
-            let dict_and_window_log = self.window_log;
+        if let Some(src) = src_size {
+            let dict_and_window_log = dict_and_window_log(self.window_log, src, dict_size);
             // ZSTD_cycleLog(): the binary tree holds two entries per position.
             let cycle_log = self.chain_log - self.strategy.bt_scale();
             if self.hash_log > dict_and_window_log + 1 {
@@ -300,6 +396,16 @@ impl CParams {
         }
         if self.window_log < ZSTD_WINDOWLOG_ABSOLUTEMIN {
             self.window_log = ZSTD_WINDOWLOG_ABSOLUTEMIN;
+        }
+        // A dictionary's fast and dfast tables tag their indices with
+        // ZSTD_SHORT_CACHE_TAG_BITS (ZSTD_CDictIndicesAreTagged), so
+        // (hashLog + 8) <= 32 && (chainLog + 8) <= 32.
+        if mode == CParamMode::CreateCDict
+            && matches!(self.strategy, Strategy::Fast | Strategy::DFast)
+        {
+            let max_short_cache_hash_log = 32 - ZSTD_SHORT_CACHE_TAG_BITS;
+            self.hash_log = self.hash_log.min(max_short_cache_hash_log);
+            self.chain_log = self.chain_log.min(max_short_cache_hash_log);
         }
         // ZSTD_ps_auto is resolved to ZSTD_ps_enable here; the row matchfinder
         // cannot hash more than 32 bits in total.
@@ -501,6 +607,51 @@ mod tests {
         assert_eq!(CParams::min_gain(1 << 17, Strategy::BtOpt), (1 << 11) + 2);
         assert_eq!(CParams::min_gain(1 << 17, Strategy::BtUltra), (1 << 10) + 2);
         assert_eq!(CParams::min_gain(1 << 17, Strategy::BtUltra2), (1 << 9) + 2);
+    }
+
+    /// `ZSTD_getCParams_internal` with a dictionary, values worked from
+    /// the C: the row is chosen by input plus dictionary size (an unknown
+    /// input with a dictionary counts 499 bytes), the window shrinks to
+    /// both, and the hash and chain logs to `ZSTD_dictAndWindowLog`.
+    #[test]
+    fn dictionary_sizes_select_and_adjust() {
+        let logs = |cp: CParams| {
+            (
+                cp.window_log,
+                cp.chain_log,
+                cp.hash_log,
+                cp.search_log,
+                cp.min_match,
+                cp.target_length,
+                cp.strategy,
+            )
+        };
+        // 10 KB + 10 KB: the <= 128 KiB row of level 9 (17, 16, 17, 5, 4,
+        // 8, lazy2); tSize 20480 -> windowLog 15, hashLog 16, chainLog 15.
+        let cp = CParams::for_level_with(9, Some(10 << 10), 10 << 10, CParamMode::NoAttachDict);
+        assert_eq!(logs(cp), (15, 15, 16, 5, 4, 8, Strategy::Lazy2));
+        // The dictionary's own tables: 10 KiB + 499 picks the <= 16 KiB row
+        // (14, 15, 14, 5, 4, 8, btlazy2); the input counts 513 bytes.
+        let cp = CParams::for_level_with(9, None, 10 << 10, CParamMode::CreateCDict);
+        assert_eq!(logs(cp), (14, 15, 14, 5, 4, 8, Strategy::BtLazy2));
+        // Attached, the dictionary does not count.
+        let cp = CParams::for_level_with(5, Some(1000), 50_000, CParamMode::AttachDict);
+        assert_eq!(cp, CParams::for_level(5, 1000));
+        // Level 19 with a 2 MiB dictionary: the > 256 KiB row (23, 24, 22,
+        // 7, 3, 256, btultra2), windowLog 22 for both, the tree shrinks by 1.
+        let cp = CParams::for_level_with(19, Some(1000), 2 << 20, CParamMode::NoAttachDict);
+        assert_eq!(logs(cp), (22, 23, 22, 7, 3, 256, Strategy::BtUltra2));
+        // An unknown input without a dictionary keeps the row as it is.
+        let cp = CParams::for_level_with(3, None, 0, CParamMode::NoAttachDict);
+        assert_eq!(logs(cp), (21, 16, 17, 1, 5, 0, Strategy::DFast));
+        // ZSTD_dictAndWindowLog
+        assert_eq!(dict_and_window_log(17, 1000, 0), 17);
+        assert_eq!(dict_and_window_log(19, 600 << 10, 1 << 20), 21);
+        assert_eq!(dict_and_window_log(19, 1000, 1 << 10), 19);
+        assert_eq!(
+            dict_and_window_log(20, 100, 1 << ZSTD_WINDOWLOG_MAX),
+            ZSTD_WINDOWLOG_MAX
+        );
     }
 
     #[test]
