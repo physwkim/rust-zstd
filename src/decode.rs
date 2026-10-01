@@ -2991,21 +2991,72 @@ struct Prefix {
     window: usize,
 }
 
+impl Prefix {
+    /// The destination of the frame's next block in `output`, the frame
+    /// being `output[self.start..]`: `room` bytes are reserved past its
+    /// end. All of the frame's history is in it (`ExtHistory::NONE`).
+    fn dst(self, output: &mut Vec<u8>, room: usize) -> Dst {
+        output.reserve(room);
+        Dst {
+            // SAFETY: `start` is at most `output.len()`.
+            base: unsafe { output.as_mut_ptr().add(self.start) },
+            op: output.len() - self.start,
+            window: self.window,
+        }
+    }
+}
+
+/// Where a block decodes to: the current segment of the frame's output
+/// starts at `base` (libzstd's `prefixStart`) and holds the `op` bytes
+/// before the block. A match reaches back at most `window` bytes,
+/// Window_Size (`Prefix`), through the segment and then its
+/// `ExtHistory`.
+///
+/// Users of a `Dst` rely on: `base..base + op` is initialized, and
+/// `base + op..base + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid
+/// for writes in the allocation of `base`.
+#[derive(Clone, Copy)]
+struct Dst {
+    base: *mut u8,
+    op: usize,
+    window: usize,
+}
+
+/// Output of the frame that precedes a `Dst`'s segment and lies apart from
+/// it: the `len` bytes that end at `end` (libzstd's `virtualStart` to
+/// `dictEnd`). They are initialized; writes to the segment may land in
+/// them (the streaming round buffer reuses them), so they are only read
+/// through raw pointers.
+#[derive(Clone, Copy)]
+struct ExtHistory {
+    end: *const u8,
+    len: usize,
+}
+
+impl ExtHistory {
+    /// No history outside the segment.
+    const NONE: ExtHistory = ExtHistory {
+        end: ptr::null(),
+        len: 0,
+    };
+}
+
 /// A block's sequences, executed into the frame by `execute_with_copies`
 /// with the copies it picks.
 trait BlockSequences {
-    /// Execute the sequences straight into `out`, whose bytes from
-    /// `prefix.start` on are the frame so far; matches reach back no
-    /// further, nor past `prefix.window`. `out` is grown by the block
-    /// limit plus slack up front so that all copies use fixed-size chunks
-    /// and may overshoot; it is truncated to the real length on return.
-    fn execute<W: WildCopy>(
+    /// Execute the sequences straight into `dst`, from `dst.op` on, and
+    /// return the block's end (from `dst.base`). All copies use
+    /// fixed-size chunks and may overshoot, within the room `Dst`
+    /// guarantees.
+    ///
+    /// # Safety
+    /// `dst` meets the `Dst` contract.
+    unsafe fn execute<W: WildCopy>(
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix: Prefix,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String>;
+        dst: Dst,
+    ) -> Result<usize, String>;
 }
 
 /// Execute `seqs` with the copies for its block, for the fused decoder and
@@ -3013,71 +3064,82 @@ trait BlockSequences {
 /// ones otherwise, and the `ShortOffsets` variants when the block's offsets
 /// table gives many short offsets. Each copy type runs in a function of its
 /// own. The block may decode to `block_size_max` bytes (RFC 8878 lines
-/// 566-568).
-fn execute_with_copies<S: BlockSequences>(
+/// 566-568). Returns the block's end in `dst`.
+///
+/// # Safety
+/// `dst` meets the `Dst` contract.
+unsafe fn execute_with_copies<S: BlockSequences>(
     simd: Level,
     offsets: &FSETable,
     seqs: S,
     offset_hist: &mut [u32; 3],
     block_size_max: usize,
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    let base = out.len();
+    dst: Dst,
+) -> Result<usize, String> {
     let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
-    match simd {
+    let Dst { base, op, window } = dst;
+    let end = match simd {
         // SAFETY: fearless_simd makes an `Avx2` only after detecting AVX2
         // and FMA on this CPU (`Level::new`).
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        Level::Avx2(w) => unsafe {
+        Level::Avx2(w) => {
             if short {
-                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix, out)
+                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, base, op, window)
             } else {
-                execute_avx2(w, seqs, offset_hist, prefix, out)
+                execute_avx2(w, seqs, offset_hist, base, op, window)
             }
-        },
-        _ if short => execute_portable(
-            FallbackShortOffsets(Fallback::new()),
-            seqs,
-            offset_hist,
-            prefix,
-            out,
-        ),
-        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix, out),
+        }
+        _ if short => {
+            let w = FallbackShortOffsets(Fallback::new());
+            execute_portable(w, seqs, offset_hist, base, op, window)
+        }
+        _ => execute_portable(Fallback::new(), seqs, offset_hist, base, op, window),
     }?;
-    let decoded = out.len() - base;
+    let decoded = end - op;
     if decoded > block_size_max {
         return Err(format!(
             "Block decodes to {} bytes, past Block_Maximum_Size {}",
             decoded, block_size_max
         ));
     }
-    Ok(())
+    Ok(end)
 }
 
+/// `seqs.execute` into the `Dst` of `base`, `op` and `window`. The fields
+/// come apart so that they arrive in registers: passed as one `Dst`, by
+/// reference, the AVX2 short-offset loop ran 6% more instructions
+/// (words_1M L1).
+///
+/// # Safety
+/// The `Dst` meets its contract.
 #[inline(never)]
-fn execute_portable<W: WildCopy, S: BlockSequences>(
+unsafe fn execute_portable<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix, out)
+    base: *mut u8,
+    op: usize,
+    window: usize,
+) -> Result<usize, String> {
+    seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
 /// `execute_portable` compiled with AVX2.
+///
+/// # Safety
+/// The CPU supports AVX2, and the `Dst` meets its contract.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline(never)]
-fn execute_avx2<W: WildCopy, S: BlockSequences>(
+unsafe fn execute_avx2<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix, out)
+    base: *mut u8,
+    op: usize,
+    window: usize,
+) -> Result<usize, String> {
+    seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
 /// A compressed block's sequences section after its tables, with the
@@ -3095,60 +3157,61 @@ struct SeqInput<'a> {
 /// of slack.
 impl BlockSequences for SeqInput<'_> {
     #[inline(always)]
-    fn execute<W: WildCopy>(
+    unsafe fn execute<W: WildCopy>(
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix: Prefix,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        let prefix_start = prefix.start;
-        let base = out.len();
-        // Spare capacity only: the block's bytes are written by the copies
-        // in `exec_sequence`, so zero-filling them first is wasted work.
-        out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
-        // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which
-        // is the extent `run_sequences` may write (see its contract).
-        let end = unsafe {
-            run_sequences(
-                w,
-                self,
-                offset_hist,
-                out.as_mut_ptr().add(prefix_start),
-                base - prefix_start,
-                prefix.window,
-            )?
-        };
-        // SAFETY: on success `run_sequences` initialized every byte of
-        // `prefix_start + (base - prefix_start)..prefix_start + end`, and
-        // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length
-        // within the reserved capacity.
-        unsafe { out.set_len(prefix_start + end) };
-        Ok(())
+        dst: Dst,
+    ) -> Result<usize, String> {
+        run_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
     }
 }
 
-/// Execute the block's sequences into the buffer at `out`, which starts at
-/// the frame's first byte; `op` is where this block starts and `window`
-/// the frame's Window_Size (`Prefix::window`). Returns the
-/// block's end, at most `op + MAX_BLOCK_SIZE`, with every byte of
-/// `op..end` written; bytes past `end` may have been written too, and
-/// nothing before `op` is.
+/// `SeqInput` whose matches reach on into `ext` before the segment,
+/// executed by its own instantiation of the loop: the AVX2 loop that can
+/// copy from `ext` and go on runs 2-3% more instructions (words_1M L1,
+/// rssrc_8M L3, elf_8M L9), so a block without `ext`, as every one-shot
+/// one is, takes the loop in which a match before the segment exits. Both
+/// give the same verdicts.
+struct ExtSeqInput<'a> {
+    seqs: SeqInput<'a>,
+    ext: ExtHistory,
+}
+
+impl BlockSequences for ExtSeqInput<'_> {
+    #[inline(always)]
+    unsafe fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        dst: Dst,
+    ) -> Result<usize, String> {
+        run_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
+    }
+}
+
+/// Execute the block's sequences into `dst` from `dst.op` on. Returns the
+/// block's end, at most `dst.op + MAX_BLOCK_SIZE`, with every byte of
+/// `dst.op..end` written; bytes past `end` may have been written too, and
+/// nothing before `dst.op` is. Matches reach into `ext` only when `EXT`;
+/// otherwise they stop at the segment (`exec_sequence`).
 ///
 /// # Safety
-/// `out..out + op` is initialized and
-/// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid for
-/// writes.
+/// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
+/// `EXT`.
 #[inline(always)]
-unsafe fn run_sequences<W: WildCopy>(
+unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
     w: W,
     seqs: SeqInput<'_>,
+    ext: ExtHistory,
     offset_hist: &mut [u32; 3],
-    out: *mut u8,
-    op: usize,
-    window: usize,
+    dst: Dst,
 ) -> Result<usize, String> {
+    let Dst {
+        base: out,
+        op,
+        window,
+    } = dst;
     let SeqInput {
         num_sequences,
         bit_stream,
@@ -3206,16 +3269,17 @@ unsafe fn run_sequences<W: WildCopy>(
             oend_w: out.add(oend),
             lit_limit: lit_start.add(literals_len),
             prefix: out,
+            ext,
             window,
         }
     };
 
     for _ in 1..num_sequences {
         let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
-        exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+        exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     }
     let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
-    exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+    exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     let hist = st.hist;
     // Both cursors only ever advance within their slices (see
     // `exec_sequence`), so these differences are in-bounds indexes.
@@ -3259,12 +3323,13 @@ struct SeqCursor {
 
 /// Bounds of one block's sequence execution: the output limit less
 /// `WILDCOPY_OVERLENGTH`, the literals end less `WILDCOPY_OVERLENGTH`, and
-/// how far back a match may copy from: the frame's first byte and
-/// Window_Size (`Prefix`).
+/// how far back a match may copy from: the current segment's first byte,
+/// then the history before it, and Window_Size (`Dst`).
 struct SeqLimits {
     oend_w: *mut u8,
     lit_limit: *const u8,
     prefix: *mut u8,
+    ext: ExtHistory,
     window: usize,
 }
 
@@ -3357,9 +3422,11 @@ fn decode_sequence(
 
 /// Copy `ll` literals then `ml` match bytes from `offset` back
 /// (ZSTD_execSequenceSplitLitBuffer) and advance `cur`. Both buffers carry
-/// `WILDCOPY_OVERLENGTH` bytes of slack past their limits.
+/// `WILDCOPY_OVERLENGTH` bytes of slack past their limits. A match that
+/// starts before the segment is copied from `lim.ext` when `EXT`, and is
+/// `OffsetTooFar` otherwise, as it is with an empty `lim.ext`.
 #[inline(always)]
-fn exec_sequence<W: WildCopy>(
+fn exec_sequence<W: WildCopy, const EXT: bool>(
     w: W,
     cur: &mut SeqCursor,
     lim: &SeqLimits,
@@ -3370,7 +3437,7 @@ fn exec_sequence<W: WildCopy>(
     let op = cur.op;
     let lit = cur.lit;
     // The window has a branch of its own, ahead of the rest: folded into
-    // the frame-start check with `min` it cost AVX2 words_1M decode 2-6%,
+    // the segment-start check with `min` it cost AVX2 words_1M decode 2-6%,
     // and after that check 2.5-3.7% of cycles, against 0.6-2.4% here.
     if offset > lim.window {
         return Err(SeqError::OffsetPastWindow);
@@ -3387,7 +3454,24 @@ fn exec_sequence<W: WildCopy>(
     }
     // Rejects offset 0 as well (it wraps to usize::MAX).
     if offset.wrapping_sub(1) >= o_lit_end - lim.prefix as usize {
-        return Err(SeqError::OffsetTooFar);
+        if !EXT {
+            return Err(SeqError::OffsetTooFar);
+        }
+        // SAFETY: as below, the checks above hold; the match starts before
+        // the segment, which `exec_sequence_ext` takes from there.
+        unsafe {
+            exec_sequence_ext(
+                w,
+                op,
+                lit,
+                (ll, ml, offset),
+                o_lit_end - lim.prefix as usize,
+                lim.ext,
+            )?;
+            cur.lit = lit.add(ll);
+            cur.op = op.add(ll + ml);
+        }
+        return Ok(());
     }
 
     // SAFETY: the checks above give, with `ml >= 1`,
@@ -3402,15 +3486,66 @@ fn exec_sequence<W: WildCopy>(
     // `o_lit_end + ml + 31` is writable. The advanced cursors keep the
     // `SeqCursor` invariant.
     unsafe {
-        // Literals: nearly always at most 16 bytes.
-        copy16(op, lit);
-        if ll > 16 {
-            w.wildcopy(op.add(16), lit.add(16), ll - 16);
-        }
+        copy_literals(w, op, lit, ll);
         cur.lit = lit.add(ll);
 
         w.copy_match(op.add(ll), offset, ml, o_lit_end - lim.prefix as usize);
         cur.op = op.add(ll + ml);
+    }
+    Ok(())
+}
+
+/// Copy `ll` literals from `lit` to `op`, overshooting by up to 31 bytes.
+///
+/// # Safety
+/// `ll + 31` bytes readable at `lit` and writable at `op`, in different
+/// buffers.
+#[inline(always)]
+unsafe fn copy_literals<W: WildCopy>(w: W, op: *mut u8, lit: *const u8, ll: usize) {
+    // Nearly always at most 16 bytes.
+    copy16(op, lit);
+    if ll > 16 {
+        w.wildcopy(op.add(16), lit.add(16), ll - 16);
+    }
+}
+
+/// `exec_sequence` for the sequence `(ll, ml, offset)` at `op` whose match
+/// starts before the current segment, `avail` bytes of which precede the
+/// match's destination (ZSTD_execSequence's extDict branch): it starts in
+/// `ext`, or before it, which is `OffsetTooFar` (offset 0 included). A
+/// match that runs past the end of `ext` continues from the segment's
+/// first byte.
+///
+/// # Safety
+/// `exec_sequence`'s checks before its segment-start check hold, and so
+/// do the `Dst` contract for the segment and the `ExtHistory` one for
+/// `ext`.
+#[cold]
+#[inline(never)]
+unsafe fn exec_sequence_ext<W: WildCopy>(
+    w: W,
+    op: *mut u8,
+    lit: *const u8,
+    (ll, ml, offset): (usize, usize, usize),
+    avail: usize,
+    ext: ExtHistory,
+) -> Result<(), SeqError> {
+    // `offset > avail` here unless it is 0.
+    if offset == 0 || offset - avail > ext.len {
+        return Err(SeqError::OffsetTooFar);
+    }
+    copy_literals(w, op, lit, ll);
+    let dst = op.add(ll);
+    // The match starts `back` bytes before the end of `ext`, and its first
+    // `head` bytes are there. `ext` may share a buffer with the segment,
+    // so the copy allows overlap.
+    let back = offset - avail;
+    let head = back.min(ml);
+    ptr::copy(ext.end.sub(back), dst, head);
+    if ml > head {
+        // The rest starts at the segment's first byte, `offset` bytes
+        // before `dst + head`, with all `offset` bytes between written.
+        w.copy_match(dst.add(head), offset, ml - head, offset);
     }
     Ok(())
 }
@@ -3951,7 +4086,22 @@ fn decode_blocks(
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
             BlockType::Compressed => {
-                decompress_block(content, block_size_max, scratch, frame.prefix, output, simd)?
+                let dst = frame
+                    .prefix
+                    .dst(output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+                // SAFETY: `Prefix::dst` meets the `Dst` contract, and on
+                // success the block's bytes up to `end` are written.
+                unsafe {
+                    let end = decompress_block(
+                        content,
+                        block_size_max,
+                        scratch,
+                        dst,
+                        ExtHistory::NONE,
+                        simd,
+                    )?;
+                    output.set_len(frame.prefix.start + end);
+                }
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
@@ -4043,14 +4193,19 @@ fn decode_block_literals(
     Ok(())
 }
 
-fn decompress_block(
+/// Decode compressed block `raw` into `dst`, after `ext`, in a frame whose
+/// Block_Maximum_Size is `block_size_max`; returns the block's end.
+///
+/// # Safety
+/// `dst` and `ext` meet their contracts.
+unsafe fn decompress_block(
     raw: &[u8],
     block_size_max: usize,
     workspace: &mut DecoderScratch,
-    prefix: Prefix,
-    output: &mut Vec<u8>,
+    dst: Dst,
+    ext: ExtHistory,
     simd: Level,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let parts = split_block(raw, block_size_max)?;
     decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
     let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
@@ -4065,15 +4220,13 @@ fn decompress_block(
             fse: &workspace.fse,
             literals: &workspace.literals_buffer,
         };
-        execute_with_copies(
-            simd,
-            &workspace.fse.offsets,
-            seqs,
-            &mut workspace.offset_hist,
-            block_size_max,
-            prefix,
-            output,
-        )?;
+        let (offsets, hist) = (&workspace.fse.offsets, &mut workspace.offset_hist);
+        if ext.len == 0 {
+            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+        } else {
+            let seqs = ExtSeqInput { seqs, ext };
+            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+        }
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -4081,10 +4234,12 @@ fn decompress_block(
                 raw.len() as isize * 8
             ));
         }
-        output.extend_from_slice(&workspace.literals_buffer[..literals_len]);
+        // `split_block` held the literals to `block_size_max`, within the
+        // room `dst` has.
+        let literals = &workspace.literals_buffer[..literals_len];
+        ptr::copy_nonoverlapping(literals.as_ptr(), dst.base.add(dst.op), literals.len());
+        Ok(dst.op + literals.len())
     }
-
-    Ok(())
 }
 
 // ============================================================
@@ -4547,15 +4702,20 @@ mod parallel {
                     seqs: &slot.seqs,
                     literals: &slot.literals,
                 };
-                execute_with_copies(
-                    simd,
-                    &slot.fse.offsets,
-                    seqs,
-                    hist,
-                    block_size_max,
-                    prefix,
-                    output,
-                )?;
+                let dst = prefix.dst(output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+                // SAFETY: `Prefix::dst` meets the `Dst` contract, and on
+                // success the block's bytes up to `end` are written.
+                unsafe {
+                    let end = execute_with_copies(
+                        simd,
+                        &slot.fse.offsets,
+                        seqs,
+                        hist,
+                        block_size_max,
+                        dst,
+                    )?;
+                    output.set_len(prefix.start + end);
+                }
             }
         }
         Ok(())
@@ -4570,72 +4730,49 @@ mod parallel {
 
     impl BlockSequences for DecodedSeqs<'_> {
         #[inline(always)]
-        fn execute<W: WildCopy>(
+        unsafe fn execute<W: WildCopy>(
             self,
             w: W,
             offset_hist: &mut [u32; 3],
-            prefix: Prefix,
-            out: &mut Vec<u8>,
-        ) -> Result<(), String> {
-            let prefix_start = prefix.start;
-            let base = out.len();
-            out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-            // SAFETY: `prefix_start <= base`, and the capacity holds
-            // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
-            // the extent `execute_sequences` may write.
-            let end = unsafe {
-                execute_sequences(
-                    w,
-                    self.seqs,
-                    self.literals,
-                    offset_hist,
-                    out.as_mut_ptr().add(prefix_start),
-                    base - prefix_start,
-                    prefix.window,
-                )?
-            };
-            // SAFETY: on success every byte up to `prefix_start + end` is
-            // initialized, within the reserved capacity.
-            unsafe { out.set_len(prefix_start + end) };
-            Ok(())
+            dst: Dst,
+        ) -> Result<usize, String> {
+            execute_sequences(w, self.seqs, self.literals, offset_hist, dst)
         }
     }
 
-    /// Execute decoded sequences from `op` in the buffer at `out` (the
-    /// frame start) with Window_Size `window`; returns the block's end.
-    /// Same contract as `run_sequences`.
+    /// Execute decoded sequences into `dst` from `dst.op` on; returns the
+    /// block's end. Same contract as `run_sequences`.
     ///
     /// # Safety
-    /// `out..out + op` is initialized and
-    /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
+    /// `dst` meets the `Dst` contract.
     #[inline(always)]
     unsafe fn execute_sequences<W: WildCopy>(
         w: W,
         seqs: &[RawSeq],
         literals: &[u8],
         offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-        window: usize,
+        dst: Dst,
     ) -> Result<usize, String> {
+        let out = dst.base;
         let mut hist = offset_hist.map(|o| o as usize);
         let lit = literals.as_ptr();
         // In bounds by the contract, and `literals` ends with
         // `WILDCOPY_OVERLENGTH` bytes of slack.
         let mut cur = SeqCursor {
-            op: out.add(op),
+            op: out.add(dst.op),
             lit,
         };
         let lim = SeqLimits {
-            oend_w: out.add(op + MAX_BLOCK_SIZE),
+            oend_w: out.add(dst.op + MAX_BLOCK_SIZE),
             lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
             prefix: out,
-            window,
+            ext: ExtHistory::NONE,
+            window: dst.window,
         };
         for s in seqs {
             let ll = s.ll as usize;
             let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence(w, &mut cur, &lim, ll, s.ml as usize, offset)
+            exec_sequence::<W, false>(w, &mut cur, &lim, ll, s.ml as usize, offset)
                 .map_err(seq_error_message)?;
         }
         // Last literals; both cursors only advanced within their buffers.
@@ -5354,13 +5491,12 @@ mod tests {
     struct CopyProbe;
 
     impl BlockSequences for CopyProbe {
-        fn execute<W: WildCopy>(
+        unsafe fn execute<W: WildCopy>(
             self,
             _: W,
             _: &mut [u32; 3],
-            _: Prefix,
-            _: &mut Vec<u8>,
-        ) -> Result<(), String> {
+            _: Dst,
+        ) -> Result<usize, String> {
             let name = std::any::type_name::<W>();
             Err(name.rsplit("::").next().unwrap_or(name).to_string())
         }
@@ -5384,16 +5520,10 @@ mod tests {
                 start: 0,
                 window: usize::MAX,
             };
-            execute_with_copies(
-                level,
-                t,
-                CopyProbe,
-                &mut [1, 4, 8],
-                0,
-                prefix,
-                &mut Vec::new(),
-            )
-            .unwrap_err()
+            let mut out = Vec::new();
+            let dst = prefix.dst(&mut out, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+            // SAFETY: `Prefix::dst` meets the `Dst` contract.
+            unsafe { execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, dst) }.unwrap_err()
         };
         let mut t = FSETable::new(MAX_OFFSET_CODE);
         for (level, plain, short) in levels {
@@ -5409,6 +5539,86 @@ mod tests {
             assert_eq!(pick(level, &t), short, "RLE 3");
             t.build_rle(10, of.base, of.bits);
             assert_eq!(pick(level, &t), plain, "RLE 10");
+        }
+    }
+
+    /// Compressed block of one sequence in RLE-mode tables: no literals,
+    /// then `ml` bytes (3..=34) copied from `offset` back.
+    fn one_match_block(offset: u32, ml: u8) -> Vec<u8> {
+        let value = offset + 3;
+        let code = 31 - value.leading_zeros();
+        let mut body = vec![0x00, 1, 0x54, 0, code as u8, ml - 3];
+        let stream = (1u64 << code) | u64::from(value - (1 << code));
+        body.extend_from_slice(&stream.to_le_bytes()[..code as usize / 8 + 1]);
+        body
+    }
+
+    /// A match reaches back through the segment into `ExtHistory` up to
+    /// its first byte and no further, wholly inside it or running on into
+    /// the segment, still bounded by Window_Size; without history it stops
+    /// at the segment, as in one-shot decoding.
+    #[test]
+    fn match_reaches_into_ext_history() {
+        let ext: Vec<u8> = (0..64).collect();
+        let seg: Vec<u8> = (100..110).collect();
+        let mut levels = vec![Level::fallback()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if let Level::Avx2(w) = Level::new() {
+            levels.push(Level::Avx2(w));
+        }
+        // (offset, match length, ext bytes, window, accepted)
+        let cases = [
+            (10, 4, 64, 1 << 20, true),
+            (11, 4, 64, 1 << 20, true),
+            (11, 30, 64, 1 << 20, true),
+            (20, 4, 64, 1 << 20, true),
+            (20, 34, 64, 1 << 20, true),
+            (74, 4, 64, 1 << 20, true),
+            (74, 34, 64, 1 << 20, true),
+            (75, 4, 64, 1 << 20, false),
+            (11, 4, 0, 1 << 20, false),
+            (11, 4, 1, 1 << 20, true),
+            (12, 4, 1, 1 << 20, false),
+            (60, 4, 64, 60, true),
+            (60, 4, 64, 59, false),
+        ];
+        for simd in levels {
+            for (offset, ml, ext_len, window, accept) in cases {
+                let name = format!("offset {offset} ml {ml} ext {ext_len} window {window}");
+                let ext = &ext[ext.len() - ext_len..];
+                let mut out = seg.clone();
+                out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+                let dst = Dst {
+                    base: out.as_mut_ptr(),
+                    op: out.len(),
+                    window,
+                };
+                let history = ExtHistory {
+                    end: ext.as_ptr_range().end,
+                    len: ext.len(),
+                };
+                let block = one_match_block(offset as u32, ml);
+                let mut scratch = DecoderScratch::new();
+                // SAFETY: `out` holds the segment with the room `Dst` needs
+                // reserved, and `ext` is the history.
+                let got = unsafe {
+                    decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd).map(
+                        |end| {
+                            out.set_len(end);
+                            out
+                        },
+                    )
+                };
+                if !accept {
+                    assert!(got.is_err(), "{name}: accepted");
+                    continue;
+                }
+                let mut want = [ext, &seg[..]].concat();
+                for _ in 0..ml {
+                    want.push(want[want.len() - offset]);
+                }
+                assert_eq!(got.as_deref(), Ok(&want[ext.len()..]), "{name}");
+            }
         }
     }
 
