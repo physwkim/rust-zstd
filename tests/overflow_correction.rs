@@ -17,6 +17,10 @@
 //! libzstd corrects once its indices pass 3500 MiB, at levels 1 and 3 and
 //! level 3 with long distance matching, and gates it against libzstd's.
 //!
+//! `window_low_follows_libzstd_low_limit` (not ignored) checks the match
+//! state's window, `lowLimit` included, block by block against
+//! `tests/data/window_low_frequent.txt`.
+//!
 //! Ignored by default; release build (the 4.5 GiB test needs about 12 GB
 //! of memory):
 //!
@@ -26,7 +30,9 @@
 
 mod common;
 
-use rust_zstd::compress::{CompressOptions, Compressor, ParamSwitch};
+use rust_zstd::compress::block::{build_seq_store, BlockLdm, BlockState};
+use rust_zstd::compress::matchstate::MatchState;
+use rust_zstd::compress::{CParams, CompressOptions, Compressor, ParamSwitch, SeqStore};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -287,4 +293,73 @@ fn frequent_correction_counts_on_reused_context() {
         rows += 1;
     }
     assert_eq!(rows, 4);
+}
+
+/// The match state's window on every block equals libzstd's
+/// (`tests/data/window_low_frequent.c`) as `ZSTD_compress_frameChunk`
+/// leaves it: the index of the block's first byte, `nbOverflowCorrections`,
+/// and `lowLimit`, which `ZSTD_window_enforceMaxDist` raises to the window
+/// size below the block and `ZSTD_window_correctOverflow` moves down with
+/// the indices. Inputs of 20 MiB, past each level's window, with frequent
+/// corrections; the blocks libzstd compressed enter one match state in
+/// turn, frames after the first on the reset (reused) state. Each frame's
+/// first block is also compressed, where btultra2's `ZSTD_initStats_ultra`
+/// moves the window past it.
+#[test]
+fn window_low_follows_libzstd_low_limit() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/window_low_frequent.txt");
+    let text = std::fs::read_to_string(&path).expect("tests/data/window_low_frequent.txt");
+    let fields = |line: &str| -> Vec<usize> {
+        line.split(' ')
+            .map(|f| f.parse().unwrap_or_else(|_| panic!("row {line:?}")))
+            .collect()
+    };
+    let mut lines = text.lines().peekable();
+    let mut cases = 0;
+    while let Some(line) = lines.next() {
+        let case = line.strip_prefix("case ").expect("case row");
+        let (level, rest) = case.split_once(' ').unwrap();
+        let level: i32 = level.parse().unwrap();
+        let f = fields(rest);
+        let (len, frames) = (f[0], f[1]);
+        let cp = CParams::for_level(level, len);
+        let applied = (
+            cp.window_log as usize,
+            cp.chain_log as usize,
+            cp.strategy as usize,
+        );
+        assert_eq!(applied, (f[2], f[3], f[4]), "L{level}: parameters");
+        let data = input(len);
+        let mut store = SeqStore::new();
+        let mut ms = MatchState::new(cp, 0);
+        ms.set_correct_frequently(true);
+        for frame in 0..frames {
+            if frame > 0 {
+                ms.reset(cp, 0);
+            }
+            let mut end = 0;
+            while let Some(row) = lines.next_if(|l| !l.starts_with("frame ")) {
+                let b = fields(row);
+                let (start, size) = (b[0], b[1]);
+                assert_eq!(start, end, "L{level} frame {frame}: blocks not contiguous");
+                let entered = ms.enter_block(start..start + size);
+                let got = (
+                    ms.index(start),
+                    ms.window_low(),
+                    ms.window().nb_overflow_corrections() as usize,
+                );
+                let want = (b[2], b[3], b[4]);
+                assert_eq!(got, want, "L{level} frame {frame}: block {row}");
+                if start == 0 {
+                    let rep = BlockState::initial().rep;
+                    build_seq_store(&mut ms, &data, entered, rep, &mut store, &mut BlockLdm::Off);
+                }
+                end = start + size;
+            }
+            assert_eq!(end, len, "L{level} frame {frame}: blocks");
+            lines.next().expect("frame row");
+        }
+        cases += 1;
+    }
+    assert_eq!(cases, 5);
 }
