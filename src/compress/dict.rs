@@ -27,11 +27,14 @@
 //!
 //! Cost: the joined buffer copies the content and the input once per
 //! frame, `content.len() + input.len()` bytes of allocation and memcpy. In
-//! exchange every finder searches one contiguous buffer, as without a
-//! dictionary; libzstd instead searches the dictionary where it lies
-//! (`ZSTD_extDict` and `ZSTD_dictMatchState` variants of every finder).
+//! exchange every finder searches one contiguous buffer; libzstd instead
+//! searches the dictionary where it lies (`ZSTD_extDict` and
+//! `ZSTD_dictMatchState` variants of every finder). Its copied tables
+//! keep the content in the `dictBase` segment, so the finders here follow
+//! the `ZSTD_extDict` rules where the content ends ([`Window::dict_limit`]).
 //!
 //! [`Window::lowest_match_index`]: super::matchstate::Window::lowest_match_index
+//! [`Window::dict_limit`]: super::matchstate::Window::dict_limit
 //! [`WINDOW_START_INDEX`]: super::matchstate::WINDOW_START_INDEX
 
 use super::block::{self, BlockState, TableLoad};

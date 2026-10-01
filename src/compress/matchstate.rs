@@ -64,24 +64,32 @@ const INDEX_OVERFLOW_MARGIN: usize = 16 << 20;
 /// or chunk.
 pub const CURRENT_MAX: usize = if MEM_32BITS { 2000 << 20 } else { 3500 << 20 };
 
-/// `ZSTD_window_t` over one contiguous input at a time (`lowLimit ==
-/// dictLimit`, no `dictBase`): the position <-> index mapping of a
-/// [`MatchState`] or an [`LdmState`](super::ldm::LdmState), each of which
-/// owns one and alone moves it.
+/// `ZSTD_window_t` over one contiguous input at a time (no `dictBase`):
+/// the position <-> index mapping of a [`MatchState`] or an
+/// [`LdmState`](super::ldm::LdmState), each of which owns one and alone
+/// moves it.
 ///
 /// A dictionary is content in front of the input, in the same contiguous
 /// window (the caller lays the two out back to back), with its end at
 /// `loaded_dict_end` (`ZSTD_MatchState_t::loadedDictEnd`, kept here with
-/// the indices it is compared with). libzstd keeps a loaded dictionary in
-/// the `dictBase` segment instead (`ZSTD_extDict`); the distances are the
-/// same.
+/// the indices it is compared with). libzstd keeps the content in the
+/// `dictBase` segment instead, `[lowLimit, dictLimit)`, and the input from
+/// `dictLimit` on: the distances are the same, but while the segment is
+/// in the window (`ZSTD_window_hasExtDict`) every finder runs its
+/// `ZSTD_extDict` variant, whose rules differ at the segment's edge. The
+/// window keeps `dictLimit` ([`Window::dict_limit`]) so that the finders
+/// can follow those rules.
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
     /// `window.base` as a position of the input slice: the position of
     /// index 0 (wrapping, it may lie before the input).
     base: usize,
-    /// `window.lowLimit` (== `dictLimit`): the lowest valid index.
+    /// `window.lowLimit`: the lowest valid index.
     low: usize,
+    /// `window.dictLimit`: where the input begins after loaded dictionary
+    /// content (libzstd's prefix start), `low` without one; never below
+    /// `low`. Indices `[low, dict_limit)` are libzstd's `dictBase` segment.
+    dict_limit: usize,
     /// `window.nextSrc` as a position of the input slice: the end of the
     /// input indexed so far, where the next input's indices continue.
     next_src: usize,
@@ -106,6 +114,7 @@ impl Window {
         Self {
             base: origin.wrapping_sub(WINDOW_START_INDEX),
             low: WINDOW_START_INDEX,
+            dict_limit: WINDOW_START_INDEX,
             next_src: origin,
             loaded_dict_end: 0,
             nb_overflow_corrections: 0,
@@ -121,6 +130,7 @@ impl Window {
         let end = self.index(self.next_src);
         self.base = origin.wrapping_sub(end);
         self.low = end;
+        self.dict_limit = end;
         self.next_src = origin;
         // ZSTD_reset_matchState: `loadedDictEnd = 0`.
         self.loaded_dict_end = 0;
@@ -129,15 +139,37 @@ impl Window {
     /// `ZSTD_loadDictionaryContent`'s `loadedDictEnd`: the content entered
     /// so far, which ends at the window's end, is a dictionary whose every
     /// byte matches may reference until [`Window::check_dict_validity`]
-    /// clears it.
+    /// clears it. The input's (non-contiguous) `ZSTD_window_update` then
+    /// makes the content the `dictBase` segment, the input starting at
+    /// `dictLimit`, unless it is under [`HASH_READ_SIZE`] bytes ("too
+    /// small extDict"), which drops it from the window.
     fn load_dict(&mut self) {
         self.loaded_dict_end = self.index(self.next_src);
+        self.dict_limit = self.loaded_dict_end;
+        if self.dict_limit - self.low < HASH_READ_SIZE {
+            self.low = self.dict_limit;
+        }
     }
 
     /// `loadedDictEnd`: where the valid dictionary ends, `None` once it is
     /// invalidated or without one.
     pub fn loaded_dict_end(&self) -> Option<usize> {
         (self.loaded_dict_end != 0).then_some(self.loaded_dict_end)
+    }
+
+    /// `window.dictLimit`: the index where the input begins after loaded
+    /// dictionary content, [`Window::low`] once no content is left in the
+    /// window or without a dictionary.
+    #[inline(always)]
+    pub fn dict_limit(&self) -> usize {
+        self.dict_limit
+    }
+
+    /// `ZSTD_window_hasExtDict`: whether dictionary content, libzstd's
+    /// `dictBase` segment `[low, dict_limit)`, is in the window.
+    #[inline(always)]
+    pub fn has_ext_dict(&self) -> bool {
+        self.low < self.dict_limit
     }
 
     /// `ZSTD_checkDictValidity` for a block ending at position
@@ -164,6 +196,7 @@ impl Window {
     pub fn rebase(&mut self, shift: usize) {
         assert!(shift <= self.next_src, "rebase past the window's end");
         self.low = self.low.max(self.index(shift));
+        self.dict_limit = self.dict_limit.max(self.low);
         self.base = self.base.wrapping_sub(shift);
         self.next_src -= shift;
     }
@@ -294,6 +327,11 @@ impl Window {
         } else {
             self.low - reduced
         };
+        self.dict_limit = if self.dict_limit < reduced + WINDOW_START_INDEX {
+            WINDOW_START_INDEX
+        } else {
+            self.dict_limit - reduced
+        };
         // ZSTD_overflowCorrectIfNeeded: invalidate dictionaries on overflow
         // correction.
         self.loaded_dict_end = 0;
@@ -315,6 +353,7 @@ impl Window {
         let block_end_idx = self.index(block_end);
         if block_end_idx > max_dist + self.loaded_dict_end {
             self.low = self.low.max(block_end_idx - max_dist);
+            self.dict_limit = self.dict_limit.max(self.low);
             self.loaded_dict_end = 0;
         }
     }
@@ -341,11 +380,13 @@ impl Window {
         }
     }
 
-    /// `ZSTD_initStats_ultra`'s window move: `base -= len`, `dictLimit` and
-    /// `lowLimit` up by `len`.
+    /// `ZSTD_initStats_ultra`'s window move, without a dictionary segment:
+    /// `base -= len`, `dictLimit` and `lowLimit` up by `len`.
     fn skip(&mut self, len: usize) {
+        debug_assert!(!self.has_ext_dict());
         self.base = self.base.wrapping_sub(len);
         self.low += len;
+        self.dict_limit = self.low;
     }
 }
 
@@ -994,7 +1035,7 @@ impl MatchState {
         self.window.pos(idx)
     }
 
-    /// `window.lowLimit` / `window.dictLimit`: the lowest valid index.
+    /// `window.lowLimit`: the lowest valid index.
     #[inline(always)]
     pub fn window_low(&self) -> usize {
         self.window.low
@@ -1053,10 +1094,10 @@ impl MatchState {
     /// dictionary stays valid only if the block ends within the window size
     /// of it (`ZSTD_checkDictValidity`), then `ZSTD_window_enforceMaxDist`
     /// raises the window's low end to the window size below the block's
-    /// start and `next_to_update` resumes no lower. So `window_low` is
-    /// libzstd's `lowLimit` and `dictLimit` on every block, which
-    /// `ZSTD_insertDUBT1` reads as `windowValid` for candidates of earlier
-    /// blocks.
+    /// start (and `dictLimit` no lower than it) and `next_to_update`
+    /// resumes no lower. So `window_low` is libzstd's `lowLimit` on every
+    /// block, which `ZSTD_insertDUBT1` reads as `windowValid` for
+    /// candidates of earlier blocks.
     pub fn enter_block(&mut self, positions: Range<usize>) -> EnteredBlock {
         self.enter(positions.clone(), Some(positions.clone()), false);
         let max_dist = 1usize << self.cparams.window_log;
@@ -1243,6 +1284,18 @@ impl MatchState {
     pub fn lowest_match_index(&self, cur: usize) -> usize {
         self.window
             .lowest_match_index(cur, 1usize << self.cparams.window_log)
+    }
+
+    /// Whether the fast and double-fast finders run their `ZSTD_extDict`
+    /// variant on the block ending at index `end`: dictionary content is
+    /// in the window ([`Window::has_ext_dict`]) and the lowest index the
+    /// block's last position may reference is in it, else
+    /// `ZSTD_compressBlock_{fast,doubleFast}_extDict_generic` switch to the
+    /// "regular" variant. Implies [`Window::has_ext_dict`], since the
+    /// lowest match index is never below `low`.
+    #[inline]
+    pub fn ext_dict_in_reach(&self, end: usize) -> bool {
+        self.lowest_match_index(end - 1) < self.window.dict_limit
     }
 }
 

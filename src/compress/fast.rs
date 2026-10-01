@@ -11,8 +11,8 @@
 //! one of the invariants stated in `compress_block_generic`.
 
 use super::common::{
-    byte, candidate_valid, hash_ptr, prefetch, read32, simd_level, tget, tset, MatchCount, Src,
-    HASH_READ_SIZE, K_SEARCH_STRENGTH,
+    byte, candidate_valid, hash_ptr, index_overlap_check, prefetch, read32, simd_level, tget, tset,
+    MatchCount, Src, HASH_READ_SIZE, K_SEARCH_STRENGTH,
 };
 use super::matchstate::{Block, EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
@@ -71,11 +71,19 @@ enum Found {
 
 /// `ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, srcSize,
 /// mls, useCmov)`, monomorphized over `MLS` and `CMOV`; with `EXT`,
-/// `ZSTD_compressBlock_fast_extDict_generic`, which libzstd runs while a
-/// loaded dictionary is valid. Over the one contiguous window the two
-/// differ only in the table entry of the next position after a match found
-/// past the first position: noDict writes it before the match when
-/// `step <= 4`, extDict after it when the match covers the position.
+/// `ZSTD_compressBlock_fast_extDict_generic`, which libzstd runs while
+/// dictionary content is in reach ([`MatchState::ext_dict_in_reach`]),
+/// the content `[prefix_start, dict_limit)` being its `dictBase` segment.
+/// Over the one contiguous window the two differ at that segment's end
+/// and in one table write. extDict disables a repcode of more than `ip0 -
+/// prefix_start` at the block start (noDict: more than `ip0 -
+/// window_low`), takes no repcode at `ip2` starting in
+/// `[dict_limit - 3, dict_limit]` nor an immediate one straddling
+/// `dict_limit` ([`index_overlap_check`]), and stops a catch-up at the
+/// start of the match's segment. The table entry of the next position
+/// after a match found past the first position goes in before the match
+/// when `step <= 4` (noDict), after it when the match covers the position
+/// (extDict).
 ///
 /// Bounds invariants covering every unchecked read below:
 ///
@@ -117,6 +125,9 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: 
     // C bounds the block by `ZSTD_getLowestPrefixIndex(endIndex)`; the
     // bound of its last position holds for every position.
     let prefix_start = ms.lowest_match_index(iend - 1);
+    // extDict: the input's first index (`prefixStartIndex`; C's
+    // `dictStartIndex` is `prefix_start` here). Unused without `EXT`.
+    let dict_limit = ms.window().dict_limit();
     // C: ilimit = iend - HASH_READ_SIZE, possibly below istart; every
     // comparison against it then sends the loop to _cleanup.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
@@ -130,8 +141,13 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: 
     let mut rep_offset2 = rep[1];
     let (mut offset_saved1, mut offset_saved2) = (0u32, 0u32);
     {
-        let window_low = ms.lowest_match_index(ip0);
-        let max_rep = (ip0 - window_low) as u32;
+        // extDict: the block-wide bound (libzstd disables `offset >= curr -
+        // dictStartIndex`, a repcode at `dictStartIndex` too).
+        let max_rep = if EXT {
+            (ip0 - prefix_start) as u32
+        } else {
+            (ip0 - ms.lowest_match_index(ip0)) as u32
+        };
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;
             rep_offset2 = 0;
@@ -183,7 +199,18 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: 
                 // Here ip1 == ip0 + 1 and ip3 == ip2 + 1.
 
                 // load repcode match for ip[2]
-                let rval = read32(src, ip2 - rep_offset1 as usize) ^ rep_mask;
+                let rval = if EXT {
+                    // intentional underflow: no repcode starting in
+                    // [dict_limit - 3, dict_limit]
+                    let rep_index = (ip2 as u32).wrapping_sub(rep_offset1);
+                    if (dict_limit as u32).wrapping_sub(rep_index) >= 4 && rep_offset1 > 0 {
+                        read32(src, rep_index as usize)
+                    } else {
+                        read32(src, ip2) ^ 1 // guaranteed to not match
+                    }
+                } else {
+                    read32(src, ip2 - rep_offset1 as usize) ^ rep_mask
+                };
 
                 // write back hash table entry
                 current0 = ip0;
@@ -285,11 +312,18 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: 
                 rep_offset1 = (ip0 - match0) as u32;
                 let offcode = offset_to_offbase(rep_offset1);
                 let mut m_length = 4;
+                // extDict: the start of the match's segment.
+                let low_match = if EXT && match0 >= dict_limit {
+                    dict_limit
+                } else {
+                    prefix_start
+                };
                 // Count the backwards match length.
-                // SAFETY: ip0 > anchor >= istart and match0 > prefix_start
-                // keep both indices >= src.lo() and below ip0 < iend.
+                // SAFETY: ip0 > anchor >= istart and match0 > low_match >=
+                // prefix_start keep both indices >= src.lo() and below ip0 <
+                // iend.
                 unsafe {
-                    while ((ip0 > anchor) & (match0 > prefix_start))
+                    while ((ip0 > anchor) & (match0 > low_match))
                         && byte(src, ip0 - 1) == byte(src, match0 - 1)
                     {
                         ip0 -= 1;
@@ -334,6 +368,11 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: 
                 // rep_offset2 == 0 means rep_offset2 is invalidated
                 if rep_offset2 > 0 {
                     while ip0 <= ilimit
+                        && (!EXT
+                            || index_overlap_check(
+                                dict_limit,
+                                (ip0 as u32).wrapping_sub(rep_offset2),
+                            ))
                         && read32(src, ip0) == read32(src, ip0 - rep_offset2 as usize)
                     {
                         // store sequence
@@ -392,9 +431,9 @@ pub fn compress_block(
     out: &mut SeqStore,
 ) -> usize {
     let block = block.range();
-    // ZSTD_selectBlockCompressor: ZSTD_compressBlock_fast_extDict while a
-    // loaded dictionary is valid (ZSTD_matchState_dictMode).
-    let ext = ms.window().loaded_dict_end().is_some();
+    // ZSTD_selectBlockCompressor: ZSTD_compressBlock_fast_extDict while
+    // dictionary content is in reach.
+    let ext = ms.ext_dict_in_reach(block.end);
     match simd_level() {
         // SAFETY: fearless_simd constructs the witness only after detecting
         // AVX2 on this CPU, and BMI2 is detected here.

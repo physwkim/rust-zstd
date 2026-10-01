@@ -15,7 +15,7 @@
 //! (`ZSTD_btGetAllMatches`): it inserts the position and collects every
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
-use super::common::{byte, read32, tget, MatchCount, Src, HASH_READ_SIZE};
+use super::common::{byte, index_overlap_check, read32, tget, MatchCount, Src, HASH_READ_SIZE};
 use super::matchstate::{EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, repcode_to_offbase, ZSTD_REP_NUM};
 use fearless_simd::Fallback;
@@ -245,19 +245,23 @@ unsafe fn insert_and_find_first_index_hash3(
     tget(hash_table3, hash3)
 }
 
-/// `ZSTD_insertBtAndGetAllMatches(..., dictMode = ZSTD_noDict, mls)`:
-/// insert `ip` into the tree and write to `matches` every candidate longer
-/// than all previous ones, starting above `length_to_beat - 1`: repcodes
-/// first (`ll0` shifts them as the decoder does after a zero literal
-/// length), then the 3-byte hash (`MLS == 3`), then the tree walk. Returns
-/// the number of matches, in increasing length.
+/// `ZSTD_insertBtAndGetAllMatches(..., dictMode = ZSTD_noDict, mls)`, with
+/// `EXT` `ZSTD_extDict`: insert `ip` into the tree and write to `matches`
+/// every candidate longer than all previous ones, starting above
+/// `length_to_beat - 1`: repcodes first (`ll0` shifts them as the decoder
+/// does after a zero literal length), then the 3-byte hash (`MLS == 3`),
+/// then the tree walk. Returns the number of matches, in increasing
+/// length. Over the one contiguous window the two modes differ only in
+/// the repcodes into the dictionary content, the `dictBase` segment
+/// `[window_low, dict_limit)`: extDict takes none starting in its last
+/// three bytes ([`index_overlap_check`]).
 ///
 /// # Safety
 /// `ip + HASH_READ_SIZE <= i_limit <= src.end()`, `ip >= ms.window_low()`,
 /// `ms.next_to_update >= ip`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
+unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32, const EXT: bool>(
     m: M,
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
@@ -274,7 +278,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     let curr = ip;
     let min_match: u32 = if MLS == 3 { 3 } else { 4 };
     let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
-    let dict_limit = ms.window_low();
+    let dict_limit = ms.window().dict_limit();
     let bt_low = curr.saturating_sub(bt_mask);
     let window_low = ms.lowest_match_index(curr);
     // `matchLow = windowLow ? windowLow : 1`; `window_low >= WINDOW_START_INDEX`.
@@ -321,9 +325,24 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
                         i_limit,
                     ) + min_match as usize;
                 }
+            } else if EXT {
+                // repIndex < dictLimit || repIndex >= curr
+                let rep_index = (curr as u32).wrapping_sub(rep_offset);
+                // intentional overflow: `curr > repIndex >= windowLow`
+                if (rep_offset.wrapping_sub(1) as usize) < curr - window_low
+                    && index_overlap_check(dict_limit, rep_index)
+                    && read_min_match(src, ip, min_match)
+                        == read_min_match(src, rep_index as usize, min_match)
+                {
+                    rep_len = m.count(
+                        src,
+                        ip + min_match as usize,
+                        rep_index as usize + min_match as usize,
+                        i_limit,
+                    ) + min_match as usize;
+                }
             }
-            // repIndex < dictLimit || repIndex >= curr: no extDict or
-            // dictMatchState here.
+            // no dictMatchState here.
             // save longer solution
             if rep_len > best_length {
                 best_length = rep_len;
@@ -437,16 +456,17 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     mnum as u32
 }
 
-/// `ZSTD_btGetAllMatches_internal(..., ZSTD_noDict, mls)`: nothing inside an
-/// area a previous long match let the tree skip, else bring the tree up to
-/// `ip` and collect `ip`'s matches, see [`insert_bt_and_get_all_matches`].
+/// `ZSTD_btGetAllMatches_internal(..., ZSTD_noDict, mls)`, with `EXT`
+/// `ZSTD_extDict`: nothing inside an area a previous long match let the
+/// tree skip, else bring the tree up to `ip` and collect `ip`'s matches,
+/// see [`insert_bt_and_get_all_matches`].
 ///
 /// # Safety
 /// `ip + HASH_READ_SIZE <= i_high_limit <= src.end()`,
 /// `ip >= ms.window_low()`, and the tables pass [`assert_opt_bounds`].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32>(
+pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32, const EXT: bool>(
     m: M,
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
@@ -462,7 +482,7 @@ pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32>(
         return 0; // skipped area
     }
     update_tree_internal::<M, MLS>(m, ms, src, ip, i_high_limit);
-    insert_bt_and_get_all_matches::<M, MLS>(
+    insert_bt_and_get_all_matches::<M, MLS, EXT>(
         m,
         matches,
         ms,

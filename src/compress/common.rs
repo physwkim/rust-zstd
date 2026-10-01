@@ -165,6 +165,18 @@ pub fn candidate_valid(idx: usize, low: usize, cur: usize) -> bool {
     idx.wrapping_sub(low) < cur - low
 }
 
+/// `ZSTD_index_overlap_check(prefixLowestIndex, repIndex)`, in `U32` as C
+/// computes it: false when a repcode match at `rep_index` would start in
+/// the last three bytes before `prefix_lowest`, so that its first four
+/// bytes straddle the two segments of libzstd's window (`ZSTD_extDict`).
+#[inline(always)]
+pub fn index_overlap_check(prefix_lowest: usize, rep_index: u32) -> bool {
+    (prefix_lowest as u32)
+        .wrapping_sub(1)
+        .wrapping_sub(rep_index)
+        >= 3
+}
+
 /// `PREFETCH_L1(base + pos)`: a cache hint, no-op on targets without the
 /// intrinsic. Like C's, it is unbounded: the hint never faults, so `pos`
 /// may lie outside `src`, and a bound check here costs fast's search loop

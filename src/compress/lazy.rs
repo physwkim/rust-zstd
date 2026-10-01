@@ -1,5 +1,6 @@
 //! Greedy / lazy / lazy2 block compressors: port of `zstd_lazy.c`
-//! (`ZSTD_compressBlock_lazy_generic`, no-dictionary mode) with both match
+//! (`ZSTD_compressBlock_lazy_generic`, no-dictionary mode, and
+//! `ZSTD_compressBlock_lazy_extDict_generic`) with both match
 //! finders: the hash chain (`ZSTD_HcFindBestMatch`) and the row-based finder
 //! (`ZSTD_RowFindBestMatch`, tag table + SIMD tag compare). The method is
 //! chosen like `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto)`: rows whenever
@@ -10,8 +11,8 @@
 //! `1` is `DUBT_UNSORTED_MARK`, both below `window_low`.
 
 use super::common::{
-    byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,
-    Src, HASH_READ_SIZE,
+    byte, candidate_valid, count, index_overlap_check, prefetch, prefetch_l1, read32, read64, tget,
+    tset, MatchCount, Src, HASH_READ_SIZE,
 };
 use super::matchstate::{Block, EnteredPrefix, MatchState, Window};
 use super::params::{CParams, Strategy};
@@ -1198,10 +1199,18 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
 // ---------------------------------------------------------------------------
 
 /// `ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, srcSize,
-/// searchMethod, depth, ZSTD_noDict)`. Returns the anchor of the trailing
-/// literals.
+/// searchMethod, depth, ZSTD_noDict)`; with `EXT`,
+/// `ZSTD_compressBlock_lazy_extDict_generic`, which libzstd runs while
+/// dictionary content, its `dictBase` segment `[window_low, dict_limit)`,
+/// is in the window ([`Window::has_ext_dict`]). Over the one contiguous
+/// window the two differ at that segment's end: extDict keeps a repcode
+/// out of reach instead of disabling it, takes none starting in
+/// `[dict_limit - 3, dict_limit)` ([`index_overlap_check`]) or out of
+/// reach, and stops a catch-up at the start of the match's segment. The
+/// searches are the same, `ZSTD_count_2segments` being `ZSTD_count` over
+/// the contiguous segments. Returns the anchor of the trailing literals.
 #[inline(always)]
-fn lazy_generic<S: Search>(
+fn lazy_generic<const EXT: bool, S: Search>(
     ms: &mut MatchState,
     src: Src,
     block: Range<usize>,
@@ -1215,19 +1224,30 @@ fn lazy_generic<S: Search>(
     let mut anchor = istart;
     // Below `istart + 1` the loop conditions are false anyway.
     let ilimit = iend.saturating_sub(S::ILIMIT_MARGIN);
-    let prefix_lowest = ms.window_low();
+    // `window.dictLimit`, `window_low` without `EXT`.
+    let prefix_lowest = ms.window().dict_limit();
+    // extDict: the start of the `dictBase` segment.
+    let dict_lowest = ms.window_low();
 
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offset_saved1 = 0u32;
     let mut offset_saved2 = 0u32;
+    debug_assert!(!EXT || (offset_1 > 0 && offset_2 > 0));
+    // extDict: whether repcode `offset` at `curr` is in reach and does not
+    // start in the last three bytes of the segment (`(U32)(curr -
+    // offset)`, as C wraps it).
+    let ext_rep_ok = |ms: &MatchState, curr: usize, offset: u32| {
+        index_overlap_check(prefix_lowest, (curr as u32).wrapping_sub(offset))
+            && offset as usize <= curr - ms.lowest_match_index(curr)
+    };
 
-    // C: `ip += (dictAndPrefixLength == 0)`
+    // C: `ip += (dictAndPrefixLength == 0)` / `ip += (ip == prefixStart)`
     let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
     }
-    {
+    if !EXT {
         let curr = ip;
         let window_low = ms.lowest_match_index(curr);
         let max_rep = (curr - window_low) as u32;
@@ -1249,7 +1269,8 @@ fn lazy_generic<S: Search>(
     // 4-byte reads at `<= ip + 1` and counts starting `<= ip + 5` stay inside
     // `src`. A rep offset is `> 0` and `<= ip - window_low` (clamped by
     // `max_rep` above, or the distance to a candidate `>= low_limit >=
-    // window_low`, and `ip` only grows), so `ip - offset >= src.lo()`.
+    // window_low`, and `ip` only grows), so `ip - offset >= src.lo()`;
+    // with `EXT`, `ext_rep_ok` checks `offset <= ip - window_low` first.
     while ip < ilimit {
         let mut match_length = 0usize;
         let mut off_base = REPCODE1_TO_OFFBASE;
@@ -1258,8 +1279,12 @@ fn lazy_generic<S: Search>(
         // check repCode
         let mut rep_at_depth0 = false;
         // SAFETY: see the loop header.
-        let rep_hit = offset_1 > 0
-            && unsafe { read32(src, ip + 1 - offset_1 as usize) == read32(src, ip + 1) };
+        let rep_hit =
+            if EXT {
+                ext_rep_ok(ms, ip + 1, offset_1)
+            } else {
+                offset_1 > 0
+            } && unsafe { read32(src, ip + 1 - offset_1 as usize) == read32(src, ip + 1) };
         if rep_hit {
             // SAFETY: see the loop header.
             match_length =
@@ -1295,7 +1320,11 @@ fn lazy_generic<S: Search>(
                     ip += 1;
                     // SAFETY: see the loop header (`ip <= ilimit`).
                     let rep_hit = off_base != 0
-                        && offset_1 > 0
+                        && if EXT {
+                            ext_rep_ok(ms, ip, offset_1)
+                        } else {
+                            offset_1 > 0
+                        }
                         && unsafe { read32(src, ip) == read32(src, ip - offset_1 as usize) };
                     if rep_hit {
                         // SAFETY: see the loop header.
@@ -1329,7 +1358,11 @@ fn lazy_generic<S: Search>(
                         ip += 1;
                         // SAFETY: see the loop header (`ip <= ilimit`).
                         let rep_hit = off_base != 0
-                            && offset_1 > 0
+                            && if EXT {
+                                ext_rep_ok(ms, ip, offset_1)
+                            } else {
+                                offset_1 > 0
+                            }
                             && unsafe { read32(src, ip) == read32(src, ip - offset_1 as usize) };
                         if rep_hit {
                             // SAFETY: see the loop header.
@@ -1371,10 +1404,16 @@ fn lazy_generic<S: Search>(
             // catch up
             if offbase_is_offset(off_base) {
                 let offset = offbase_to_offset(off_base) as usize;
-                // SAFETY: `src.lo() <= prefix_lowest <= start - 1 - offset <
+                // extDict: the start of the match's segment.
+                let m_start = if EXT && start - offset < prefix_lowest {
+                    dict_lowest
+                } else {
+                    prefix_lowest
+                };
+                // SAFETY: `src.lo() <= m_start <= start - 1 - offset <
                 // start - 1 < ip < iend <= src.end()`.
                 while start > anchor
-                    && start - offset > prefix_lowest
+                    && start - offset > m_start
                     && unsafe { byte(src, start - 1) == byte(src, start - 1 - offset) }
                 {
                     start -= 1;
@@ -1400,7 +1439,11 @@ fn lazy_generic<S: Search>(
         // check immediate repcode
         // SAFETY (both): see the loop header (`ip <= ilimit`).
         while ip <= ilimit
-            && offset_2 > 0
+            && if EXT {
+                ext_rep_ok(ms, ip, offset_2)
+            } else {
+                offset_2 > 0
+            }
             && unsafe { read32(src, ip) == read32(src, ip - offset_2 as usize) }
         {
             let match_length =
@@ -1468,7 +1511,7 @@ fn detected_level() -> Level {
 /// The row-finder block loop for one tag-mask implementation, specialised on
 /// `mls` and `rowLog` like C's `ZSTD_FOR_EACH_MLS_ROWLOG` templates.
 #[inline(always)]
-fn row_block<M: TagMask + MatchCount>(
+fn row_block<const EXT: bool, M: TagMask + MatchCount>(
     mask: M,
     ms: &mut MatchState,
     src: Src,
@@ -1479,7 +1522,7 @@ fn row_block<M: TagMask + MatchCount>(
 ) -> usize {
     macro_rules! go {
         ($mls:literal, $row_log:literal) => {
-            lazy_generic(
+            lazy_generic::<EXT, _>(
                 ms,
                 src,
                 block,
@@ -1505,7 +1548,7 @@ fn row_block<M: TagMask + MatchCount>(
 
 /// [`row_block`] with the scalar tag compare.
 #[inline(never)]
-fn row_block_scalar(
+fn row_block_scalar<const EXT: bool>(
     ms: &mut MatchState,
     src: Src,
     block: Range<usize>,
@@ -1513,7 +1556,7 @@ fn row_block_scalar(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    row_block(Fallback::new(), ms, src, block, rep, out, depth)
+    row_block::<EXT, _>(Fallback::new(), ms, src, block, rep, out, depth)
 }
 
 /// [`row_block`] compiled with SSE4.2 enabled, using the SSE tag compare.
@@ -1524,7 +1567,7 @@ fn row_block_scalar(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(never)]
 #[target_feature(enable = "sse4.2")]
-unsafe fn row_block_sse(
+unsafe fn row_block_sse<const EXT: bool>(
     mask: Sse4_2,
     ms: &mut MatchState,
     src: Src,
@@ -1533,7 +1576,7 @@ unsafe fn row_block_sse(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    row_block(mask, ms, src, block, rep, out, depth)
+    row_block::<EXT, _>(mask, ms, src, block, rep, out, depth)
 }
 
 /// [`row_block`] compiled with AVX2 enabled, using the AVX2 tag compare.
@@ -1544,7 +1587,7 @@ unsafe fn row_block_sse(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(never)]
 #[target_feature(enable = "avx2")]
-unsafe fn row_block_avx2(
+unsafe fn row_block_avx2<const EXT: bool>(
     mask: Avx2,
     ms: &mut MatchState,
     src: Src,
@@ -1553,7 +1596,7 @@ unsafe fn row_block_avx2(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    row_block(mask, ms, src, block, rep, out, depth)
+    row_block::<EXT, _>(mask, ms, src, block, rep, out, depth)
 }
 
 /// [`row_block`] compiled with NEON enabled, using the NEON tag compare.
@@ -1564,7 +1607,7 @@ unsafe fn row_block_avx2(
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[target_feature(enable = "neon")]
-unsafe fn row_block_neon(
+unsafe fn row_block_neon<const EXT: bool>(
     mask: Neon,
     ms: &mut MatchState,
     src: Src,
@@ -1573,12 +1616,12 @@ unsafe fn row_block_neon(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    row_block(mask, ms, src, block, rep, out, depth)
+    row_block::<EXT, _>(mask, ms, src, block, rep, out, depth)
 }
 
 /// The hash-chain block loop specialised on `mls`.
 #[inline(never)]
-fn hc_block(
+fn hc_block<const EXT: bool>(
     ms: &mut MatchState,
     src: Src,
     block: Range<usize>,
@@ -1587,16 +1630,16 @@ fn hc_block(
     depth: u32,
 ) -> usize {
     match mls_of(&ms.cparams) {
-        4 => lazy_generic(ms, src, block, rep, out, depth, HcSearch::<4>),
-        5 => lazy_generic(ms, src, block, rep, out, depth, HcSearch::<5>),
-        _ => lazy_generic(ms, src, block, rep, out, depth, HcSearch::<6>),
+        4 => lazy_generic::<EXT, _>(ms, src, block, rep, out, depth, HcSearch::<4>),
+        5 => lazy_generic::<EXT, _>(ms, src, block, rep, out, depth, HcSearch::<5>),
+        _ => lazy_generic::<EXT, _>(ms, src, block, rep, out, depth, HcSearch::<6>),
     }
 }
 
 /// The binary-tree block loop specialised on `mls`
 /// (`ZSTD_compressBlock_btlazy2`) for one [`MatchCount`] level.
 #[inline(always)]
-fn bt_block<M: MatchCount>(
+fn bt_block<const EXT: bool, M: MatchCount>(
     count: M,
     ms: &mut MatchState,
     src: Src,
@@ -1607,7 +1650,7 @@ fn bt_block<M: MatchCount>(
 ) -> usize {
     let p = BtParams::of(ms);
     match mls_of(&ms.cparams) {
-        4 => lazy_generic(
+        4 => lazy_generic::<EXT, _>(
             ms,
             src,
             block,
@@ -1616,7 +1659,7 @@ fn bt_block<M: MatchCount>(
             depth,
             BtSearch::<M, 4> { count, p },
         ),
-        5 => lazy_generic(
+        5 => lazy_generic::<EXT, _>(
             ms,
             src,
             block,
@@ -1625,7 +1668,7 @@ fn bt_block<M: MatchCount>(
             depth,
             BtSearch::<M, 5> { count, p },
         ),
-        _ => lazy_generic(
+        _ => lazy_generic::<EXT, _>(
             ms,
             src,
             block,
@@ -1639,7 +1682,7 @@ fn bt_block<M: MatchCount>(
 
 /// [`bt_block`] with the scalar `ZSTD_count`.
 #[inline(never)]
-fn bt_block_scalar(
+fn bt_block_scalar<const EXT: bool>(
     ms: &mut MatchState,
     src: Src,
     block: Range<usize>,
@@ -1647,7 +1690,7 @@ fn bt_block_scalar(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    bt_block(Fallback::new(), ms, src, block, rep, out, depth)
+    bt_block::<EXT, _>(Fallback::new(), ms, src, block, rep, out, depth)
 }
 
 /// [`bt_block`] compiled with AVX2 enabled, using the AVX2 match count.
@@ -1658,7 +1701,7 @@ fn bt_block_scalar(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(never)]
 #[target_feature(enable = "avx2")]
-unsafe fn bt_block_avx2(
+unsafe fn bt_block_avx2<const EXT: bool>(
     count: Avx2,
     ms: &mut MatchState,
     src: Src,
@@ -1667,7 +1710,7 @@ unsafe fn bt_block_avx2(
     out: &mut SeqStore,
     depth: u32,
 ) -> usize {
-    bt_block(count, ms, src, block, rep, out, depth)
+    bt_block::<EXT, _>(count, ms, src, block, rep, out, depth)
 }
 
 /// `ZSTD_compressBlock_greedy/lazy/lazy2[_row]/btlazy2` for the strategy in
@@ -1731,23 +1774,44 @@ pub fn compress_block_with(
     let block = block.range();
     let depth = depth_of(ms.cparams.strategy);
     assert_block_bounds(ms, src, block.end);
+    // ZSTD_selectBlockCompressor: the ZSTD_extDict variant while
+    // dictionary content is in the window (ZSTD_matchState_dictMode).
+    if ms.window().has_ext_dict() {
+        dispatch::<true>(ms, src, block, rep, out, depth, level)
+    } else {
+        dispatch::<false>(ms, src, block, rep, out, depth, level)
+    }
+}
+
+/// The block loop of [`compress_block_with`] for `ms.search_method` and
+/// `level`, in its extDict variant with `EXT`.
+#[inline(always)]
+fn dispatch<const EXT: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    depth: u32,
+    level: Level,
+) -> usize {
     match ms.search_method {
-        SearchMethod::HashChain => hc_block(ms, src, block, rep, out, depth),
+        SearchMethod::HashChain => hc_block::<EXT>(ms, src, block, rep, out, depth),
         // SAFETY (all four unsafe arms): fearless_simd constructs a witness
         // only after detecting its feature set on this CPU.
         SearchMethod::BinaryTree => match level {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Level::Avx2(w) => unsafe { bt_block_avx2(w, ms, src, block, rep, out, depth) },
-            _ => bt_block_scalar(ms, src, block, rep, out, depth),
+            Level::Avx2(w) => unsafe { bt_block_avx2::<EXT>(w, ms, src, block, rep, out, depth) },
+            _ => bt_block_scalar::<EXT>(ms, src, block, rep, out, depth),
         },
         SearchMethod::RowHash => match level {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Level::Sse4_2(w) => unsafe { row_block_sse(w, ms, src, block, rep, out, depth) },
+            Level::Sse4_2(w) => unsafe { row_block_sse::<EXT>(w, ms, src, block, rep, out, depth) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Level::Avx2(w) => unsafe { row_block_avx2(w, ms, src, block, rep, out, depth) },
+            Level::Avx2(w) => unsafe { row_block_avx2::<EXT>(w, ms, src, block, rep, out, depth) },
             #[cfg(target_arch = "aarch64")]
-            Level::Neon(w) => unsafe { row_block_neon(w, ms, src, block, rep, out, depth) },
-            _ => row_block_scalar(ms, src, block, rep, out, depth),
+            Level::Neon(w) => unsafe { row_block_neon::<EXT>(w, ms, src, block, rep, out, depth) },
+            _ => row_block_scalar::<EXT>(ms, src, block, rep, out, depth),
         },
     }
 }
