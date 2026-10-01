@@ -23,7 +23,9 @@ use super::{
     write_raw_block, CommittedBlockState, CompressError, CompressOptions, Compressor, Context,
     JobLdm,
 };
+use crate::constants::ZSTD_BLOCKSIZE_MAX;
 use crate::xxhash::Xxh64;
+use std::io::{self, Write};
 
 /// `ZSTD_EndDirective`: what a [`Compressor::compress_stream`] call does
 /// once its input is consumed.
@@ -401,5 +403,79 @@ impl Compressor {
             _ if unconsumed => pending.max(1),
             _ => pending,
         })
+    }
+}
+
+/// `ZSTD_CStreamOutSize`: room for one whole block and its headers.
+const OUT_SIZE: usize = ZSTD_BLOCKSIZE_MAX + (ZSTD_BLOCKSIZE_MAX >> 8) + 64;
+
+/// An [`io::Write`] adapter over [`Compressor::compress_stream`]: `write`
+/// is `Continue`, `flush` is `Flush` then the writer's flush, and
+/// [`Encoder::finish`] is `End`. Dropped unfinished, the frame is left
+/// incomplete.
+pub struct Encoder<W: Write> {
+    writer: W,
+    cctx: Compressor,
+    out: Vec<u8>,
+}
+
+impl<W: Write> Encoder<W> {
+    /// A frame compressed with `opts` into `writer`, of unknown size.
+    pub fn new(writer: W, opts: CompressOptions) -> Self {
+        Self::with_compressor(writer, Compressor::new(opts))
+    }
+
+    /// A frame compressed with `cctx`, whose pledged size it keeps, into
+    /// `writer`.
+    pub fn with_compressor(writer: W, cctx: Compressor) -> Self {
+        Self {
+            writer,
+            cctx,
+            out: vec![0; OUT_SIZE],
+        }
+    }
+
+    /// The underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
+    /// Run `end_op` over `src` until it is consumed and, for `Flush` and
+    /// `End`, complete, writing every output buffer.
+    fn run(&mut self, src: &[u8], end_op: EndDirective) -> io::Result<()> {
+        let mut src_pos = 0;
+        loop {
+            let mut dst_pos = 0;
+            let left = self
+                .cctx
+                .compress_stream(src, &mut src_pos, &mut self.out, &mut dst_pos, end_op)
+                .map_err(io::Error::other)?;
+            self.writer.write_all(&self.out[..dst_pos])?;
+            let done = match end_op {
+                EndDirective::Continue => src_pos == src.len() && dst_pos < self.out.len(),
+                EndDirective::Flush | EndDirective::End => left == 0,
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// End the frame and return the writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.run(&[], EndDirective::End)?;
+        Ok(self.writer)
+    }
+}
+
+impl<W: Write> Write for Encoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.run(buf, EndDirective::Continue)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.run(&[], EndDirective::Flush)?;
+        self.writer.flush()
     }
 }

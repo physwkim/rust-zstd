@@ -10,7 +10,7 @@ pub mod huf;
 mod xxhash;
 
 pub use compress::{
-    compress, compress_to_vec, compress_with, CompressError, CompressOptions, Compressor,
+    compress, compress_to_vec, compress_with, CompressError, CompressOptions, Compressor, Encoder,
     EndDirective, ParamSwitch,
 };
 pub use decode::decompress;

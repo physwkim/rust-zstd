@@ -14,7 +14,8 @@
 mod common;
 
 use common::{assert_gate, assert_round_trip, datasets, MIB};
-use rust_zstd::compress::{CompressError, CompressOptions, Compressor, EndDirective};
+use rust_zstd::compress::{CompressError, CompressOptions, Compressor, Encoder, EndDirective};
+use std::io::Write;
 use zstd::zstd_safe::zstd_sys as sys;
 
 const CHUNKS: [usize; 4] = [1, 7, 1013, 64 << 10];
@@ -417,6 +418,30 @@ fn multithreaded_streaming_is_unsupported() {
         },
     );
     assert_eq!(frame, one_shot);
+}
+
+/// The `io::Write` adapter writes the unpledged stream's frame.
+#[test]
+fn encoder_writes_the_stream_frame() {
+    let data = &set(0);
+    let data = prefix(data, 700 << 10);
+    let mut enc = Encoder::new(Vec::new(), opts(3));
+    for piece in data.chunks(10_000) {
+        enc.write_all(piece).unwrap();
+    }
+    let frame = enc.finish().unwrap();
+    let mut cctx = Compressor::new(opts(3));
+    assert_eq!(frame, stream(&mut cctx, data, 10_000, &[], 1 << 17));
+    assert_round_trip("encoder", data, &frame);
+
+    let mut enc = Encoder::new(Vec::new(), opts(3));
+    enc.write_all(&data[..1000]).unwrap();
+    enc.flush().unwrap();
+    let flushed = enc.get_ref().len();
+    assert!(flushed > 0, "flush wrote nothing");
+    enc.write_all(&data[1000..]).unwrap();
+    let frame = enc.finish().unwrap();
+    assert_round_trip("encoder flush", data, &frame);
 }
 
 /// The corpus grid of the self-consistency gate: chunk sizes 1, 7, 1013

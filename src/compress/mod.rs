@@ -49,7 +49,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Condvar,
 };
-pub use stream::EndDirective;
+pub use stream::{Encoder, EndDirective};
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
