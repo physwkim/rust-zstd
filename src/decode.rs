@@ -1287,9 +1287,12 @@ enum HufStreamStatus {
 /// Backward bit reader over one Huffman or sequences stream.
 ///
 /// `container` holds the 8 bytes starting at `ptr`; bits are consumed from
-/// its high end (the stream is read from its last byte backwards). Once
-/// `bits_consumed` exceeds the data actually loaded, reads return zeros and
-/// the final `is_finished` check rejects the stream.
+/// its high end (the stream is read from its last byte backwards). Below
+/// 64 bits consumed, a lookup reaching past the container's low end reads
+/// zeros there. From 64 on, lookups shift by `bits_consumed & 63`, as
+/// BIT_lookBitsFast masks its shift, and so re-read the container from its
+/// top. The final `is_finished` check rejects a stream consumed past 64
+/// bits; a lookup at exactly 64 that consumes nothing passes it.
 struct BitDStream<'s> {
     src: &'s [u8],
     ptr: usize,
