@@ -104,7 +104,8 @@ impl LdmParams {
     }
 
     /// `ZSTD_ldm_adjustParameters(params, cParams)` for the frame's final
-    /// compression parameters.
+    /// compression parameters. A hash log, explicit or derived, whose table
+    /// cannot be allocated panics: above 27 where `usize` is 32 bits.
     pub fn adjusted(mut self, cparams: &CParams) -> Self {
         let strategy = cparams.strategy as u32;
         self.window_log = cparams.window_log;
@@ -139,6 +140,13 @@ impl LdmParams {
             self.bucket_size_log = strategy.clamp(LDM_BUCKET_SIZE_LOG, BUCKETSIZELOG_MAX);
         }
         self.bucket_size_log = self.bucket_size_log.min(self.hash_log);
+        // libzstd's 32-bit table size wraps past 2^32 bytes and its writes
+        // run out of bounds (R1-15): refuse a table that cannot exist.
+        assert!(
+            self.hash_log <= HASHLOG_ALLOC_MAX,
+            "ldm_hash_log {} over {HASHLOG_ALLOC_MAX}: its table would exceed isize::MAX bytes",
+            self.hash_log
+        );
         self
     }
 }
@@ -300,6 +308,15 @@ struct LdmEntry {
     offset: u32,
     checksum: u32,
 }
+
+/// The largest hash log whose table fits in `max_bytes`.
+const fn hash_log_fitting(max_bytes: usize) -> u32 {
+    (max_bytes / size_of::<LdmEntry>()).ilog2()
+}
+
+/// The largest hash log whose table can be allocated, a `Vec` holding at
+/// most `isize::MAX` bytes: 27 where `usize` is 32 bits.
+pub(crate) const HASHLOG_ALLOC_MAX: u32 = hash_log_fitting(isize::MAX as usize);
 
 /// `ldmState_t` with its window: the hash table persists across the
 /// blocks (or jobs) of a frame.
@@ -463,8 +480,8 @@ impl LdmState {
         }
 
         // Initialize the rolling hash state with the first minMatchLength
-        // bytes (ZSTD_ldm_gear_reset leaves the state as it is).
-        let mut hash_state = GearState::new(&params);
+        // bytes.
+        let mut hash_state = GearState::new(&params, &src[istart..istart + min_match]);
         let mut ip = istart + min_match;
         let mut splits = [0usize; LDM_BATCH_SIZE];
         let mut candidates = [(0usize, 0usize, 0u32); LDM_BATCH_SIZE];
@@ -543,8 +560,10 @@ impl LdmState {
 
                 // A match that ends after the hashed data is a repeating,
                 // overlapping pattern: skip over it (continue the outer
-                // loop at anchor; ip + hashed == anchor).
+                // loop at anchor; ip + hashed == anchor), the rolling hash
+                // restarting on the minMatchLength bytes before anchor.
                 if anchor > ip + hashed {
+                    hash_state.reset(&src[anchor - min_match..anchor]);
                     ip = anchor - hashed;
                     break;
                 }
@@ -673,10 +692,11 @@ struct GearState {
 }
 
 impl GearState {
-    /// `ZSTD_ldm_gear_init`: a split every `1 << hash_rate_log` bytes on
-    /// average, tested on the highest bits that still depend only on the
-    /// last `min_match_length` bytes.
-    fn new(params: &LdmParams) -> Self {
+    /// `ZSTD_ldm_gear_init`, then [`GearState::reset`] on `first`, the
+    /// `min_match_length` bytes before the first byte fed: a split every
+    /// `1 << hash_rate_log` bytes on average, tested on the highest bits
+    /// that still depend only on the last `min_match_length` bytes.
+    fn new(params: &LdmParams, first: &[u8]) -> Self {
         let max_bits_in_mask = params.min_match_length.min(64);
         let hash_rate_log = params.hash_rate_log;
         let stop_mask = if hash_rate_log > 0 && hash_rate_log <= max_bits_in_mask {
@@ -685,10 +705,24 @@ impl GearState {
             // In this degenerate case we simply honor the hash rate.
             (1u64 << hash_rate_log) - 1
         };
-        Self {
+        let mut state = Self {
             rolling: u32::MAX as u64,
             stop_mask,
-        }
+        };
+        state.reset(first);
+        state
+    }
+
+    /// `ZSTD_ldm_gear_reset`: feed `data`, the `min_match_length` bytes
+    /// before the next byte fed, without recording splits, so the stop
+    /// mask's bits from then on depend on the input alone. libzstd 1.5.7
+    /// computes this hash but never stores it (R1-17), which leaves the
+    /// first splits after a chunk start or a skip to `~0` or to the bytes
+    /// before the skip.
+    fn reset(&mut self, data: &[u8]) {
+        self.rolling = data.iter().fold(self.rolling, |hash, &b| {
+            gear_step(hash, GEAR_TAB[b as usize])
+        });
     }
 
     /// `ZSTD_ldm_gear_feed`: record in `splits` the end offset of every
@@ -1060,6 +1094,32 @@ mod tests {
         }
     }
 
+    /// A hash log whose table cannot be allocated, explicit or derived from
+    /// the rate and window logs, panics in `adjusted` (R1-15): above 27
+    /// where `usize` is 32 bits, never on 64 bits.
+    #[test]
+    fn unallocatable_hash_log_panics() {
+        // 2^27 8-byte entries are 1 GiB, 2^28 are 2 GiB.
+        assert_eq!(hash_log_fitting(i32::MAX as usize), 27);
+        assert_eq!(
+            HASHLOG_ALLOC_MAX >= ZSTD_HASHLOG_MAX,
+            cfg!(target_pointer_width = "64")
+        );
+        let cp = cparams(Strategy::Fast, ZSTD_WINDOWLOG_MAX);
+        for log in ZSTD_HASHLOG_MIN..=ZSTD_HASHLOG_MAX {
+            let explicit = LdmParams::requested(log, 0, 0, 0);
+            let derived =
+                (log < cp.window_log).then(|| LdmParams::requested(0, 0, 0, cp.window_log - log));
+            for p in [Some(explicit), derived].into_iter().flatten() {
+                let adjusted = std::panic::catch_unwind(|| p.adjusted(&cp));
+                match adjusted {
+                    Ok(a) => assert!(log <= HASHLOG_ALLOC_MAX && a.hash_log == log, "{p:?}"),
+                    Err(_) => assert!(log > HASHLOG_ALLOC_MAX, "{p:?}"),
+                }
+            }
+        }
+    }
+
     fn store(seqs: &[(u32, u32, u32)]) -> RawSeqStore {
         RawSeqStore {
             seqs: seqs
@@ -1298,5 +1358,90 @@ mod tests {
         assert_eq!(corrections, 3);
         assert!(off.len() > 100);
         assert!(on == off);
+    }
+
+    /// `len` xorshift64 bytes.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 56) as u8
+            })
+            .collect()
+    }
+
+    /// Whether `window`, the `min_match_length` bytes before a position,
+    /// makes that position a split point: the stop mask's bits depend on
+    /// them alone, whatever the rolling state before them.
+    fn is_split(stop_mask: u64, window: &[u8]) -> bool {
+        let hash = window
+            .iter()
+            .fold(0, |hash, &b| gear_step(hash, GEAR_TAB[b as usize]));
+        hash & stop_mask == 0
+    }
+
+    /// `ZSTD_ldm_gear_reset` as documented (R1-17): after a reset on the
+    /// `min_match_length` bytes before it, `feed` records the input's split
+    /// points from the first byte on, at the chunk start (from `~0`) and
+    /// after a skip (from whatever state the skip left).
+    #[test]
+    fn gear_reset_makes_splits_depend_on_the_input_alone() {
+        let data = noise(8192, 1);
+        for (min_match, rate) in [(64, 4), (32, 4), (16, 3), (8, 2)] {
+            let p = LdmParams {
+                min_match_length: min_match,
+                ..params(20, 4, rate)
+            };
+            let mm = min_match as usize;
+            let mut state = GearState::new(&p, &data[..mm]);
+            for start in [mm, 3000] {
+                if start != mm {
+                    state.reset(&data[start - mm..start]);
+                }
+                let mut splits = [0; LDM_BATCH_SIZE];
+                let (hashed, num_splits) = state.feed(&data[start..], &mut splits);
+                let want: Vec<usize> = (1..=hashed)
+                    .filter(|&n| is_split(state.stop_mask, &data[start + n - mm..start + n]))
+                    .collect();
+                assert_eq!(
+                    splits[..num_splits],
+                    want,
+                    "min match {min_match}, at {start}"
+                );
+                assert_eq!(num_splits, LDM_BATCH_SIZE);
+            }
+        }
+    }
+
+    /// Every split `generate_sequences` inserts is a split point of the
+    /// input alone, after the chunk start and after the skip over each
+    /// overlapping match alike (R1-17).
+    #[test]
+    fn inserted_splits_depend_on_the_input_alone() {
+        let (a, b) = (noise(16 << 10, 2), noise(16 << 10, 3));
+        let src = [&a, &a, &b, &b, &noise(4096, 4)]
+            .map(Vec::as_slice)
+            .concat();
+        let p = params(20, 2, 4);
+        let mut state = LdmState::new(p, 0);
+        let mut out = RawSeqStore::default();
+        state.generate_sequences(&src, 0..src.len(), usize::MAX, &mut out);
+        // Each copy is one match that ends past the hashed batch: a skip.
+        assert_eq!(out.seqs.len(), 2);
+        let stop_mask = GearState::new(&p, &[]).stop_mask;
+        let mm = p.min_match_length as usize;
+        let mut inserted = 0;
+        for entry in state.hash_table.iter().filter(|e| e.offset != 0) {
+            let split = state.window.pos(entry.offset as usize);
+            assert!(
+                is_split(stop_mask, &src[split..split + mm]),
+                "split at {split}"
+            );
+            inserted += 1;
+        }
+        assert!(inserted > 1000, "{inserted}");
     }
 }

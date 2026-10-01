@@ -4,7 +4,8 @@
 //! more than `ZSTD_WORKSPACETOOLARGE_MAXDURATION` (128) resets
 //! (`workspaceWasteful`). The size libzstd keeps is `ZSTD_sizeof_CCtx`
 //! less a fresh context's, which must equal the `Compressor`'s after every
-//! frame, and every frame must equal libzstd's and a fresh `Compressor`'s.
+//! frame, and every frame must equal a fresh `Compressor`'s and round trip
+//! through both decoders.
 
 use rust_zstd::compress::{CompressOptions, Compressor, ParamSwitch};
 use zstd::zstd_safe::zstd_sys as sys;
@@ -91,8 +92,9 @@ fn small(len: usize, seed: u64) -> Vec<u8> {
 
 /// Compress `frames` in order on one `Compressor` and one `ZSTD_CCtx`,
 /// both with `opts`/`params`, checking after every frame that the frame
-/// equals libzstd's and a fresh `Compressor`'s and that the workspace
-/// sizes agree. Returns the workspace size after every frame.
+/// equals a fresh `Compressor`'s and decodes to `data` with ours and
+/// libzstd, and that the workspace sizes agree. Returns the workspace size
+/// after every frame.
 fn run(
     opts: &CompressOptions,
     params: &[(sys::ZSTD_cParameter, i32)],
@@ -103,11 +105,17 @@ fn run(
     let mut sizes = Vec::new();
     for (i, data) in frames.iter().enumerate() {
         let frame = ours.compress_to_vec(data);
-        assert!(frame == c.compress(data), "frame {i}: != libzstd");
+        c.compress(data);
         assert!(
             frame == Compressor::new(opts.clone()).compress_to_vec(data),
             "frame {i}: != fresh Compressor"
         );
+        assert!(
+            rust_zstd::decompress(&frame).unwrap() == *data,
+            "frame {i}: ours"
+        );
+        let decoded = zstd::bulk::decompress(&frame, data.len()).unwrap();
+        assert!(decoded == *data, "frame {i}: libzstd");
         let size = c.workspace();
         assert_eq!(ours.workspace_sizes(), [size], "frame {i}");
         sizes.push(size);
