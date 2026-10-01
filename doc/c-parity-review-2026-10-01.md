@@ -6,11 +6,13 @@ checked against RFC 8878 for reference-side bugs.
 
 ## Accepted divergences (user decisions, not findings)
 
-- Decoder accept/reject follows one-shot `ZSTD_decompressDCtx` with an
-  ample dst buffer (Huffman log 12, raw/RLE past 128 KiB, any window up to
-  `ZSTD_WINDOWLOG_MAX`), not RFC-strict and not streaming `maxWindowSize`.
-  The output `Vec` grows, so capacity-dependent one-shot limits are modeled
-  as a large buffer.
+- Decoder accept/reject follows RFC 8878, not libzstd (user decision
+  2026-10-01, replacing one-shot `ZSTD_decompressDCtx` parity). Frames the
+  RFC allows are accepted even where libzstd rejects them; frames it calls
+  invalid are rejected even where libzstd decodes them. Offset ==
+  Window_Size is accepted (§3.1.1, "up to a distance of Window_Size").
+  The resource limit the RFC leaves to the decoder is window log <=
+  `ZSTD_WINDOWLOG_MAX`.
 - `CompressOptions::default()` is single-threaded `ZSTD_compress2`
   (one job); `job_size: Some(n)` is ZSTDMT at that job size, `Some(0)` its
   automatic size. Frames depend on job size, never on thread count.
@@ -25,32 +27,26 @@ checked against RFC 8878 for reference-side bugs.
 - No legacy v0.1-v0.7 frame decoding (R1-7).
 - No `ZSTD_c_literalCompressionMode` (experimental in libzstd); literals
   follow its auto rule, so default frames are unaffected (R2-16).
-- libzstd bugs that change frames or verdicts are copied for parity (R1-6,
-  R1-11, R1-17, R1-18, R1-22), except R1-16: an LDM hash rate log
-  above the adjusted window log derives ZSTD_HASHLOG_MIN, not libzstd's
-  wrapped 30.
+- libzstd bugs are not copied (user decision 2026-10-01). Frames may
+  therefore differ from libzstd's. The merge gate is a round trip through
+  rust-zstd, libzstd and ruzstd plus a size no larger than stock libzstd's
+  within a small tolerance; byte comparison with libzstd is a diagnostic.
 
 ## Open Findings
 
-### R2-1: A compressed block whose raw literals libzstd reads in place decodes past Block_Maximum_Size + 32 in one-shot libzstd; the port rejects it
+### R1-8: A skippable Frame_Size of 0xFFFFFFF8 or more is rejected like libzstd's `readSkippableFrameSize`
 
-Severity: Medium
+Severity: Low
 
 Class: reference-faithful gap
 
-Rust: `src/decode.rs:3076` — `if decoded > decoded_block_max(block_size_max)` rejects every compressed block that decodes past `block_size_max + 32` ("Block decodes to 7770 bytes, past Block_Maximum_Size 1024 + 32"). The executors stop even earlier, at the constant `oend = op + DECODED_BLOCK_MAX` (`:3196`; MT `:4643`), with "Block content exceeds block size limit". The doc comment at `:2825-2830` assumes the literals always sit at `dst + block_size_max + WILDCOPY_OVERLENGTH`. `tests/decode_block_size_max.rs:255` claims libzstd parity at this bound, but it builds every case with `rle_literals` (`:127-157`), so it never reaches the in-place branch.
+Rust: `src/decode.rs:2568` (`parse_frame_header`) refuses a skippable frame whose 8-byte header plus Frame_Size wraps a u32 (47488d9, copied from libzstd).
 
-C reference: `decompress/zstd_decompress_block.c:274-293` — raw literals are not copied when `lhSize+litSize+WILDCOPY_OVERLENGTH <= srcSize`, i.e. when 32 or more block bytes follow them. Instead `litPtr = istart+lhSize` and `litBufferLocation = ZSTD_not_in_dst`. `:1623` then sets `oend = ostart + maxDstSize`, where `maxDstSize` is the whole remaining dst capacity (`zstd_decompress.c:1018` → `zstd_decompress_block.c:2171`). One-shot never checks the decoded size after the block (`zstd_decompress.c:1031-1037`).
+C reference: `decompress/zstd_decompress.c:587` `readSkippableFrameSize` adds `ZSTD_SKIPPABLEHEADERSIZE` to Frame_Size in U32 and returns `frameParameter_unsupported` on a wrap. RFC 8878 §3.1.2 allows any 32-bit Frame_Size ("User_Data can't be bigger than (2^32-1) bytes").
 
-Impact: proven by probe (`p1`):
-- **1 KiB window:** a 37-byte block of 30 sequences decodes to 7770 bytes. One-shot libzstd returns `Ok(7780)`; all four Rust paths (serial/MT × SIMD/portable) return Err.
-- **1 MiB window:** a 35-byte block of 14 sequences (ML code 52) decodes to 917546 bytes. libzstd returns `Ok(917556)`; Rust returns Err.
-- **Streaming:** `ZSTD_decompressStream` rejects both.
-- **Fuzzing:** the x86-64 fuzz against body-path libzstd found the same shape once in 1.6M mutations ("Block decodes to 2000 bytes, past Block_Maximum_Size 1024 + 32"). The port's paths never disagreed with each other.
+Impact: a valid skippable frame of 4 GiB - 8 bytes or more is rejected.
 
-The accepted divergence ("one-shot `ZSTD_decompressDCtx` with an ample dst") puts no per-block bound on this branch; only dst capacity limits it. Matching it means dropping the bsm+32 bound for in-place raw literals, so this needs a user decision.
-
-Decided 2026-10-01 (existing one-shot rule, ample dst): accept like `ZSTD_decompressFrame`; raw literals read in place bound the block only by the output.
+Decided 2026-10-01: accept it (RFC decoder rule).
 
 ### R2-8: Block path never runs `ZSTD_window_enforceMaxDist` or the `nextToUpdate >= lowLimit` clamp, so `Window::low` stops tracking C's `lowLimit`/`dictLimit`
 
@@ -115,7 +111,8 @@ At frame 129 libzstd releases about 80 MiB; ours never does. Not probed: at L22 
 
 ## libzstd bugs
 
-Upstream reports. Where the port copies one, its row says so.
+Upstream reports. Where the port still shares one, its Decided or Port
+line says what the port does; that line goes when the port fix lands.
 
 ### R1-4: [libzstd] The 4-stream Huffman fast path skips the end-of-stream and end-mark checks, so the one-shot verdict depends on the host CPU (our port does not copy this)
 
@@ -156,7 +153,7 @@ C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2
 
 Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
 
-Decided 2026-10-01: the port keeps copying libzstd.
+Decided 2026-10-01 (revised): the port fixes it. A Huffman stream must be consumed exactly (RFC 8878 §4.2.2), whichever of X1 and X2 decodes it.
 
 ### R1-10: [libzstd] `ZSTD_deriveSeqStoreChunk` keeps a long length that sits exactly at the chunk end
 
@@ -182,7 +179,7 @@ C reference: `zstd_lazy.c:661`: `ZSTD_insertAndFindFirstIndex` passes `ms->cPara
 
 Impact: Proven with a probe against libzstd 1.5.7 (scratch `probe2`). The setup was a 100000-byte random prefix set with `ZSTD_CCtx_refPrefix`, the same bytes as input, `ZSTD_c_windowLog` 14 and hashLog/chainLog 16. With minMatch 5 or 6 the output is 83656 bytes; with minMatch 7 it is 100031 bytes (no match at all) for greedy, lazy and lazy2 on the hash chain, btlazy2 and btopt. The row finder is unaffected (34490 bytes at minMatch 5, 6 and 7). Every prefix or dictionary match is lost, which violates no RFC rule but is a pure ratio bug. Our port is unreachable today: there is no `min_match` option, and the greedy through btlazy2 rows of the level tables use minMatch 4 or 5 only.
 
-Decided 2026-10-01: the port copies libzstd in both loaders (R1-12).
+Decided 2026-10-01 (revised): the port fixes it. Both loaders hash `BOUNDED(4, minMatch, 6)` bytes, as the searches do.
 
 ### R1-14: [libzstd] The fast and row-lazy finders form pointers outside the input object (C11 6.5.6p8 undefined behaviour); the attribute on them only silences UBSan
 
@@ -217,6 +214,8 @@ Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
 
 The port panics in the three explicit cases; in the rate case it derives hash log 6 (see Accepted divergences). At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
 
+Decided 2026-10-01: the port fixes its panic. An LDM hash log whose table cannot be allocated on the target is refused in `frame_params` before any output.
+
 ### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state (port copied the bug)
 
 Severity: Low
@@ -231,7 +230,7 @@ Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chu
 
 The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
 
-Decided 2026-10-01: the port keeps copying libzstd.
+Decided 2026-10-01 (revised): the port fixes it. The reset feeds the first minMatch bytes into the rolling state, and so does the skip.
 
 ### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again (port copied the bug)
 
@@ -247,7 +246,7 @@ Impact: when a series ends with trailing literals (`lastStretch.litlen > 0`), `i
 
 The bug was found by reading. That the port copied it is supported by the L19 byte-identical probe in R1-17.
 
-Decided 2026-10-01: the port keeps copying libzstd.
+Decided 2026-10-01 (revised): the port fixes it with the `else`.
 
 ### R1-19: [libzstd] `iend - 8` / `iend - HASH_READ_SIZE` form a pointer before `istart` for inputs under 8 bytes (undefined behaviour); port did not copy it
 
@@ -291,7 +290,7 @@ C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The
 
 Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
 
-Decided 2026-10-01: the port keeps copying libzstd.
+Decided 2026-10-01 (revised): the port fixes it. `nb_events` counts the positions it samples.
 
 ### R2-2: [libzstd+port] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
 
@@ -309,7 +308,7 @@ Impact: proven by probe (`p3`, `p1`).
 
 libzstd gives one RFC-invalid frame two verdicts depending on the API, and a 4-byte RLE block expands to 2 MiB instead of the RFC's 128 KiB.
 
-Port: copies one-shot libzstd (Accepted divergences).
+Port: copies one-shot libzstd. To be fixed (RFC decoder rule): every block's Block_Size and decoded size are at most Block_Maximum_Size.
 
 ### R2-3: [libzstd+port] X2's last-symbol step accepts a Huffman stream that ran out one symbol early, and the made-up byte depends on how libzstd was built
 
@@ -338,7 +337,7 @@ The one sampled case per class has this shape: the same exhausted stream lands o
 
 So libzstd gives one frame three outcomes: BMI2 x86-64, non-BMI2 x86-64, and 32-bit. The port matches only the second, so on BMI2 hosts and on i686 it returns different bytes, or the opposite verdict, from the system libzstd. This is the missing-symbol counterpart of R1-6 (one extra symbol). R1-4's verdict split does not cover the case where both return Ok with different bytes.
 
-Port: copies the 64-bit body path (R1 default: copy libzstd bugs). Its struct comment at `src/decode.rs:1290-1292` says the lookup returns zeros; it re-reads the container.
+Port: copies the 64-bit body path. To be fixed with R1-6. Its struct comment at `src/decode.rs:1290-1292` says the lookup returns zeros; it re-reads the container.
 
 ### R2-4: [libzstd+port] Match offsets at or beyond Window_Size are accepted as long as they stay inside the frame
 
@@ -352,7 +351,7 @@ C reference: `decompress/zstd_decompress_block.c:1052-1054` (also `:930-932`, `:
 
 Impact: proven by probe (`p2`). Setup: Window_Size 1 KiB (and 2 KiB), two raw blocks of 1000 bytes, then one sequence with offset 1024, 1025, 1900 or 2000. One-shot libzstd, streaming libzstd and all Rust paths return `Ok(2010)`; only offset 2001 (before the frame start) is rejected. A frame that relies on this decodes in libzstd and the port, but is invalid for a decoder that keeps only Window_Size bytes, which the RFC allows. `p10` confirms that offsets into a previous frame are rejected on every path.
 
-Port: copies one-shot libzstd.
+Port: copies one-shot libzstd. To be fixed (RFC decoder rule): an offset above Window_Size is rejected; offset == Window_Size stays accepted.
 
 ### R2-5: [libzstd] ZSTD_decompressStream accepts a Compressed_Block with Block_Size 0 as an empty block; one-shot rejects it (the port follows one-shot)
 
@@ -378,7 +377,7 @@ C reference: `decompress/zstd_decompress_block.c:187-190` — `litSize < MIN_LIT
 
 Impact: proven by probe (`p9`). Size_Format 01 with Regenerated_Size 4 and four 1-byte streams, each holding one 1-bit symbol, is rejected by libzstd (one-shot and streaming) and by Rust. Sizes 6, 7 and 9 (last stream 0 or 1 byte) are `Ok` everywhere. An RFC-valid frame of this shape from another encoder is rejected by both.
 
-Port: copies libzstd.
+Port: copies libzstd. To be fixed (RFC decoder rule): Regenerated_Size 4 is accepted.
 
 ### R2-7: [libzstd+port] Huffman trees with a 12-bit maximum code length are accepted; RFC 8878 caps codes at 11 bits
 
@@ -392,7 +391,7 @@ C reference: `common/huf.h:37` — `HUF_TABLELOG_MAX 12`. `common/entropy_common
 
 Impact: proven by probe (`p6`). Direct weights 12..1 with an implied last weight of 1 (sum 4096, Max_Number_of_Bits 12) decode to `Ok(7)` in one-shot libzstd, streaming libzstd and all Rust paths, the same as the 11-bit control. This row is only for the upstream list; the port side is already covered by a user decision.
 
-Port: copies libzstd (Accepted divergences, Huffman log 12).
+Port: copies libzstd. To be fixed (RFC decoder rule): Max_Number_of_Bits 12 is rejected.
 
 ### R2-10: [libzstd] `ZSTD_resetCCtx_internal` subtracts two NULL pointers on a CCtx's first use
 
@@ -449,7 +448,7 @@ Impact: Probe-proven (`scratchpad/probe/src/bin/winedge2.rs`). Input: W random b
 
 Both decoders accept these frames (our round trip passed). A decoder that enforces §3.1.1.4 literally would reject frames from levels 5–12 and 16–22 whenever data repeats exactly one window back. No such decoder exists locally (ruzstd keeps more than W bytes and accepts them).
 
-Port: copies libzstd for byte identity (R1 default).
+Port: copies libzstd. To be fixed: the encoder never emits offset == Window_Size, the RFC's stricter reading.
 
 ### R2-14: [libzstd] Finders form pointers outside the input buffer (C11 6.5.6p8 undefined behaviour); the port does not copy it
 
