@@ -104,7 +104,7 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
     let bt_low = curr.saturating_sub(bt_mask);
     // windowLow is based on target because we only need positions that will
     // be in the window at the end of the tree update.
-    let window_low = ms.lowest_prefix_index(target);
+    let window_low = ms.lowest_match_index(target);
     let (hash_table, bt, _) = ms.ws.tables_mut();
     let h = super::common::hash_ptr::<MLS>(src, ip, cp.hash_log);
     let mut match_index = tget(hash_table, h);
@@ -276,7 +276,7 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32>(
     let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
     let dict_limit = ms.window_low();
     let bt_low = curr.saturating_sub(bt_mask);
-    let window_low = ms.lowest_prefix_index(curr);
+    let window_low = ms.lowest_match_index(curr);
     // `matchLow = windowLow ? windowLow : 1`; `window_low >= WINDOW_START_INDEX`.
     let match_low = window_low;
     let hash_log3 = cp.hash_log3();

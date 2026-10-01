@@ -78,7 +78,7 @@ enum Found {
 /// * (I2) candidates: a table entry is used only after [`match4_found`]
 ///   established `prefix_start <= match_idx < ip0`, so `match_idx + 4 <=
 ///   ip0 + 4 <= iend` and `ip0 - match_idx >= 1`.
-/// * (I3) repcodes: on entry `rep_offset1/2 <= ip0 - window_low(ip0)`;
+/// * (I3) repcodes: on entry `rep_offset1/2 <= ip0 - lowest_match_index(ip0)`;
 ///   afterwards `rep_offset1 = ip0 - match_idx` with (I2), and
 ///   `rep_offset2` is a former `rep_offset1`. A repcode is only applied at
 ///   positions `p >= ` the `ip0` it was derived at, hence
@@ -105,7 +105,9 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
     let iend = block.end;
     assert!(istart <= iend && iend <= src.end());
     assert!((1..=32).contains(&hlog));
-    let prefix_start = ms.lowest_prefix_index(iend);
+    // C bounds the block by `ZSTD_getLowestPrefixIndex(endIndex)`; the
+    // bound of its last position holds for every position.
+    let prefix_start = ms.lowest_match_index(iend - 1);
     // C: ilimit = iend - HASH_READ_SIZE, possibly below istart; every
     // comparison against it then sends the loop to _cleanup.
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
@@ -119,7 +121,7 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
     let mut rep_offset2 = rep[1];
     let (mut offset_saved1, mut offset_saved2) = (0u32, 0u32);
     {
-        let window_low = ms.lowest_prefix_index(ip0);
+        let window_low = ms.lowest_match_index(ip0);
         let max_rep = (ip0 - window_low) as u32;
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;

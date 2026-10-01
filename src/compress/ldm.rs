@@ -468,8 +468,9 @@ impl LdmState {
         let ents_per_bucket = 1usize << params.bucket_size_log;
         let h_bits = params.hash_log - params.bucket_size_log;
         let window = self.window;
-        let lowest = window.low();
-        let low_pos = window.pos(lowest);
+        // The bound of the chunk's last position holds for every split.
+        let lowest = window.lowest_match_index(window.index(chunk.end - 1), 1 << params.window_log);
+        let low_pos = window.pos(window.low());
         let (istart, iend) = (chunk.start, chunk.end);
         // Below `istart + min_match` the loop condition is false anyway.
         let ilimit = iend.saturating_sub(HASH_READ_SIZE);
@@ -518,7 +519,7 @@ impl LdmState {
                 let mut best: Option<(u32, usize, usize)> = None;
                 let mut best_length = 0;
                 for cur in bucket {
-                    if cur.checksum != checksum || cur.offset as usize <= lowest {
+                    if cur.checksum != checksum || (cur.offset as usize) < lowest {
                         continue;
                     }
                     let p_match = window.pos(cur.offset as usize);
