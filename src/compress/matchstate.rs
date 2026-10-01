@@ -1,5 +1,6 @@
 //! Persistent match-finder state: port of `ZSTD_MatchState_t`
-//! (zstd_compress_internal.h) for the no-dictionary case.
+//! (zstd_compress_internal.h), with a dictionary only as content loaded in
+//! front of the input (see [`Window`]).
 //!
 //! The finders address the input by index, as libzstd does through
 //! `window.base`; no window starts below [`WINDOW_START_INDEX`], so index
@@ -30,7 +31,8 @@
 //! (`ZSTD_overflowCorrectIfNeeded`), so inputs of any size compress.
 //!
 //! A candidate index `c` is usable at index `cur` only if
-//! `c >= window_low` and `cur - c < (1 << window_log)`; see
+//! `c >= window_low` and `cur - c < (1 << window_log)`, or, while a loaded
+//! dictionary is valid, `c >= window_low`; see
 //! [`Window::lowest_match_index`].
 //!
 //! The tables share one allocation ([`Workspace`], the table area of
@@ -62,10 +64,17 @@ const INDEX_OVERFLOW_MARGIN: usize = 16 << 20;
 /// or chunk.
 pub const CURRENT_MAX: usize = if MEM_32BITS { 2000 << 20 } else { 3500 << 20 };
 
-/// `ZSTD_window_t` without a dictionary (`lowLimit == dictLimit`, no
-/// `dictBase`) over one contiguous input at a time: the position <-> index
-/// mapping of a [`MatchState`] or an [`LdmState`](super::ldm::LdmState),
-/// each of which owns one and alone moves it.
+/// `ZSTD_window_t` over one contiguous input at a time (`lowLimit ==
+/// dictLimit`, no `dictBase`): the position <-> index mapping of a
+/// [`MatchState`] or an [`LdmState`](super::ldm::LdmState), each of which
+/// owns one and alone moves it.
+///
+/// A dictionary is content in front of the input, in the same contiguous
+/// window (the caller lays the two out back to back), with its end at
+/// `loaded_dict_end` (`ZSTD_MatchState_t::loadedDictEnd`, kept here with
+/// the indices it is compared with). libzstd keeps a loaded dictionary in
+/// the `dictBase` segment instead (`ZSTD_extDict`); the distances are the
+/// same.
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
     /// `window.base` as a position of the input slice: the position of
@@ -76,6 +85,11 @@ pub struct Window {
     /// `window.nextSrc` as a position of the input slice: the end of the
     /// input indexed so far, where the next input's indices continue.
     next_src: usize,
+    /// `loadedDictEnd`: the index where loaded dictionary content ends
+    /// while the whole dictionary is still valid, else `0`. Set by
+    /// [`Window::load_dict`], cleared once the input passes the window
+    /// size ([`Window::check_dict_validity`]).
+    loaded_dict_end: usize,
     /// `nbOverflowCorrections`.
     nb_overflow_corrections: u32,
     /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`: correct whenever
@@ -93,6 +107,7 @@ impl Window {
             base: origin.wrapping_sub(WINDOW_START_INDEX),
             low: WINDOW_START_INDEX,
             next_src: origin,
+            loaded_dict_end: 0,
             nb_overflow_corrections: 0,
             correct_frequently,
         }
@@ -107,6 +122,37 @@ impl Window {
         self.base = origin.wrapping_sub(end);
         self.low = end;
         self.next_src = origin;
+        // ZSTD_reset_matchState: `loadedDictEnd = 0`.
+        self.loaded_dict_end = 0;
+    }
+
+    /// `ZSTD_loadDictionaryContent`'s `loadedDictEnd`: the content entered
+    /// so far, which ends at the window's end, is a dictionary whose every
+    /// byte matches may reference until [`Window::check_dict_validity`]
+    /// clears it.
+    fn load_dict(&mut self) {
+        self.loaded_dict_end = self.index(self.next_src);
+    }
+
+    /// `loadedDictEnd`: where the valid dictionary ends, `None` once it is
+    /// invalidated or without one.
+    pub fn loaded_dict_end(&self) -> Option<usize> {
+        (self.loaded_dict_end != 0).then_some(self.loaded_dict_end)
+    }
+
+    /// `ZSTD_checkDictValidity` for a block ending at position
+    /// `block_end`: the dictionary stays valid only while the block ends
+    /// within `max_dist` of the dictionary's end, so that while it is
+    /// valid no more than Window_Size bytes have been decoded after it
+    /// (RFC 8878 §5, rfc8878.txt:1836-1844). libzstd also invalidates it
+    /// when `loadedDictEnd != dictLimit`, which in its two-segment window
+    /// marks a dictionary contiguous with the input; here the dictionary
+    /// is always contiguous, and that test does not apply.
+    #[inline]
+    fn check_dict_validity(&mut self, block_end: usize, max_dist: usize) {
+        if self.index(block_end) > self.loaded_dict_end + max_dist {
+            self.loaded_dict_end = 0;
+        }
     }
 
     /// The contiguous `ZSTD_window_update`: the input now reaches position
@@ -157,10 +203,10 @@ impl Window {
         self.correct_frequently = on;
     }
 
-    /// `ZSTD_window_canOverflowCorrect` without a dictionary
-    /// (`loadedDictEnd == 0`): whether the index of position `src` is large
-    /// enough for a correction that keeps the whole window. In `U32`, as
-    /// libzstd computes it.
+    /// `ZSTD_window_canOverflowCorrect`: whether the index of position
+    /// `src` is large enough for a correction that keeps the whole window,
+    /// and is past the dictionary's validity. In `U32`, as libzstd computes
+    /// it.
     fn can_overflow_correct(&self, cycle_log: u32, max_dist: u32, src: usize) -> bool {
         let cycle_size = 1u32 << cycle_log;
         let curr = self.index(src) as u32;
@@ -177,11 +223,11 @@ impl Window {
         let index_large_enough = curr > adjusted_index;
         // Only overflow correct early if the dictionary is invalidated
         // already, so we don't hurt compression ratio.
-        let dictionary_invalidated = curr > max_dist;
+        let dictionary_invalidated = curr > max_dist + self.loaded_dict_end as u32;
         index_large_enough && dictionary_invalidated
     }
 
-    /// `ZSTD_window_needOverflowCorrection` (`loadedDictEnd == 0`): whether
+    /// `ZSTD_window_needOverflowCorrection`: whether
     /// the window must be corrected before the positions `src..src_end` are
     /// indexed.
     #[inline]
@@ -235,6 +281,9 @@ impl Window {
         } else {
             self.low - reduced
         };
+        // ZSTD_overflowCorrectIfNeeded: invalidate dictionaries on overflow
+        // correction.
+        self.loaded_dict_end = 0;
         // Ensure we can still reference the full window.
         debug_assert!(new_current - max_dist >= WINDOW_START_INDEX as u32);
         // Ensure that lowLimit didn't underflow.
@@ -243,29 +292,40 @@ impl Window {
         correction
     }
 
-    /// `ZSTD_window_enforceMaxDist` (`loadedDictEnd == 0`): raise `lowLimit`
-    /// to `max_dist` below the index of position `block_end` (C's name; the
-    /// block path passes the block's start, the long distance matcher its
-    /// chunk's end).
+    /// `ZSTD_window_enforceMaxDist`: once the index of position
+    /// `block_end` (C's name; the block path passes the block's start, the
+    /// long distance matcher its chunk's end) is more than `max_dist` past
+    /// the dictionary's end (or past `0` without one), raise `lowLimit` to
+    /// `max_dist` below it and drop the dictionary.
     #[inline]
     pub fn enforce_max_dist(&mut self, block_end: usize, max_dist: usize) {
         let block_end_idx = self.index(block_end);
-        if block_end_idx > max_dist {
+        if block_end_idx > max_dist + self.loaded_dict_end {
             self.low = self.low.max(block_end_idx - max_dist);
+            self.loaded_dict_end = 0;
         }
     }
 
     /// The lowest index a match from index `cur` may reference in a window
     /// of `window_size` bytes: none below `low`, and none `window_size` or
     /// more back, since every offset must be smaller than Window_Size (RFC
-    /// 8878 §3.1.1.4, rfc8878.txt:1204-1206). Every finder and the long
-    /// distance matcher bound their candidates and repcodes by this one
-    /// rule; libzstd's `ZSTD_getLowestPrefixIndex` lets most of its finders
-    /// reach exactly `window_size` back. Non-decreasing in `cur`, so the
-    /// bound of a range's last position holds for the whole range.
+    /// 8878 §3.1.1.4, rfc8878.txt:1204-1206). While a loaded dictionary is
+    /// valid ([`Window::check_dict_validity`]), every index from `low` on:
+    /// the dictionary may be referenced at any offset until Window_Size
+    /// bytes follow it (§5, rfc8878.txt:1836-1844), and no input byte is
+    /// `window_size` back yet (`ZSTD_getLowestMatchIndex`). Every finder and
+    /// the long distance matcher bound their candidates and repcodes by
+    /// this one rule; libzstd's `ZSTD_getLowestPrefixIndex` lets most of its
+    /// finders reach exactly `window_size` back. Non-decreasing in `cur`
+    /// within a block, so the bound of a range's last position holds for
+    /// the whole range.
     #[inline(always)]
     pub fn lowest_match_index(&self, cur: usize, window_size: usize) -> usize {
-        self.low.max((cur + 1).saturating_sub(window_size))
+        if self.loaded_dict_end != 0 {
+            self.low
+        } else {
+            self.low.max((cur + 1).saturating_sub(window_size))
+        }
     }
 
     /// `ZSTD_initStats_ultra`'s window move: `base -= len`, `dictLimit` and
@@ -558,6 +618,21 @@ impl Workspace {
         reduce_table(hash, correction, false);
         reduce_table(chain, correction, preserve_mark);
         reduce_table(hash3, correction, false);
+        self.valid = self.layout.index_end();
+    }
+
+    /// `ZSTD_copyCDictTableIntoCCtx` for every table of `src`, laid out as
+    /// this one's but for `hashTable3`, which is zeroed instead, between
+    /// `ZSTD_cwksp_mark_tables_dirty` and `_clean`: the index area then
+    /// holds only values below the window end of `src`, which the owner
+    /// takes over, and nothing past it is vouched for any more.
+    fn copy_tables(&mut self, src: &Workspace) {
+        let (hash, chain, tag) = self.tables_mut();
+        let (src_hash, src_chain, src_tag) = src.tables();
+        hash.copy_from_slice(src_hash);
+        chain.copy_from_slice(src_chain);
+        tag.copy_from_slice(src_tag);
+        self.opt_tables_mut().2.fill(0);
         self.valid = self.layout.index_end();
     }
 
@@ -937,13 +1012,16 @@ impl MatchState {
     /// [`EnteredPrefix`] the finders and the strategies' `load_prefix`
     /// require; outside a test, this is the only caller of the private
     /// [`Window::extend_to`] and [`MatchState::correct_overflow_if_needed`].
-    fn enter(&mut self, input: Range<usize>, indexed: Option<Range<usize>>) {
+    fn enter(&mut self, input: Range<usize>, indexed: Option<Range<usize>>, dict: bool) {
         assert!(
             self.window.next_src <= input.start && input.start <= input.end,
             "input {input:?} does not follow the window's end {}",
             self.window.next_src
         );
         self.window.extend_to(input.end);
+        if dict {
+            self.window.load_dict();
+        }
         if let Some(indexed) = indexed {
             self.correct_overflow_if_needed(indexed);
         }
@@ -952,15 +1030,18 @@ impl MatchState {
     /// `ZSTD_compress_frameChunk`'s set-up of the block at `positions`, for
     /// every block whatever its size: the window covers it
     /// (`ZSTD_compressContinue_internal`'s `ZSTD_window_update`), the
-    /// overflow check runs for it (see `MatchState::enter`), then
-    /// `ZSTD_window_enforceMaxDist` raises the window's low end to the
-    /// window size below the block's start and `next_to_update` resumes no
-    /// lower. So `window_low` is libzstd's `lowLimit` and `dictLimit` on
-    /// every block, which `ZSTD_insertDUBT1` reads as `windowValid` for
-    /// candidates of earlier blocks.
+    /// overflow check runs for it (see `MatchState::enter`), a loaded
+    /// dictionary stays valid only if the block ends within the window size
+    /// of it (`ZSTD_checkDictValidity`), then `ZSTD_window_enforceMaxDist`
+    /// raises the window's low end to the window size below the block's
+    /// start and `next_to_update` resumes no lower. So `window_low` is
+    /// libzstd's `lowLimit` and `dictLimit` on every block, which
+    /// `ZSTD_insertDUBT1` reads as `windowValid` for candidates of earlier
+    /// blocks.
     pub fn enter_block(&mut self, positions: Range<usize>) -> EnteredBlock {
-        self.enter(positions.clone(), Some(positions.clone()));
+        self.enter(positions.clone(), Some(positions.clone()), false);
         let max_dist = 1usize << self.cparams.window_log;
+        self.window.check_dict_validity(positions.end, max_dist);
         self.window.enforce_max_dist(positions.start, max_dist);
         // Ensure hash/chain table insertion resumes no sooner than lowlimit.
         self.next_to_update = self.next_to_update.max(self.window.low);
@@ -976,13 +1057,59 @@ impl MatchState {
     /// are left unindexed (`None`, no overflow check and no table write);
     /// more get the overflow check and are returned.
     pub fn enter_prefix(&mut self, prefix: Range<usize>) -> Option<EnteredPrefix> {
+        self.enter_content(prefix, false)
+    }
+
+    /// [`MatchState::enter_prefix`] for dictionary content (not
+    /// `forceWindow`): the window also records where the dictionary ends
+    /// (`loadedDictEnd`, [`Window::loaded_dict_end`]), before the overflow
+    /// check, which would invalidate it as in libzstd. Matches may then
+    /// reference all of it until the input passes the window size, see
+    /// [`Window::lowest_match_index`].
+    pub fn enter_dict(&mut self, content: Range<usize>) -> Option<EnteredPrefix> {
+        self.enter_content(content, true)
+    }
+
+    fn enter_content(&mut self, content: Range<usize>, dict: bool) -> Option<EnteredPrefix> {
         let cp = &self.cparams;
         let max_dict_size = 1usize << (cp.hash_log + 3).max(cp.chain_log + 1).min(31);
-        let indexed = prefix.start.max(prefix.end.saturating_sub(max_dict_size))..prefix.end;
+        let indexed = content.start.max(content.end.saturating_sub(max_dict_size))..content.end;
         let long = indexed.len() > HASH_READ_SIZE;
-        self.enter(prefix, long.then(|| indexed.clone()));
+        self.enter(content, long.then(|| indexed.clone()), dict);
         self.next_to_update = self.index(indexed.start);
         long.then_some(EnteredPrefix(indexed))
+    }
+
+    /// `ZSTD_resetCCtx_byCopyingCDict` after the reset: the tables, window
+    /// and `next_to_update` of `dict`, a state that loaded dictionary
+    /// content ([`MatchState::enter_dict`]) at the positions where this
+    /// state's input lays it out, so the content needs no hashing again.
+    /// `hashTable3`, which a dictionary never fills, is zeroed; the row
+    /// finder's salt is `dict`'s, which hashed its tags. The tables must
+    /// have the same shape: `dict`'s parameters with any window log, and its
+    /// lazy finder (`useRowMatchFinder` from the dictionary). The overflow
+    /// correction knob stays this state's.
+    pub fn copy_dict(&mut self, dict: &MatchState) {
+        assert_eq!(
+            (
+                self.cparams.hash_log,
+                self.cparams.chain_log,
+                self.cparams.strategy
+            ),
+            (
+                dict.cparams.hash_log,
+                dict.cparams.chain_log,
+                dict.cparams.strategy
+            ),
+            "tables of another shape"
+        );
+        assert_eq!(self.search_method, dict.search_method);
+        self.ws.copy_tables(&dict.ws);
+        let frequently = self.window.correct_frequently();
+        self.window = dict.window;
+        self.window.set_correct_frequently(frequently);
+        self.next_to_update = dict.next_to_update;
+        self.hash_salt = dict.hash_salt;
     }
 
     /// The indices of an entered prefix's suffix to index.
@@ -1214,6 +1341,58 @@ mod tests {
             raised + 1
         );
         assert_eq!(window.lowest_match_index(raised, size), raised);
+    }
+
+    /// A loaded dictionary leaves every index from `low` on valid until a
+    /// block ends more than the window size past it
+    /// (`ZSTD_checkDictValidity`); only then does the block start raise
+    /// `low` (`ZSTD_window_enforceMaxDist`). A correction drops it, and so
+    /// does the next reset.
+    #[test]
+    fn loaded_dictionary_stays_valid_for_a_window() {
+        let data = vec![0u8; 10_000];
+        let mut cp = CParams::for_level(1, 1 << 20);
+        cp.window_log = 10;
+        let mut ms = MatchState::new(cp, 0);
+        let dict_end = WINDOW_START_INDEX + 3000;
+        ms.enter_dict(0..3000);
+        assert_eq!(ms.window().loaded_dict_end(), Some(dict_end));
+        // A block ending exactly a window after the dictionary keeps it.
+        let entered = ms.enter_block(3000..4024);
+        ms.start_block(&data, entered);
+        assert_eq!(ms.window().loaded_dict_end(), Some(dict_end));
+        assert_eq!(ms.lowest_match_index(dict_end + 1023), WINDOW_START_INDEX);
+        // One byte further drops it, and the block start raises `low`.
+        let entered = ms.enter_block(4024..4025);
+        ms.start_block(&data, entered);
+        assert_eq!(ms.window().loaded_dict_end(), None);
+        assert_eq!(ms.window_low(), dict_end + 1024 - 1024);
+        assert_eq!(
+            ms.lowest_match_index(dict_end + 1500),
+            dict_end + 1500 + 1 - 1024
+        );
+        // The next input starts without one.
+        ms.reset(cp, 0);
+        ms.enter_dict(0..100);
+        assert!(ms.window().loaded_dict_end().is_some());
+        ms.reset(cp, 0);
+        assert_eq!(ms.window().loaded_dict_end(), None);
+
+        // With the knob, no correction before the input passes the window
+        // size beyond the dictionary; a correction drops it.
+        let (cycle_log, max_dist) = (12, 1u32 << 19);
+        let mut w = Window::new(0, true);
+        let min = (1 << 12) + (1 << 19) + WINDOW_START_INDEX;
+        w.extend_to(at(min + 100));
+        w.load_dict();
+        let need = |w: &Window, start: usize| {
+            w.need_overflow_correction(cycle_log, max_dist, w.pos(start), w.pos(start + 10))
+        };
+        assert!(!need(&w, min + 101));
+        assert!(!need(&w, min + 100 + (1 << 19)));
+        assert!(need(&w, min + 101 + (1 << 19)));
+        w.correct_overflow(cycle_log, max_dist, at(min + 101 + (1 << 19)));
+        assert_eq!(w.loaded_dict_end(), None);
     }
 
     /// `ZSTD_reduceTable` / `_btlazy2`: indices below the correction plus
