@@ -15,14 +15,16 @@
 //! reported beside ours, as are `ZSTD_compress_usingDict` and
 //! `ZSTD_compress_usingCDict`. Raw prefixes are gated against
 //! `ZSTD_CCtx_refPrefix`. Our decoder does not take dictionaries yet, so
-//! libzstd's is the round trip.
+//! libzstd's is the round trip. Streaming with a dictionary is not
+//! implemented and must say so.
 
 mod common;
 
 use rust_zstd::compress::{
-    compress_with_dict, compress_with_prefix, CompressDict, CompressOptions, Compressor,
-    ParamSwitch, JOBSIZE_MIN,
+    compress_with_dict, compress_with_prefix, CompressDict, CompressError, CompressOptions,
+    Compressor, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
 };
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use zstd::zstd_safe::zstd_sys::{self as sys, ZSTD_cParameter as P};
@@ -626,4 +628,51 @@ fn dictionary_frames_are_one_job() {
     let one = frame(None);
     assert!(frame(Some(JOBSIZE_MIN)) == one);
     assert_lib_decodes("job size", &one, &trained, &src);
+}
+
+/// A streaming frame of options with a dictionary fails with
+/// `Unsupported("dictionary")` before it consumes or writes anything,
+/// whatever its first call's directive, through `compress_stream` and
+/// through `Encoder`; one-shot frames of the same `Compressor` still use
+/// the dictionary.
+#[test]
+fn streaming_with_a_dictionary_is_unsupported() {
+    let samples = log_samples(120);
+    let (content, src) = (samples[..80].concat(), samples[80..].concat());
+    let dict = Arc::new(CompressDict::new(&content, 3).unwrap());
+    let opts = CompressOptions {
+        dict: Some(dict.clone()),
+        ..Default::default()
+    };
+    let unsupported = CompressError::Unsupported("dictionary");
+    let mut dst = vec![0; 1 << 16];
+    for end_op in [
+        EndDirective::Continue,
+        EndDirective::Flush,
+        EndDirective::End,
+    ] {
+        let mut cctx = Compressor::new(opts.clone());
+        let (mut src_pos, mut dst_pos) = (0, 0);
+        let mut call = |cctx: &mut Compressor| {
+            cctx.compress_stream(&src, &mut src_pos, &mut dst, &mut dst_pos, end_op)
+        };
+        assert_eq!(call(&mut cctx), Err(unsupported.clone()), "{end_op:?}");
+        assert_eq!(
+            call(&mut cctx),
+            Err(CompressError::StageWrong),
+            "{end_op:?}"
+        );
+        cctx.reset_stream();
+        assert_eq!(call(&mut cctx), Err(unsupported.clone()), "{end_op:?}");
+        assert_eq!((src_pos, dst_pos), (0, 0), "{end_op:?}");
+        assert!(cctx.compress_to_vec(&src) == compress_with_dict(&src, &dict));
+    }
+
+    let encoder_error = |e: std::io::Error| e.get_ref()?.downcast_ref::<CompressError>().cloned();
+    let mut encoder = Encoder::new(Vec::new(), opts.clone());
+    let e = encoder.write_all(&src).unwrap_err();
+    assert_eq!(encoder_error(e), Some(unsupported.clone()));
+    assert!(encoder.get_ref().is_empty());
+    let e = Encoder::new(Vec::new(), opts).finish().unwrap_err();
+    assert_eq!(encoder_error(e), Some(unsupported));
 }

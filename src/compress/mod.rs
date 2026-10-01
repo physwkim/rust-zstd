@@ -175,7 +175,9 @@ pub struct CompressOptions {
     /// `ZSTD_compress2` does: its level supersedes `level`, the frame
     /// header carries its ID, and the frame is one job whatever
     /// `job_size` says (ZSTDMT with a dictionary is not supported yet).
-    /// See [`CompressDict`] and [`dict`].
+    /// Streaming with a dictionary is not supported yet either:
+    /// [`Compressor::compress_stream`] and [`Encoder`] fail with
+    /// [`CompressError::Unsupported`]. See [`CompressDict`] and [`dict`].
     pub dict: Option<Arc<CompressDict>>,
 }
 

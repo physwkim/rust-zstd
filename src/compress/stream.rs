@@ -287,7 +287,9 @@ impl Compressor {
     /// pledged size (the call consumes none of it) or ends short of it;
     /// [`CompressError::Unsupported`] for a `job_size` frame that is not
     /// one first `End` call or pledged at most `JOBSIZE_MIN`
-    /// (multithreaded streaming is not implemented). After an error every
+    /// (multithreaded streaming is not implemented), and for any frame of
+    /// options with a [`CompressOptions::dict`] (streaming with a
+    /// dictionary is not implemented). After an error every
     /// call returns [`CompressError::StageWrong`] until
     /// [`Compressor::reset_stream`].
     ///
@@ -325,6 +327,9 @@ impl Compressor {
             }
             match &mut self.stream.stage {
                 Stage::Failed => return Err(CompressError::StageWrong),
+                Stage::Idle if self.opts.dict.is_some() => {
+                    return Err(CompressError::Unsupported("dictionary"));
+                }
                 Stage::Ended => {
                     // ZSTD_CCtx_reset(zcs, ZSTD_reset_session_only)
                     self.stream.stage = Stage::Idle;
