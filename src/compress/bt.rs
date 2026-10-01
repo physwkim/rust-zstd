@@ -495,7 +495,9 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
 }
 
 /// `ZSTD_updateTree(ms, ip, iend)`: `update_tree_internal` with the hash
-/// width `minMatch` (as C passes it, not bounded to `3..=6`), e.g.
+/// width the tree searches use, `BOUNDED(4, minMatch, 6)` (`3` hashes like
+/// `4`); C passes `minMatch` itself, 7 at minMatch 7, where no search
+/// finds the inserted positions (R1-11). E.g.
 /// `ZSTD_loadDictionaryContent`'s `ZSTD_updateTree(ms, iend - 8, iend)`
 /// that sorts a prefix into the tree before a job's first block.
 ///
@@ -510,11 +512,10 @@ pub fn update_tree(ms: &mut MatchState, src: Src, ip: usize, iend: usize) {
     let m = Fallback::new();
     // SAFETY: the bounds were just asserted.
     unsafe {
-        match ms.cparams.min_match {
+        match super::lazy::mls_of(&ms.cparams) {
+            4 => update_tree_internal::<_, 4>(m, ms, src, ip, iend),
             5 => update_tree_internal::<_, 5>(m, ms, src, ip, iend),
-            6 => update_tree_internal::<_, 6>(m, ms, src, ip, iend),
-            7 => update_tree_internal::<_, 7>(m, ms, src, ip, iend),
-            _ => update_tree_internal::<_, 4>(m, ms, src, ip, iend),
+            _ => update_tree_internal::<_, 6>(m, ms, src, ip, iend),
         }
     }
 }
