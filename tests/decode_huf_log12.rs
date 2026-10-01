@@ -274,6 +274,7 @@ fn check_frame(
             }
         }
     }
+    common::assert_stream_parity(&format!("{plan:?}"), &f);
     // A rejected frame's 11-bit sections were not checked.
     if log12 {
         paths.retain(|p| p.0 == 12);

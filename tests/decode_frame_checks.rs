@@ -4,6 +4,8 @@
 //! when accepted, serial and MT at both SIMD levels, except where RFC 8878
 //! decides otherwise, as a test notes.
 
+mod common;
+
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 
 /// Output capacity given to libzstd's one-shot decoder, above every
@@ -49,6 +51,7 @@ fn check(name: &str, f: &[u8], accept: bool) {
             }
         }
     }
+    common::assert_stream_parity(name, f);
 }
 
 fn lcg_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -260,6 +263,7 @@ fn every_input_byte_belongs_to_a_frame() {
         Vec::<u8>::new()
     );
     assert_eq!(rust_zstd::decompress(&[]).unwrap(), Vec::<u8>::new());
+    common::assert_stream_parity("empty input", &[]);
 }
 
 /// Frame of one raw block holding `content`, whose header carries the
@@ -482,5 +486,7 @@ fn skippable_frame_of_any_32_bit_size_is_skipped() {
                 }
             }
         }
+        // Not a byte or 7 at a time: 4 GiB.
+        common::assert_stream_parity_at(&name, &f, &[4096, usize::MAX]);
     }
 }

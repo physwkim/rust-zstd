@@ -5,6 +5,8 @@
 //! (ZSTD_decompressDCtx) outcome, checked, and where both accept the bytes
 //! must match.
 
+mod common;
+
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 
 const MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -192,6 +194,7 @@ fn check_vs(name: &str, f: &[u8], accept: bool, libzstd: bool) {
             }
         }
     }
+    common::assert_stream_parity(name, f);
 }
 
 /// `check_vs` for a frame libzstd gives the same outcome.
