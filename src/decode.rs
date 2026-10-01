@@ -173,10 +173,14 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
     while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
         let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
             Ok(parsed) => parsed,
-            Err(e) => match e.skip_frame_length() {
-                Some(frame_len) => {
+            Err(e) => match e.skip_frame_size() {
+                Some(frame_size) => {
+                    // Up to 2^32 + 7 bytes with the header (RFC 8878 lines
+                    // 1325-1329); on 32-bit targets a sum past usize::MAX is
+                    // past the end of any input too.
                     let end = pos
-                        .checked_add(frame_len as usize)
+                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
+                        .and_then(|p| p.checked_add(frame_size as usize))
                         .filter(|&end| end <= data.len())
                         .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
                     pos = end;
@@ -2512,27 +2516,27 @@ impl FrameHeader {
 
 struct FrameDecoderError {
     msg: String,
-    /// A skippable frame's length, header included.
-    skip_length: Option<u32>,
+    /// A skippable frame's Frame_Size: the length of its User_Data.
+    skip_size: Option<u32>,
 }
 
 impl FrameDecoderError {
     fn new(msg: String) -> Self {
         Self {
             msg,
-            skip_length: None,
+            skip_size: None,
         }
     }
 
-    fn skip(length: u32) -> Self {
+    fn skip(size: u32) -> Self {
         Self {
-            msg: format!("Skippable frame with length {}", length),
-            skip_length: Some(length),
+            msg: format!("Skippable frame with Frame_Size {}", size),
+            skip_size: Some(size),
         }
     }
 
-    fn skip_frame_length(&self) -> Option<u32> {
-        self.skip_length
+    fn skip_frame_size(&self) -> Option<u32> {
+        self.skip_size
     }
 }
 
@@ -2568,16 +2572,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
             .ok_or_else(|| {
                 FrameDecoderError::new("Error reading skip frame size: truncated".into())
             })?;
-        // readSkippableFrameSize: the length, header included, must fit in
-        // 32 bits (frameParameter_unsupported), whatever the input size.
-        let frame_len = skip_size
-            .checked_add(SKIPPABLE_FRAME_HEADER_LEN as u32)
-            .ok_or_else(|| {
-                FrameDecoderError::new(format!(
-                    "Skippable frame size {skip_size:#x} unsupported: with its header it overflows 32 bits"
-                ))
-            })?;
-        return Err(FrameDecoderError::skip(frame_len));
+        return Err(FrameDecoderError::skip(skip_size));
     }
 
     if magic_num != ZSTD_MAGIC {
