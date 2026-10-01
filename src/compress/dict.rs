@@ -27,11 +27,14 @@
 //!
 //! Cost: the joined buffer copies the content and the input once per
 //! frame, `content.len() + input.len()` bytes of allocation and memcpy. In
-//! exchange every finder searches one contiguous buffer, as without a
-//! dictionary; libzstd instead searches the dictionary where it lies
-//! (`ZSTD_extDict` and `ZSTD_dictMatchState` variants of every finder).
+//! exchange every finder searches one contiguous buffer; libzstd instead
+//! searches the dictionary where it lies (`ZSTD_extDict` and
+//! `ZSTD_dictMatchState` variants of every finder). Its copied tables
+//! keep the content in the `dictBase` segment, so the finders here follow
+//! the `ZSTD_extDict` rules where the content ends ([`Window::dict_limit`]).
 //!
 //! [`Window::lowest_match_index`]: super::matchstate::Window::lowest_match_index
+//! [`Window::dict_limit`]: super::matchstate::Window::dict_limit
 //! [`WINDOW_START_INDEX`]: super::matchstate::WINDOW_START_INDEX
 
 use super::block::{self, BlockState, TableLoad};
@@ -39,7 +42,7 @@ use super::lazy::{default_search_method, SearchMethod};
 use super::ldm::LdmParams;
 use super::matchstate::MatchState;
 use super::opt::DictStats;
-use super::params::{CParamMode, CParams, Strategy, ZSTD_CLEVEL_DEFAULT};
+use super::params::{CParamMode, CParams, ZSTD_CLEVEL_DEFAULT};
 use super::{CompressError, CompressOptions};
 use crate::constants::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
 use crate::fse::{FseCTable, FseState, FseTableState};
@@ -205,38 +208,24 @@ pub(super) struct FrameDict<'a> {
     opt_stats: Option<&'a DictStats>,
 }
 
-/// `attachDictSizeCutoffs`: the input size up to which libzstd attaches a
-/// dictionary's tables of `strategy` rather than copying them, which
-/// sizes the frame's parameters for the input alone
-/// (`ZSTD_cpm_attachDict`).
-fn attach_dict_size_cutoff(strategy: Strategy) -> u64 {
-    match strategy {
-        Strategy::Fast | Strategy::BtUltra | Strategy::BtUltra2 => 8 << 10,
-        Strategy::DFast => 16 << 10,
-        Strategy::Greedy
-        | Strategy::Lazy
-        | Strategy::Lazy2
-        | Strategy::BtLazy2
-        | Strategy::BtOpt => 32 << 10,
-    }
-}
-
 impl<'a> FrameDict<'a> {
-    /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` for an input of
-    /// `src_size` bytes: `opts` at the dictionary's level, sized for the
-    /// input and the dictionary (`ZSTD_getCParamMode`), then the
-    /// dictionary's tables with the frame's window log for an input below
-    /// 128 KiB or six times the dictionary's size, else the frame's own
-    /// tables loaded with the content (`ZSTD_compressBegin_internal`). The
-    /// dictionary's entropy tables and repeat offsets either way.
+    /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` and
+    /// `ZSTD_dictForceCopy` for an input of `src_size` bytes: `opts` at the
+    /// dictionary's level, sized for the input and the dictionary (the
+    /// tables are never attached, so `ZSTD_getCParamMode` is
+    /// `ZSTD_cpm_noAttachDict`), then the dictionary's tables with the
+    /// frame's window log for an input below 128 KiB or six times the
+    /// dictionary's size, else the frame's own tables loaded with the
+    /// content (`ZSTD_compressBegin_internal`). The dictionary's entropy
+    /// tables and repeat offsets either way.
     pub(super) fn of(dict: &'a CompressDict, src_size: usize, opts: &CompressOptions) -> Self {
         let pledged = src_size as u64;
-        let mode = if pledged <= attach_dict_size_cutoff(dict.ms.cparams.strategy) {
-            CParamMode::AttachDict
-        } else {
-            CParamMode::NoAttachDict
-        };
-        let (frame, ldm) = opts.frame_cparams(dict.level, src_size, dict.dict_size, mode);
+        let (frame, ldm) = opts.frame_cparams(
+            dict.level,
+            src_size,
+            dict.dict_size,
+            CParamMode::NoAttachDict,
+        );
         let use_tables = dict.dict_size > 0
             && (pledged < USE_CDICT_PARAMS_SRCSIZE_CUTOFF
                 || pledged < dict.dict_size as u64 * USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER);
@@ -806,6 +795,22 @@ mod tests {
             let mut field = [0u8; 4];
             field[..len].copy_from_slice(&frame[at..at + len]);
             assert_eq!(u32::from_le_bytes(field), id);
+        }
+    }
+
+    /// A 4 KiB input with 100 KiB of content, below every strategy's
+    /// `attachDictSizeCutoffs`: libzstd's force-copy frame still counts the
+    /// content (`ZSTD_cpm_noAttachDict`), a window of `highbit(4 KiB + 100
+    /// KiB - 1) + 1 = 17`, which sets the 3-byte hash log and enables the
+    /// post-block splitter; the input alone would give 12.
+    #[test]
+    fn frame_window_counts_the_content() {
+        let content: Vec<u8> = (0..100 << 10).map(|i| (i * 7 % 251) as u8).collect();
+        for level in [1, 3, 9, 13, 19] {
+            let dict = CompressDict::new(&content, level).unwrap();
+            let frame = FrameDict::of(&dict, 4 << 10, &CompressOptions::default());
+            assert_eq!(frame.frame.window_log, 17, "level {level}");
+            assert_eq!(frame.applied.window_log, 17, "level {level}");
         }
     }
 }

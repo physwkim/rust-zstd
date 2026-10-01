@@ -465,12 +465,12 @@ type GetAllMatches = unsafe fn(
     u32,
 ) -> u32;
 
-/// `ZSTD_btGetAllMatches_noDict_<mls>` with the 8-byte count.
+/// `ZSTD_btGetAllMatches_{noDict,extDict}_<mls>` with the 8-byte count.
 ///
 /// # Safety
 /// As [`bt_get_all_matches`].
 #[allow(clippy::too_many_arguments)]
-unsafe fn get_all_matches_scalar<const MLS: u32>(
+unsafe fn get_all_matches_scalar<const MLS: u32, const EXT: bool>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
@@ -481,7 +481,7 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
     ll0: u32,
     length_to_beat: u32,
 ) -> u32 {
-    bt_get_all_matches::<Fallback, MLS>(
+    bt_get_all_matches::<Fallback, MLS, EXT>(
         Fallback::new(),
         matches,
         ms,
@@ -495,15 +495,15 @@ unsafe fn get_all_matches_scalar<const MLS: u32>(
     )
 }
 
-/// `ZSTD_btGetAllMatches_noDict_<mls>` compiled with AVX2, counting 32
-/// bytes per step.
+/// `ZSTD_btGetAllMatches_{noDict,extDict}_<mls>` compiled with AVX2,
+/// counting 32 bytes per step.
 ///
 /// # Safety
 /// As [`bt_get_all_matches`]; the CPU must support AVX2.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
-unsafe fn get_all_matches_avx2<const MLS: u32>(
+unsafe fn get_all_matches_avx2<const MLS: u32, const EXT: bool>(
     matches: &mut [Match; ZSTD_OPT_SIZE],
     ms: &mut MatchState,
     next_to_update3: &mut usize,
@@ -514,7 +514,7 @@ unsafe fn get_all_matches_avx2<const MLS: u32>(
     ll0: u32,
     length_to_beat: u32,
 ) -> u32 {
-    bt_get_all_matches::<Avx2, MLS>(
+    bt_get_all_matches::<Avx2, MLS, EXT>(
         Avx2::new_unchecked(),
         matches,
         ms,
@@ -537,23 +537,24 @@ struct Finders<'a> {
     ldm: RawSeqView<'a>,
 }
 
-/// `ZSTD_selectBtGetAllMatches(ms, ZSTD_noDict)`: the finder for
-/// `mls = BOUNDED(3, minMatch, 6)` and this CPU's SIMD level.
-fn select_get_all_matches(min_match: u32, level: Level) -> GetAllMatches {
+/// `ZSTD_selectBtGetAllMatches(ms, dictMode)`: the finder for `mls =
+/// BOUNDED(3, minMatch, 6)` and this CPU's SIMD level, in its `ZSTD_extDict`
+/// variant with `EXT`.
+fn select_get_all_matches<const EXT: bool>(min_match: u32, level: Level) -> GetAllMatches {
     let mls = min_match.clamp(3, 6);
     match level {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Level::Avx2(_) => match mls {
-            3 => get_all_matches_avx2::<3>,
-            4 => get_all_matches_avx2::<4>,
-            5 => get_all_matches_avx2::<5>,
-            _ => get_all_matches_avx2::<6>,
+            3 => get_all_matches_avx2::<3, EXT>,
+            4 => get_all_matches_avx2::<4, EXT>,
+            5 => get_all_matches_avx2::<5, EXT>,
+            _ => get_all_matches_avx2::<6, EXT>,
         },
         _ => match mls {
-            3 => get_all_matches_scalar::<3>,
-            4 => get_all_matches_scalar::<4>,
-            5 => get_all_matches_scalar::<5>,
-            _ => get_all_matches_scalar::<6>,
+            3 => get_all_matches_scalar::<3, EXT>,
+            4 => get_all_matches_scalar::<4, EXT>,
+            5 => get_all_matches_scalar::<5, EXT>,
+            _ => get_all_matches_scalar::<6, EXT>,
         },
     }
 }
@@ -575,10 +576,31 @@ pub fn compress_block(
     out: &mut SeqStore,
     ldm: RawSeqView,
 ) -> usize {
+    // ZSTD_selectBlockCompressor: the extDict variant while dictionary
+    // content is in the window.
+    if ms.window().has_ext_dict() {
+        compress_block_mode::<true>(ms, src, block, rep, out, ldm)
+    } else {
+        compress_block_mode::<false>(ms, src, block, rep, out, ldm)
+    }
+}
+
+/// [`compress_block`] with the `ZSTD_extDict` finders if `EXT`. Out of
+/// line, so that choosing the finder takes no runtime operand in the
+/// no-dictionary parser: one does, and its register allocation changes.
+#[inline(never)]
+fn compress_block_mode<const EXT: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+) -> usize {
     let block = block.range();
     assert_opt_bounds(ms, src, block.end);
     let finders = Finders {
-        get_all_matches: select_get_all_matches(ms.cparams.min_match, simd_level()),
+        get_all_matches: select_get_all_matches::<EXT>(ms.cparams.min_match, simd_level()),
         ldm,
     };
     let mut state = ms
@@ -831,7 +853,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     // init
     stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end), dict_stats.as_ref());
     // C: `ip += (ip == prefixStart)`
-    let prefix_lowest = ms.window_low();
+    let prefix_lowest = ms.window().dict_limit();
     let mut ip = istart;
     if ip == prefix_lowest {
         ip += 1;
@@ -1283,7 +1305,7 @@ mod tests {
             let mut state = ms.opt.take().unwrap();
             let mut out = SeqStore::new();
             let finders = Finders {
-                get_all_matches: select_get_all_matches(cp.min_match, simd_level()),
+                get_all_matches: select_get_all_matches::<false>(cp.min_match, simd_level()),
                 ldm: RawSeqView::default(),
             };
             let (view, block) = init_stats_ultra(

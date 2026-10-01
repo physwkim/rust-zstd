@@ -426,6 +426,41 @@ fn dictionary_frames_pass_the_gate() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The held-out samples of the generated corpora at a level of every
+/// strategy are libzstd's force-copy frames byte for byte, a stricter
+/// check than the gate's size bound: the finders follow libzstd's
+/// `ZSTD_extDict` rules at the end of the dictionary content. The crate
+/// source corpus is left out: it changes with every edit, and fast,
+/// double-fast and btlazy2 may match the first byte of the content where
+/// libzstd's do not (`dictStartIndex < matchIndex`;
+/// `Window::lowest_match_index` is one inclusive bound), which some
+/// versions of it reach.
+#[test]
+fn dictionary_frames_equal_force_copy() {
+    let mut failures = Vec::new();
+    for corpus in corpora().into_iter().filter(|c| c.name != "source") {
+        for (kind, dict) in dictionaries(&corpus) {
+            for level in [-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19] {
+                let ours = CompressDict::new(&dict, level).unwrap();
+                let lib = LibCDict::new(&dict, level);
+                let differ: Vec<usize> = (0..corpus.test.len())
+                    .filter(|&i| {
+                        let src = &corpus.test[i];
+                        compress_with_dict(src, &ours) != lib.compress(src, Attach::ForceCopy, &[])
+                    })
+                    .collect();
+                if !differ.is_empty() {
+                    failures.push(format!(
+                        "{} {kind} L{level}: inputs {differ:?} differ",
+                        corpus.name
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Levels across every strategy, and input sizes either side of each
 /// strategy's attach cutoff (8, 16 and 32 KiB), of 128 KiB and of six times
 /// a 32 KiB dictionary (the dictionary's tables or the frame's own),
