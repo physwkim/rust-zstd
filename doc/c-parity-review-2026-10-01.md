@@ -66,21 +66,6 @@ Impact: frames are the same today. I checked each place the raised value is read
 
 What does differ is state: `window.low` (C's `lowLimit`/`dictLimit`), and the value it has after overflow correction. That state becomes visible once a dictionary path lands, because there `loadedDictEnd`, `ZSTD_checkDictValidity` and `prefixLowest` all read the raised `dictLimit`.
 
-### R2-9: `block_splitter_level` out of range is accepted on empty input and panics after the header is written on non-empty input
-
-Severity: Low
-
-Class: reference-independent defect / interop-contract gap
-
-Rust: `src/compress/mod.rs:354` — `Compressor::compress` appends the frame header to the caller's `out` first (`write_frame_header`). On empty input it then returns early at `:365`. Only after that does `block_sizing` (`:378`) call `presplit::split_level`, which checks the range with a release assert (`src/compress/presplit.rs:126`).
-- Value 7 on empty input: the call returns the valid frame `28 b5 2f fd 20 00 01 00 00`.
-- Value 7 on a 17-byte input: it panics with "block_splitter_level 7 out of range 0..=6", and `out` already holds the partial header `28 b5 2f fd 20 11`.
-- The LDM options are checked at the top of `frame_params`, before any output, so they fail the same way on every input.
-
-C reference: `$Z/compress/zstd_compress.c:982-983` — `ZSTD_CCtxParams_setParameter` runs `BOUNDCHECK(ZSTD_c_blockSplitterLevel, value)`. `ZSTD_CCtx_setParameter(ZSTD_c_experimentalParam20, 7)` returns `parameter_outOfBound` before any compression runs, whatever the input size.
-
-Impact: whether a bad option is caught depends on the input size: empty input passes, other input panics. A caller that catches the panic (`catch_unwind`) and reuses `out` gets a truncated frame header in its buffer. The check belongs with the other option checks in `frame_params`, before the header is written. Proven by probe (`bsl` mode).
-
 ### R2-13: Match-finder and LDM tables only grow; libzstd frees an oversized workspace after 128 uses
 
 Severity: Medium
