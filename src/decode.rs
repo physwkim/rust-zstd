@@ -5099,7 +5099,9 @@ mod parallel {
 
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool. Returns `Ok(false)` without consuming input when
-    /// the frame has fewer than `min_blocks` blocks.
+    /// the block headers do not show `min_blocks` blocks: the frame has
+    /// fewer, or a header before them fails, which the serial decoder then
+    /// reports.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
@@ -5112,11 +5114,17 @@ mod parallel {
             return Ok(false);
         }
         let block_size_max = frame.block_size_max;
+        let mut rest = &data[*pos..];
+        for _ in 1..min_blocks {
+            match locate_block(rest, block_size_max) {
+                Ok((block, content)) if !block.last_block => {
+                    rest = &rest[BLOCK_HEADER_LEN + content.len()..];
+                }
+                _ => return Ok(false),
+            }
+        }
         let mut end = *pos;
         let plans = plan_frame(data, &mut end, block_size_max)?;
-        if plans.len() < min_blocks {
-            return Ok(false);
-        }
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
