@@ -15,12 +15,14 @@
 //! at the index where the previous input ended (`ZSTD_window_clear`). What
 //! earlier inputs stored stays in the tables, all of it below the new
 //! `window_low`, where every finder takes an entry for a miss as it takes
-//! `0`. [`MatchState::reset`] alone decides to restart at
-//! [`WINDOW_START_INDEX`] instead (`needsIndexReset`): on first use, when
-//! the tables outgrow their allocation, or when the previous input ended
-//! within 16 MiB of [`CURRENT_MAX`] (`ZSTD_indexTooCloseToMax`). Table
-//! cells are zeroed only where [`Workspace`] cannot vouch for them (the
-//! `tableValidEnd` of `ZSTD_cwksp`).
+//! `0`. [`MatchState::reset_needing`] alone decides to restart at
+//! [`WINDOW_START_INDEX`] instead (`needsIndexReset`): when the workspace
+//! is resized (`Workspace::reserve`: on first use, when it is too small
+//! for the reset, or when it has been three times too large after more
+//! than 128 resets), or when the previous input ended within 16 MiB of
+//! [`CURRENT_MAX`] (`ZSTD_indexTooCloseToMax`). Table cells are zeroed only
+//! where [`Workspace`] cannot vouch for them (the `tableValidEnd` of
+//! `ZSTD_cwksp`).
 //!
 //! Indices are stored as `u32`: before a block would end above
 //! [`CURRENT_MAX`], [`MatchState::enter_block`] moves the window's base
@@ -37,11 +39,14 @@
 
 use std::ops::Range;
 
+use super::bt::ZSTD_OPT_SIZE;
 use super::common::{Src, HASH_READ_SIZE};
 use super::lazy::{default_search_method, SearchMethod, DUBT_UNSORTED_MARK};
+use super::ldm::LdmParams;
 use super::opt::OptState;
-use super::params::{CParams, Strategy};
-use crate::constants::MEM_32BITS;
+use super::params::{CParams, Strategy, ZSTD_HASHLOG3_MAX};
+use super::seqstore::WILDCOPY_OVERLENGTH;
+use crate::constants::{MAX_LL, MAX_ML, MAX_OFF, MEM_32BITS, ZSTD_BLOCKSIZE_MAX};
 
 /// `ZSTD_WINDOW_START_INDEX`: the index of a fresh window's first byte.
 pub const WINDOW_START_INDEX: usize = 2;
@@ -292,7 +297,7 @@ pub struct MatchState {
     /// the context's life, mixed into the salt on every reset.
     pub hash_salt_entropy: u32,
     /// `opt`: the optimal parser's statistics and work tables, allocated
-    /// for the opt strategies and kept (not shrunk) across resets.
+    /// for the opt strategies and kept until the workspace is resized.
     pub opt: Option<Box<OptState>>,
     /// The lazy match finder the tables are sized for (`useRowMatchFinder`
     /// resolved): [`MatchState::new`] and [`MatchState::reset`] take
@@ -326,11 +331,22 @@ pub struct MatchState {
 /// indices of inputs it has indexed; `ZSTD_cwksp`'s `tableValidEnd`), which
 /// after `ZSTD_window_clear` are all misses: index tables laid over those
 /// words need no zeroing.
+///
+/// It also keeps `ZSTD_cwksp`'s size bookkeeping for the whole context
+/// (see `Workspace::reserve`), whose resize frees the context's other
+/// buffers too.
 #[derive(Default)]
 pub struct Workspace {
     pages: Vec<Page>,
     layout: Layout,
     valid: usize,
+    /// `ZSTD_cwksp_sizeof`: the [`needed_space`] of the reset that last
+    /// resized the workspace.
+    size: usize,
+    /// `ZSTD_cwksp_used` after the last reset: its [`needed_space`].
+    used: usize,
+    /// `workspaceOversizedDuration`.
+    oversized_duration: u32,
 }
 
 /// Where the tables of [`Workspace`] lie, in words from the start of the
@@ -444,26 +460,53 @@ impl Workspace {
         bytemuck::cast_slice_mut(&mut self.pages)
     }
 
-    /// Whether the tables for `cparams` and `method` fit the allocation (not
-    /// `workspaceTooSmall`).
-    fn fits(&self, cparams: &CParams, method: SearchMethod) -> bool {
-        Layout::of(cparams, method).words() <= self.pages.len() * PAGE_WORDS
+    /// `ZSTD_resetCCtx_internal`'s workspace check for a reset that needs
+    /// `needed` bytes ([`needed_space`]): `ZSTD_cwksp_bump_oversized_duration`,
+    /// then `resizeWorkspace = workspaceTooSmall || workspaceWasteful`.
+    /// Wasteful is three times `needed` free after the previous reset's use
+    /// (`ZSTD_cwksp_check_too_large`) once more than
+    /// [`WORKSPACE_TOO_LARGE_MAX_DURATION`] resets have passed since the
+    /// last resize: libzstd bumps the duration for `additionalNeededSpace`
+    /// 0, which is always free, so it counts every reset, oversized or not.
+    /// A resize frees the tables (`ZSTD_cwksp_free`), which
+    /// [`Workspace::reset`] then allocates at their size; the owner frees
+    /// the context's other buffers. Returns whether the workspace was
+    /// resized.
+    ///
+    /// `used` stands in for `ZSTD_cwksp_used`, which the workspace's
+    /// alignment padding makes up to `2 * ZSTD_CWKSP_ALIGNMENT_BYTES` (128)
+    /// smaller than the need: libzstd may find up to 128 bytes more free.
+    fn reserve(&mut self, needed: usize) -> bool {
+        let available = self.size - self.used;
+        self.oversized_duration = self.oversized_duration.saturating_add(1);
+        let too_small = self.size < needed;
+        let wasteful = available >= needed.saturating_mul(WORKSPACE_TOO_LARGE_FACTOR)
+            && self.oversized_duration > WORKSPACE_TOO_LARGE_MAX_DURATION;
+        let resize = too_small || wasteful;
+        if resize {
+            self.pages = Vec::new();
+            self.size = needed;
+            self.oversized_duration = 0;
+        }
+        self.used = needed;
+        resize
     }
 
     /// Lay the tables for `cparams` and `method` out
     /// (`ZSTD_reset_matchState` with `ZSTDcrp_makeClean`). Tables that do
-    /// not fit get a new zeroed allocation (`ZSTD_cwksp_create`; the owner
-    /// resets its indices); otherwise `index_reset` forgets every word
-    /// (`ZSTD_cwksp_mark_tables_dirty`), and the index area's words past
-    /// `valid` are zeroed (`ZSTD_cwksp_clean_tables`), as is the padding
-    /// between the index tables. The tag table is never zeroed here:
+    /// not fit get a new zeroed allocation: after [`Workspace::reserve`]
+    /// freed them, or when tables of another shape outgrow them within a
+    /// workspace libzstd keeps (its indices continue). Otherwise
+    /// `index_reset` forgets every word (`ZSTD_cwksp_mark_tables_dirty`),
+    /// and the index area's words past `valid` are zeroed
+    /// (`ZSTD_cwksp_clean_tables`), as is the padding between the index
+    /// tables. The tag table is never zeroed here:
     /// `ZSTD_cwksp_reserve_aligned_init_once` only zeroes new memory.
     fn reset(&mut self, cparams: &CParams, method: SearchMethod, index_reset: bool) {
         let layout = Layout::of(cparams, method);
         let index_end = layout.index_end();
         let pages = layout.words() / PAGE_WORDS;
         if self.pages.len() < pages {
-            debug_assert!(index_reset);
             // ZSTD_cwksp_free before ZSTD_cwksp_create: never both at once.
             drop(std::mem::take(&mut self.pages));
             self.pages = zeroed_pages(pages);
@@ -571,6 +614,103 @@ impl Workspace {
     }
 }
 
+/// `ZSTD_WORKSPACETOOLARGE_FACTOR`.
+const WORKSPACE_TOO_LARGE_FACTOR: usize = 3;
+
+/// `ZSTD_WORKSPACETOOLARGE_MAXDURATION`.
+const WORKSPACE_TOO_LARGE_MAX_DURATION: u32 = 128;
+
+/// `ZSTD_CONTENTSIZE_UNKNOWN`.
+const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
+
+/// `ZSTD_CWKSP_ALIGNMENT_BYTES`.
+const CWKSP_ALIGNMENT: usize = 64;
+
+/// `ZSTD_cwksp_aligned64_alloc_size`.
+const fn aligned64(size: usize) -> usize {
+    size.next_multiple_of(CWKSP_ALIGNMENT)
+}
+
+/// `TMP_WORKSPACE_SIZE`: `ENTROPY_WORKSPACE_SIZE`, `(8 << 10) + 512 +
+/// 4 * (MaxSeq + 2)`, the larger of it and `ZSTD_SLIPBLOCK_WORKSPACESIZE`.
+const TMP_WORKSPACE_SIZE: usize = 8920;
+
+/// `sizeof(ZSTD_compressedBlockState_t)`: the Huffman table's 257
+/// `size_t` entries, the FSE tables and the repeat offsets.
+const COMPRESSED_BLOCK_STATE_SIZE: usize = if MEM_32BITS { 4596 } else { 5632 };
+
+/// `optPotentialSpace` of `ZSTD_sizeof_matchState`: the optimal parser's
+/// frequencies, its `ZSTD_match_t` (8 bytes) and its `ZSTD_optimal_t` (28
+/// bytes) arrays.
+const OPT_SPACE: usize = aligned64((MAX_ML + 1) * 4)
+    + aligned64((MAX_LL + 1) * 4)
+    + aligned64((MAX_OFF + 1) * 4)
+    + aligned64(256 * 4)
+    + aligned64(ZSTD_OPT_SIZE * 8)
+    + aligned64(ZSTD_OPT_SIZE * 28);
+
+/// `ZSTD_estimateCCtxSize_usingCCtxParams_internal`, the workspace bytes
+/// `ZSTD_resetCCtx_internal` needs, for compression parameters `cparams`
+/// with the lazy finder `method`, long distance matching parameters `ldm`
+/// and an input of `pledged_src_size` bytes. The context is not static and
+/// has no in or out buffer (`ZSTD_compress2` makes both `ZSTD_bm_stable`,
+/// a ZSTDMT job is `ZSTDb_not_buffered`), no sequence producer and the
+/// default `ZSTD_c_maxBlockSize`.
+pub fn needed_space(
+    cparams: &CParams,
+    method: SearchMethod,
+    ldm: Option<&LdmParams>,
+    pledged_src_size: u64,
+) -> usize {
+    let window_size = pledged_src_size.clamp(1, 1 << cparams.window_log) as usize;
+    let block_size = ZSTD_BLOCKSIZE_MAX.min(window_size);
+    // ZSTD_maxNbSeq
+    let max_nb_seq = block_size / if cparams.min_match == 3 { 3 } else { 4 };
+    // Literals, `SeqDef` (8 bytes) sequences, their three code arrays.
+    let token_space = WILDCOPY_OVERLENGTH + block_size + aligned64(max_nb_seq * 8) + 3 * max_nb_seq;
+    // ZSTD_ldm_getTableSize (bucket offsets and 8-byte `ldmEntry_t`s), then
+    // ZSTD_ldm_getMaxNbSeq 12-byte `rawSeq`s.
+    let ldm_space = ldm.map_or(0, |p| {
+        let buckets = 1usize << (p.hash_log - p.bucket_size_log.min(p.hash_log));
+        buckets + (8 << p.hash_log) + aligned64(block_size / p.min_match_length as usize * 12)
+    });
+    TMP_WORKSPACE_SIZE
+        + 2 * COMPRESSED_BLOCK_STATE_SIZE
+        + ldm_space
+        + match_state_size(cparams, method)
+        + token_space
+}
+
+/// `ZSTD_sizeof_matchState` for a context (`forCCtx`, no dedicated
+/// dictionary search). Unlike [`CParams::hash_log3`] it counts the 3-byte
+/// hash table for every strategy with `min_match == 3`, as
+/// `ZSTD_reset_matchState` reserves it.
+fn match_state_size(cparams: &CParams, method: SearchMethod) -> usize {
+    // ZSTD_rowMatchFinderUsed
+    let row = cparams.row_match_finder_supported() && method == SearchMethod::RowHash;
+    // ZSTD_allocateChainTable
+    let chain = if cparams.strategy != Strategy::Fast && !row {
+        1usize << cparams.chain_log
+    } else {
+        0
+    };
+    let hash = 1usize << cparams.hash_log;
+    let hash3 = if cparams.min_match == 3 {
+        1usize << cparams.window_log.min(ZSTD_HASHLOG3_MAX)
+    } else {
+        0
+    };
+    let opt = if cparams.strategy.is_opt() {
+        OPT_SPACE
+    } else {
+        0
+    };
+    let tags = if row { aligned64(hash) } else { 0 };
+    // ZSTD_cwksp_slack_space_required
+    let slack = 2 * CWKSP_ALIGNMENT;
+    4 * (chain + hash + hash3) + opt + slack + tags
+}
+
 /// The positions of a block inside the window, its overflow check done.
 /// Only [`MatchState::enter_block`] makes one, and
 /// [`MatchState::start_block`] takes it, so no block reaches a finder
@@ -619,6 +759,18 @@ impl MatchState {
 
     /// [`MatchState::new`] with tables for the lazy finder `method`.
     pub fn new_for(cparams: CParams, origin: usize, method: SearchMethod) -> Self {
+        let needed = needed_space(&cparams, method, None, CONTENTSIZE_UNKNOWN);
+        Self::new_needing(cparams, origin, method, needed)
+    }
+
+    /// [`MatchState::new_for`] as the first reset of a context that needs
+    /// `needed` bytes of workspace, see [`MatchState::reset_needing`].
+    pub fn new_needing(
+        cparams: CParams,
+        origin: usize,
+        method: SearchMethod,
+        needed: usize,
+    ) -> Self {
         let mut ms = Self {
             cparams,
             ws: Workspace::default(),
@@ -629,20 +781,35 @@ impl MatchState {
             opt: None,
             search_method: method,
         };
-        ms.reset_for(cparams, origin, method);
+        ms.reset_needing(cparams, origin, method, needed);
         ms
     }
 
-    /// `ZSTD_resetCCtx_internal` with `ZSTDcrp_makeClean` on a used context,
-    /// for an input whose window starts at position `origin`: the one place
-    /// that decides whether indices continue (`needsIndexReset`).
+    /// [`MatchState::reset_needing`] in a context that holds nothing but
+    /// these tables and sizes them for any input: [`needed_space`] without
+    /// long distance matching, for `ZSTD_CONTENTSIZE_UNKNOWN`.
+    pub fn reset(&mut self, cparams: CParams, origin: usize) {
+        self.reset_for(cparams, origin, default_search_method(&cparams))
+    }
+
+    /// [`MatchState::reset`] with tables for the lazy finder `method`.
+    pub fn reset_for(&mut self, cparams: CParams, origin: usize, method: SearchMethod) {
+        let needed = needed_space(&cparams, method, None, CONTENTSIZE_UNKNOWN);
+        self.reset_needing(cparams, origin, method, needed);
+    }
+
+    /// `ZSTD_resetCCtx_internal` with `ZSTDcrp_makeClean` on a used context
+    /// whose reset needs `needed` bytes of workspace ([`needed_space`]), for
+    /// an input whose window starts at position `origin`, with tables for
+    /// the lazy finder `method`: the one place that decides whether the
+    /// workspace is resized (`Workspace::reserve`) and whether indices
+    /// continue (`needsIndexReset`). Returns whether the workspace was
+    /// resized, which frees the optimal parser's tables here and the
+    /// context's other buffers at the caller.
     ///
     /// Indices restart at [`WINDOW_START_INDEX`] (`ZSTDirp_reset`:
-    /// `ZSTD_window_init`, every table word zeroed) when the tables for
-    /// `cparams` outgrow the allocation (`workspaceTooSmall`; a new one is
-    /// made; the lazy finder's tables count, so switching between the row
-    /// finder and the hash chain lays out and checks the other finder's
-    /// tables) or the previous input ended too close to [`CURRENT_MAX`]
+    /// `ZSTD_window_init`, every table word zeroed) when the workspace is
+    /// resized or the previous input ended too close to [`CURRENT_MAX`]
     /// (`ZSTD_indexTooCloseToMax`). Otherwise they continue
     /// (`ZSTDirp_continue`): `ZSTD_window_clear` puts position `origin` at
     /// the index where the previous input ended and makes it the window's
@@ -663,13 +830,18 @@ impl MatchState {
     ///
     /// The overflow correction knob ([`MatchState::set_correct_frequently`])
     /// is a property of the context and survives the reset.
-    pub fn reset(&mut self, cparams: CParams, origin: usize) {
-        self.reset_for(cparams, origin, default_search_method(&cparams))
-    }
-
-    /// [`MatchState::reset`] with tables for the lazy finder `method`.
-    pub fn reset_for(&mut self, cparams: CParams, origin: usize, method: SearchMethod) {
-        let index_reset = !self.ws.fits(&cparams, method) || self.window.too_close_to_max();
+    pub fn reset_needing(
+        &mut self,
+        cparams: CParams,
+        origin: usize,
+        method: SearchMethod,
+        needed: usize,
+    ) -> bool {
+        let resized = self.ws.reserve(needed);
+        if resized {
+            self.opt = None;
+        }
+        let index_reset = resized || self.window.too_close_to_max();
         self.ws.reset(&cparams, method, index_reset);
         self.search_method = method;
         if index_reset {
@@ -688,6 +860,13 @@ impl MatchState {
                 .get_or_insert_with(|| Box::new(OptState::new()))
                 .invalidate();
         }
+        resized
+    }
+
+    /// `ZSTD_cwksp_sizeof`: the bytes libzstd's workspace would hold for
+    /// this state's context, see [`MatchState::reset_needing`].
+    pub fn workspace_size(&self) -> usize {
+        self.ws.size
     }
 
     /// Test knob: `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, see
@@ -1064,6 +1243,36 @@ mod tests {
         assert_eq!(ms.window_low(), WINDOW_START_INDEX);
         assert_eq!(ms.tables().0.len(), 1 << 11);
         assert!(ms.tables().0.iter().all(|&e| e == 0));
+    }
+
+    /// `workspaceWasteful`: a workspace three times a reset's need is kept,
+    /// indices continuing, until the first reset past 128 since it was
+    /// sized, which frees it and allocates the tables at their size.
+    #[test]
+    fn reset_shrinks_a_wasteful_workspace() {
+        let big = CParams::for_level(19, 64 << 20);
+        let small = CParams::for_level(19, 1024);
+        let method = default_search_method(&big);
+        let needed = needed_space(&big, method, None, 64 << 20);
+        let mut ms = MatchState::new_needing(big, 0, method, needed);
+        let big_pages = ms.ws.pages.len();
+        let needed = needed_space(&small, method, None, 1024);
+        assert!(3 * needed <= ms.workspace_size());
+        for n in 1..=130 {
+            ms.enter_block(0..1000);
+            let resized = ms.reset_needing(small, 0, method, needed);
+            assert_eq!(resized, n == 129, "reset {n}");
+            let low = if n < 129 { 1000 * n } else { 1000 * (n - 129) };
+            assert_eq!(ms.window_low(), WINDOW_START_INDEX + low, "reset {n}");
+            let pages = Layout::of(&small, method).words() / PAGE_WORDS;
+            assert_eq!(
+                ms.ws.pages.len(),
+                if n < 129 { big_pages } else { pages },
+                "reset {n}"
+            );
+            assert!(ms.opt.is_some());
+        }
+        assert_eq!(ms.workspace_size(), needed);
     }
 
     /// `tableValidEnd`: index tables laid over words that held indices are

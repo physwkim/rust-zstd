@@ -33,8 +33,9 @@ use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
+use lazy::default_search_method;
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
-use matchstate::MatchState;
+use matchstate::{needed_space, MatchState};
 pub use params::{CParams, ParamSwitch, Strategy};
 use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
@@ -277,27 +278,88 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 
 /// A reusable `ZSTD_CCtx`: the options plus ZSTDMT's pool of contexts
 /// (`ContextPool`), which every job, a single-threaded frame's one job
-/// included, runs on, and which is kept across calls. A context's match
-/// state is reset for each job like `ZSTD_resetCCtx_internal`: indices
-/// continue from its previous input and its tables are kept, see
-/// [`MatchState::reset`]. Every frame is identical to [`compress_with`]'s.
+/// included, runs on, and which is kept across calls. A context is reset
+/// for each job (and each empty frame) like `ZSTD_resetCCtx_internal`:
+/// indices continue from its previous input and its tables are kept until
+/// its workspace is resized, see [`MatchState::reset_needing`]. Every
+/// frame is identical to [`compress_with`]'s.
 pub struct Compressor {
     opts: CompressOptions,
     contexts: ContextPool,
     /// ZSTDMT's long distance matching state (`serialState.ldmState`),
-    /// once a multithreaded frame has used it.
+    /// once a multithreaded frame has used it. Outside any context's
+    /// workspace, its tables only grow, as `ZSTDMT_serialState_reset`'s.
     serial_ldm: Option<LdmState>,
 }
 
 /// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
 /// match state once a job has run, its block buffers, and the long distance
 /// matching state a single-threaded frame generates each block's matches
-/// from (`ldmState`).
+/// from (`ldmState`). libzstd keeps all three in the context's workspace,
+/// whose bookkeeping is in the match state's [`matchstate::Workspace`].
 #[derive(Default)]
 struct Context {
     ms: Option<MatchState>,
     scratch: BlockScratch,
     ldm_state: Option<LdmState>,
+}
+
+/// Where a job's long distance matches come from: nowhere, the frame's
+/// serial state (ZSTDMT's `rawSeqStore`), or the context's own state with
+/// these parameters, block by block (`ZSTD_buildSeqStore`).
+enum JobLdm<'a> {
+    Off,
+    External(&'a mut RawSeqStore),
+    Internal(LdmParams),
+}
+
+impl Context {
+    /// `ZSTD_resetCCtx_internal` for an input of `pledged` bytes (the
+    /// frame's, or a later ZSTDMT job's own) whose window starts at
+    /// position `origin`, with the overflow correction knob `frequently`.
+    /// The match state's reset decides from what libzstd's workspace would
+    /// need ([`needed_space`]) whether the workspace is resized; a resize
+    /// frees the block buffers and the long distance matching tables too
+    /// (`ZSTD_cwksp_free`). Returns the match state, the block buffers and
+    /// the job's long distance matches.
+    fn reset<'a>(
+        &'a mut self,
+        cparams: CParams,
+        origin: usize,
+        ldm: JobLdm<'a>,
+        pledged: usize,
+        frequently: bool,
+    ) -> (&'a mut MatchState, &'a mut BlockScratch, BlockLdm<'a>) {
+        let method = default_search_method(&cparams);
+        let ldm_params = match &ldm {
+            JobLdm::Internal(params) => Some(params),
+            JobLdm::Off | JobLdm::External(_) => None,
+        };
+        let needed = needed_space(&cparams, method, ldm_params, pledged as u64);
+        let (ms, resized) = match &mut self.ms {
+            Some(ms) => {
+                let resized = ms.reset_needing(cparams, origin, method, needed);
+                (ms, resized)
+            }
+            slot => {
+                let ms = MatchState::new_needing(cparams, origin, method, needed);
+                (slot.insert(ms), true)
+            }
+        };
+        if resized {
+            self.scratch = BlockScratch::default();
+            self.ldm_state = None;
+        }
+        ms.set_correct_frequently(frequently);
+        let ldm = match ldm {
+            JobLdm::Off => BlockLdm::Off,
+            JobLdm::External(seqs) => BlockLdm::External(seqs),
+            JobLdm::Internal(params) => {
+                BlockLdm::Internal(reset_ldm_state(&mut self.ldm_state, params, frequently))
+            }
+        };
+        (ms, &mut self.scratch, ldm)
+    }
 }
 
 /// `ZSTDMT_CCtxPool`: the contexts jobs run on, last in first out. A job
@@ -359,6 +421,16 @@ impl Compressor {
         )
     }
 
+    /// Test hook for the workspace shrink: the workspace size
+    /// (`ZSTD_cwksp_sizeof`) of each idle context that has been reset, in
+    /// the order [`ContextPool::with_context`] hands them out.
+    #[doc(hidden)]
+    pub fn workspace_sizes(&self) -> Vec<usize> {
+        let contexts = self.contexts.free.lock().unwrap();
+        let ms = contexts.iter().rev().filter_map(|ctx| ctx.ms.as_ref());
+        ms.map(MatchState::workspace_size).collect()
+    }
+
     /// Append one frame holding `src` to `out`.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
@@ -376,6 +448,13 @@ impl Compressor {
         let mut checksum = self.opts.checksum.then(Xxh64::new);
 
         if src.is_empty() {
+            // ZSTD_compress2 resets a context for the empty frame too.
+            let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
+            let frequently = self.opts.overflow_correct_frequently;
+            self.contexts.expand(1);
+            self.contexts.with_context(|ctx| {
+                ctx.reset(cparams, 0, ldm, 0, frequently);
+            });
             write_raw_block(out, &[], true);
             write_epilogue(out, checksum);
             return;
@@ -413,21 +492,15 @@ impl Compressor {
                 }
             },
             |k, job, ctx, seqs, out| {
-                let Context {
-                    ms,
-                    scratch,
-                    ldm_state,
-                } = ctx;
-                let mut ldm = match ldm_params {
-                    None => BlockLdm::Off,
-                    Some(_) if mt => BlockLdm::External(seqs),
-                    Some(params) => {
-                        BlockLdm::Internal(reset_ldm_state(ldm_state, params, frequently))
-                    }
+                let ldm = match ldm_params {
+                    None => JobLdm::Off,
+                    Some(_) if mt => JobLdm::External(seqs),
+                    Some(params) => JobLdm::Internal(params),
                 };
                 compress_job(
                     src,
                     cparams,
+                    ldm,
                     frequently,
                     sizing,
                     overlap,
@@ -436,9 +509,7 @@ impl Compressor {
                     k + 1 == n_jobs,
                     split,
                     pipelined,
-                    ms,
-                    scratch,
-                    &mut ldm,
+                    ctx,
                     out,
                 )
             },
@@ -510,11 +581,11 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 }
 
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
-/// appended to `out`, on the match state in `ms_slot` reset for this job
-/// (allocated on first use) with `scratch`'s buffers and the long distance
-/// matches of `ldm`. Job 0 starts from `repStartValue` with its first byte
-/// as the window start; a later job's window starts `overlap` bytes before
-/// it, and the job indexes that prefix (`ZSTD_loadDictionaryContent` on the
+/// appended to `out`, on `ctx` reset for this job ([`Context::reset`]) with
+/// the long distance matches of `ldm`. Job 0 starts from `repStartValue`
+/// with its first byte as the window start and pledges the whole frame; a
+/// later job pledges itself, its window starts `overlap` bytes before it,
+/// and the job indexes that prefix (`ZSTD_loadDictionaryContent` on the
 /// raw-content prefix), starts with invalidated repeat offsets and no
 /// entropy tables, so its first block cannot reference state the decoder
 /// obtained from the previous job. `sizing` cuts the job into blocks;
@@ -524,6 +595,7 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 fn compress_job(
     data: &[u8],
     cparams: CParams,
+    ldm: JobLdm,
     frequently: bool,
     sizing: BlockSizing,
     overlap: usize,
@@ -532,34 +604,25 @@ fn compress_job(
     last_job: bool,
     split: bool,
     pipelined: bool,
-    ms_slot: &mut Option<MatchState>,
-    scratch: &mut BlockScratch,
-    ldm: &mut BlockLdm,
+    ctx: &mut Context,
     out: &mut Vec<u8>,
 ) {
     // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
     let prefix = job_prefix(&job, first_job, overlap);
-    let mut ms = match ms_slot.take() {
-        Some(mut ms) => {
-            ms.reset(cparams, prefix.start);
-            ms
-        }
-        None => MatchState::new(cparams, prefix.start),
-    };
-    ms.set_correct_frequently(frequently);
+    let pledged = if first_job { data.len() } else { job.len() };
+    let (ms, scratch, mut ldm) = ctx.reset(cparams, prefix.start, ldm, pledged, frequently);
     let mut initial = BlockState::initial();
     if !first_job {
-        block::load_prefix(&mut ms, data, prefix);
+        block::load_prefix(ms, data, prefix);
         initial.invalidate_rep_codes();
     }
     let mut state = CommittedBlockState::new(initial);
     scratch.reserve(sizing.block_size_max);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
-        &mut ms, data, job, sizing, first_job, last_job, split, &mut state, scratch, ldm, out,
+        ms, data, job, sizing, first_job, last_job, split, &mut state, scratch, &mut ldm, out,
         pipelined,
     );
-    *ms_slot = Some(ms);
 }
 
 /// Run `f` over every job, in job order, appending to `out`, each job on a
@@ -1009,6 +1072,7 @@ mod tests {
                 compress_job(
                     &data,
                     cparams,
+                    JobLdm::Off,
                     false,
                     block_sizing(&opts, &cparams, true, 0),
                     overlap,
@@ -1017,9 +1081,7 @@ mod tests {
                     true,
                     false,
                     false,
-                    &mut ctx.ms,
-                    &mut ctx.scratch,
-                    &mut BlockLdm::Off,
+                    &mut ctx,
                     &mut out,
                 );
                 out
@@ -1321,6 +1383,7 @@ mod tests {
                     compress_job(
                         src,
                         cparams,
+                        JobLdm::External(seqs),
                         false,
                         sizing,
                         overlap,
@@ -1329,9 +1392,7 @@ mod tests {
                         k + 1 == n,
                         split,
                         pipelined,
-                        &mut ctx.ms,
-                        &mut ctx.scratch,
-                        &mut BlockLdm::External(seqs),
+                        ctx,
                         out,
                     )
                 }
@@ -1562,6 +1623,7 @@ mod tests {
                     compress_job(
                         src,
                         cparams,
+                        JobLdm::Off,
                         false,
                         sizing,
                         overlap,
@@ -1570,9 +1632,7 @@ mod tests {
                         k + 1 == n,
                         false,
                         pipelined,
-                        &mut ctx.ms,
-                        &mut ctx.scratch,
-                        &mut BlockLdm::Off,
+                        ctx,
                         out,
                     )
                 }
@@ -1591,6 +1651,30 @@ mod tests {
                 "level {level}: frame != header + jobs"
             );
             assert_eq!(crate::decompress(&frame).unwrap(), data);
+        }
+    }
+
+    /// The resize that frees a wasteful workspace frees the context's block
+    /// buffers with it, as `ZSTD_cwksp_free` frees every buffer libzstd
+    /// keeps there; until then they are kept.
+    #[test]
+    fn context_resize_frees_block_buffers() {
+        let opts = CompressOptions {
+            level: 19,
+            ldm: ParamSwitch::Enable,
+            ..Default::default()
+        };
+        let (big, big_ldm) = opts.frame_params(64 << 20);
+        let (small, small_ldm) = opts.frame_params(1024);
+        let mut ctx = Context::default();
+        let ldm = JobLdm::Internal(big_ldm.unwrap());
+        let (_, scratch, _) = ctx.reset(big, 0, ldm, 64 << 20, false);
+        scratch.reserve(ZSTD_BLOCKSIZE_MAX);
+        for n in 1..=129 {
+            let ldm = JobLdm::Internal(small_ldm.unwrap());
+            let (_, scratch, _) = ctx.reset(small, 0, ldm, 1024, false);
+            let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;
+            assert_eq!(kept, n < 129, "reset {n}");
         }
     }
 
@@ -1619,6 +1703,7 @@ mod tests {
         compress_job(
             data,
             cparams,
+            JobLdm::Off,
             false,
             sizing,
             overlap,
@@ -1627,9 +1712,7 @@ mod tests {
             true,
             split,
             pipelined,
-            &mut ctx.ms,
-            &mut ctx.scratch,
-            &mut BlockLdm::Off,
+            &mut ctx,
             &mut out,
         );
         out
