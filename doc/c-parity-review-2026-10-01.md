@@ -66,34 +66,6 @@ Impact: frames are the same today. I checked each place the raised value is read
 
 What does differ is state: `window.low` (C's `lowLimit`/`dictLimit`), and the value it has after overflow correction. That state becomes visible once a dictionary path lands, because there `loadedDictEnd`, `ZSTD_checkDictValidity` and `prefixLowest` all read the raised `dictLimit`.
 
-### R2-13: Match-finder and LDM tables only grow; libzstd frees an oversized workspace after 128 uses
-
-Severity: Medium
-
-Class: reference-faithful gap
-
-Rust:
-- `src/compress/matchstate.rs:449` — `Workspace::fits` checks only `workspaceTooSmall`.
-- `:465` — new pages are allocated only when `self.pages.len() < pages`.
-- `:672` — `index_reset = !fits || too_close_to_max()`, with no "wasteful" condition.
-- `src/compress/ldm.rs:336-344` — `LdmState::reset` uses `clear()` and `resize()`, which keep the old capacity.
-
-A reused `Compressor` (and every `ContextPool` context) therefore keeps the tables of the largest frame it ever compressed.
-
-C reference:
-- `zstd_compress.c:2154-2170` — on each reset, `ZSTD_cwksp_bump_oversized_duration(ws, 0)` runs, then `resizeWorkspace = workspaceTooSmall || workspaceWasteful` → `ZSTD_cwksp_free` + `ZSTD_cwksp_create(neededSpace)` + `ZSTDirp_reset`.
-- `zstd_cwksp.h:746-763` and `zstd_internal.h:258,265` define "wasteful": spare space ≥ 3× the need for more than 128 consecutive resets.
-- The LDM tables are inside the same cwksp.
-
-Impact: Probe-proven (`scratchpad/probe/src/bin/shrink.rs`). Setup: L19, one reused context, one 64 MiB frame, then 200 frames of 1 KiB. RSS above the starting point after N small frames:
-
-| Context | N = 1 | N = 128 | N = 129 | N = 200 |
-|---|---|---|---|---|
-| libzstd | +16.8 MiB | +16.8 MiB | −63.7 MiB | −63.7 MiB |
-| ours | +18.0 MiB | +18.7 MiB | +18.7 MiB | +18.7 MiB |
-
-At frame 129 libzstd releases about 80 MiB; ours never does. Not probed: at L22 the large-input tables (chainLog 27, hashLog 25) come to about 640 MiB, kept for the life of the `Compressor`. Output frames are unaffected.
-
 ## libzstd bugs
 
 Upstream reports. Where the port still shares one, its Decided or Port
