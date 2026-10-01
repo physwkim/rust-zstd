@@ -1181,7 +1181,13 @@ mod tests {
         assert_eq!(state.prev().rep, [7, 7, 16]);
 
         let mut frame = Vec::new();
-        super::super::write_frame_header(&mut frame, b.src.len() as u64, cparams.window_log, false);
+        super::super::write_frame_header(
+            &mut frame,
+            b.src.len() as u64,
+            cparams.window_log,
+            false,
+            0,
+        );
         frame.extend_from_slice(&blocks);
         assert_eq!(crate::decompress(&frame).unwrap(), b.src);
         assert_eq!(zstd::stream::decode_all(&frame[..]).unwrap(), b.src);
