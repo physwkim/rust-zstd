@@ -69,11 +69,6 @@ Severity: Low
 
 Class: libzstd bug
 
-Rust: `src/decode.rs:1897-1914` — `huf_decode_last_symbol_x2` writes one symbol but runs `br.skip_bits(entry.nb_bits)` for a `length == 2` cell and clamps `bits_consumed` to 64. X1 or X2 is picked by `huf_select_x2(dst_size, source.len())` (`:871`). Probe P8 lowers the regenerated size of a 4-stream section by 1, which leaves stream 4 with one encoded symbol that is never decoded:
-- Seed 20 (X2 selected, 8220→8219): libzstd body path `Ok(8219)`, Rust `Ok(8219)`.
-- All 10 X1-selected rows: both reject.
-- X2 seeds 3, 10 and 12, where the final two symbols do not fit one cell: both reject.
-
 C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` runs `BIT_skipBits(DStream, dt[val].nbBits)` for `length != 1`, and clamps to 64 with the comment "ugly hack; works only because it's the last symbol". `BIT_endOfDStream` then passes (`:1373`, `:1495`). X1's `HUF_decodeSymbolX1` consumes only the symbol's own bits, and the X1 body rejects the same shape (`:592`, `:692`). The choice between the two comes from the timing heuristic `HUF_selectDecoder` (`:1821-1843`, used at `:1930`).
 
 Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
@@ -95,8 +90,6 @@ Impact: in libzstd itself this is harmless. The stray write lands inside the arr
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/compress/bt.rs:527` — `7 => update_tree_internal::<_, 7>(...)`: our btlazy2 and btopt+ prefix loader copies the bug. `src/compress/lazy.rs:1775-1787` (`HcSearch::<mls_of>` inside `load_prefix`) does not copy it: it hashes with `BOUNDED(4, minMatch, 6)`. That deviation is stated in the doc comment at `lazy.rs:1757-1759`.
 
 C reference: `zstd_lazy.c:661`: `ZSTD_insertAndFindFirstIndex` passes `ms->cParams.minMatch`, which is `ZSTD_hashPtr` case 7. `zstd_opt.c:584`: `ZSTD_updateTree` does the same. Both are called from `ZSTD_loadDictionaryContent` (`zstd_compress.c:5010`, `:5028`). The block searches use `mls = BOUNDED(4, minMatch, 6)` (`zstd_lazy.c:1531`, `:1955`), so they hash 6 bytes. The row loader is consistent: `ZSTD_row_update` uses `MIN(minMatch, 6)` (`zstd_lazy.c:952`).
 
@@ -123,8 +116,6 @@ Severity: High
 
 Class: libzstd bug
 
-Rust: `src/compress/ldm.rs:338-339` — `self.hash_table.resize(1 << params.hash_log, LdmEntry::default())`. On i686, explicit hash logs 28, 29 and 30 end in a `capacity overflow` panic from `raw_vec/mod.rs:28`. The port does not corrupt memory. At 28 it panics where libzstd returns `memory_allocation`.
-
 C reference: `lib/zstd.h:1263,1267,1296` — under MEM_32bits, `ZSTD_LDM_HASHLOG_MAX = ZSTD_HASHLOG_MAX = 30`, so ZSTD_c_ldmHashLog 29 and 30 pass the bounds check. `lib/compress/zstd_ldm.c:171-175` computes `ldmHSize * sizeof(ldmEntry_t)`, which is 2^32 or 2^33 and wraps to 0 in a 32-bit size_t. The workspace estimate therefore reserves nothing for the table. `lib/compress/zstd_compress.c:2224-2226` then reserves and memsets a 0-byte `hashTable`, and ZSTD_ldm_insertEntry indexes up to 2^hashLog entries into it.
 
 Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
@@ -140,8 +131,6 @@ The port panics in the three explicit cases; in the rate case it derives hash lo
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/compress/ldm.rs:463-464` — "Initialize the rolling hash state with the first minMatchLength bytes (ZSTD_ldm_gear_reset leaves the state as it is)". Nothing is fed before `ip += min_match`. At `ldm.rs:542-548` the overlapping-match skip sets `ip = anchor - hashed` without re-hashing `[anchor - minMatch, anchor)`.
 
 C reference: `lib/compress/zstd_ldm.c:60-85` — the contract says it "feeds [data, data + minMatchLength) into the hash … effectively resets the hash state". The body computes a local `hash` from `state->rolling` but never writes `state->rolling = hash`. It is called at `:378` (after `gear_init` sets `rolling = ~0` at `:37`) and at `:501` (after a skip).
 
@@ -201,8 +190,6 @@ Severity: Low
 
 Class: libzstd bug
 
-Rust: `src/compress/presplit.rs:71` — `self.nb_events = (limit / RATE) as u64;` after sampling positions `0, RATE, 2·RATE, … < limit`. The test `record_counts_floor_of_limit_over_rate` (`presplit.rs:225`) pins nb_events = 190 against an event total of 191 at rate 43. The port copies the bug deliberately, for byte parity.
-
 C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
 
 Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
@@ -212,8 +199,6 @@ Impact: The pre-splitter's distance and threshold are slightly biased, which can
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/decode.rs:3958-3962` — `Raw => output.extend_from_slice(content)` and `RLE => output.resize(.. block.decompressed_size ..)` take any 21-bit Block_Size. Compressed blocks are bounded only at `block_size_max + 32` (`:2831-2833`, `:3076`). The port copies one-shot libzstd on purpose (Accepted divergences: "raw/RLE past 128 KiB").
 
 C reference: `decompress/zstd_decompress.c:1016-1026` — one-shot `ZSTD_decompressFrame` bounds raw and RLE blocks only by `oend-op`, and compressed blocks only by where the literals sit (bsm+32, or unbounded per R2-1). Streaming `ZSTD_decompressContinue` rejects `cBlockSize > blockSizeMax` (`:1315`) and, for every block type, `rSize > blockSizeMax` (`:1367`, "Decompressed Block Size Exceeds Maximum"). RFC 8878 §3.1.1.2.3 says "Block_Size is limited by Block_Maximum_Size". §3.1.1.2.4 says that maximum "is applicable to both the decompressed size and the compressed size of any block".
 
@@ -228,11 +213,6 @@ libzstd gives one RFC-invalid frame two verdicts depending on the API, and a 4-b
 Severity: Medium
 
 Class: libzstd bug
-
-Rust: `src/decode.rs:1903-1921` — at `bits_consumed == 64` with a 2-symbol cell, `huf_decode_last_symbol_x2` writes `entry.sequence as u8` and consumes nothing, so `is_finished` (`:1416`) passes.
-- The cell index comes from `look_bits` (`:1332`): `(container << (bits_consumed & 63)) >> (64 - n)`.
-- At 64 bits consumed this re-reads the top of the container, i.e. the stream's first 8 bytes. It does not return zeros, despite what the struct comment at `:1290-1292` says.
-- The port follows the 64-bit libzstd body path on every target, i686 included.
 
 C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` skips nothing when `bitsConsumed == sizeof(bitContainer)*8`. `common/bitstream.h:346-351` — `BIT_lookBitsFast` masks the shift with `regMask`, so it looks up `bitContainer << 0`, which is 32 or 64 bits wide depending on the build. `:449-452` — `BIT_endOfDStream` then holds. The BMI2 fast path is different: it finishes the tail with `bit->start = args->ilowest` (`:281-303`, `:1697-1712`), so it reads the previous stream's bytes, and it runs no end check. RFC 8878 §4.2.2: a bitstream "not entirely and exactly consumed ... is considered faulty".
 
@@ -256,8 +236,6 @@ Severity: Low
 
 Class: libzstd bug
 
-Rust: `src/decode.rs:3403-3404` — `offset.wrapping_sub(1) >= o_lit_end - lim.prefix`, where `prefix` is the frame start ("Match offset reaches before the frame start"). The MT path uses the same `SeqLimits { prefix: out }` (`:4642-4650`). `window_size` is only used to derive `block_size_max` (`:3809-3814`).
-
 C reference: `decompress/zstd_decompress_block.c:1052-1054` (also `:930-932`, `:979-981`) — one-shot checks `sequence.offset > oLitEnd - prefixStart`, then against `virtualStart`. Without a dictionary both are the frame start, and there is no window term. RFC 8878 §3.1.1.4 says "all offsets leading to previously decoded data must be smaller than Window_Size", and §3.1.1.3 only requires "previous decoded data, up to a distance of Window_Size".
 
 Impact: proven by probe (`p2`). Setup: Window_Size 1 KiB (and 2 KiB), two raw blocks of 1000 bytes, then one sequence with offset 1024, 1025, 1900 or 2000. One-shot libzstd, streaming libzstd and all Rust paths return `Ok(2010)`; only offset 2001 (before the frame start) is rejected. A frame that relies on this decodes in libzstd and the port, but is invalid for a decoder that keeps only Window_Size bytes, which the RFC allows. `p10` confirms that offsets into a previous frame are rejected on every path.
@@ -280,8 +258,6 @@ Severity: Low
 
 Class: libzstd bug
 
-Rust: `src/decode.rs:1272`, `:1516-1519` — `MIN_LITERALS_FOR_4_STREAMS = 6`, error "Huffman 4-stream output too small: 4 bytes", copied from libzstd.
-
 C reference: `decompress/zstd_decompress_block.c:187-190` — `litSize < MIN_LITERALS_FOR_4_STREAMS` (6, `common/zstd_internal.h:92`) returns `literals_headerWrong`. `decompress/huf_decompress.c:609` and `:1390` apply the same limit (`dstSize < 6`). RFC 8878 §3.1.1.3.1.6 says each stream decodes `(Regenerated_Size+3)/4` bytes, "except for the last stream, which may be up to 3 bytes smaller". So Regenerated_Size 4 splits as 1,1,1,1, which is valid. Size 5 is invalid, so the RFC's lower bound is "4, or 6 and above", not 6.
 
 Impact: proven by probe (`p9`). Size_Format 01 with Regenerated_Size 4 and four 1-byte streams, each holding one 1-bit symbol, is rejected by libzstd (one-shot and streaming) and by Rust. Sizes 6, 7 and 9 (last stream 0 or 1 byte) are `Ok` everywhere. An RFC-valid frame of this shape from another encoder is rejected by both.
@@ -291,8 +267,6 @@ Impact: proven by probe (`p9`). Size_Format 01 with Regenerated_Size 4 and four 
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/decode.rs:58-59` — `HUF_TABLELOG_MAX: u32 = 12`, with the comment "the format caps the log at 11, libzstd's decoder at 12". The checks are at `:945-946` and `:955`. This is copied on purpose (Accepted divergences: "Huffman log 12").
 
 C reference: `common/huf.h:37` — `HUF_TABLELOG_MAX 12`. `common/entropy_common.c:280` and `:288` — `HUF_readStats_body` only rejects weights or a tableLog above 12. RFC 8878 §4.2.1: "This specification limits the maximum code length to 11 bits."
 
