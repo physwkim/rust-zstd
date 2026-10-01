@@ -867,6 +867,51 @@ fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
     time1 < time0
 }
 
+/// One 8-bit counter per Huffman weight 0..=15, kept in two registers:
+/// `lo` holds weights 0..8 and `hi` weights 8..16, a byte each.
+#[derive(Default)]
+struct WeightLanes {
+    lo: u64,
+    hi: u64,
+}
+
+impl WeightLanes {
+    /// Add `n << (8 * (w % 8))` to the half that holds weight `w`.
+    #[inline(always)]
+    fn add(&mut self, w: u8, n: u64) {
+        let v = n << (8 * (w & 7));
+        if w & 8 == 0 {
+            self.lo = self.lo.wrapping_add(v);
+        } else {
+            self.hi = self.hi.wrapping_add(v);
+        }
+    }
+
+    /// Add one to the counter of weight `w`.
+    #[inline(always)]
+    fn bump(&mut self, w: u8) {
+        const ONE: [[u64; 2]; 16] = {
+            let mut t = [[0; 2]; 16];
+            let mut w = 0;
+            while w < 16 {
+                t[w][w / 8] = 1 << (8 * (w % 8));
+                w += 1;
+            }
+            t
+        };
+        let [lo, hi] = ONE[usize::from(w & 15)];
+        self.lo = self.lo.wrapping_add(lo);
+        self.hi = self.hi.wrapping_add(hi);
+    }
+
+    /// The counter of weight `w`.
+    #[inline(always)]
+    fn get(&self, w: u8) -> u8 {
+        let half = if w & 8 == 0 { self.lo } else { self.hi };
+        (half >> (8 * (w & 7))) as u8
+    }
+}
+
 struct HuffmanTable {
     /// Single-symbol table, `1 << HUF_FAST_TABLE_LOG` cells once the first
     /// single-symbol build sized it; the built table when `!is_x2`.
@@ -1012,14 +1057,27 @@ impl HuffmanTable {
     /// `nb_weights` weights read: symbols per weight, the table log, the
     /// implied last weight and a full binary tree.
     fn weight_stats(&mut self, nb_weights: usize) -> Result<(), String> {
+        let weights = &self.weights[..nb_weights];
+        // Weights are at most 15 (4 raw bits) and fewer than 256: count
+        // them in `WeightLanes` rather than in memory, where runs of one
+        // weight would wait on store forwarding.
+        let mut counts = WeightLanes::default();
+        for &w in weights {
+            counts.bump(w);
+        }
+        if (HUF_TABLELOG_MAX as u8 + 1..16).any(|w| counts.get(w) != 0) {
+            let w = weights.iter().find(|&&w| u32::from(w) > HUF_TABLELOG_MAX);
+            return Err(format!(
+                "Weight {} exceeds max {}",
+                w.unwrap(),
+                HUF_TABLELOG_MAX
+            ));
+        }
         let mut rank_stats = [0u32; HUF_TABLELOG_MAX as usize + 1];
         let mut weight_total = 0u32;
-        for &w in &self.weights[..nb_weights] {
-            if u32::from(w) > HUF_TABLELOG_MAX {
-                return Err(format!("Weight {} exceeds max {}", w, HUF_TABLELOG_MAX));
-            }
-            rank_stats[usize::from(w)] += 1;
-            weight_total += (1 << w) >> 1;
+        for (w, n) in rank_stats.iter_mut().enumerate() {
+            *n = u32::from(counts.get(w as u8));
+            weight_total += *n * ((1 << w) >> 1);
         }
         if weight_total == 0 {
             return Err("Missing weights".to_string());
@@ -1050,6 +1108,29 @@ impl HuffmanTable {
         Ok(())
     }
 
+    /// Order the symbols by weight, then by value, into `sorted` (libzstd
+    /// symbols[], sortedSymbol[]) and return where each weight's symbols
+    /// start, followed by the end of the last weight.
+    fn sort_symbols(&mut self) -> [usize; HUF_TABLELOG_MAX as usize + 2] {
+        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 2];
+        // The next slot of each weight, as in `weight_stats`. A slot of 256
+        // only follows the last symbol, and its carry reaches lanes of
+        // higher weights, which have no symbols.
+        let mut next = WeightLanes::default();
+        let mut start = 0usize;
+        for (w, &n) in self.rank_stats.iter().enumerate() {
+            rank_start[w] = start;
+            next.add(w as u8, start as u64);
+            start += n as usize;
+        }
+        rank_start[HUF_TABLELOG_MAX as usize + 1] = start;
+        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
+            self.sorted[usize::from(next.get(w))] = s as u8;
+            next.bump(w);
+        }
+        rank_start
+    }
+
     /// Fill the single-symbol table at `HUF_FAST_TABLE_LOG` bits
     /// (HUF_readDTableX1_wksp with HUF_rescaleStats): each symbol of `n`
     /// bits owns `1 << (HUF_FAST_TABLE_LOG - n)` consecutive cells, ordered
@@ -1060,33 +1141,20 @@ impl HuffmanTable {
         let max_bits = u32::from(self.max_num_bits);
         let dt_log = HUF_FAST_TABLE_LOG;
         let rescale = dt_log - max_bits;
+        let rank_start = self.sort_symbols();
         let rank_stats = &self.rank_stats;
-
-        // Symbols ordered by weight, then by value (libzstd symbols[]).
-        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 1];
-        let mut next = 0usize;
-        for w in 0..=max_bits as usize {
-            rank_start[w] = next;
-            next += rank_stats[w] as usize;
-        }
-        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
-            let r = &mut rank_start[usize::from(w)];
-            self.sorted[*r] = s as u8;
-            *r += 1;
-        }
 
         // Fill the table one weight at a time, so that the run length is a
         // constant of each loop, writing each symbol's cells four to a word
         // (HUF_DEltX1_set4) over the table's bytes.
         self.decode.resize(1 << dt_log, HuffmanEntry::default());
         let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut self.decode[..]);
-        let mut symbol = rank_stats[0] as usize;
         let mut u = 0usize;
         for w in 1..=max_bits as usize {
             let count = rank_stats[w] as usize;
             let length = 1usize << (w - 1 + rescale as usize);
             let num_bits = (max_bits + 1 - w as u32) as u8;
-            let syms = &self.sorted[symbol..symbol + count];
+            let syms = &self.sorted[rank_start[w]..rank_start[w + 1]];
             let d4 = |s: u8| u64::from(u16::from_le_bytes([s, num_bits])) * 0x0001_0001_0001_0001;
             let run = &mut cells[2 * u..2 * (u + count * length)];
             match length {
@@ -1120,7 +1188,6 @@ impl HuffmanTable {
                 }
             }
             u += count * length;
-            symbol += count;
         }
     }
 
@@ -1140,23 +1207,8 @@ impl HuffmanTable {
             max_w -= 1;
         }
 
-        // rank_start[w]: first index of weight w in the sorted list.
-        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 2];
-        let mut next = 0usize;
-        for w in 1..=max_w {
-            rank_start[w] = next;
-            next += self.rank_stats[w] as usize;
-        }
-        rank_start[max_w + 1] = next;
-
-        // Weight-0 symbols go after all others, and are never read.
-        let mut fill = rank_start;
-        fill[0] = next;
-        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
-            let r = &mut fill[usize::from(w)];
-            self.sorted[*r] = s as u8;
-            *r += 1;
-        }
+        // Weight-0 symbols come first, and are never read.
+        let rank_start = self.sort_symbols();
 
         // rank_val[consumed][w]: first cell of weight w once `consumed` bits
         // of the lookup have been used by a first symbol.
@@ -5914,6 +5966,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Both tables of libzstd's descriptions of random codes (raw and
+    /// FSE-compressed, 2 to 256 symbols, some of weight 0, 6- to 11-bit),
+    /// each build over the previous one, cell for cell against their
+    /// definition: single-symbol cells in order of weight, then symbol, a
+    /// symbol of weight `w` owning `1 << (w - 1 + rescale)` of them; a
+    /// double-symbol cell is the single-symbol lookup of its index plus,
+    /// exactly when both fit in the table log, the lookup that follows it.
+    #[test]
+    fn huf_tables_match_definition() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let log = HUF_FAST_TABLE_LOG;
+        let mut t = HuffmanTable::new();
+        let (mut raw, mut zero, mut full) = (0, 0, 0);
+        for case in 0..2000 {
+            let nb = 2 + rand() as usize % 255;
+            let skew = rand() % 20;
+            let sparse = rand() % 4;
+            let mut counts: Vec<u32> = (0..nb)
+                .map(|_| {
+                    let c = 1 + (rand() >> (31 - skew % 31)) % 5000;
+                    if rand() % 4 < sparse {
+                        0
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            // Two symbols at least, the last one among them.
+            counts[0] = counts[0].max(1);
+            counts[nb - 1] = counts[nb - 1].max(1);
+            let max_bits = (6 + case % 6).max(highest_bit_set(nb as u32) + 1);
+            let Some(desc) = huf_description_c(&counts, max_bits) else {
+                continue;
+            };
+            let (_, nb_weights) = t.read_weights(&desc).unwrap();
+            t.weight_stats(nb_weights).unwrap();
+            let max = u32::from(t.max_num_bits);
+            let weights = &t.weights[..t.nb_symbols];
+            raw += usize::from(desc[0] >= 128);
+            zero += usize::from(weights.contains(&0));
+            full += usize::from(weights.len() == 256);
+
+            let mut order: Vec<usize> = (0..weights.len()).filter(|&s| weights[s] != 0).collect();
+            order.sort_by_key(|&s| weights[s]);
+            let mut x1 = Vec::new();
+            for s in order {
+                let w = u32::from(weights[s]);
+                let cell = (s as u8, (max + 1 - w) as u8);
+                x1.extend(std::iter::repeat_n(cell, 1 << (w - 1 + log - max)));
+            }
+            let x2: Vec<(u16, u8, u8)> = (0..1 << log)
+                .map(|i| {
+                    let (a, a_bits) = x1[i];
+                    let (b, b_bits) = x1[(i << a_bits) & ((1 << log) - 1)];
+                    if u32::from(a_bits + b_bits) <= log {
+                        (u16::from(a) | u16::from(b) << 8, a_bits + b_bits, 2)
+                    } else {
+                        (u16::from(a), a_bits, 1)
+                    }
+                })
+                .collect();
+
+            t.fill_x1();
+            let got: Vec<(u8, u8)> = t.decode.iter().map(|e| (e.symbol, e.num_bits)).collect();
+            assert_eq!(got, x1, "case {case}: {desc:02x?}");
+            t.fill_x2();
+            let got: Vec<(u16, u8, u8)> = t
+                .decode_x2
+                .iter()
+                .map(|e| (e.sequence, e.nb_bits, e.length))
+                .collect();
+            assert_eq!(got, x2, "case {case}: {desc:02x?}");
+        }
+        assert!(
+            raw > 100 && zero > 500 && full > 3,
+            "{raw} raw, {zero} with weight 0, {full} of 256"
+        );
     }
 
     /// A table rebuilt over a larger one, an RLE one or one with -1 counts
