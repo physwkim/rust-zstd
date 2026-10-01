@@ -144,6 +144,17 @@ pub struct DecodeOptions {
     pub simd: bool,
 }
 
+impl DecodeOptions {
+    /// The SIMD level `simd` picks.
+    fn simd_level(&self) -> Level {
+        if self.simd {
+            Level::new()
+        } else {
+            Level::fallback()
+        }
+    }
+}
+
 impl Default for DecodeOptions {
     /// What `decompress` uses.
     fn default() -> Self {
@@ -165,58 +176,50 @@ impl Default for DecodeOptions {
 /// `decompress` with the paths chosen by `opts`.
 #[doc(hidden)]
 pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    let mut scratch: Option<DecoderScratch> = None;
+    let simd = opts.simd_level();
+    let mut dec = FrameDecoder::new(simd);
+    let mut out = VecOut {
+        output: Vec::new(),
+        prefix: Prefix {
+            start: 0,
+            window: 0,
+        },
+    };
     let mut pos = 0usize;
-
-    // ZSTD_decompressMultiFrame: a frame starts wherever at least
-    // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left over.
-    while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
-        let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
-            Ok(parsed) => parsed,
-            Err(e) => match e.skip_frame_size() {
-                Some(frame_size) => {
-                    // Up to 2^32 + 7 bytes with the header (RFC 8878 lines
-                    // 1325-1329); on 32-bit targets a sum past usize::MAX is
-                    // past the end of any input too.
-                    let end = pos
-                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
-                        .and_then(|p| p.checked_add(frame_size as usize))
-                        .filter(|&end| end <= data.len())
-                        .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
-                    pos = end;
-                    continue;
-                }
-                None => return Err(format!("Frame header error: {}", e)),
-            },
-        };
-        pos += header_len;
-
-        let scratch = scratch.get_or_insert_with(DecoderScratch::new);
-        scratch.reset();
-        let simd = if opts.simd {
-            Level::new()
-        } else {
-            Level::fallback()
-        };
-        decode_frame(
-            &frame_header,
+    loop {
+        let rest = &data[pos..];
+        let (skipped, _) = dec.skip(rest.len());
+        pos += skipped;
+        let rest = &data[pos..];
+        let len = dec.unit_len(rest);
+        if len > rest.len() {
+            dec.end_of_input(rest)?;
+            return Ok(out.output);
+        }
+        if dec.process(&rest[..len], &mut out)? != Event::FrameStarted {
+            pos += len;
+            continue;
+        }
+        pos += len;
+        let frame = dec.frame().expect("a started frame has blocks");
+        reserve_frame(
+            &mut out.output,
+            frame.content_size,
+            &data[pos..],
+            frame.block_size_max,
+        )?;
+        #[cfg(feature = "parallel")]
+        if parallel::decode_frame_blocks(
             data,
             &mut pos,
-            scratch,
-            &mut output,
+            frame,
+            &mut out,
             opts.min_parallel_blocks,
             simd,
-        )?;
+        )? {
+            dec.blocks_ended()?;
+        }
     }
-    if pos != data.len() {
-        return Err(format!(
-            "Input not entirely consumed: {} bytes left, too few for a frame",
-            data.len() - pos
-        ));
-    }
-
-    Ok(output)
 }
 
 // ============================================================
@@ -2068,6 +2071,7 @@ enum BlockType {
     Reserved,
 }
 
+#[derive(Clone, Copy)]
 struct BlockHeader {
     last_block: bool,
     block_type: BlockType,
@@ -3906,136 +3910,403 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 }
 
 // ============================================================
-// Block decoder
+// Frame decoder
 // ============================================================
 
-/// Decode every block of one frame from `data[*pos..]` straight into
-/// `output`, then check the content size and checksum. Matches reach back
-/// at most Window_Size bytes and never before the frame's own start
-/// (`Prefix`). Frames of at least `min_parallel_blocks` blocks are decoded
-/// by `parallel` when enabled.
-#[inline(never)]
-fn decode_frame(
-    header: &FrameHeader,
-    data: &[u8],
-    pos: &mut usize,
+/// Where a `FrameDecoder` stands in its input (ZSTD_decompressContinue's
+/// ZSTDds_* stages). Each stage but `Skip` takes one unit: a frame header,
+/// a block with its header, or a Content_Checksum, whole
+/// (`FrameDecoder::unit_len`).
+enum Stage {
+    /// Between frames: the next unit is a frame header, or a skippable
+    /// frame's magic number and Frame_Size.
+    FrameHeader,
+    /// `left` bytes of a skippable frame's User_Data still to skip, in
+    /// pieces of any size.
+    Skip { left: u64 },
+    /// The blocks of a frame.
+    Block(Frame),
+    /// The frame's Content_Checksum, which must equal `computed`.
+    Checksum { computed: u32 },
+}
+
+/// What the unit `FrameDecoder::process` took was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Event {
+    /// A frame's header: its blocks follow.
+    FrameStarted,
+    /// A skippable frame's header or a block, not the frame's last unit.
+    Continue,
+    /// A frame's last unit: the decoder is between frames again.
+    FrameEnded,
+}
+
+/// The frame being decoded: the bounds its header sets and what its blocks
+/// have decoded to (ZSTD_DCtx's `fParams`, `decodedSize`, `xxhState`).
+struct Frame {
+    /// Window_Size: how far back a match reaches, `usize::MAX` for a window
+    /// past the address space.
+    window: usize,
+    /// Block_Maximum_Size (RFC 8878 lines 557-564), the bound
+    /// `parse_block_header` puts on every Block_Size, `split_block` on a
+    /// compressed block's literals and `execute_with_copies` on what its
+    /// sequences decode to.
+    block_size_max: usize,
+    content_size: Option<u64>,
+    decoded: u64,
+    checksum: Option<Xxh64>,
+}
+
+impl Frame {
+    fn new(header: &FrameHeader) -> Result<Frame, String> {
+        let window_size = header.window_size()?;
+        Ok(Frame {
+            window: usize::try_from(window_size).unwrap_or(usize::MAX),
+            block_size_max: window_size.min(MAX_BLOCK_SIZE as u64) as usize,
+            content_size: header.frame_content_size(),
+            decoded: 0,
+            checksum: header.descriptor.content_checksum_flag().then(Xxh64::new),
+        })
+    }
+
+    /// Account for the bytes a block decoded to, while they are in cache: a
+    /// frame that decodes past its Frame_Content_Size fails here, which
+    /// keeps a decoder's buffer within that size.
+    fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.decoded += bytes.len() as u64;
+        if let Some(h) = &mut self.checksum {
+            h.update(bytes);
+        }
+        match self.content_size {
+            Some(fcs) if self.decoded > fcs => Err(self.content_size_mismatch(fcs)),
+            _ => Ok(()),
+        }
+    }
+
+    fn content_size_mismatch(&self, fcs: u64) -> String {
+        format!(
+            "Frame content size mismatch: header says {}, decoded {}",
+            fcs, self.decoded
+        )
+    }
+}
+
+/// Where a `FrameDecoder` decodes frames to: for `decompress`, the output
+/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer.
+trait FrameOut {
+    /// Make ready for a frame whose matches reach at most `window` bytes
+    /// back, and which decodes to `content_size` bytes if that is known.
+    fn start(&mut self, window: usize, content_size: Option<u64>) -> Result<(), String>;
+
+    /// The destination of the frame's next block and the history before
+    /// its segment, which meet the `Dst` and `ExtHistory` contracts.
+    fn block_dst(&mut self) -> (Dst, ExtHistory);
+
+    /// Take the block written to the last `block_dst` up to `end` (from its
+    /// `base`), and return the block's bytes.
+    ///
+    /// # Safety
+    /// Every byte of that destination from its `op` to `end` is written.
+    unsafe fn commit(&mut self, end: usize) -> &[u8];
+}
+
+/// The resumable core of both decoders (ZSTD_decompressContinue): it takes
+/// the input one unit at a time and decodes each block into a `FrameOut`.
+/// `decompress` hands it units of the whole input, `Decompressor` the
+/// units it gathers from the pieces it gets, so both take every verdict
+/// here.
+struct FrameDecoder {
+    stage: Stage,
+    scratch: Option<DecoderScratch>,
+    simd: Level,
+}
+
+impl FrameDecoder {
+    fn new(simd: Level) -> FrameDecoder {
+        FrameDecoder {
+            stage: Stage::FrameHeader,
+            scratch: None,
+            simd,
+        }
+    }
+
+    /// Between frames, where the input may end.
+    fn between_frames(&self) -> bool {
+        matches!(self.stage, Stage::FrameHeader)
+    }
+
+    /// The frame whose blocks come next, if they do.
+    fn frame(&mut self) -> Option<&mut Frame> {
+        match &mut self.stage {
+            Stage::Block(frame) => Some(frame),
+            _ => None,
+        }
+    }
+
+    /// How many bytes the current unit takes, `head` being its first bytes
+    /// so far, which may be fewer, or more: a frame header's length follows
+    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes and a block's from its
+    /// header, so with fewer the length is what it takes to learn it. The
+    /// bytes of a skippable frame left to skip, in `Stage::Skip`.
+    fn unit_len(&self, head: &[u8]) -> usize {
+        match &self.stage {
+            Stage::FrameHeader => frame_header_len(head),
+            Stage::Skip { left } => usize::try_from(*left).unwrap_or(usize::MAX),
+            Stage::Block(frame) => match parse_block_header(head, frame.block_size_max) {
+                Ok((block, header_len)) => header_len + block.content_size as usize,
+                // Too short to tell, or rejected once whole.
+                Err(_) => BLOCK_HEADER_LEN,
+            },
+            Stage::Checksum { .. } => CHECKSUM_LEN,
+        }
+    }
+
+    /// Skip up to `avail` bytes of a skippable frame: returns how many it
+    /// skipped and whether that ended the frame.
+    fn skip(&mut self, avail: usize) -> (usize, bool) {
+        let Stage::Skip { left } = &mut self.stage else {
+            return (0, false);
+        };
+        let n = usize::try_from(*left).map_or(avail, |left| left.min(avail));
+        *left -= n as u64;
+        if *left != 0 {
+            return (n, false);
+        }
+        self.stage = Stage::FrameHeader;
+        (n, true)
+    }
+
+    /// Take the current unit, `unit_len(unit)` bytes, and decode it into
+    /// `out`. Not for `Stage::Skip`.
+    fn process(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+        match &mut self.stage {
+            Stage::FrameHeader => self.frame_header(unit, out),
+            Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
+            Stage::Block(frame) => {
+                let (block, content) = locate_block(unit, frame.block_size_max)?;
+                let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
+                decode_block(&block, content, frame, scratch, out, self.simd)?;
+                if !block.last_block {
+                    return Ok(Event::Continue);
+                }
+                self.blocks_ended()
+            }
+            Stage::Checksum { computed } => {
+                let stored = u32::from_le_bytes(unit.try_into().unwrap());
+                if stored != *computed {
+                    return Err(format!(
+                        "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
+                        stored, computed
+                    ));
+                }
+                self.stage = Stage::FrameHeader;
+                Ok(Event::FrameEnded)
+            }
+        }
+    }
+
+    fn frame_header(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+        let header = match parse_frame_header(unit) {
+            Ok((header, _)) => header,
+            Err(e) => match e.skip_frame_size() {
+                Some(size) => {
+                    self.stage = Stage::Skip {
+                        left: u64::from(size),
+                    };
+                    return Ok(Event::Continue);
+                }
+                None => return Err(frame_header_error(e)),
+            },
+        };
+        let frame = Frame::new(&header)?;
+        self.scratch.get_or_insert_with(DecoderScratch::new).reset();
+        out.start(frame.window, frame.content_size)?;
+        self.stage = Stage::Block(frame);
+        Ok(Event::FrameStarted)
+    }
+
+    /// After the frame's last block: check its size, then expect its
+    /// checksum, if it has one.
+    fn blocks_ended(&mut self) -> Result<Event, String> {
+        let Stage::Block(frame) = std::mem::replace(&mut self.stage, Stage::FrameHeader) else {
+            unreachable!("blocks end in Stage::Block");
+        };
+        if let Some(fcs) = frame.content_size {
+            if frame.decoded != fcs {
+                return Err(frame.content_size_mismatch(fcs));
+            }
+        }
+        match frame.checksum {
+            Some(h) => {
+                self.stage = Stage::Checksum {
+                    computed: h.digest() as u32,
+                };
+                Ok(Event::Continue)
+            }
+            None => Ok(Event::FrameEnded),
+        }
+    }
+
+    /// The verdict on input that ends `partial` bytes into the current
+    /// unit, fewer than `unit_len(partial)`: the bytes the one-shot input
+    /// ends with, or those `Decompressor` holds when it finishes. It may
+    /// end only between frames.
+    fn end_of_input(&self, partial: &[u8]) -> Result<(), String> {
+        Err(match &self.stage {
+            Stage::FrameHeader if partial.is_empty() => return Ok(()),
+            // ZSTD_decompressMultiFrame: a frame starts wherever at least
+            // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left
+            // over.
+            Stage::FrameHeader if partial.len() < FRAME_HEADER_PREFIX_LEN => format!(
+                "Input not entirely consumed: {} bytes left, too few for a frame",
+                partial.len()
+            ),
+            Stage::FrameHeader => match parse_frame_header(partial) {
+                Err(e) => frame_header_error(e),
+                Ok(_) => unreachable!("a whole frame header is a unit"),
+            },
+            Stage::Skip { .. } => "Skippable frame extends past end of input".to_string(),
+            Stage::Block(frame) => match locate_block(partial, frame.block_size_max) {
+                Err(e) => e,
+                Ok(_) => unreachable!("a whole block is a unit"),
+            },
+            Stage::Checksum { .. } => "Error reading checksum: truncated".to_string(),
+        })
+    }
+}
+
+/// Block_Header's length.
+const BLOCK_HEADER_LEN: usize = 3;
+
+/// Content_Checksum's length.
+const CHECKSUM_LEN: usize = 4;
+
+fn frame_header_error(e: FrameDecoderError) -> String {
+    format!("Frame header error: {}", e)
+}
+
+/// The length of the frame header that starts `head` (ZSTD_frameHeaderSize),
+/// as far as `parse_frame_header` reads, or `FRAME_HEADER_PREFIX_LEN` while
+/// `head` is shorter than that or does not start a frame.
+fn frame_header_len(head: &[u8]) -> usize {
+    let Some(&[m0, m1, m2, m3, descriptor]) = head.get(..FRAME_HEADER_PREFIX_LEN) else {
+        return FRAME_HEADER_PREFIX_LEN;
+    };
+    let magic = u32::from_le_bytes([m0, m1, m2, m3]);
+    if (0x184D2A50..=0x184D2A5F).contains(&magic) {
+        return SKIPPABLE_FRAME_HEADER_LEN;
+    }
+    if magic != ZSTD_MAGIC {
+        return FRAME_HEADER_PREFIX_LEN;
+    }
+    let d = FrameDescriptor(descriptor);
+    FRAME_HEADER_PREFIX_LEN
+        + usize::from(!d.single_segment_flag())
+        + d.dictionary_id_bytes().unwrap_or(0) as usize
+        + d.frame_content_size_bytes().unwrap_or(0) as usize
+}
+
+/// The block at the start of `src`, in a frame whose Block_Maximum_Size is
+/// `block_size_max`: its header and content.
+fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]), String> {
+    let (block, header_len) = parse_block_header(src, block_size_max)?;
+    let content = src
+        .get(header_len..header_len + block.content_size as usize)
+        .ok_or_else(|| "Block content extends past end of input".to_string())?;
+    Ok((block, content))
+}
+
+/// Decode `block` with `content` into `out`, a block of `frame`.
+fn decode_block(
+    block: &BlockHeader,
+    content: &[u8],
+    frame: &mut Frame,
     scratch: &mut DecoderScratch,
-    output: &mut Vec<u8>,
-    min_parallel_blocks: usize,
+    out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
-    // Any window the header takes: this decoder keeps no window buffer,
-    // so the window only bounds the blocks and the match offsets.
-    let window_size = header.window_size()?;
-    // Block_Maximum_Size (RFC 8878 lines 557-564), the bound
-    // `parse_block_header` puts on every Block_Size, `split_block` on a
-    // compressed block's literals and `execute_with_copies` on what its
-    // sequences decode to.
-    let block_size_max = window_size.min(MAX_BLOCK_SIZE as u64) as usize;
-    let prefix = Prefix {
-        start: output.len(),
-        // A window past the address space bounds no offset.
-        window: usize::try_from(window_size).unwrap_or(usize::MAX),
+    let (dst, ext) = out.block_dst();
+    // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
+    // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
+    // bytes (`parse_block_header`), within the room `Dst` has, from input
+    // apart from it; on success each arm wrote the block up to `end`.
+    let bytes = unsafe {
+        let at = dst.base.add(dst.op);
+        let end = match block.block_type {
+            BlockType::Raw => {
+                ptr::copy_nonoverlapping(content.as_ptr(), at, content.len());
+                dst.op + content.len()
+            }
+            BlockType::RLE => {
+                let len = block.decompressed_size as usize;
+                ptr::write_bytes(at, content[0], len);
+                dst.op + len
+            }
+            BlockType::Compressed => {
+                decompress_block(content, frame.block_size_max, scratch, dst, ext, simd)?
+            }
+            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
+        };
+        out.commit(end)
     };
-    let mut frame = FrameContent::new(prefix, header.descriptor.content_checksum_flag());
-
-    if let Some(fcs) = header.frame_content_size() {
-        // Room for the whole frame plus what the sequence executors reserve
-        // past a block's start, so that no block has to grow the buffer
-        // (and move everything decoded). A content size past what the
-        // blocks can decode to fails the size check below, so it gets no
-        // room beyond that.
-        let content = fcs.min(blocks_decoded_bound(&data[*pos..], block_size_max));
-        let want = usize::try_from(content)
-            .ok()
-            .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
-            .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
-        output
-            .try_reserve(want)
-            .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))?;
-    }
-
-    #[cfg(feature = "parallel")]
-    let decoded = parallel::decode_frame_blocks(
-        data,
-        pos,
-        block_size_max,
-        &mut frame,
-        output,
-        min_parallel_blocks,
-        simd,
-    )?;
-    #[cfg(not(feature = "parallel"))]
-    let decoded = {
-        let _ = min_parallel_blocks;
-        false
-    };
-    if !decoded {
-        decode_blocks(data, pos, block_size_max, scratch, &mut frame, output, simd)?;
-    }
-
-    if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame.prefix.start) as u64;
-        if decoded != fcs {
-            return Err(format!(
-                "Frame content size mismatch: header says {}, decoded {}",
-                fcs, decoded
-            ));
-        }
-    }
-
-    if let Some(computed) = frame.checksum(output) {
-        let stored = data
-            .get(*pos..*pos + 4)
-            .ok_or_else(|| "Error reading checksum: truncated".to_string())?;
-        *pos += 4;
-        let stored = u32::from_le_bytes(stored.try_into().unwrap());
-        if stored != computed {
-            return Err(format!(
-                "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
-                stored, computed
-            ));
-        }
-    }
-    Ok(())
+    frame.block_decoded(bytes)
 }
 
-/// A frame's content in the output: where it starts, how far back its
-/// matches reach and, when the frame has a Content_Checksum, the XXH64 of
-/// what has been decoded (ZSTD_decompressFrame's `xxhState`).
-struct FrameContent {
-    /// Output position of the frame's first byte, and its Window_Size.
+/// The one-shot driver's `FrameOut`: frames decode straight into one
+/// `Vec`, each block after the last, so a frame's history is all in it.
+struct VecOut {
+    output: Vec<u8>,
+    /// The current frame's.
     prefix: Prefix,
-    checksum: Option<Xxh64>,
-    /// Output position up to which `checksum` has been fed.
-    fed: usize,
 }
 
-impl FrameContent {
-    fn new(prefix: Prefix, has_checksum: bool) -> Self {
-        Self {
-            prefix,
-            checksum: has_checksum.then(Xxh64::new),
-            fed: prefix.start,
-        }
+impl FrameOut for VecOut {
+    fn start(&mut self, window: usize, _content_size: Option<u64>) -> Result<(), String> {
+        self.prefix = Prefix {
+            start: self.output.len(),
+            window,
+        };
+        Ok(())
     }
 
-    /// Feed the checksum what has been decoded since the last call. The
-    /// block loops call this after each block, while it is in cache.
-    fn feed(&mut self, output: &[u8]) {
-        if let Some(h) = &mut self.checksum {
-            h.update(&output[self.fed..]);
-            self.fed = output.len();
-        }
+    fn block_dst(&mut self) -> (Dst, ExtHistory) {
+        let dst = self
+            .prefix
+            .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+        (dst, ExtHistory::NONE)
     }
 
-    /// The Content_Checksum of the frame decoded into `output`: the low
-    /// half of the XXH64 of every byte from `base`, whatever the block
-    /// loops fed.
-    fn checksum(&mut self, output: &[u8]) -> Option<u32> {
-        self.feed(output);
-        self.checksum.as_ref().map(|h| h.digest() as u32)
+    unsafe fn commit(&mut self, end: usize) -> &[u8] {
+        let start = self.output.len();
+        // The bytes up to `end` are written, and `end` is within the room
+        // `Prefix::dst` reserved.
+        self.output.set_len(self.prefix.start + end);
+        &self.output[start..]
     }
+}
+
+/// Reserve room in `output` for a frame of `content_size` bytes whose blocks
+/// start `blocks`, plus what a block's destination reserves past its start,
+/// so that no block has to grow the buffer (and move everything decoded). A
+/// content size past what the blocks can decode to fails the size check, so
+/// it gets no room beyond that.
+fn reserve_frame(
+    output: &mut Vec<u8>,
+    content_size: Option<u64>,
+    blocks: &[u8],
+    block_size_max: usize,
+) -> Result<(), String> {
+    let Some(fcs) = content_size else {
+        return Ok(());
+    };
+    let content = fcs.min(blocks_decoded_bound(blocks, block_size_max));
+    let want = usize::try_from(content)
+        .ok()
+        .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
+        .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
+    output
+        .try_reserve(want)
+        .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))
 }
 
 /// The most the blocks at the start of `data` decode to: the sum of each
@@ -4045,11 +4316,8 @@ impl FrameContent {
 fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     let mut rest = data;
     let mut bound = 0u64;
-    while let Ok((block, header_len)) = parse_block_header(rest, block_size_max) {
-        let Some(next) = rest.get(header_len + block.content_size as usize..) else {
-            break;
-        };
-        rest = next;
+    while let Ok((block, content)) = locate_block(rest, block_size_max) {
+        rest = &rest[BLOCK_HEADER_LEN + content.len()..];
         bound = bound.saturating_add(match block.block_type {
             BlockType::Compressed => block_size_max as u64,
             _ => u64::from(block.decompressed_size),
@@ -4061,58 +4329,9 @@ fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     bound
 }
 
-/// The serial block loop of `decode_frame`: decode every block of the
-/// frame at `data[*pos..]` into `output`.
-fn decode_blocks(
-    data: &[u8],
-    pos: &mut usize,
-    block_size_max: usize,
-    scratch: &mut DecoderScratch,
-    frame: &mut FrameContent,
-    output: &mut Vec<u8>,
-    simd: Level,
-) -> Result<(), String> {
-    loop {
-        let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
-        *pos += header_len;
-        let content = data
-            .get(*pos..*pos + block.content_size as usize)
-            .ok_or_else(|| "Block content extends past end of input".to_string())?;
-        *pos += content.len();
-
-        match block.block_type {
-            BlockType::Raw => output.extend_from_slice(content),
-            BlockType::RLE => {
-                output.resize(output.len() + block.decompressed_size as usize, content[0])
-            }
-            BlockType::Compressed => {
-                let dst = frame
-                    .prefix
-                    .dst(output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-                // SAFETY: `Prefix::dst` meets the `Dst` contract, and on
-                // success the block's bytes up to `end` are written.
-                unsafe {
-                    let end = decompress_block(
-                        content,
-                        block_size_max,
-                        scratch,
-                        dst,
-                        ExtHistory::NONE,
-                        simd,
-                    )?;
-                    output.set_len(frame.prefix.start + end);
-                }
-            }
-            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
-        }
-        frame.feed(output);
-
-        if block.last_block {
-            break;
-        }
-    }
-    Ok(())
-}
+// ============================================================
+// Block decoder
+// ============================================================
 
 /// A compressed block's sections, located from their headers
 /// (ZSTD_decodeLiteralsBlock's and ZSTD_decodeSeqHeaders' size parsing).
@@ -4301,12 +4520,8 @@ mod parallel {
         let mut huf_def = None;
         let mut fse_def: [Option<usize>; 3] = [None; 3];
         loop {
-            let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
-            *pos += header_len;
-            let content = data
-                .get(*pos..*pos + block.content_size as usize)
-                .ok_or_else(|| "Block content extends past end of input".to_string())?;
-            *pos += content.len();
+            let (block, content) = locate_block(&data[*pos..], block_size_max)?;
+            *pos += BLOCK_HEADER_LEN + content.len();
             let i = plans.len();
             plans.push(match block.block_type {
                 BlockType::Raw => Plan::Raw(content),
@@ -4785,21 +5000,21 @@ mod parallel {
         Ok(cur.op as usize + rest - out as usize)
     }
 
-    /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
+    /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool. Returns `Ok(false)` without consuming input when
     /// the frame has fewer than `min_blocks` blocks.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
-        block_size_max: usize,
-        frame: &mut FrameContent,
-        output: &mut Vec<u8>,
+        frame: &mut Frame,
+        out: &mut VecOut,
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
         if min_blocks == usize::MAX {
             return Ok(false);
         }
+        let block_size_max = frame.block_size_max;
         let mut end = *pos;
         let plans = plan_frame(data, &mut end, block_size_max)?;
         if plans.len() < min_blocks {
@@ -4873,18 +5088,19 @@ mod parallel {
                     }
                     _ => cell.slot.lock().unwrap(),
                 };
+                let start = out.output.len();
                 execute_block(
                     plan,
                     &mut slot,
                     &mut hist,
                     block_size_max,
-                    frame.prefix,
-                    output,
+                    out.prefix,
+                    &mut out.output,
                     simd,
                 )?;
                 drop(slot);
                 spawn_decode(i + ring.len());
-                frame.feed(output);
+                frame.block_decoded(&out.output[start..])?;
             }
             Ok::<(), String>(())
         })?;
