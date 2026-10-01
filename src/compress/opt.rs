@@ -1164,15 +1164,10 @@ mod tests {
                 assert!(s.seqs > 1000, "{strategy:?} mm{min_match}: {s:?}");
                 assert!(s.cross_block_matches > 0, "{strategy:?} mm{min_match}");
                 let s = roundtrip_job(&OPT, &data, cp, 1 << 17, 5000, 200 << 10, [1, 4, 8]);
-                // With min_match 7 libzstd loads the prefix with 7-byte
-                // hashes (`ZSTD_updateTree` passes `minMatch` unbounded) but
-                // the parser looks up 6-byte ones: the prefix is reachable
-                // only through hash collisions.
-                assert_eq!(
-                    s.prefix_matches > 0,
-                    min_match < 7,
-                    "{strategy:?} mm{min_match}: {s:?}"
-                );
+                // The prefix loader hashes as the parser looks up, 6 bytes
+                // at min_match 7 (libzstd hashes 7 there and never matches
+                // the prefix, R1-11).
+                assert!(s.prefix_matches > 0, "{strategy:?} mm{min_match}: {s:?}");
             }
         }
     }
