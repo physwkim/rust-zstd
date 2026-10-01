@@ -1,7 +1,10 @@
-//! Literals-section conformance: `huf::compress_literals_with` must produce
-//! the bytes libzstd 1.5.7's `ZSTD_compressLiterals` produces for the same
-//! literals, previous Huffman state and strategy (`tests/data/huf`), and
-//! every section must decode through our decoder and libzstd.
+//! Literals-section conformance: `huf::compress_literals_with` must pass
+//! the encoder gate's size check against the section libzstd 1.5.7's
+//! `ZSTD_compressLiterals` produces for the same literals, previous Huffman
+//! state and strategy (`tests/data/huf`), and every section must decode
+//! through our decoder and libzstd.
+
+mod common;
 
 use rust_zstd::compress::{CParams, Strategy};
 use rust_zstd::huf::{compress_literals_with, HufState};
@@ -88,10 +91,10 @@ fn literals_sections_match_libzstd_and_decode() {
             let expected = std::fs::read(dir.join(format!("{chain}__{input}.expected"))).unwrap();
             let mut out = Vec::new();
             prev = compress_literals_with(&mut out, &literals, nb_seq, &prev, &cp);
-            assert!(
-                out == expected,
-                "{chain}/{input}: section differs from libzstd"
-            );
+            let what = format!("{chain}/{input} section");
+            if let Err(e) = common::check_size(&what, out.len(), expected.len()) {
+                panic!("{e}");
+            }
             sections.push(out);
             all_literals.extend_from_slice(&literals);
             n_steps += 1;

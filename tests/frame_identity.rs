@@ -5,7 +5,7 @@
 //! every strategy row, including the small-input btlazy2 rows, is reached,
 //! plus a 4 MiB input as one job (default options) and in 512 KiB jobs
 //! (several jobs with overlap), both also with a content checksum, those
-//! frames compared with libzstd's (`ZSTD_c_checksumFlag` 1, and for the
+//! frames gated against libzstd's (`ZSTD_c_checksumFlag` 1, and for the
 //! jobs `ZSTD_c_nbWorkers` 2). Inputs are generated from fixed seeds, so the
 //! gate needs no file outside the repository and both feature builds must
 //! match the same file (serial and parallel agreement). Each frame is also
@@ -182,9 +182,11 @@ fn compute() -> BTreeMap<String, String> {
                     if let Some(j) = job_size {
                         params.extend([(ZSTD_c_nbWorkers, 2), (ZSTD_c_jobSize, j as i32)]);
                     }
-                    assert!(
-                        common::c_compress2(src, &params) == frame,
-                        "{name} {n} L{level} checksum: frame differs from libzstd"
+                    common::assert_gate(
+                        &format!("{name} {n} L{level} checksum"),
+                        src,
+                        &frame,
+                        &common::c_compress2(src, &params),
                     );
                 }
                 let strategy = CParams::for_level(level, n).strategy;

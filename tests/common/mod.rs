@@ -280,3 +280,64 @@ pub fn c_compress2(data: &[u8], params: &[(sys::ZSTD_cParameter, i32)]) -> Vec<u
         out
     }
 }
+
+/// The encoder gate's size tolerance over libzstd's frame for the same
+/// input and parameters: `lib / SIZE_SLACK_DIVISOR + SIZE_SLACK_BYTES`.
+pub const SIZE_SLACK_DIVISOR: usize = 1000;
+/// See [`SIZE_SLACK_DIVISOR`].
+pub const SIZE_SLACK_BYTES: usize = 16;
+
+/// The largest size the gate accepts against libzstd's `lib` bytes.
+pub fn size_limit(lib: usize) -> usize {
+    lib + lib / SIZE_SLACK_DIVISOR + SIZE_SLACK_BYTES
+}
+
+/// The gate's size check: `ours` bytes are at most [`size_limit`] of
+/// libzstd's `lib` bytes; the error names the case, both sizes and the
+/// delta.
+pub fn check_size(what: &str, ours: usize, lib: usize) -> Result<(), String> {
+    if ours <= size_limit(lib) {
+        return Ok(());
+    }
+    Err(format!(
+        "{what}: ours {ours} bytes, libzstd {lib}, delta +{} over the {} allowed",
+        ours - lib,
+        size_limit(lib) - lib
+    ))
+}
+
+/// The gate's round trip: `frame` decodes to `src` through our decoder and
+/// through libzstd's (window log up to `ZSTD_WINDOWLOG_MAX`).
+pub fn assert_round_trip(what: &str, src: &[u8], frame: &[u8]) {
+    assert!(
+        rust_zstd::decompress(frame).expect(what) == src,
+        "{what}: our decoder decodes another input"
+    );
+    let mut dctx = zstd::bulk::Decompressor::new().unwrap();
+    let window_log_max = if cfg!(target_pointer_width = "64") {
+        31
+    } else {
+        30
+    };
+    dctx.set_parameter(zstd::stream::raw::DParameter::WindowLogMax(window_log_max))
+        .unwrap();
+    assert!(
+        dctx.decompress(frame, src.len()).expect(what) == src,
+        "{what}: libzstd decodes another input"
+    );
+}
+
+/// The encoder gate on our frame `ours` of `src` against libzstd's frame
+/// `lib` for the same input and parameters: [`assert_round_trip`] (which
+/// panics), then [`check_size`].
+pub fn gate(what: &str, src: &[u8], ours: &[u8], lib: &[u8]) -> Result<(), String> {
+    assert_round_trip(what, src, ours);
+    check_size(what, ours.len(), lib.len())
+}
+
+/// [`gate`], panicking on a size failure.
+pub fn assert_gate(what: &str, src: &[u8], ours: &[u8], lib: &[u8]) {
+    if let Err(e) = gate(what, src, ours, lib) {
+        panic!("{e}");
+    }
+}

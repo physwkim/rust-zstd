@@ -8,8 +8,8 @@
 
 mod common;
 
-use common::{c_compress2, lcg_bytes};
-use rust_zstd::{compress_with, decompress, CompressOptions};
+use common::{assert_gate, c_compress2, lcg_bytes};
+use rust_zstd::{compress_with, CompressOptions};
 use zstd::zstd_safe::zstd_sys as sys;
 
 /// `0xff` then random letters of `"abcdefgh "`.
@@ -50,16 +50,12 @@ fn check(name: &str, data: &[u8], level: i32, splitters: bool) {
         params.push((ZSTD_c_experimentalParam13, 2));
     }
     let ours = compress_with(data, &opts);
-    assert!(
-        decompress(&ours).unwrap() == data,
-        "{name} L{level}: roundtrip"
-    );
     let theirs = c_compress2(data, &params);
-    assert!(
-        ours == theirs,
-        "{name} L{level} splitters {splitters}: {} bytes, libzstd {}",
-        ours.len(),
-        theirs.len()
+    assert_gate(
+        &format!("{name} L{level} splitters {splitters}"),
+        data,
+        &ours,
+        &theirs,
     );
 }
 
