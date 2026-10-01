@@ -137,7 +137,7 @@ C reference:
 
 Impact: No frame difference; the compiler may assume these pointers stay in bounds. Our negative-level probe (levels -131072, -131071, -100000, -65536, -1000, -257..-255, -130..-127, -64, -33..-31, -9, -8, with block tails of 0..100 bytes) was byte-identical to libzstd, so the UB has no observed effect on output in this build.
 
-### R1-15: [libzstd] On 32-bit, ldmHashLog 29/30 wraps the LDM hash-table size to 0 bytes, so libzstd writes out of bounds and segfaults (port did not copy the bug; it panics)
+### R1-15: [libzstd] On 32-bit, ldmHashLog 29/30 wraps the LDM hash-table size to 0 bytes, so libzstd writes out of bounds and segfaults (port did not copy the bug)
 
 Severity: High
 
@@ -155,9 +155,7 @@ Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
 
 The port panics in the three explicit cases; in the rate case it derives hash log 6 (see Accepted divergences). At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
 
-Decided 2026-10-01: the port fixes its panic. An LDM hash log whose table cannot be allocated on the target is refused in `frame_params` before any output.
-
-### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state (port copied the bug)
+### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state
 
 Severity: Low
 
@@ -170,8 +168,6 @@ C reference: `lib/compress/zstd_ldm.c:60-85` — the contract says it "feeds [da
 Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chunk start and each skip, the stopMask bits depend on `~0` or on pre-skip bytes rather than on the preceding minMatch bytes. Split points, and so inserted entries and found LDM matches, differ from the documented design. Frames stay valid; only ratio is affected.
 
 The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
-
-Decided 2026-10-01 (revised): the port fixes it. The reset feeds the first minMatch bytes into the rolling state, and so does the skip.
 
 ### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again (port copied the bug)
 
