@@ -353,6 +353,60 @@ fn modes_bytes(f: &[u8]) -> Vec<(usize, usize)> {
     modes
 }
 
+/// libzstd's frame of `content` at `level`, streamed with a flush (a block
+/// end) after each of `chunks` bytes.
+fn flushed_frame(content: &[u8], chunks: &[usize], level: i32) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), level).unwrap();
+    let mut at = 0;
+    for &n in chunks {
+        enc.write_all(&content[at..at + n]).unwrap();
+        enc.flush().unwrap();
+        at += n;
+    }
+    enc.write_all(&content[at..]).unwrap();
+    enc.finish().unwrap()
+}
+
+/// Repeat_Mode reuses the table the previous block's sequences decoded
+/// with, the predefined one included (ZSTD_buildSeqTable's set_repeat keeps
+/// LLTptr, which set_basic points at LL_defaultDTable): libzstd frames
+/// decode to the same content with each Predefined_Mode that follows one of
+/// the same table switched to Repeat_Mode, after a block with no tables or
+/// its own ones.
+#[test]
+fn repeat_mode_after_predefined_mode() {
+    let content = text(60_000);
+    let frames: [(i32, &[usize]); 4] = [
+        (1, &[100, 100, 100]),
+        (1, &[30_000, 20, 20, 20]),
+        (1, &[500, 500, 500, 500]),
+        (19, &[100, 100, 100]),
+    ];
+    for (level, chunks) in frames {
+        let f = flushed_frame(&content, chunks, level);
+        let mut g = f.clone();
+        let mut switched = 0;
+        for w in modes_bytes(&f).windows(2) {
+            let (prev, at) = (f[w[0].0], w[1].0);
+            // LL, OF, ML modes: bits 7-6, 5-4, 3-2.
+            for shift in [6, 4, 2] {
+                if prev >> shift & 3 == 0 && f[at] >> shift & 3 == 0 {
+                    g[at] |= 3 << shift;
+                    switched += 1;
+                }
+            }
+        }
+        let name = format!("L{level} flushed after {chunks:?}, {switched} modes switched");
+        assert!(switched >= 2, "{name}");
+        check(&name, &g, true);
+        assert!(
+            zstd::bulk::decompress(&g, CAPACITY).unwrap() == content,
+            "{name}"
+        );
+    }
+}
+
 /// Copies of 4 bytes from alternately 24 and 40 bytes back: each is one
 /// sequence without literals at levels 4 and up, over 0x7F00 in a block.
 fn alternating_copies(len: usize) -> Vec<u8> {

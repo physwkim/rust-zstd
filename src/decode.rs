@@ -47,6 +47,7 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+use std::sync::LazyLock;
 
 mod stream;
 pub use stream::{DecompressReader, Decompressor};
@@ -340,9 +341,6 @@ struct FSETable {
     /// Symbols laid out in order before spreading, with room for the last
     /// 8-byte write (libzstd spread), sized like `symbol_next`.
     spread: Vec<u8>,
-    /// True while the table holds a predefined sequence distribution, so the
-    /// next block in Predefined mode can reuse it without rebuilding.
-    predefined: bool,
 }
 
 impl FSETable {
@@ -355,7 +353,6 @@ impl FSETable {
             symbol_probabilities: Vec::with_capacity(256),
             symbol_next: Vec::new(),
             spread: Vec::new(),
-            predefined: false,
         }
     }
 
@@ -368,7 +365,6 @@ impl FSETable {
         self.symbol_probabilities.clear();
         self.size = 0;
         self.accuracy_log = 0;
-        self.predefined = false;
     }
 
     /// One-cell table for an RLE-coded sequence section
@@ -2356,7 +2352,38 @@ struct FSEScratch {
     offsets: FSETable,
     literal_lengths: FSETable,
     match_lengths: FSETable,
+    /// Where the table blocks decode each code with is, in `SEQ_TABLES`
+    /// order (libzstd's LLTptr, OFTptr, MLTptr).
+    source: [SeqTableSource; 3],
 }
+
+/// Where the table blocks decode a sequence code with is.
+#[derive(Clone, Copy)]
+enum SeqTableSource {
+    /// The scratch's own table: the last FSE_Compressed or RLE
+    /// description's, or none.
+    Own,
+    /// `PREDEFINED_TABLES`: the last description was Predefined_Mode.
+    Predefined,
+}
+
+/// The LL, OF and ML tables of the predefined distributions, in
+/// `SEQ_TABLES` order, built on first use and shared by every decoder, as
+/// libzstd's static LL_defaultDTable, OF_defaultDTable and ML_defaultDTable.
+static PREDEFINED_TABLES: LazyLock<[FSETable; 3]> = LazyLock::new(|| {
+    std::array::from_fn(|t| {
+        let kind = &SEQ_TABLES[t];
+        let mut table = FSETable::new(kind.max_code);
+        table
+            .build_from_probabilities(
+                kind.default_log,
+                kind.default_distribution,
+                Some((kind.base, kind.bits)),
+            )
+            .expect("predefined distributions tile their tables");
+        table
+    })
+});
 
 struct DecoderScratch {
     huf: HuffmanScratch,
@@ -2372,11 +2399,7 @@ impl DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
             },
-            fse: FSEScratch {
-                offsets: FSETable::new(MAX_OFFSET_CODE),
-                literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
-                match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-            },
+            fse: FSEScratch::new(),
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
         }
@@ -2385,9 +2408,7 @@ impl DecoderScratch {
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.fse.literal_lengths.reset();
-        self.fse.match_lengths.reset();
-        self.fse.offsets.reset();
+        self.fse.reset();
         self.huf.table.reset();
     }
 }
@@ -2862,8 +2883,44 @@ impl CompressionModes {
 }
 
 impl FSEScratch {
-    /// The table for `SEQ_TABLES[t]`.
-    fn table_mut(&mut self, t: usize) -> &mut FSETable {
+    fn new() -> FSEScratch {
+        FSEScratch {
+            offsets: FSETable::new(MAX_OFFSET_CODE),
+            literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
+            match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
+            source: [SeqTableSource::Own; 3],
+        }
+    }
+
+    /// No tables, for a new frame.
+    fn reset(&mut self) {
+        self.literal_lengths.reset();
+        self.match_lengths.reset();
+        self.offsets.reset();
+        self.source = [SeqTableSource::Own; 3];
+    }
+
+    /// The table blocks decode `SEQ_TABLES[t]` codes with; none yet while
+    /// its `decode()` is empty.
+    fn table(&self, t: usize) -> &FSETable {
+        match self.source[t] {
+            SeqTableSource::Predefined => &PREDEFINED_TABLES[t],
+            SeqTableSource::Own => match t {
+                0 => &self.literal_lengths,
+                1 => &self.offsets,
+                _ => &self.match_lengths,
+            },
+        }
+    }
+
+    /// The LL, OF, ML tables (`SEQ_TABLES` order) blocks decode with.
+    fn tables(&self) -> [&FSETable; 3] {
+        std::array::from_fn(|t| self.table(t))
+    }
+
+    /// The scratch's own table for `SEQ_TABLES[t]`, which descriptions
+    /// build.
+    fn own_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
             0 => &mut self.literal_lengths,
             1 => &mut self.offsets,
@@ -2885,12 +2942,7 @@ fn build_sequence_tables(
 
     let mut bytes_read = 0;
     for (t, mode) in modes.all().into_iter().enumerate() {
-        bytes_read += build_sequence_table(
-            mode,
-            &source[bytes_read..],
-            scratch.table_mut(t),
-            &SEQ_TABLES[t],
-        )?;
+        bytes_read += build_sequence_table(mode, &source[bytes_read..], scratch, t)?;
     }
     Ok(bytes_read)
 }
@@ -2926,15 +2978,25 @@ fn short_offset_share(table: &FSETable) -> usize {
     short << (usize::from(OF_MAX_LOG) - usize::from(table.accuracy_log))
 }
 
+/// Make the table `mode` gives the one `scratch` decodes `SEQ_TABLES[t]`
+/// codes with, and return the length of its description in `source`
+/// (ZSTD_buildSeqTable). Predefined_Mode builds nothing: it selects
+/// `PREDEFINED_TABLES`.
 fn build_sequence_table(
     mode: ModeType,
     source: &[u8],
-    table: &mut FSETable,
-    kind: &SeqTableKind,
+    scratch: &mut FSEScratch,
+    t: usize,
 ) -> Result<usize, String> {
+    let kind = &SEQ_TABLES[t];
     let codes = Some((kind.base, kind.bits));
     match mode {
-        ModeType::FSECompressed => table.build_decoder(source, kind.max_log, codes),
+        ModeType::FSECompressed => {
+            scratch.source[t] = SeqTableSource::Own;
+            scratch
+                .own_mut(t)
+                .build_decoder(source, kind.max_log, codes)
+        }
         ModeType::RLE => {
             let Some(&code) = source.first() else {
                 return Err(format!("Missing byte for RLE {} table", kind.name));
@@ -2942,22 +3004,16 @@ fn build_sequence_table(
             if code > kind.max_code {
                 return Err(format!("RLE {} code {} exceeds max", kind.name, code));
             }
-            table.build_rle(code, kind.base, kind.bits);
+            scratch.source[t] = SeqTableSource::Own;
+            scratch.own_mut(t).build_rle(code, kind.base, kind.bits);
             Ok(1)
         }
         ModeType::Predefined => {
-            if !table.predefined {
-                table.build_from_probabilities(
-                    kind.default_log,
-                    kind.default_distribution,
-                    codes,
-                )?;
-                table.predefined = true;
-            }
+            scratch.source[t] = SeqTableSource::Predefined;
             Ok(0)
         }
         ModeType::Repeat => {
-            if table.decode().is_empty() {
+            if scratch.table(t).decode().is_empty() {
                 return Err(format!(
                     "Repeat mode without a previous {} table",
                     kind.name
@@ -3162,7 +3218,8 @@ unsafe fn execute_avx2<W: WildCopy, S: BlockSequences>(
 struct SeqInput<'a> {
     num_sequences: u32,
     bit_stream: &'a [u8],
-    fse: &'a FSEScratch,
+    /// LL, OF, ML tables (`SEQ_TABLES` order).
+    fse: [&'a FSETable; 3],
     literals: &'a [u8],
 }
 
@@ -3232,12 +3289,13 @@ unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
         fse,
         literals,
     } = seqs;
-    let ll_dt = fse.literal_lengths.decode();
-    let of_dt = fse.offsets.decode();
-    let ml_dt = fse.match_lengths.decode();
-    let ll_log = u32::from(fse.literal_lengths.accuracy_log);
-    let of_log = u32::from(fse.offsets.accuracy_log);
-    let ml_log = u32::from(fse.match_lengths.accuracy_log);
+    let [ll_t, of_t, ml_t] = fse;
+    let ll_dt = ll_t.decode();
+    let of_dt = of_t.decode();
+    let ml_dt = ml_t.decode();
+    let ll_log = u32::from(ll_t.accuracy_log);
+    let of_log = u32::from(of_t.accuracy_log);
+    let ml_log = u32::from(ml_t.accuracy_log);
     // The state lookups below are unchecked: an initial state is
     // `accuracy_log` bits, and every cell of a table built by
     // `build_decoding_table` or `build_rle` satisfies
@@ -4474,18 +4532,19 @@ unsafe fn decompress_block(
 
     if seq_section.num_sequences != 0 {
         let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        let fse = workspace.fse.tables();
         let seqs = SeqInput {
             num_sequences: seq_section.num_sequences,
             bit_stream: &raw[table_bytes..],
-            fse: &workspace.fse,
+            fse,
             literals: &workspace.literals_buffer,
         };
-        let (offsets, hist) = (&workspace.fse.offsets, &mut workspace.offset_hist);
+        let hist = &mut workspace.offset_hist;
         if ext.len == 0 {
-            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+            execute_with_copies(simd, fse[1], seqs, hist, block_size_max, dst)
         } else {
             let seqs = ExtSeqInput { seqs, ext };
-            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+            execute_with_copies(simd, fse[1], seqs, hist, block_size_max, dst)
         }
     } else {
         if !raw.is_empty() {
@@ -4725,16 +4784,11 @@ mod parallel {
             let d = plan.fse_def[t];
             if d == i {
                 slot.fse_from[t] = None;
-                used += build_sequence_table(
-                    mode,
-                    &src[used..],
-                    slot.fse.table_mut(t),
-                    &SEQ_TABLES[t],
-                )?;
+                used += build_sequence_table(mode, &src[used..], &mut slot.fse, t)?;
                 slot.fse_from[t] = Some(i);
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                build_table_from(compressed(&plans[d]), t, &mut slot.fse)?;
                 slot.fse_from[t] = Some(d);
             }
         }
@@ -4746,7 +4800,7 @@ mod parallel {
     fn build_table_from(
         def: &CompressedPlan<'_>,
         t: usize,
-        table: &mut FSETable,
+        fse: &mut FSEScratch,
     ) -> Result<(), String> {
         let modes = def
             .parts
@@ -4766,7 +4820,7 @@ mod parallel {
                 ModeType::Predefined | ModeType::Repeat => 0,
             };
         }
-        build_sequence_table(modes[t], &src[used..], table, &SEQ_TABLES[t]).map(|_| ())
+        build_sequence_table(modes[t], &src[used..], fse, t).map(|_| ())
     }
 
     /// The block's three sequence tables, checked for the unchecked state
@@ -4777,7 +4831,7 @@ mod parallel {
         bit_stream: &'a [u8],
         fse: &'a FSEScratch,
     ) -> Result<SeqStream<'a>, String> {
-        let tables = [&fse.literal_lengths, &fse.offsets, &fse.match_lengths];
+        let tables = fse.tables();
         let logs = tables.map(|t| u32::from(t.accuracy_log));
         // Every state is `accuracy_log` bits or `next_state + bits` of a
         // cell, which `build_decoding_table` / `build_rle` keep below
@@ -4964,7 +5018,7 @@ mod parallel {
                 unsafe {
                     let end = execute_with_copies(
                         simd,
-                        &slot.fse.offsets,
+                        slot.fse.table(1),
                         seqs,
                         hist,
                         block_size_max,
@@ -5688,6 +5742,32 @@ mod tests {
         }
     }
 
+    /// Predefined_Mode selects the shared `PREDEFINED_TABLES` and builds
+    /// nothing; Repeat_Mode keeps the table selected, predefined or own,
+    /// and fails while there is none, as in a new frame.
+    #[test]
+    fn predefined_mode_selects_shared_tables() {
+        let mut fse = FSEScratch::new();
+        for t in 0..3 {
+            let predefined: *const FSETable = &PREDEFINED_TABLES[t];
+            let own: *const FSETable = fse.own_mut(t);
+            build_sequence_table(ModeType::Predefined, &[], &mut fse, t).unwrap();
+            assert!(fse.own_mut(t).decode().is_empty(), "built nothing");
+            // Description length and the table selected after a block.
+            let mut block = |mode, src: &[u8]| {
+                let len = build_sequence_table(mode, src, &mut fse, t)?;
+                Ok::<_, String>((len, fse.table(t) as *const FSETable))
+            };
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, predefined)));
+            assert_eq!(block(ModeType::RLE, &[1]), Ok((1, own)));
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, own)));
+            assert_eq!(block(ModeType::Predefined, &[]), Ok((0, predefined)));
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, predefined)));
+            fse.reset();
+            assert!(build_sequence_table(ModeType::Repeat, &[], &mut fse, t).is_err());
+        }
+    }
+
     /// `build_from_probabilities` refuses what `read_ncount_body` refuses
     /// in a table description: counts that do not tile the table, counts
     /// below -1, too many symbols and accuracy logs out of range.
@@ -5732,9 +5812,12 @@ mod tests {
             t.build_rle(code, of.base, of.bits);
             assert_eq!(short_offset_share(&t), scan(&t), "RLE {code}");
         }
-        t.build_from_probabilities(of.default_log, of.default_distribution, codes)
-            .unwrap();
-        assert_eq!(short_offset_share(&t), scan(&t), "predefined");
+        let predefined = &PREDEFINED_TABLES[1];
+        assert_eq!(
+            short_offset_share(predefined),
+            scan(predefined),
+            "predefined"
+        );
         let mut probs = vec![-1i32; 32];
         probs[2] = 100;
         probs[3] = 60;
