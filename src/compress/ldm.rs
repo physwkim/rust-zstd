@@ -378,6 +378,11 @@ impl LdmState {
         &self.window
     }
 
+    /// [`Window::rebase`]: the input moved `shift` bytes down.
+    pub fn rebase(&mut self, shift: usize) {
+        self.window.rebase(shift);
+    }
+
     pub fn params(&self) -> &LdmParams {
         &self.params
     }

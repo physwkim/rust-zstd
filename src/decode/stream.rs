@@ -65,7 +65,7 @@ impl Decompressor {
     /// call starts on a new frame.
     pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, String> {
         self.reset();
-        let content = decompress_frames(&mut self.dec, src);
+        let content = decompress_frames(&mut self.dec, src, None);
         // An error leaves the frame decoder inside a frame.
         self.reset();
         content
@@ -179,7 +179,7 @@ impl Decompressor {
                 }
                 &self.unit[..]
             };
-            let event = self.dec.process(unit, &mut self.ring)?;
+            let event = self.dec.process(unit, &mut self.ring, None)?;
             self.unit.clear();
             self.frame_ended = event == Event::FrameEnded;
         }
