@@ -138,21 +138,17 @@ Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chu
 
 The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
 
-### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again (port copied the bug)
+### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again
 
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/compress/opt.rs:1047-1057` — the `if last_stretch.litlen > 0 { … opt[store_end - 1] = last_stretch; }` block is followed unconditionally by `opt[store_end] = last_stretch; let mut store_start = store_end;`, with a comment saying libzstd 1.5.7 does the same. The `mlen == 0` branch at `opt.rs:1079-1085` (`ip = anchor + llen`) is unreachable.
 
 C reference: `lib/compress/zstd_opt.c:1385-1394` — `if (lastStretch.litlen > 0) { …storeStart = storeEnd-1; opt[storeStart] = lastStretch; } { opt[storeEnd] = lastStretch; storeStart = storeEnd; }`. This is a bare block where `else` was meant. It overwrites the literals-only entry, and the `mlen==0` store branch at `:1420-1424` becomes dead.
 
 Impact: when a series ends with trailing literals (`lastStretch.litlen > 0`), `ip` restarts at the end of the last match instead of after the literals. The next series re-runs match finding and pricing over those positions. The effect is CPU cost and a different parse at levels 16-22 (btopt/btultra/btultra2); frames stay valid.
 
 The bug was found by reading. That the port copied it is supported by the L19 byte-identical probe in R1-17.
-
-Decided 2026-10-01 (revised): the port fixes it with the `else`.
 
 ### R1-19: [libzstd] `iend - 8` / `iend - HASH_READ_SIZE` form a pointer before `istart` for inputs under 8 bytes (undefined behaviour); port did not copy it
 
@@ -296,17 +292,11 @@ C reference: `$Z/compress/zstdmt_compress.c:1326` — `sectionsSize = mtctx->tar
 
 Impact: the frame is unchanged; ZSTDMT has fewer jobs in flight than requested (a smaller buffer means it waits for earlier jobs to finish), so throughput drops. Unsigned wraparound is defined behavior, so this is wrong sizing, not UB. Found by reading; not probed on a 32-bit target.
 
-### R2-12: [libzstd+port] lazy/row/opt match finders emit offset == Window_Size, which RFC 8878 §3.1.1.4 forbids
+### R2-12: [libzstd] lazy/row/opt match finders emit offset == Window_Size, which RFC 8878 §3.1.1.4 forbids
 
 Severity: Low
 
 Class: libzstd bug
-
-Rust: `src/compress/matchstate.rs:894` — `lowest_prefix_index` returns `cur - max_distance`, so a candidate exactly `1 << window_log` back still counts as valid. These callers accept it:
-- HC: `src/compress/lazy.rs:225`/`:239` (`candidate_valid(match_index, low_limit, curr)`, i.e. `>=`).
-- Row: `src/compress/lazy.rs:1095`/`:1151`.
-- Lazy rep limit: `src/compress/lazy.rs:1235-1236` (`max_rep = curr - window_low`, which can equal the window size).
-- Opt: `src/compress/bt.rs:279-281`, `:313` and `:379` (`match_low`, `rep_index >= window_low`).
 
 Two finders exclude it: btlazy2/DUBT (`lazy.rs:381`, `window_low + 1`) and fast/dfast, whose low bound is taken at the block end. The port copied this behaviour: frames are byte-identical to libzstd.
 
@@ -326,8 +316,6 @@ Impact: Probe-proven (`scratchpad/probe/src/bin/winedge2.rs`). Input: W random b
 - L1, L3 and L4 (fast/dfast) do not match even at W−1.
 
 Both decoders accept these frames (our round trip passed). A decoder that enforces §3.1.1.4 literally would reject frames from levels 5–12 and 16–22 whenever data repeats exactly one window back. No such decoder exists locally (ruzstd keeps more than W bytes and accepts them).
-
-Port: copies libzstd. To be fixed: the encoder never emits offset == Window_Size, the RFC's stricter reading.
 
 ### R2-14: [libzstd] Finders form pointers outside the input buffer (C11 6.5.6p8 undefined behaviour); the port does not copy it
 

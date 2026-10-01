@@ -24,9 +24,12 @@ const DICT_MAGIC: u32 = 0xEC30_A437;
 /// dictionary may have Dictionary_ID 0 against lines 1812-1813 (0 only
 /// means "no dictionary" in a frame header). These resolve which history
 /// and tables a frame gets, not whether a frame is well-formed.
+///
+/// Clones share the parsed dictionary.
+#[derive(Clone)]
 pub struct DecodeDict {
     id: u32,
-    content: Vec<u8>,
+    content: Arc<[u8]>,
     entropy: Option<Arc<DictEntropy>>,
 }
 
@@ -52,7 +55,7 @@ impl DecodeDict {
         if dict.len() < 8 || magic != Some(DICT_MAGIC) {
             return Ok(DecodeDict {
                 id: 0,
-                content: dict.to_vec(),
+                content: dict.into(),
                 entropy: None,
             });
         }
@@ -61,7 +64,7 @@ impl DecodeDict {
             load_entropy(dict).map_err(|e| format!("Dictionary corrupted: {e}"))?;
         Ok(DecodeDict {
             id,
-            content: dict[used..].to_vec(),
+            content: dict[used..].into(),
             entropy: Some(Arc::new(entropy)),
         })
     }
