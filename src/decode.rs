@@ -48,7 +48,7 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 mod dict;
 pub use dict::DecodeDict;
@@ -214,9 +214,20 @@ pub fn decompress_with_dict_options(
     dict: Option<&DecodeDict>,
     opts: &DecodeOptions,
 ) -> Result<Vec<u8>, String> {
-    let simd = opts.simd_level();
-    let mut dec = FrameDecoder::new(simd);
-    dec.dict = dict.cloned();
+    decompress_frames(&mut FrameDecoder::new(opts), data, dict)
+}
+
+/// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
+/// `data`, whole, each from `dict` if given, with `dec`, which stands
+/// between frames: a fresh one for `decompress`, a `Decompressor`'s own for
+/// its `decompress`.
+fn decompress_frames(
+    dec: &mut FrameDecoder,
+    data: &[u8],
+    dict: Option<&DecodeDict>,
+) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "parallel")]
+    let (min_parallel_blocks, simd) = (dec.min_parallel_blocks, dec.simd);
     let mut out = VecOut {
         output: Vec::new(),
         prefix: Prefix {
@@ -236,7 +247,7 @@ pub fn decompress_with_dict_options(
             dec.end_of_input(rest)?;
             return Ok(out.output);
         }
-        if dec.process(&rest[..len], &mut out)? != Event::FrameStarted {
+        if dec.process(&rest[..len], &mut out, dict)? != Event::FrameStarted {
             pos += len;
             continue;
         }
@@ -257,7 +268,7 @@ pub fn decompress_with_dict_options(
                 frame,
                 init,
                 &mut out,
-                opts.min_parallel_blocks,
+                min_parallel_blocks,
                 simd,
             )? {
                 dec.blocks_ended()?;
@@ -380,9 +391,6 @@ struct FSETable {
     /// Symbols laid out in order before spreading, with room for the last
     /// 8-byte write (libzstd spread), sized like `symbol_next`.
     spread: Vec<u8>,
-    /// True while the table holds a predefined sequence distribution, so the
-    /// next block in Predefined mode can reuse it without rebuilding.
-    predefined: bool,
 }
 
 impl FSETable {
@@ -392,22 +400,10 @@ impl FSETable {
             cells: Vec::new(),
             size: 0,
             accuracy_log: 0,
-            symbol_probabilities: Vec::with_capacity(256),
+            symbol_probabilities: Vec::new(),
             symbol_next: Vec::new(),
             spread: Vec::new(),
-            predefined: false,
         }
-    }
-
-    /// Make this table `src`, reusing this one's allocations.
-    fn copy_from(&mut self, src: &FSETable) {
-        debug_assert_eq!(self.max_symbol, src.max_symbol);
-        self.cells.clone_from(&src.cells);
-        self.size = src.size;
-        self.accuracy_log = src.accuracy_log;
-        self.symbol_probabilities
-            .clone_from(&src.symbol_probabilities);
-        self.predefined = src.predefined;
     }
 
     /// The decoding table: `1 << accuracy_log` cells once built, else none.
@@ -419,7 +415,6 @@ impl FSETable {
         self.symbol_probabilities.clear();
         self.size = 0;
         self.accuracy_log = 0;
-        self.predefined = false;
     }
 
     /// One-cell table for an RLE-coded sequence section
@@ -2415,7 +2410,41 @@ struct FSEScratch {
     offsets: FSETable,
     literal_lengths: FSETable,
     match_lengths: FSETable,
+    /// Where the table blocks decode each code with is, in `SEQ_TABLES`
+    /// order (libzstd's LLTptr, OFTptr, MLTptr).
+    source: [SeqTableSource; 3],
 }
+
+/// Where the table blocks decode a sequence code with is.
+#[derive(Clone, Copy)]
+enum SeqTableSource {
+    /// The scratch's own table: the last FSE_Compressed or RLE
+    /// description's, or none.
+    Own,
+    /// `PREDEFINED_TABLES`: the last description was Predefined_Mode.
+    Predefined,
+    /// The table of the dictionary the frame started from: no block of
+    /// the frame has described one yet (`DecoderScratch::load_dict`).
+    Dict,
+}
+
+/// The LL, OF and ML tables of the predefined distributions, in
+/// `SEQ_TABLES` order, built on first use and shared by every decoder, as
+/// libzstd's static LL_defaultDTable, OF_defaultDTable and ML_defaultDTable.
+static PREDEFINED_TABLES: LazyLock<[FSETable; 3]> = LazyLock::new(|| {
+    std::array::from_fn(|t| {
+        let kind = &SEQ_TABLES[t];
+        let mut table = FSETable::new(kind.max_code);
+        table
+            .build_from_probabilities(
+                kind.default_log,
+                kind.default_distribution,
+                Some((kind.base, kind.bits)),
+            )
+            .expect("predefined distributions tile their tables");
+        table
+    })
+});
 
 struct DecoderScratch {
     huf: HuffmanScratch,
@@ -2427,10 +2456,9 @@ struct DecoderScratch {
     /// rather than copied, as libzstd points its DCtx at the DDict's.
     dict: Option<Arc<DictEntropy>>,
     /// The Huffman table in use is `dict`'s, not `huf`'s: true from
-    /// `load_dict` until a block of the frame builds one.
+    /// `load_dict` until a block of the frame builds one. The sequence
+    /// tables' counterpart is `SeqTableSource::Dict`.
     huf_from_dict: bool,
-    /// The same for the LL, OF, ML tables (`SEQ_TABLES` order).
-    fse_from_dict: [bool; 3],
 }
 
 impl DecoderScratch {
@@ -2439,16 +2467,11 @@ impl DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
             },
-            fse: FSEScratch {
-                offsets: FSETable::new(MAX_OFFSET_CODE),
-                literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
-                match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-            },
+            fse: FSEScratch::new(),
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
             dict: None,
             huf_from_dict: false,
-            fse_from_dict: [false; 3],
         }
     }
 
@@ -2457,10 +2480,7 @@ impl DecoderScratch {
         self.literals_buffer.clear();
         self.dict = None;
         self.huf_from_dict = false;
-        self.fse_from_dict = [false; 3];
-        self.fse.literal_lengths.reset();
-        self.fse.match_lengths.reset();
-        self.fse.offsets.reset();
+        self.fse.reset();
         self.huf.table.reset();
     }
 }
@@ -2931,8 +2951,47 @@ impl CompressionModes {
 }
 
 impl FSEScratch {
-    /// The table for `SEQ_TABLES[t]`.
-    fn table(&self, t: usize) -> &FSETable {
+    fn new() -> FSEScratch {
+        FSEScratch {
+            offsets: FSETable::new(MAX_OFFSET_CODE),
+            literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
+            match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
+            source: [SeqTableSource::Own; 3],
+        }
+    }
+
+    /// No tables, for a new frame.
+    fn reset(&mut self) {
+        self.literal_lengths.reset();
+        self.match_lengths.reset();
+        self.offsets.reset();
+        self.source = [SeqTableSource::Own; 3];
+    }
+
+    /// The table blocks decode `SEQ_TABLES[t]` codes with, `dict` being
+    /// the tables of the dictionary the frame started from; none yet while
+    /// its `decode()` is empty.
+    #[inline]
+    fn table<'s>(&'s self, t: usize, dict: Option<&'s FSEScratch>) -> &'s FSETable {
+        match (self.source[t], dict) {
+            (SeqTableSource::Own, _) => self.own(t),
+            (SeqTableSource::Predefined, _) => &PREDEFINED_TABLES[t],
+            (SeqTableSource::Dict, Some(d)) => d.own(t),
+            (SeqTableSource::Dict, None) => {
+                unreachable!("only a frame started from a dictionary uses its tables")
+            }
+        }
+    }
+
+    /// The LL, OF, ML tables (`SEQ_TABLES` order) blocks decode with.
+    #[inline]
+    fn tables<'s>(&'s self, dict: Option<&'s FSEScratch>) -> [&'s FSETable; 3] {
+        std::array::from_fn(|t| self.table(t, dict))
+    }
+
+    /// The scratch's own table for `SEQ_TABLES[t]`, which descriptions
+    /// build.
+    fn own(&self, t: usize) -> &FSETable {
         match t {
             0 => &self.literal_lengths,
             1 => &self.offsets,
@@ -2940,8 +2999,8 @@ impl FSEScratch {
         }
     }
 
-    /// The table for `SEQ_TABLES[t]`.
-    fn table_mut(&mut self, t: usize) -> &mut FSETable {
+    /// `own`, mutable.
+    fn own_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
             0 => &mut self.literal_lengths,
             1 => &mut self.offsets,
@@ -2952,13 +3011,10 @@ impl FSEScratch {
 
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
-/// Repeat mode keeps a table `from_dict` names in use; any other mode
-/// builds `scratch`'s and clears `from_dict`.
 fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
-    from_dict: &mut [bool; 3],
 ) -> Result<usize, String> {
     let modes = section
         .modes
@@ -2966,16 +3022,7 @@ fn build_sequence_tables(
 
     let mut bytes_read = 0;
     for (t, mode) in modes.all().into_iter().enumerate() {
-        let repeat = matches!(mode, ModeType::Repeat);
-        if !(repeat && from_dict[t]) {
-            bytes_read += build_sequence_table(
-                mode,
-                &source[bytes_read..],
-                scratch.table_mut(t),
-                &SEQ_TABLES[t],
-            )?;
-        }
-        from_dict[t] &= repeat;
+        bytes_read += build_sequence_table(mode, &source[bytes_read..], scratch, t)?;
     }
     Ok(bytes_read)
 }
@@ -3011,15 +3058,25 @@ fn short_offset_share(table: &FSETable) -> usize {
     short << (usize::from(OF_MAX_LOG) - usize::from(table.accuracy_log))
 }
 
+/// Make the table `mode` gives the one `scratch` decodes `SEQ_TABLES[t]`
+/// codes with, and return the length of its description in `source`
+/// (ZSTD_buildSeqTable). Predefined_Mode builds nothing: it selects
+/// `PREDEFINED_TABLES`.
 fn build_sequence_table(
     mode: ModeType,
     source: &[u8],
-    table: &mut FSETable,
-    kind: &SeqTableKind,
+    scratch: &mut FSEScratch,
+    t: usize,
 ) -> Result<usize, String> {
+    let kind = &SEQ_TABLES[t];
     let codes = Some((kind.base, kind.bits));
     match mode {
-        ModeType::FSECompressed => table.build_decoder(source, kind.max_log, codes),
+        ModeType::FSECompressed => {
+            scratch.source[t] = SeqTableSource::Own;
+            scratch
+                .own_mut(t)
+                .build_decoder(source, kind.max_log, codes)
+        }
         ModeType::RLE => {
             let Some(&code) = source.first() else {
                 return Err(format!("Missing byte for RLE {} table", kind.name));
@@ -3027,22 +3084,18 @@ fn build_sequence_table(
             if code > kind.max_code {
                 return Err(format!("RLE {} code {} exceeds max", kind.name, code));
             }
-            table.build_rle(code, kind.base, kind.bits);
+            scratch.source[t] = SeqTableSource::Own;
+            scratch.own_mut(t).build_rle(code, kind.base, kind.bits);
             Ok(1)
         }
         ModeType::Predefined => {
-            if !table.predefined {
-                table.build_from_probabilities(
-                    kind.default_log,
-                    kind.default_distribution,
-                    codes,
-                )?;
-                table.predefined = true;
-            }
+            scratch.source[t] = SeqTableSource::Predefined;
             Ok(0)
         }
         ModeType::Repeat => {
-            if table.decode().is_empty() {
+            if matches!(scratch.source[t], SeqTableSource::Own)
+                && scratch.own(t).decode().is_empty()
+            {
                 return Err(format!(
                     "Repeat mode without a previous {} table",
                     kind.name
@@ -3060,6 +3113,7 @@ enum SeqError {
     NotEnoughLiterals,
     BlockTooLarge,
     OffsetTooFar,
+    OffsetBeforeDict,
     OffsetPastWindow,
 }
 
@@ -3070,6 +3124,7 @@ fn seq_error_message(e: SeqError) -> String {
         SeqError::NotEnoughLiterals => "Sequence needs more literals than the block has".into(),
         SeqError::BlockTooLarge => "Block content exceeds block size limit".into(),
         SeqError::OffsetTooFar => "Match offset reaches before the frame start".into(),
+        SeqError::OffsetBeforeDict => "Match offset reaches before the dictionary start".into(),
         SeqError::OffsetPastWindow => "Match offset exceeds Window_Size".into(),
     }
 }
@@ -3643,9 +3698,9 @@ unsafe fn copy_literals<W: WildCopy>(w: W, op: *mut u8, lit: *const u8, ll: usiz
 /// `exec_sequence` for the sequence `(ll, ml, offset)` at `op` whose match
 /// starts before the current segment, `avail` bytes of which precede the
 /// match's destination (ZSTD_execSequence's extDict branch): it starts in
-/// `ext`, or before it, which is `OffsetTooFar` (offset 0 included). A
-/// match that runs past the end of `ext` continues from the segment's
-/// first byte.
+/// `ext`, or before it, which is `OffsetBeforeDict` when `ext` is a
+/// dictionary and `OffsetTooFar` otherwise, as offset 0 is. A match that
+/// runs past the end of `ext` continues from the segment's first byte.
 ///
 /// # Safety
 /// `exec_sequence`'s checks before its segment-start check hold, and so
@@ -3662,8 +3717,15 @@ unsafe fn exec_sequence_ext<W: WildCopy>(
     ext: ExtHistory,
 ) -> Result<(), SeqError> {
     // `offset > avail` here unless it is 0.
-    if offset == 0 || offset - avail > ext.len {
+    if offset == 0 {
         return Err(SeqError::OffsetTooFar);
+    }
+    if offset - avail > ext.len {
+        return Err(if ext.dict {
+            SeqError::OffsetBeforeDict
+        } else {
+            SeqError::OffsetTooFar
+        });
     }
     copy_literals(w, op, lit, ll);
     let dst = op.add(ll);
@@ -4148,17 +4210,21 @@ struct FrameDecoder {
     stage: Stage,
     scratch: Option<DecoderScratch>,
     simd: Level,
-    /// The dictionary every frame starts from, if any.
-    dict: Option<DecodeDict>,
+    /// `DecodeOptions::min_parallel_blocks`, for `decompress_frames`: the
+    /// units `Decompressor::decompress_stream` hands it decode on the
+    /// current thread.
+    #[cfg(feature = "parallel")]
+    min_parallel_blocks: usize,
 }
 
 impl FrameDecoder {
-    fn new(simd: Level) -> FrameDecoder {
+    fn new(opts: &DecodeOptions) -> FrameDecoder {
         FrameDecoder {
             stage: Stage::FrameHeader,
             scratch: None,
-            simd,
-            dict: None,
+            simd: opts.simd_level(),
+            #[cfg(feature = "parallel")]
+            min_parallel_blocks: opts.min_parallel_blocks,
         }
     }
 
@@ -4210,10 +4276,16 @@ impl FrameDecoder {
     }
 
     /// Take the current unit, `unit_len(unit)` bytes, and decode it into
-    /// `out`. Not for `Stage::Skip`.
-    fn process(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+    /// `out`, a frame header starting the frame from `dict` if given. Not
+    /// for `Stage::Skip`.
+    fn process(
+        &mut self,
+        unit: &[u8],
+        out: &mut impl FrameOut,
+        dict: Option<&DecodeDict>,
+    ) -> Result<Event, String> {
         match &mut self.stage {
-            Stage::FrameHeader => self.frame_header(unit, out),
+            Stage::FrameHeader => self.frame_header(unit, out, dict),
             Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
             Stage::Block(frame) => {
                 let (block, content) = locate_block(unit, frame.block_size_max)?;
@@ -4238,7 +4310,12 @@ impl FrameDecoder {
         }
     }
 
-    fn frame_header(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+    fn frame_header(
+        &mut self,
+        unit: &[u8],
+        out: &mut impl FrameOut,
+        dict: Option<&DecodeDict>,
+    ) -> Result<Event, String> {
         let header = match parse_frame_header(unit) {
             Ok((header, _)) => header,
             Err(e) => match e.skip_frame_size() {
@@ -4253,7 +4330,7 @@ impl FrameDecoder {
         };
         let frame = Frame::new(&header)?;
         // ZSTD_decodeFrameHeader's dictionary_wrong check.
-        match (header.dict_id, &self.dict) {
+        match (header.dict_id, dict) {
             (0, _) => {}
             (id, Some(d)) if id == d.id() => {}
             (id, Some(d)) => {
@@ -4266,7 +4343,7 @@ impl FrameDecoder {
         }
         let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
-        if let Some(e) = self.dict.as_ref().and_then(DecodeDict::entropy) {
+        if let Some(e) = dict.and_then(DecodeDict::entropy) {
             scratch.load_dict(e);
         }
         out.start(frame.window, frame.content_size);
@@ -4555,8 +4632,9 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
 }
 
 /// Decode the block's literals into `target` (cleared first) and append
-/// `WILDCOPY_OVERLENGTH` bytes of slack. Treeless literals use `repeat`
-/// when given, else `huf`'s table.
+/// `WILDCOPY_OVERLENGTH` bytes of slack, in one allocation when `target`
+/// has to grow (`split_block` bounded the literals' size). Treeless
+/// literals use `repeat` when given, else `huf`'s table.
 fn decode_block_literals(
     parts: &BlockParts<'_>,
     huf: &mut HuffmanScratch,
@@ -4564,6 +4642,7 @@ fn decode_block_literals(
     target: &mut Vec<u8>,
 ) -> Result<(), String> {
     target.clear();
+    target.reserve(parts.literals.regenerated_size as usize + WILDCOPY_OVERLENGTH);
     let used = decode_literals(&parts.literals, huf, repeat, parts.literals_src, target)?;
     assert!(
         parts.literals.regenerated_size == target.len() as u32,
@@ -4606,24 +4685,20 @@ unsafe fn decompress_block(
     let raw = parts.sequences_src;
 
     if seq_section.num_sequences != 0 {
-        let from_dict = &mut workspace.fse_from_dict;
-        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse, from_dict)?;
-        let fse: [&FSETable; 3] = std::array::from_fn(|t| match dict {
-            Some(d) if from_dict[t] => d.fse.table(t),
-            _ => workspace.fse.table(t),
-        });
+        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        let fse = workspace.fse.tables(dict.map(|d| &d.fse));
         let seqs = SeqInput {
             num_sequences: seq_section.num_sequences,
             bit_stream: &raw[table_bytes..],
             fse,
             literals: &workspace.literals_buffer,
         };
-        let (offsets, hist) = (fse[1], &mut workspace.offset_hist);
+        let hist = &mut workspace.offset_hist;
         if ext.len == 0 {
-            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+            execute_with_copies(simd, fse[1], seqs, hist, block_size_max, dst)
         } else {
             let seqs = ExtSeqInput { seqs, ext };
-            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+            execute_with_copies(simd, fse[1], seqs, hist, block_size_max, dst)
         }
     } else {
         if !raw.is_empty() {
@@ -4704,8 +4779,9 @@ mod parallel {
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
         let mut huf_def = (init.huf_table().max_num_bits != 0).then_some(START);
-        let mut fse_def: [Option<usize>; 3] =
-            std::array::from_fn(|t| (!init.fse_table(t).decode().is_empty()).then_some(START));
+        let mut fse_def: [Option<usize>; 3] = std::array::from_fn(|t| {
+            matches!(init.fse.source[t], SeqTableSource::Dict).then_some(START)
+        });
         loop {
             let (block, content) = locate_block(&data[*pos..], block_size_max)?;
             *pos += BLOCK_HEADER_LEN + content.len();
@@ -4878,24 +4954,21 @@ mod parallel {
             let d = plan.fse_def[t];
             if d == i {
                 slot.fse_from[t] = None;
-                used += build_sequence_table(
-                    mode,
-                    &src[used..],
-                    slot.fse.table_mut(t),
-                    &SEQ_TABLES[t],
-                )?;
+                used += build_sequence_table(mode, &src[used..], &mut slot.fse, t)?;
                 slot.fse_from[t] = Some(i);
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
                 if d == START {
-                    slot.fse.table_mut(t).copy_from(init.fse_table(t));
+                    // The dictionary's table, as `load_dict` selects it.
+                    slot.fse.source[t] = SeqTableSource::Dict;
                 } else {
-                    build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                    build_table_from(compressed(&plans[d]), t, &mut slot.fse)?;
                 }
                 slot.fse_from[t] = Some(d);
             }
         }
-        decode_sequences(seq.num_sequences, &src[used..], &slot.fse, &mut slot.seqs)
+        let tables = slot.fse.tables(init.dict.as_deref().map(|d| &d.fse));
+        decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
     }
 
     /// Build table `t` from its description in the earlier block `def`,
@@ -4903,7 +4976,7 @@ mod parallel {
     fn build_table_from(
         def: &CompressedPlan<'_>,
         t: usize,
-        table: &mut FSETable,
+        fse: &mut FSEScratch,
     ) -> Result<(), String> {
         let modes = def
             .parts
@@ -4923,7 +4996,7 @@ mod parallel {
                 ModeType::Predefined | ModeType::Repeat => 0,
             };
         }
-        build_sequence_table(modes[t], &src[used..], table, &SEQ_TABLES[t]).map(|_| ())
+        build_sequence_table(modes[t], &src[used..], fse, t).map(|_| ())
     }
 
     /// The block's three sequence tables, checked for the unchecked state
@@ -4932,9 +5005,8 @@ mod parallel {
     /// start of `run_sequences`.
     fn seq_stream_begin<'a>(
         bit_stream: &'a [u8],
-        fse: &'a FSEScratch,
+        tables: [&'a FSETable; 3],
     ) -> Result<SeqStream<'a>, String> {
-        let tables = [&fse.literal_lengths, &fse.offsets, &fse.match_lengths];
         let logs = tables.map(|t| u32::from(t.accuracy_log));
         // Every state is `accuracy_log` bits or `next_state + bits` of a
         // cell, which `build_decoding_table` / `build_rle` keep below
@@ -4963,10 +5035,10 @@ mod parallel {
     fn decode_sequences(
         num_sequences: u32,
         bit_stream: &[u8],
-        fse: &FSEScratch,
+        tables: [&FSETable; 3],
         seqs: &mut Vec<RawSeq>,
     ) -> Result<(), String> {
-        let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, fse)?;
+        let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, tables)?;
         let mut st = [ll, ml, of];
         // Zero-fill first: when the executing thread last read these lines
         // from another CCD, the fill's bulk stores take ownership of them
@@ -5095,6 +5167,7 @@ mod parallel {
     fn execute_block(
         plan: &Plan<'_>,
         slot: &mut Slot,
+        dict: Option<&FSEScratch>,
         hist: &mut [u32; 3],
         block_size_max: usize,
         out: &mut VecOut<'_>,
@@ -5116,7 +5189,7 @@ mod parallel {
                     literals: &slot.literals,
                 };
                 let (dst, ext) = out.block_dst()?;
-                let offsets = &slot.fse.offsets;
+                let offsets = slot.fse.table(1, dict);
                 // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
                 // contracts, and on success the block's bytes up to `end`
                 // are written.
@@ -5221,7 +5294,9 @@ mod parallel {
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool, starting from the tables and repeat offsets in
     /// `init` (a dictionary's, or none). Returns `Ok(false)` without
-    /// consuming input when the frame has fewer than `min_blocks` blocks.
+    /// consuming input when the block headers do not show `min_blocks`
+    /// blocks: the frame has fewer, or a header before them fails, which
+    /// the serial decoder then reports.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
@@ -5235,11 +5310,17 @@ mod parallel {
             return Ok(false);
         }
         let block_size_max = frame.block_size_max;
+        let mut rest = &data[*pos..];
+        for _ in 1..min_blocks {
+            match locate_block(rest, block_size_max) {
+                Ok((block, content)) if !block.last_block => {
+                    rest = &rest[BLOCK_HEADER_LEN + content.len()..];
+                }
+                _ => return Ok(false),
+            }
+        }
         let mut end = *pos;
         let plans = plan_frame(data, &mut end, block_size_max, init)?;
-        if plans.len() < min_blocks {
-            return Ok(false);
-        }
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -5257,6 +5338,7 @@ mod parallel {
             .collect();
         let ring = &ring[..];
         let mut hist = init.offset_hist;
+        let dict = init.dict.as_deref().map(|d| &d.fse);
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -5309,7 +5391,7 @@ mod parallel {
                     _ => cell.slot.lock().unwrap(),
                 };
                 let start = out.output.len();
-                execute_block(plan, &mut slot, &mut hist, block_size_max, out, simd)?;
+                execute_block(plan, &mut slot, dict, &mut hist, block_size_max, out, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
                 frame.block_decoded(&out.output[start..])?;
@@ -5871,6 +5953,45 @@ mod tests {
         }
     }
 
+    /// Predefined_Mode selects the shared `PREDEFINED_TABLES` and builds
+    /// nothing; Repeat_Mode keeps the table selected, the dictionary's,
+    /// predefined or own, and fails while there is none, as in a new frame
+    /// without a dictionary.
+    #[test]
+    fn predefined_mode_selects_shared_tables() {
+        let mut fse = FSEScratch::new();
+        let mut dict = FSEScratch::new();
+        for t in 0..3 {
+            build_sequence_table(ModeType::RLE, &[0], &mut dict, t).unwrap();
+            let predefined: *const FSETable = &PREDEFINED_TABLES[t];
+            let own: *const FSETable = fse.own(t);
+            // As `DecoderScratch::load_dict` starts a frame.
+            fse.source[t] = SeqTableSource::Dict;
+            assert_eq!(
+                build_sequence_table(ModeType::Repeat, &[], &mut fse, t),
+                Ok(0)
+            );
+            assert!(
+                ptr::eq(fse.table(t, Some(&dict)), dict.own(t)),
+                "dictionary's"
+            );
+            build_sequence_table(ModeType::Predefined, &[], &mut fse, t).unwrap();
+            assert!(fse.own(t).decode().is_empty(), "built nothing");
+            // Description length and the table selected after a block.
+            let mut block = |mode, src: &[u8]| {
+                let len = build_sequence_table(mode, src, &mut fse, t)?;
+                Ok::<_, String>((len, fse.table(t, Some(&dict)) as *const FSETable))
+            };
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, predefined)));
+            assert_eq!(block(ModeType::RLE, &[1]), Ok((1, own)));
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, own)));
+            assert_eq!(block(ModeType::Predefined, &[]), Ok((0, predefined)));
+            assert_eq!(block(ModeType::Repeat, &[]), Ok((0, predefined)));
+            fse.reset();
+            assert!(build_sequence_table(ModeType::Repeat, &[], &mut fse, t).is_err());
+        }
+    }
+
     /// `build_from_probabilities` refuses what `read_ncount_body` refuses
     /// in a table description: counts that do not tile the table, counts
     /// below -1, too many symbols and accuracy logs out of range.
@@ -5915,9 +6036,12 @@ mod tests {
             t.build_rle(code, of.base, of.bits);
             assert_eq!(short_offset_share(&t), scan(&t), "RLE {code}");
         }
-        t.build_from_probabilities(of.default_log, of.default_distribution, codes)
-            .unwrap();
-        assert_eq!(short_offset_share(&t), scan(&t), "predefined");
+        let predefined = &PREDEFINED_TABLES[1];
+        assert_eq!(
+            short_offset_share(predefined),
+            scan(predefined),
+            "predefined"
+        );
         let mut probs = vec![-1i32; 32];
         probs[2] = 100;
         probs[3] = 60;
@@ -5998,7 +6122,7 @@ mod tests {
     /// the segment, still bounded by Window_Size; without history it stops
     /// at the segment, as in one-shot decoding. Into a dictionary it may
     /// reach past Window_Size, while the segment before it holds at most
-    /// Window_Size bytes.
+    /// Window_Size bytes. Each rejection names the bound it crossed.
     #[test]
     fn match_reaches_into_ext_history() {
         let ext: Vec<u8> = (0..64).collect();
@@ -6008,31 +6132,35 @@ mod tests {
         if let Level::Avx2(w) = Level::new() {
             levels.push(Level::Avx2(w));
         }
-        // (offset, match length, ext bytes, window, accepted from history,
+        const OK: Option<&str> = None;
+        const FRAME: Option<&str> = Some("Match offset reaches before the frame start");
+        const DICT: Option<&str> = Some("Match offset reaches before the dictionary start");
+        const WINDOW: Option<&str> = Some("Match offset exceeds Window_Size");
+        // (offset, match length, ext bytes, window, error from history,
         // from a dictionary); the match follows the 10 segment bytes.
         let cases = [
-            (10, 4, 64, 1 << 20, true, true),
-            (11, 4, 64, 1 << 20, true, true),
-            (11, 30, 64, 1 << 20, true, true),
-            (20, 4, 64, 1 << 20, true, true),
-            (20, 34, 64, 1 << 20, true, true),
-            (74, 4, 64, 1 << 20, true, true),
-            (74, 34, 64, 1 << 20, true, true),
-            (75, 4, 64, 1 << 20, false, false),
-            (11, 4, 0, 1 << 20, false, false),
-            (11, 4, 1, 1 << 20, true, true),
-            (12, 4, 1, 1 << 20, false, false),
-            (60, 4, 64, 60, true, true),
-            (60, 4, 64, 59, false, true),
-            (11, 4, 64, 10, false, true),
-            (74, 4, 64, 10, false, true),
-            (74, 34, 64, 10, false, true),
-            (75, 4, 64, 10, false, false),
-            (10, 4, 64, 9, false, false),
-            (60, 4, 64, 9, false, false),
+            (10, 4, 64, 1 << 20, OK, OK),
+            (11, 4, 64, 1 << 20, OK, OK),
+            (11, 30, 64, 1 << 20, OK, OK),
+            (20, 4, 64, 1 << 20, OK, OK),
+            (20, 34, 64, 1 << 20, OK, OK),
+            (74, 4, 64, 1 << 20, OK, OK),
+            (74, 34, 64, 1 << 20, OK, OK),
+            (75, 4, 64, 1 << 20, FRAME, DICT),
+            (11, 4, 0, 1 << 20, FRAME, FRAME),
+            (11, 4, 1, 1 << 20, OK, OK),
+            (12, 4, 1, 1 << 20, FRAME, DICT),
+            (60, 4, 64, 60, OK, OK),
+            (60, 4, 64, 59, WINDOW, OK),
+            (11, 4, 64, 10, WINDOW, OK),
+            (74, 4, 64, 10, WINDOW, OK),
+            (74, 34, 64, 10, WINDOW, OK),
+            (75, 4, 64, 10, WINDOW, DICT),
+            (10, 4, 64, 9, WINDOW, WINDOW),
+            (60, 4, 64, 9, WINDOW, WINDOW),
         ];
         for simd in levels {
-            for (offset, ml, ext_len, window, accept, accept_dict) in cases {
+            for (offset, ml, ext_len, window, error, error_dict) in cases {
                 for dict in [false, true] {
                     let name = format!(
                         "offset {offset} ml {ml} ext {ext_len} window {window} dict {dict}"
@@ -6061,8 +6189,8 @@ mod tests {
                                 out
                             })
                     };
-                    if !(if dict { accept_dict } else { accept }) {
-                        assert!(got.is_err(), "{name}: accepted");
+                    if let Some(e) = if dict { error_dict } else { error } {
+                        assert_eq!(got.err().as_deref(), Some(e), "{name}");
                         continue;
                     }
                     let mut want = [ext, &seg[..]].concat();

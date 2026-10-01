@@ -1,9 +1,7 @@
 //! Decoder dictionaries (RFC 8878 §5; libzstd zstd_ddict.c and
 //! ZSTD_loadDEntropy of zstd_decompress.c).
 
-use super::{
-    DecoderScratch, FSEScratch, FSETable, HuffmanScratch, HuffmanTable, ModeType, SEQ_TABLES,
-};
+use super::{DecoderScratch, FSEScratch, HuffmanScratch, HuffmanTable, ModeType, SeqTableSource};
 use std::sync::Arc;
 
 /// Magic_Number of a formatted dictionary (RFC 8878 line 1809).
@@ -105,12 +103,7 @@ fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), String> {
     // RFC 8878 lines 1826-1828: offsets, match lengths, literals lengths;
     // ZSTD_buildSeqTable's checks on an FSE_Compressed_Mode table.
     for t in [1, 2, 0] {
-        pos += super::build_sequence_table(
-            ModeType::FSECompressed,
-            &dict[pos..],
-            fse.table_mut(t),
-            &SEQ_TABLES[t],
-        )?;
+        pos += super::build_sequence_table(ModeType::FSECompressed, &dict[pos..], &mut fse, t)?;
     }
 
     let reps = dict
@@ -147,7 +140,7 @@ impl DecoderScratch {
     pub(super) fn load_dict(&mut self, e: &Arc<DictEntropy>) {
         self.dict = Some(Arc::clone(e));
         self.huf_from_dict = true;
-        self.fse_from_dict = [true; 3];
+        self.fse.source = [SeqTableSource::Dict; 3];
         self.offset_hist = e.rep;
     }
 
@@ -156,14 +149,6 @@ impl DecoderScratch {
         match &self.dict {
             Some(d) if self.huf_from_dict => &d.huf.table,
             _ => &self.huf.table,
-        }
-    }
-
-    /// The `SEQ_TABLES[t]` table Repeat mode would use now.
-    pub(super) fn fse_table(&self, t: usize) -> &FSETable {
-        match &self.dict {
-            Some(d) if self.fse_from_dict[t] => d.fse.table(t),
-            _ => self.fse.table(t),
         }
     }
 }

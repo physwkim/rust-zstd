@@ -364,6 +364,63 @@ fn checksum_mismatch_stops_the_decoder() {
     d.finish().unwrap();
 }
 
+/// Stream all of `input` through `d` with 4 KiB of output room, then
+/// `finish`.
+fn stream_all(d: &mut Decompressor, input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut content = Vec::new();
+    let mut out = vec![0u8; 4096];
+    let mut pos = 0;
+    loop {
+        let mut written = 0;
+        d.decompress_stream(input, &mut pos, &mut out, &mut written)?;
+        content.extend_from_slice(&out[..written]);
+        if pos == input.len() && written == 0 {
+            break;
+        }
+    }
+    d.finish()?;
+    Ok(content)
+}
+
+/// `Decompressor::decompress` gives the outcome of the function
+/// `decompress` wherever streaming stood, mid-frame or failed, and
+/// streaming then starts on a new frame, after content or an error.
+#[test]
+fn decompress_resets_the_stream() {
+    let data = dataset("text_1m");
+    let a = zstd_bulk(&data[..300_000], 3);
+    let b = zstd_stream(&data[..1000], 19);
+    let cut = &a[..a.len() - 10];
+    let mut d = Decompressor::new();
+
+    // Mid-frame, with content to write out, then with part of a block in
+    // hand.
+    let mut out = vec![0u8; 100];
+    let (mut read, mut written) = (0, 0);
+    d.decompress_stream(&a, &mut read, &mut out, &mut written)
+        .unwrap();
+    assert!(read < a.len() && written == out.len());
+    assert_eq!(d.decompress(&b), Ok(data[..1000].to_vec()));
+    let (mut read, mut written) = (0, 0);
+    d.decompress_stream(&a[..20], &mut read, &mut out, &mut written)
+        .unwrap();
+    assert_eq!((read, written), (20, 0));
+    assert_eq!(d.decompress(&b), Ok(data[..1000].to_vec()));
+    assert_eq!(stream_all(&mut d, &a), Ok(data[..300_000].to_vec()));
+
+    // Stopped by an error.
+    let bad = [0u8; 8];
+    assert!(d.decompress_stream(&bad, &mut 0, &mut out, &mut 0).is_err());
+    assert_eq!(d.decompress(&b), Ok(data[..1000].to_vec()));
+    assert_eq!(stream_all(&mut d, &b), Ok(data[..1000].to_vec()));
+
+    // A one-shot error inside a frame.
+    let one_shot = rust_zstd::decompress(cut).unwrap_err();
+    assert_eq!(d.decompress(cut), Err(one_shot));
+    assert_eq!(stream_all(&mut d, &a), Ok(data[..300_000].to_vec()));
+    assert_eq!(d.decompress(&a), Ok(data[..300_000].to_vec()));
+}
+
 /// `finish` while content is left to write out, or mid-frame, fails; after
 /// a frame's last byte is written out it succeeds.
 #[test]

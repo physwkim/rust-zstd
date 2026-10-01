@@ -7,6 +7,7 @@
 
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use rust_zstd::Decompressor;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -387,9 +388,23 @@ pub fn stream_room(chunk: usize) -> usize {
     chunk.min(1 << 16)
 }
 
+thread_local! {
+    /// A serial decompressor per SIMD level for every
+    /// `assert_stream_parity_at` call on the thread, so each input decodes
+    /// with the tables and buffers the inputs before it, rejected ones
+    /// included, left.
+    static REUSED: RefCell<[Decompressor; 2]> = RefCell::new([false, true].map(|simd| {
+        Decompressor::with_options(&DecodeOptions {
+            min_parallel_blocks: usize::MAX,
+            simd,
+        })
+    }));
+}
+
 /// `decompress_streaming` of `input` at each of `chunks`, with as much
 /// output room up to 64 KiB, has the outcome of `decompress_with_options`,
-/// serial, at both SIMD levels: the same content or the same error.
+/// serial, at both SIMD levels: the same content or the same error. So
+/// does `Decompressor::decompress` on a decompressor every call reuses.
 pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
     fn outcome(r: &Result<Vec<u8>, String>) -> String {
         match r {
@@ -403,6 +418,13 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
             simd,
         };
         let want = decompress_with_options(input, &opts);
+        let reused = REUSED.with_borrow_mut(|d| d[usize::from(simd)].decompress(input));
+        assert!(
+            reused == want,
+            "{name} simd={simd}: a reused decompressor gives {} where one-shot gives {}",
+            outcome(&reused),
+            outcome(&want)
+        );
         for &chunk in chunks {
             let got = decompress_streaming(input, chunk, stream_room(chunk), &opts);
             assert!(
