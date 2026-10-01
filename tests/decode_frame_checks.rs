@@ -1,7 +1,8 @@
 //! Frame-level checks of ZSTD_decompressFrame / ZSTD_decompressMultiFrame:
 //! libzstd 1.5.7 frames, whole or altered, get the verdict of its one-shot
 //! (`zstd::bulk`) and streaming (`zstd::stream`) decoders, and their bytes
-//! when accepted, serial and MT at both SIMD levels.
+//! when accepted, serial and MT at both SIMD levels, except where RFC 8878
+//! decides otherwise, as a test notes.
 
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 
@@ -423,35 +424,63 @@ fn reserved_bits_must_be_zero() {
     );
 }
 
-/// A skippable Frame_Size of 0xFFFFFFF8 or more overflows 32 bits with the
-/// 8-byte header, which ZSTD_readSkippableFrameSize refuses as
-/// frameParameter_unsupported on every build, before it compares the length
-/// with the input: a header alone gets that error, not srcSize_wrong.
+/// A skippable frame's Frame_Size is any 32-bit value (RFC 8878 lines
+/// 1325-1329), the largest too; an input that stops short of it is
+/// truncated, which libzstd rejects as well.
 #[test]
-fn skippable_frame_length_fits_32_bits() {
+fn skippable_frame_short_of_its_size() {
     let hello = raw_frame(b"hello");
-    for (size, unsupported) in [
-        (0xFFFF_FFF7, false),
-        (0xFFFF_FFF8, true),
-        (0xFFFF_FFFF, true),
-    ] {
+    for size in [0xFFFF_FFF7, 0xFFFF_FFF8, 0xFFFF_FFFF] {
         for (lead_name, lead) in [("", &[][..]), ("a frame then ", &hello[..])] {
             let f = [lead, &skippable(size, &[1, 2, 3])].concat();
-            let name = format!("{lead_name}a skippable frame of size {size:#x}");
+            let name = format!("{lead_name}3 bytes of a skippable frame of size {size:#x}");
             check(&name, &f, false);
-            let theirs = zstd::bulk::decompress(&f, CAPACITY).unwrap_err();
-            let want = if unsupported {
-                "Unsupported frame parameter"
-            } else {
-                "Src size is incorrect"
-            };
-            assert_eq!(theirs.to_string(), want, "{name}");
             let ours = rust_zstd::decompress(&f).unwrap_err();
-            assert_eq!(
-                ours.contains("overflows 32 bits"),
-                unsupported,
-                "{name}: {ours}"
-            );
+            assert!(ours.contains("past end of input"), "{name}: {ours}");
+        }
+    }
+}
+
+/// A skippable frame of each of the largest Frame_Sizes, up to 2^32 + 7
+/// bytes with its header, is skipped and decoding resumes after it (RFC
+/// 8878 lines 1306-1308, 1325-1329). libzstd 1.5.7's one-shot decoder
+/// refuses a Frame_Size of 0xFFFFFFF8 or more, as its 32-bit frame length
+/// wraps.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn skippable_frame_of_any_32_bit_size_is_skipped() {
+    let hello = raw_frame(b"hello");
+    for size in [0xFFFF_FFF7u32, 0xFFFF_FFF8, 0xFFFF_FFFF] {
+        // Zeroed memory is mapped lazily: only the pages written below,
+        // the frames around the skippable one and its header, take memory.
+        let mut f = vec![0u8; 2 * hello.len() + 8 + size as usize];
+        let n = f.len();
+        f[..hello.len()].copy_from_slice(&hello);
+        f[hello.len()..][..8].copy_from_slice(&skippable(size, &[]));
+        f[n - hello.len()..].copy_from_slice(&hello);
+        let name = format!("a skippable frame of size {size:#x} between two frames");
+        let theirs = zstd::bulk::decompress(&f, CAPACITY);
+        assert_eq!(
+            theirs.is_ok(),
+            size < 0xFFFF_FFF8,
+            "{name}: libzstd {theirs:?}"
+        );
+        for simd in [false, true] {
+            for min_parallel_blocks in [usize::MAX, 1] {
+                let options = DecodeOptions {
+                    min_parallel_blocks,
+                    simd,
+                };
+                let ours = decompress_with_options(&f, &options);
+                assert_eq!(
+                    ours.as_deref(),
+                    Ok(&b"hellohello"[..]),
+                    "{name} simd={simd} min_parallel_blocks={min_parallel_blocks}"
+                );
+                if let Ok(theirs) = &theirs {
+                    assert_eq!(theirs, b"hellohello", "{name}: libzstd");
+                }
+            }
         }
     }
 }
