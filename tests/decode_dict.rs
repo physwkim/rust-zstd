@@ -1,7 +1,8 @@
-//! Dictionary decoding against libzstd: frames compressed with formatted
-//! dictionaries decode byte-exact on every decoder path, dictionaries
-//! libzstd rejects are rejected, and frames with the wrong or no
-//! dictionary are errors.
+//! Dictionary decoding against libzstd: frames compressed with trained
+//! (formatted) and raw-content dictionaries decode byte-exact on every
+//! decoder path, dictionaries libzstd rejects are rejected, and frames
+//! with the wrong or no dictionary, or offsets reaching past the
+//! dictionary or the window, are errors.
 
 mod common;
 
@@ -102,7 +103,10 @@ fn entropy_dict() -> Vec<u8> {
 
 /// The dictionaries every decode test runs with.
 fn dicts() -> Vec<(Vec<u8>, &'static str)> {
-    vec![(entropy_dict(), "entropy-only")]
+    vec![
+        (trained_dict(), "trained"),
+        (entropy_dict(), "entropy-only"),
+    ]
 }
 
 /// libzstd's frame for `src` with `dict` loaded (auto content type) and
@@ -339,6 +343,56 @@ fn frame_without_dict_id_uses_supplied_dict() {
 }
 
 #[test]
+fn raw_content_dict_frames_decode() {
+    let content = records(150, 41);
+    assert_ne!(&content[..4], &0xEC30_A437u32.to_le_bytes());
+    let dict = DecodeDict::new(&content).unwrap();
+    assert_eq!(dict.id(), 0);
+    assert_eq!(dict.content(), &content[..]);
+    for (n, seed) in [(2, 42), (50, 43), (1000, 44)] {
+        let src = records(n, seed);
+        for level in LEVELS {
+            let frame = c_compress_using_dict(&src, &content, level);
+            assert_decodes(
+                &format!("raw {n} records level {level}"),
+                &frame,
+                &dict,
+                &src,
+            );
+        }
+    }
+}
+
+/// Raw content shorter than 8 bytes is history too, as in libzstd.
+#[test]
+fn short_raw_content_dict_is_history() {
+    let content = b"abcdefg";
+    let dict = DecodeDict::new(content).unwrap();
+    assert_eq!(dict.content(), content);
+    // One compressed block: literal "xyz", then a match of 7 bytes at
+    // offset 10 that copies the whole dictionary. LL, OF and ML in RLE
+    // mode: LL code 3, OF code 3 (offset value 10 + 3 = 13 = 8 + 5,
+    // 3 extra bits), ML code 4 (match length 7).
+    let block_body = [
+        0x18, b'x', b'y', b'z', // raw literals, size 3
+        0x01, // one sequence
+        0x54, // LL, OF, ML RLE
+        3, 3, 4,    // the RLE codes
+        0x0D, // bitstream: offset extra bits 5 (101), end mark
+    ];
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, 10];
+    let header = (block_body.len() as u32) << 3 | 2 << 1 | 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&block_body);
+    let want = b"xyzabcdefg";
+    assert_eq!(
+        c_decompress_dict(&frame, content, 64).as_deref(),
+        Some(&want[..])
+    );
+    assert_decodes("7-byte dict", &frame, &dict, want);
+}
+
+#[test]
 fn wrong_or_missing_dict_is_an_error() {
     let raw = trained_dict();
     let dict = DecodeDict::new(&raw).unwrap();
@@ -414,4 +468,71 @@ fn corrupt_entropy_verdict_matches_libzstd() {
         }
     }
     assert!(loads > 0 && fails > 0, "{loads} load, {fails} fail");
+}
+
+/// An offset reaching one byte before the dictionary content is an
+/// error, for libzstd too.
+#[test]
+fn offset_before_dict_start_is_an_error() {
+    let content = lcg_bytes(4096, 71);
+    let src = [&lcg_bytes(100, 72)[..], &content[..2000]].concat();
+    let frame = c_compress_using_dict(&src, &content, 3);
+    assert_decodes(
+        "whole dict",
+        &frame,
+        &DecodeDict::new(&content).unwrap(),
+        &src,
+    );
+    let short = &content[1..];
+    assert_eq!(c_decompress_dict(&frame, short, src.len() + 1024), None);
+    assert_rejects(
+        "dict one byte short",
+        &frame,
+        Some(&DecodeDict::new(short).unwrap()),
+        "before the frame start",
+    );
+}
+
+/// RFC 8878 lines 1838-1844: an offset past Window_Size may reach the
+/// dictionary while the frame has decoded at most Window_Size bytes, and
+/// not after. The frame is libzstd's with a 256 KiB window, relabelled to
+/// 128 KiB; its first block is the `fresh` bytes up to 128 KiB, and the
+/// second starts with what is left of them then a match into the
+/// dictionary. libzstd enforces no window on offsets and decodes both.
+#[test]
+fn dict_reach_ends_at_window_size() {
+    let content = lcg_bytes(64 * 1024, 81);
+    let dict = DecodeDict::new(&content).unwrap();
+    for (fresh, ok) in [(128 * 1024, true), (128 * 1024 + 1, false)] {
+        let src = [&lcg_bytes(fresh, 82)[..], &content[..4000]].concat();
+        let mut frame = c_compress_dict(
+            &src,
+            &content,
+            &[
+                (P::ZSTD_c_compressionLevel, 3),
+                (P::ZSTD_c_windowLog, 18),
+                (P::ZSTD_c_contentSizeFlag, 0),
+            ],
+        );
+        assert_decodes("256 KiB window", &frame, &dict, &src);
+        // Frame_Header_Descriptor without Single_Segment_Flag, then the
+        // Window_Descriptor: 2^(10 + 8) -> 2^(10 + 7).
+        assert_eq!(frame[4] & 0x20, 0);
+        assert_eq!(frame[5], 8 << 3);
+        frame[5] = 7 << 3;
+        assert_eq!(
+            c_decompress_dict(&frame, &content, src.len()).as_deref(),
+            Some(&src[..])
+        );
+        if ok {
+            assert_decodes("match at Window_Size", &frame, &dict, &src);
+        } else {
+            assert_rejects(
+                "match past Window_Size",
+                &frame,
+                Some(&dict),
+                "exceeds Window_Size",
+            );
+        }
+    }
 }
