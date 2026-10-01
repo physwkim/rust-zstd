@@ -239,7 +239,9 @@ impl Window {
     }
 
     /// `ZSTD_window_enforceMaxDist` (`loadedDictEnd == 0`): raise `lowLimit`
-    /// to `max_dist` below the index of position `block_end`.
+    /// to `max_dist` below the index of position `block_end` (C's name; the
+    /// block path passes the block's start, the long distance matcher its
+    /// chunk's end).
     #[inline]
     pub fn enforce_max_dist(&mut self, block_end: usize, max_dist: usize) {
         let block_end_idx = self.index(block_end);
@@ -757,10 +759,19 @@ impl MatchState {
 
     /// `ZSTD_compress_frameChunk`'s set-up of the block at `positions`, for
     /// every block whatever its size: the window covers it
-    /// (`ZSTD_compressContinue_internal`'s `ZSTD_window_update`) and the
-    /// overflow check runs for it (see `MatchState::enter`).
+    /// (`ZSTD_compressContinue_internal`'s `ZSTD_window_update`), the
+    /// overflow check runs for it (see `MatchState::enter`), then
+    /// `ZSTD_window_enforceMaxDist` raises the window's low end to the
+    /// window size below the block's start and `next_to_update` resumes no
+    /// lower. So `window_low` is libzstd's `lowLimit` and `dictLimit` on
+    /// every block, which `ZSTD_insertDUBT1` reads as `windowValid` for
+    /// candidates of earlier blocks.
     pub fn enter_block(&mut self, positions: Range<usize>) -> EnteredBlock {
         self.enter(positions.clone(), Some(positions.clone()));
+        let max_dist = 1usize << self.cparams.window_log;
+        self.window.enforce_max_dist(positions.start, max_dist);
+        // Ensure hash/chain table insertion resumes no sooner than lowlimit.
+        self.next_to_update = self.next_to_update.max(self.window.low);
         EnteredBlock(positions)
     }
 
