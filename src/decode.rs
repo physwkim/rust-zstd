@@ -350,7 +350,7 @@ impl FSETable {
             cells: Vec::new(),
             size: 0,
             accuracy_log: 0,
-            symbol_probabilities: Vec::with_capacity(256),
+            symbol_probabilities: Vec::new(),
             symbol_next: Vec::new(),
             spread: Vec::new(),
         }
@@ -4492,13 +4492,15 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
 }
 
 /// Decode the block's literals into `target` (cleared first) and append
-/// `WILDCOPY_OVERLENGTH` bytes of slack.
+/// `WILDCOPY_OVERLENGTH` bytes of slack, in one allocation when `target`
+/// has to grow (`split_block` bounded the literals' size).
 fn decode_block_literals(
     parts: &BlockParts<'_>,
     huf: &mut HuffmanScratch,
     target: &mut Vec<u8>,
 ) -> Result<(), String> {
     target.clear();
+    target.reserve(parts.literals.regenerated_size as usize + WILDCOPY_OVERLENGTH);
     let used = decode_literals(&parts.literals, huf, parts.literals_src, target)?;
     assert!(
         parts.literals.regenerated_size == target.len() as u32,
