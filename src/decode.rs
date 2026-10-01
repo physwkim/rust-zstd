@@ -27,10 +27,12 @@
 //! SOFTWARE.
 //! ```
 //!
-//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`
+//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`, and
+//! `Decompressor` for input and output in pieces, `DecompressReader` over it.
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
-//! literals and FSE sequences. No dictionary support.
+//! literals and FSE sequences, with or without a dictionary
+//! (`decompress_with_dict`).
 
 #![allow(
     clippy::needless_range_loop,
@@ -46,6 +48,14 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+use std::sync::Arc;
+
+mod dict;
+pub use dict::DecodeDict;
+use dict::DictEntropy;
+
+mod stream;
+pub use stream::{DecompressReader, Decompressor};
 
 // ============================================================
 // Constants
@@ -118,8 +128,8 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 ///
 /// Supports any number of concatenated zstd frames. Skippable frames are
 /// skipped. Every input byte must belong to a frame: an empty input decodes
-/// to nothing, and bytes after the last frame are an error. Dictionary
-/// frames are not supported.
+/// to nothing, and bytes after the last frame are an error. A frame that
+/// names a dictionary is an error; see `decompress_with_dict`.
 ///
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
@@ -132,6 +142,23 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
 
+/// `decompress` with dictionary `dict` (ZSTD_decompress_usingDict): every
+/// frame starts from its tables and repeat offsets, and its content is the
+/// history before every frame (ZSTD_refDictContent; RFC 8878 lines
+/// 1835-1837). A match may reach it past Window_Size while the frame has
+/// decoded at most Window_Size bytes (lines 1838-1844). A frame that names
+/// another nonzero Dictionary_ID is an error (dictionary_wrong); one with
+/// no Dictionary_ID is decoded with `dict` too.
+///
+/// RFC 8878 lines 442-443 make a frame naming an unregistered ID in the
+/// reserved ranges an error. That is not enforced: registration cannot be
+/// known offline, and the caller supplying the dictionary is the "private
+/// arrangement" of lines 439-440, so a matching ID is accepted in any
+/// range, as libzstd does.
+pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, String> {
+    decompress_with_dict_options(data, Some(dict), &DecodeOptions::default())
+}
+
 /// Decoder paths to force, for testing each of them on any input.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -142,6 +169,17 @@ pub struct DecodeOptions {
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
+}
+
+impl DecodeOptions {
+    /// The SIMD level `simd` picks.
+    fn simd_level(&self) -> Level {
+        if self.simd {
+            Level::new()
+        } else {
+            Level::fallback()
+        }
+    }
 }
 
 impl Default for DecodeOptions {
@@ -165,58 +203,67 @@ impl Default for DecodeOptions {
 /// `decompress` with the paths chosen by `opts`.
 #[doc(hidden)]
 pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    let mut scratch: Option<DecoderScratch> = None;
+    decompress_with_dict_options(data, None, opts)
+}
+
+/// `decompress_with_dict`, or `decompress` without `dict`, with the paths
+/// chosen by `opts`.
+#[doc(hidden)]
+pub fn decompress_with_dict_options(
+    data: &[u8],
+    dict: Option<&DecodeDict>,
+    opts: &DecodeOptions,
+) -> Result<Vec<u8>, String> {
+    let simd = opts.simd_level();
+    let mut dec = FrameDecoder::new(simd);
+    dec.dict = dict.cloned();
+    let mut out = VecOut {
+        output: Vec::new(),
+        prefix: Prefix {
+            start: 0,
+            window: 0,
+        },
+        dict: dict.map_or(&[], DecodeDict::content),
+    };
     let mut pos = 0usize;
-
-    // ZSTD_decompressMultiFrame: a frame starts wherever at least
-    // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left over.
-    while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
-        let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
-            Ok(parsed) => parsed,
-            Err(e) => match e.skip_frame_size() {
-                Some(frame_size) => {
-                    // Up to 2^32 + 7 bytes with the header (RFC 8878 lines
-                    // 1325-1329); on 32-bit targets a sum past usize::MAX is
-                    // past the end of any input too.
-                    let end = pos
-                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
-                        .and_then(|p| p.checked_add(frame_size as usize))
-                        .filter(|&end| end <= data.len())
-                        .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
-                    pos = end;
-                    continue;
-                }
-                None => return Err(format!("Frame header error: {}", e)),
-            },
-        };
-        pos += header_len;
-
-        let scratch = scratch.get_or_insert_with(DecoderScratch::new);
-        scratch.reset();
-        let simd = if opts.simd {
-            Level::new()
-        } else {
-            Level::fallback()
-        };
-        decode_frame(
-            &frame_header,
-            data,
-            &mut pos,
-            scratch,
-            &mut output,
-            opts.min_parallel_blocks,
-            simd,
+    loop {
+        let rest = &data[pos..];
+        let (skipped, _) = dec.skip(rest.len());
+        pos += skipped;
+        let rest = &data[pos..];
+        let len = dec.unit_len(rest);
+        if len > rest.len() {
+            dec.end_of_input(rest)?;
+            return Ok(out.output);
+        }
+        if dec.process(&rest[..len], &mut out)? != Event::FrameStarted {
+            pos += len;
+            continue;
+        }
+        pos += len;
+        let (frame, _) = dec.frame_start();
+        reserve_frame(
+            &mut out.output,
+            frame.content_size,
+            &data[pos..],
+            frame.block_size_max,
         )?;
+        #[cfg(feature = "parallel")]
+        {
+            let (frame, init) = dec.frame_start();
+            if parallel::decode_frame_blocks(
+                data,
+                &mut pos,
+                frame,
+                init,
+                &mut out,
+                opts.min_parallel_blocks,
+                simd,
+            )? {
+                dec.blocks_ended()?;
+            }
+        }
     }
-    if pos != data.len() {
-        return Err(format!(
-            "Input not entirely consumed: {} bytes left, too few for a frame",
-            data.len() - pos
-        ));
-    }
-
-    Ok(output)
 }
 
 // ============================================================
@@ -352,6 +399,17 @@ impl FSETable {
         }
     }
 
+    /// Make this table `src`, reusing this one's allocations.
+    fn copy_from(&mut self, src: &FSETable) {
+        debug_assert_eq!(self.max_symbol, src.max_symbol);
+        self.cells.clone_from(&src.cells);
+        self.size = src.size;
+        self.accuracy_log = src.accuracy_log;
+        self.symbol_probabilities
+            .clone_from(&src.symbol_probabilities);
+        self.predefined = src.predefined;
+    }
+
     /// The decoding table: `1 << accuracy_log` cells once built, else none.
     fn decode(&self) -> &[FSEEntry] {
         &self.cells[..self.size]
@@ -389,6 +447,13 @@ impl FSETable {
     ) -> Result<usize, String> {
         self.reset();
         let bytes_read = self.read_probabilities(source, max_log)?;
+        // RFC 8878 lines 1372-1373: two or more symbols of nonzero
+        // probability; one alone is RLE_Mode's (lines 925-927). libzstd's
+        // FSE_readNCount does not check this.
+        let nonzero = self.symbol_probabilities.iter().filter(|&&c| c != 0);
+        if nonzero.count() < 2 {
+            return Err("FSE table has fewer than two symbols of nonzero probability".to_string());
+        }
         self.build_decoding_table(codes);
         Ok(bytes_read)
     }
@@ -671,14 +736,6 @@ fn fse_cell_state(symbol_next: &mut [u16; 256], symbol: usize, table_log: u32) -
     )
 }
 
-/// Size in u32 words of FSE_decompress_wksp's workspace for a table of
-/// `table_log` over symbols `0..=max_symbol` (FSE_DECOMPRESS_WKSP_SIZE_U32).
-const fn fse_decompress_wksp_u32(table_log: usize, max_symbol: usize) -> usize {
-    let dtable = 1 + (1 << table_log);
-    let build = (2 * (max_symbol + 1) + (1 << table_log) + 8).div_ceil(4);
-    dtable + 1 + build + 256 / 2 + 1
-}
-
 /// Decode the weights of a Huffman tree description from an FSE bitstream
 /// with two interleaved states (FSE_decompress_usingDTable_generic): four
 /// symbols per reload while the stream lasts, then one at a time until it
@@ -833,6 +890,11 @@ struct HuffmanTable {
     rank_stats: [u32; HUF_TABLELOG_MAX as usize + 1],
     /// Symbols ordered by weight (libzstd symbols, sortedSymbol).
     sorted: [u8; 256],
+    /// The weights' FSE table, over weights 0..=HUF_TABLELOG_MAX at every
+    /// accuracy log: a description listing a higher symbol is corrupt (RFC
+    /// 8878 lines 1432-1436, 1541-1543), which `read_ncount_body`'s symbol
+    /// bound enforces. libzstd's bound instead depends on the log
+    /// (HUF_READ_STATS_WORKSPACE_SIZE_U32).
     fse_table: FSETable,
 }
 
@@ -847,8 +909,24 @@ impl HuffmanTable {
             max_num_bits: 0,
             rank_stats: [0; HUF_TABLELOG_MAX as usize + 1],
             sorted: [0; 256],
-            fse_table: FSETable::new(255),
+            fse_table: FSETable::new(HUF_TABLELOG_MAX as u8),
         }
+    }
+
+    /// Make this the decoding table `src` is, reusing this one's
+    /// allocations; the weights' FSE table is build scratch and not copied.
+    fn copy_from(&mut self, src: &HuffmanTable) {
+        if src.is_x2 {
+            self.decode_x2.clone_from(&src.decode_x2);
+        } else {
+            self.decode.clone_from(&src.decode);
+        }
+        self.is_x2 = src.is_x2;
+        self.weights = src.weights;
+        self.nb_symbols = src.nb_symbols;
+        self.max_num_bits = src.max_num_bits;
+        self.rank_stats = src.rank_stats;
+        self.sorted = src.sorted;
     }
 
     /// Forget the table. Its cells stay allocated for the next build, which
@@ -929,18 +1007,6 @@ impl HuffmanTable {
                 ));
             };
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
-            // FSE_decompress_wksp's table must fit HUF_readStats's workspace
-            // (HUF_READ_STATS_WORKSPACE_SIZE_U32), sized for 6-bit tables
-            // over weights 0..=11 (libzstd's HUF_TABLELOG_MAX - 1).
-            let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
-            let log = usize::from(self.fse_table.accuracy_log);
-            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
-                return Err(format!(
-                    "Huffman weights table of log {} over {} symbols is too large",
-                    log,
-                    max_symbol + 1
-                ));
-            }
             let out = self.weights.first_chunk_mut::<255>().unwrap();
             let nb_weights = fse_decompress_weights(&self.fse_table, &src[ncount..], out)?;
             Ok((1 + header, nb_weights))
@@ -2068,6 +2134,7 @@ enum BlockType {
     Reserved,
 }
 
+#[derive(Clone, Copy)]
 struct BlockHeader {
     last_block: bool,
     block_type: BlockType,
@@ -2356,6 +2423,14 @@ struct DecoderScratch {
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
+    /// The dictionary tables the frame started with (`load_dict`), shared
+    /// rather than copied, as libzstd points its DCtx at the DDict's.
+    dict: Option<Arc<DictEntropy>>,
+    /// The Huffman table in use is `dict`'s, not `huf`'s: true from
+    /// `load_dict` until a block of the frame builds one.
+    huf_from_dict: bool,
+    /// The same for the LL, OF, ML tables (`SEQ_TABLES` order).
+    fse_from_dict: [bool; 3],
 }
 
 impl DecoderScratch {
@@ -2371,12 +2446,18 @@ impl DecoderScratch {
             },
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
+            dict: None,
+            huf_from_dict: false,
+            fse_from_dict: [false; 3],
         }
     }
 
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
+        self.dict = None;
+        self.huf_from_dict = false;
+        self.fse_from_dict = [false; 3];
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
@@ -2439,6 +2520,8 @@ struct FrameHeader {
     window_descriptor: u8,
     /// Frame_Content_Size, or None when the header omits it.
     frame_content_size: Option<u64>,
+    /// Dictionary_ID, 0 when the header omits it.
+    dict_id: u32,
 }
 
 impl FrameHeader {
@@ -2561,6 +2644,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         descriptor: FrameDescriptor(desc.0),
         frame_content_size: None,
         window_descriptor: 0,
+        dict_id: 0,
     };
 
     if !desc.single_segment_flag() {
@@ -2570,22 +2654,15 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         pos += 1;
     }
 
-    // ZSTD_decodeFrameHeader: no dictionary is loaded, so a frame naming one
-    // (any Dictionary_ID but 0) is dictionary_wrong.
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
     let dict_id = src
         .get(pos..pos + dict_id_len)
         .ok_or_else(|| FrameDecoderError::new("Error reading dictionary id: truncated".into()))?;
     pos += dict_id_len;
-    let dict_id = dict_id
+    frame_header.dict_id = dict_id
         .iter()
         .rev()
         .fold(0u32, |id, &b| id << 8 | u32::from(b));
-    if dict_id != 0 {
-        return Err(FrameDecoderError::new(format!(
-            "Frame needs dictionary {dict_id}, none is loaded"
-        )));
-    }
 
     let fcs_len = desc
         .frame_content_size_bytes()
@@ -2674,6 +2751,7 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader,
 fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2687,14 +2765,17 @@ fn decode_literals(
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            decompress_literals(section, scratch, source, target)
+            decompress_literals(section, scratch, repeat, source, target)
         }
     }
 }
 
+/// Compressed literals build `scratch`'s table; Treeless ones use `repeat`
+/// when given, else `scratch`'s.
 fn decompress_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2709,28 +2790,24 @@ fn decompress_literals(
     let source = &source[0..compressed_size];
     let mut bytes_read = 0usize;
 
-    match section.ls_type {
+    let table = match section.ls_type {
         LiteralsSectionType::Compressed => {
             bytes_read += scratch
                 .table
                 .build_decoder(source, regenerated_size, num_streams == 4)?
                 as usize;
+            &scratch.table
         }
-        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
-            return Err("Uninitialized Huffman table for treeless literals".to_string());
-        }
-        _ => {}
+        _ => repeat.unwrap_or(&scratch.table),
+    };
+    if table.max_num_bits == 0 {
+        return Err("Uninitialized Huffman table for treeless literals".to_string());
     }
 
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    huf_decompress(
-        &mut target[start..],
-        source,
-        num_streams == 4,
-        &scratch.table,
-    )?;
+    huf_decompress(&mut target[start..], source, num_streams == 4, table)?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
@@ -2855,6 +2932,15 @@ impl CompressionModes {
 
 impl FSEScratch {
     /// The table for `SEQ_TABLES[t]`.
+    fn table(&self, t: usize) -> &FSETable {
+        match t {
+            0 => &self.literal_lengths,
+            1 => &self.offsets,
+            _ => &self.match_lengths,
+        }
+    }
+
+    /// The table for `SEQ_TABLES[t]`.
     fn table_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
             0 => &mut self.literal_lengths,
@@ -2866,10 +2952,13 @@ impl FSEScratch {
 
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
+/// Repeat mode keeps a table `from_dict` names in use; any other mode
+/// builds `scratch`'s and clears `from_dict`.
 fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
+    from_dict: &mut [bool; 3],
 ) -> Result<usize, String> {
     let modes = section
         .modes
@@ -2877,12 +2966,16 @@ fn build_sequence_tables(
 
     let mut bytes_read = 0;
     for (t, mode) in modes.all().into_iter().enumerate() {
-        bytes_read += build_sequence_table(
-            mode,
-            &source[bytes_read..],
-            scratch.table_mut(t),
-            &SEQ_TABLES[t],
-        )?;
+        let repeat = matches!(mode, ModeType::Repeat);
+        if !(repeat && from_dict[t]) {
+            bytes_read += build_sequence_table(
+                mode,
+                &source[bytes_read..],
+                scratch.table_mut(t),
+                &SEQ_TABLES[t],
+            )?;
+        }
+        from_dict[t] &= repeat;
     }
     Ok(bytes_read)
 }
@@ -2991,21 +3084,78 @@ struct Prefix {
     window: usize,
 }
 
+impl Prefix {
+    /// The destination of the frame's next block in `output`, the frame
+    /// being `output[self.start..]`: `room` bytes are reserved past its
+    /// end. All of the frame's history is in it (`ExtHistory::NONE`).
+    fn dst(self, output: &mut Vec<u8>, room: usize) -> Dst {
+        output.reserve(room);
+        Dst {
+            // SAFETY: `start` is at most `output.len()`.
+            base: unsafe { output.as_mut_ptr().add(self.start) },
+            op: output.len() - self.start,
+            window: self.window,
+        }
+    }
+}
+
+/// Where a block decodes to: the current segment of the frame's output
+/// starts at `base` (libzstd's `prefixStart`) and holds the `op` bytes
+/// before the block. A match reaches back at most `window` bytes,
+/// Window_Size (`Prefix`), through the segment and then its
+/// `ExtHistory`.
+///
+/// Users of a `Dst` rely on: `base..base + op` is initialized, and
+/// `base + op..base + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid
+/// for writes in the allocation of `base`.
+#[derive(Clone, Copy)]
+struct Dst {
+    base: *mut u8,
+    op: usize,
+    window: usize,
+}
+
+/// Output of the frame that precedes a `Dst`'s segment and lies apart from
+/// it: the `len` bytes that end at `end` (libzstd's `virtualStart` to
+/// `dictEnd`). They are initialized; writes to the segment may land in
+/// them (the streaming round buffer reuses them), so they are only read
+/// through raw pointers.
+#[derive(Clone, Copy)]
+struct ExtHistory {
+    end: *const u8,
+    len: usize,
+    /// The bytes are a dictionary's content, which a match may reach past
+    /// Window_Size while the frame has decoded at most Window_Size bytes
+    /// (RFC 8878 lines 1838-1844), the segment then starting at the
+    /// frame's first byte. Any other history is bounded by Window_Size.
+    dict: bool,
+}
+
+impl ExtHistory {
+    /// No history outside the segment.
+    const NONE: ExtHistory = ExtHistory {
+        end: ptr::null(),
+        len: 0,
+        dict: false,
+    };
+}
+
 /// A block's sequences, executed into the frame by `execute_with_copies`
 /// with the copies it picks.
 trait BlockSequences {
-    /// Execute the sequences straight into `out`, whose bytes from
-    /// `prefix.start` on are the frame so far; matches reach back no
-    /// further, nor past `prefix.window`. `out` is grown by the block
-    /// limit plus slack up front so that all copies use fixed-size chunks
-    /// and may overshoot; it is truncated to the real length on return.
-    fn execute<W: WildCopy>(
+    /// Execute the sequences straight into `dst`, from `dst.op` on, and
+    /// return the block's end (from `dst.base`). All copies use
+    /// fixed-size chunks and may overshoot, within the room `Dst`
+    /// guarantees.
+    ///
+    /// # Safety
+    /// `dst` meets the `Dst` contract.
+    unsafe fn execute<W: WildCopy>(
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix: Prefix,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String>;
+        dst: Dst,
+    ) -> Result<usize, String>;
 }
 
 /// Execute `seqs` with the copies for its block, for the fused decoder and
@@ -3013,71 +3163,82 @@ trait BlockSequences {
 /// ones otherwise, and the `ShortOffsets` variants when the block's offsets
 /// table gives many short offsets. Each copy type runs in a function of its
 /// own. The block may decode to `block_size_max` bytes (RFC 8878 lines
-/// 566-568).
-fn execute_with_copies<S: BlockSequences>(
+/// 566-568). Returns the block's end in `dst`.
+///
+/// # Safety
+/// `dst` meets the `Dst` contract.
+unsafe fn execute_with_copies<S: BlockSequences>(
     simd: Level,
     offsets: &FSETable,
     seqs: S,
     offset_hist: &mut [u32; 3],
     block_size_max: usize,
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    let base = out.len();
+    dst: Dst,
+) -> Result<usize, String> {
     let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
-    match simd {
+    let Dst { base, op, window } = dst;
+    let end = match simd {
         // SAFETY: fearless_simd makes an `Avx2` only after detecting AVX2
         // and FMA on this CPU (`Level::new`).
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        Level::Avx2(w) => unsafe {
+        Level::Avx2(w) => {
             if short {
-                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix, out)
+                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, base, op, window)
             } else {
-                execute_avx2(w, seqs, offset_hist, prefix, out)
+                execute_avx2(w, seqs, offset_hist, base, op, window)
             }
-        },
-        _ if short => execute_portable(
-            FallbackShortOffsets(Fallback::new()),
-            seqs,
-            offset_hist,
-            prefix,
-            out,
-        ),
-        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix, out),
+        }
+        _ if short => {
+            let w = FallbackShortOffsets(Fallback::new());
+            execute_portable(w, seqs, offset_hist, base, op, window)
+        }
+        _ => execute_portable(Fallback::new(), seqs, offset_hist, base, op, window),
     }?;
-    let decoded = out.len() - base;
+    let decoded = end - op;
     if decoded > block_size_max {
         return Err(format!(
             "Block decodes to {} bytes, past Block_Maximum_Size {}",
             decoded, block_size_max
         ));
     }
-    Ok(())
+    Ok(end)
 }
 
+/// `seqs.execute` into the `Dst` of `base`, `op` and `window`. The fields
+/// come apart so that they arrive in registers: passed as one `Dst`, by
+/// reference, the AVX2 short-offset loop ran 6% more instructions
+/// (words_1M L1).
+///
+/// # Safety
+/// The `Dst` meets its contract.
 #[inline(never)]
-fn execute_portable<W: WildCopy, S: BlockSequences>(
+unsafe fn execute_portable<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix, out)
+    base: *mut u8,
+    op: usize,
+    window: usize,
+) -> Result<usize, String> {
+    seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
 /// `execute_portable` compiled with AVX2.
+///
+/// # Safety
+/// The CPU supports AVX2, and the `Dst` meets its contract.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline(never)]
-fn execute_avx2<W: WildCopy, S: BlockSequences>(
+unsafe fn execute_avx2<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix: Prefix,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix, out)
+    base: *mut u8,
+    op: usize,
+    window: usize,
+) -> Result<usize, String> {
+    seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
 /// A compressed block's sequences section after its tables, with the
@@ -3086,7 +3247,8 @@ fn execute_avx2<W: WildCopy, S: BlockSequences>(
 struct SeqInput<'a> {
     num_sequences: u32,
     bit_stream: &'a [u8],
-    fse: &'a FSEScratch,
+    /// LL, OF, ML tables (`SEQ_TABLES` order).
+    fse: [&'a FSETable; 3],
     literals: &'a [u8],
 }
 
@@ -3095,72 +3257,74 @@ struct SeqInput<'a> {
 /// of slack.
 impl BlockSequences for SeqInput<'_> {
     #[inline(always)]
-    fn execute<W: WildCopy>(
+    unsafe fn execute<W: WildCopy>(
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix: Prefix,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        let prefix_start = prefix.start;
-        let base = out.len();
-        // Spare capacity only: the block's bytes are written by the copies
-        // in `exec_sequence`, so zero-filling them first is wasted work.
-        out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
-        // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which
-        // is the extent `run_sequences` may write (see its contract).
-        let end = unsafe {
-            run_sequences(
-                w,
-                self,
-                offset_hist,
-                out.as_mut_ptr().add(prefix_start),
-                base - prefix_start,
-                prefix.window,
-            )?
-        };
-        // SAFETY: on success `run_sequences` initialized every byte of
-        // `prefix_start + (base - prefix_start)..prefix_start + end`, and
-        // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length
-        // within the reserved capacity.
-        unsafe { out.set_len(prefix_start + end) };
-        Ok(())
+        dst: Dst,
+    ) -> Result<usize, String> {
+        run_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
     }
 }
 
-/// Execute the block's sequences into the buffer at `out`, which starts at
-/// the frame's first byte; `op` is where this block starts and `window`
-/// the frame's Window_Size (`Prefix::window`). Returns the
-/// block's end, at most `op + MAX_BLOCK_SIZE`, with every byte of
-/// `op..end` written; bytes past `end` may have been written too, and
-/// nothing before `op` is.
+/// `SeqInput` whose matches reach on into `ext` before the segment,
+/// executed by its own instantiation of the loop: the AVX2 loop that can
+/// copy from `ext` and go on runs 2-3% more instructions (words_1M L1,
+/// rssrc_8M L3, elf_8M L9), so a block without `ext`, as every one-shot
+/// one is, takes the loop in which a match before the segment exits. Both
+/// give the same verdicts.
+struct ExtSeqInput<'a> {
+    seqs: SeqInput<'a>,
+    ext: ExtHistory,
+}
+
+impl BlockSequences for ExtSeqInput<'_> {
+    #[inline(always)]
+    unsafe fn execute<W: WildCopy>(
+        self,
+        w: W,
+        offset_hist: &mut [u32; 3],
+        dst: Dst,
+    ) -> Result<usize, String> {
+        run_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
+    }
+}
+
+/// Execute the block's sequences into `dst` from `dst.op` on. Returns the
+/// block's end, at most `dst.op + MAX_BLOCK_SIZE`, with every byte of
+/// `dst.op..end` written; bytes past `end` may have been written too, and
+/// nothing before `dst.op` is. Matches reach into `ext` only when `EXT`;
+/// otherwise they stop at the segment (`exec_sequence`).
 ///
 /// # Safety
-/// `out..out + op` is initialized and
-/// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid for
-/// writes.
+/// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
+/// `EXT`.
 #[inline(always)]
-unsafe fn run_sequences<W: WildCopy>(
+unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
     w: W,
     seqs: SeqInput<'_>,
+    ext: ExtHistory,
     offset_hist: &mut [u32; 3],
-    out: *mut u8,
-    op: usize,
-    window: usize,
+    dst: Dst,
 ) -> Result<usize, String> {
+    let Dst {
+        base: out,
+        op,
+        window,
+    } = dst;
     let SeqInput {
         num_sequences,
         bit_stream,
         fse,
         literals,
     } = seqs;
-    let ll_dt = fse.literal_lengths.decode();
-    let of_dt = fse.offsets.decode();
-    let ml_dt = fse.match_lengths.decode();
-    let ll_log = u32::from(fse.literal_lengths.accuracy_log);
-    let of_log = u32::from(fse.offsets.accuracy_log);
-    let ml_log = u32::from(fse.match_lengths.accuracy_log);
+    let [ll_t, of_t, ml_t] = fse;
+    let ll_dt = ll_t.decode();
+    let of_dt = of_t.decode();
+    let ml_dt = ml_t.decode();
+    let ll_log = u32::from(ll_t.accuracy_log);
+    let of_log = u32::from(of_t.accuracy_log);
+    let ml_log = u32::from(ml_t.accuracy_log);
     // The state lookups below are unchecked: an initial state is
     // `accuracy_log` bits, and every cell of a table built by
     // `build_decoding_table` or `build_rle` satisfies
@@ -3206,16 +3370,17 @@ unsafe fn run_sequences<W: WildCopy>(
             oend_w: out.add(oend),
             lit_limit: lit_start.add(literals_len),
             prefix: out,
+            ext,
             window,
         }
     };
 
     for _ in 1..num_sequences {
         let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
-        exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+        exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     }
     let (ll, ml, offset) = decode_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
-    exec_sequence(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
+    exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, ml, offset).map_err(seq_error_message)?;
     let hist = st.hist;
     // Both cursors only ever advance within their slices (see
     // `exec_sequence`), so these differences are in-bounds indexes.
@@ -3259,12 +3424,14 @@ struct SeqCursor {
 
 /// Bounds of one block's sequence execution: the output limit less
 /// `WILDCOPY_OVERLENGTH`, the literals end less `WILDCOPY_OVERLENGTH`, and
-/// how far back a match may copy from: the frame's first byte and
-/// Window_Size (`Prefix`).
+/// how far back a match may copy from: the current segment's first byte,
+/// then the history before it, and Window_Size (`Dst`).
+#[derive(Clone, Copy)]
 struct SeqLimits {
     oend_w: *mut u8,
     lit_limit: *const u8,
     prefix: *mut u8,
+    ext: ExtHistory,
     window: usize,
 }
 
@@ -3357,9 +3524,11 @@ fn decode_sequence(
 
 /// Copy `ll` literals then `ml` match bytes from `offset` back
 /// (ZSTD_execSequenceSplitLitBuffer) and advance `cur`. Both buffers carry
-/// `WILDCOPY_OVERLENGTH` bytes of slack past their limits.
+/// `WILDCOPY_OVERLENGTH` bytes of slack past their limits. A match that
+/// starts before the segment is copied from `lim.ext` when `EXT`, and is
+/// `OffsetTooFar` otherwise, as it is with an empty `lim.ext`.
 #[inline(always)]
-fn exec_sequence<W: WildCopy>(
+fn exec_sequence<W: WildCopy, const EXT: bool>(
     w: W,
     cur: &mut SeqCursor,
     lim: &SeqLimits,
@@ -3370,10 +3539,13 @@ fn exec_sequence<W: WildCopy>(
     let op = cur.op;
     let lit = cur.lit;
     // The window has a branch of its own, ahead of the rest: folded into
-    // the frame-start check with `min` it cost AVX2 words_1M decode 2-6%,
+    // the segment-start check with `min` it cost AVX2 words_1M decode 2-6%,
     // and after that check 2.5-3.7% of cycles, against 0.6-2.4% here.
     if offset > lim.window {
-        return Err(SeqError::OffsetPastWindow);
+        if !EXT {
+            return Err(SeqError::OffsetPastWindow);
+        }
+        return exec_sequence_past_window(w, cur, lim, ll, ml, offset);
     }
     // Addresses are compared as integers: `ll` and `ml` are below 2^32
     // and pointers are below 2^63, so these sums cannot wrap.
@@ -3387,7 +3559,24 @@ fn exec_sequence<W: WildCopy>(
     }
     // Rejects offset 0 as well (it wraps to usize::MAX).
     if offset.wrapping_sub(1) >= o_lit_end - lim.prefix as usize {
-        return Err(SeqError::OffsetTooFar);
+        if !EXT {
+            return Err(SeqError::OffsetTooFar);
+        }
+        // SAFETY: as below, the checks above hold; the match starts before
+        // the segment, which `exec_sequence_ext` takes from there.
+        unsafe {
+            exec_sequence_ext(
+                w,
+                op,
+                lit,
+                (ll, ml, offset),
+                o_lit_end - lim.prefix as usize,
+                lim.ext,
+            )?;
+            cur.lit = lit.add(ll);
+            cur.op = op.add(ll + ml);
+        }
+        return Ok(());
     }
 
     // SAFETY: the checks above give, with `ml >= 1`,
@@ -3402,15 +3591,92 @@ fn exec_sequence<W: WildCopy>(
     // `o_lit_end + ml + 31` is writable. The advanced cursors keep the
     // `SeqCursor` invariant.
     unsafe {
-        // Literals: nearly always at most 16 bytes.
-        copy16(op, lit);
-        if ll > 16 {
-            w.wildcopy(op.add(16), lit.add(16), ll - 16);
-        }
+        copy_literals(w, op, lit, ll);
         cur.lit = lit.add(ll);
 
         w.copy_match(op.add(ll), offset, ml, o_lit_end - lim.prefix as usize);
         cur.op = op.add(ll + ml);
+    }
+    Ok(())
+}
+
+/// `exec_sequence` for a match past Window_Size, which only a dictionary
+/// takes: one in `lim.ext`, while the segment holds at most Window_Size
+/// bytes before the match (`ExtHistory::dict`). The match is then bounded
+/// by the dictionary's first byte alone.
+#[cold]
+#[inline(never)]
+fn exec_sequence_past_window<W: WildCopy>(
+    w: W,
+    cur: &mut SeqCursor,
+    lim: &SeqLimits,
+    ll: usize,
+    ml: usize,
+    offset: usize,
+) -> Result<(), SeqError> {
+    // As in `exec_sequence`, the sum cannot wrap.
+    let avail = cur.op as usize + ll - lim.prefix as usize;
+    if !lim.ext.dict || avail > lim.window {
+        return Err(SeqError::OffsetPastWindow);
+    }
+    let lim = SeqLimits {
+        window: usize::MAX,
+        ..*lim
+    };
+    exec_sequence::<W, true>(w, cur, &lim, ll, ml, offset)
+}
+
+/// Copy `ll` literals from `lit` to `op`, overshooting by up to 31 bytes.
+///
+/// # Safety
+/// `ll + 31` bytes readable at `lit` and writable at `op`, in different
+/// buffers.
+#[inline(always)]
+unsafe fn copy_literals<W: WildCopy>(w: W, op: *mut u8, lit: *const u8, ll: usize) {
+    // Nearly always at most 16 bytes.
+    copy16(op, lit);
+    if ll > 16 {
+        w.wildcopy(op.add(16), lit.add(16), ll - 16);
+    }
+}
+
+/// `exec_sequence` for the sequence `(ll, ml, offset)` at `op` whose match
+/// starts before the current segment, `avail` bytes of which precede the
+/// match's destination (ZSTD_execSequence's extDict branch): it starts in
+/// `ext`, or before it, which is `OffsetTooFar` (offset 0 included). A
+/// match that runs past the end of `ext` continues from the segment's
+/// first byte.
+///
+/// # Safety
+/// `exec_sequence`'s checks before its segment-start check hold, and so
+/// do the `Dst` contract for the segment and the `ExtHistory` one for
+/// `ext`.
+#[cold]
+#[inline(never)]
+unsafe fn exec_sequence_ext<W: WildCopy>(
+    w: W,
+    op: *mut u8,
+    lit: *const u8,
+    (ll, ml, offset): (usize, usize, usize),
+    avail: usize,
+    ext: ExtHistory,
+) -> Result<(), SeqError> {
+    // `offset > avail` here unless it is 0.
+    if offset == 0 || offset - avail > ext.len {
+        return Err(SeqError::OffsetTooFar);
+    }
+    copy_literals(w, op, lit, ll);
+    let dst = op.add(ll);
+    // The match starts `back` bytes before the end of `ext`, and its first
+    // `head` bytes are there. `ext` may share a buffer with the segment,
+    // so the copy allows overlap.
+    let back = offset - avail;
+    let head = back.min(ml);
+    ptr::copy(ext.end.sub(back), dst, head);
+    if ml > head {
+        // The rest starts at the segment's first byte, `offset` bytes
+        // before `dst + head`, with all `offset` bytes between written.
+        w.copy_match(dst.add(head), offset, ml - head, offset);
     }
     Ok(())
 }
@@ -3771,136 +4037,438 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 }
 
 // ============================================================
-// Block decoder
+// Frame decoder
 // ============================================================
 
-/// Decode every block of one frame from `data[*pos..]` straight into
-/// `output`, then check the content size and checksum. Matches reach back
-/// at most Window_Size bytes and never before the frame's own start
-/// (`Prefix`). Frames of at least `min_parallel_blocks` blocks are decoded
-/// by `parallel` when enabled.
-#[inline(never)]
-fn decode_frame(
-    header: &FrameHeader,
-    data: &[u8],
-    pos: &mut usize,
+/// Where a `FrameDecoder` stands in its input (ZSTD_decompressContinue's
+/// ZSTDds_* stages). Each stage but `Skip` takes one unit: a frame header,
+/// a block with its header, or a Content_Checksum, whole
+/// (`FrameDecoder::unit_len`).
+enum Stage {
+    /// Between frames: the next unit is a frame header, or a skippable
+    /// frame's magic number and Frame_Size.
+    FrameHeader,
+    /// `left` bytes of a skippable frame's User_Data still to skip, in
+    /// pieces of any size.
+    Skip { left: u64 },
+    /// The blocks of a frame.
+    Block(Frame),
+    /// The frame's Content_Checksum, which must equal `computed`.
+    Checksum { computed: u32 },
+}
+
+/// What the unit `FrameDecoder::process` took was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Event {
+    /// A frame's header: its blocks follow.
+    FrameStarted,
+    /// A skippable frame's header or a block, not the frame's last unit.
+    Continue,
+    /// A frame's last unit: the decoder is between frames again.
+    FrameEnded,
+}
+
+/// The frame being decoded: the bounds its header sets and what its blocks
+/// have decoded to (ZSTD_DCtx's `fParams`, `decodedSize`, `xxhState`).
+struct Frame {
+    /// Window_Size: how far back a match reaches, `usize::MAX` for a window
+    /// past the address space.
+    window: usize,
+    /// Block_Maximum_Size (RFC 8878 lines 557-564), the bound
+    /// `parse_block_header` puts on every Block_Size, `split_block` on a
+    /// compressed block's literals and `execute_with_copies` on what its
+    /// sequences decode to.
+    block_size_max: usize,
+    content_size: Option<u64>,
+    decoded: u64,
+    checksum: Option<Xxh64>,
+}
+
+impl Frame {
+    fn new(header: &FrameHeader) -> Result<Frame, String> {
+        let window_size = header.window_size()?;
+        Ok(Frame {
+            window: usize::try_from(window_size).unwrap_or(usize::MAX),
+            block_size_max: window_size.min(MAX_BLOCK_SIZE as u64) as usize,
+            content_size: header.frame_content_size(),
+            decoded: 0,
+            checksum: header.descriptor.content_checksum_flag().then(Xxh64::new),
+        })
+    }
+
+    /// Account for the bytes a block decoded to, while they are in cache: a
+    /// frame that decodes past its Frame_Content_Size fails here, which
+    /// keeps a decoder's buffer within that size.
+    fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.decoded += bytes.len() as u64;
+        if let Some(h) = &mut self.checksum {
+            h.update(bytes);
+        }
+        match self.content_size {
+            Some(fcs) if self.decoded > fcs => Err(self.content_size_mismatch(fcs)),
+            _ => Ok(()),
+        }
+    }
+
+    fn content_size_mismatch(&self, fcs: u64) -> String {
+        format!(
+            "Frame content size mismatch: header says {}, decoded {}",
+            fcs, self.decoded
+        )
+    }
+}
+
+/// Where a `FrameDecoder` decodes frames to: for `decompress`, the output
+/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer.
+trait FrameOut {
+    /// Make ready for a frame whose matches reach at most `window` bytes
+    /// back, and which decodes to `content_size` bytes if that is known.
+    /// Neither claim allocates: only what the blocks decode to does.
+    fn start(&mut self, window: usize, content_size: Option<u64>);
+
+    /// The destination of the frame's next block and the history before
+    /// its segment, which meet the `Dst` and `ExtHistory` contracts, or an
+    /// error if there is no room for it.
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String>;
+
+    /// Take the block written to the last `block_dst` up to `end` (from its
+    /// `base`), and return the block's bytes.
+    ///
+    /// # Safety
+    /// Every byte of that destination from its `op` to `end` is written.
+    unsafe fn commit(&mut self, end: usize) -> &[u8];
+}
+
+/// The resumable core of both decoders (ZSTD_decompressContinue): it takes
+/// the input one unit at a time and decodes each block into a `FrameOut`.
+/// `decompress` hands it units of the whole input, `Decompressor` the
+/// units it gathers from the pieces it gets, so both take every verdict
+/// here.
+struct FrameDecoder {
+    stage: Stage,
+    scratch: Option<DecoderScratch>,
+    simd: Level,
+    /// The dictionary every frame starts from, if any.
+    dict: Option<DecodeDict>,
+}
+
+impl FrameDecoder {
+    fn new(simd: Level) -> FrameDecoder {
+        FrameDecoder {
+            stage: Stage::FrameHeader,
+            scratch: None,
+            simd,
+            dict: None,
+        }
+    }
+
+    /// Inside a skippable frame's User_Data.
+    fn skipping(&self) -> bool {
+        matches!(self.stage, Stage::Skip { .. })
+    }
+
+    /// Right after `Event::FrameStarted`: the frame, and the scratch with
+    /// the tables and repeat offsets it starts from.
+    fn frame_start(&mut self) -> (&mut Frame, &DecoderScratch) {
+        match (&mut self.stage, &self.scratch) {
+            (Stage::Block(frame), Some(scratch)) => (frame, scratch),
+            _ => unreachable!("a started frame has blocks and a scratch"),
+        }
+    }
+
+    /// How many bytes the current unit takes, `head` being its first bytes
+    /// so far, which may be fewer, or more: a frame header's length follows
+    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes and a block's from its
+    /// header, so with fewer the length is what it takes to learn it. The
+    /// bytes of a skippable frame left to skip, in `Stage::Skip`.
+    fn unit_len(&self, head: &[u8]) -> usize {
+        match &self.stage {
+            Stage::FrameHeader => frame_header_len(head),
+            Stage::Skip { left } => usize::try_from(*left).unwrap_or(usize::MAX),
+            Stage::Block(frame) => match parse_block_header(head, frame.block_size_max) {
+                Ok((block, header_len)) => header_len + block.content_size as usize,
+                // Too short to tell, or rejected once whole.
+                Err(_) => BLOCK_HEADER_LEN,
+            },
+            Stage::Checksum { .. } => CHECKSUM_LEN,
+        }
+    }
+
+    /// Skip up to `avail` bytes of a skippable frame: returns how many it
+    /// skipped and whether that ended the frame.
+    fn skip(&mut self, avail: usize) -> (usize, bool) {
+        let Stage::Skip { left } = &mut self.stage else {
+            return (0, false);
+        };
+        let n = usize::try_from(*left).map_or(avail, |left| left.min(avail));
+        *left -= n as u64;
+        if *left != 0 {
+            return (n, false);
+        }
+        self.stage = Stage::FrameHeader;
+        (n, true)
+    }
+
+    /// Take the current unit, `unit_len(unit)` bytes, and decode it into
+    /// `out`. Not for `Stage::Skip`.
+    fn process(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+        match &mut self.stage {
+            Stage::FrameHeader => self.frame_header(unit, out),
+            Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
+            Stage::Block(frame) => {
+                let (block, content) = locate_block(unit, frame.block_size_max)?;
+                let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
+                decode_block(&block, content, frame, scratch, out, self.simd)?;
+                if !block.last_block {
+                    return Ok(Event::Continue);
+                }
+                self.blocks_ended()
+            }
+            Stage::Checksum { computed } => {
+                let stored = u32::from_le_bytes(unit.try_into().unwrap());
+                if stored != *computed {
+                    return Err(format!(
+                        "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
+                        stored, computed
+                    ));
+                }
+                self.stage = Stage::FrameHeader;
+                Ok(Event::FrameEnded)
+            }
+        }
+    }
+
+    fn frame_header(&mut self, unit: &[u8], out: &mut impl FrameOut) -> Result<Event, String> {
+        let header = match parse_frame_header(unit) {
+            Ok((header, _)) => header,
+            Err(e) => match e.skip_frame_size() {
+                Some(size) => {
+                    self.stage = Stage::Skip {
+                        left: u64::from(size),
+                    };
+                    return Ok(Event::Continue);
+                }
+                None => return Err(frame_header_error(e)),
+            },
+        };
+        let frame = Frame::new(&header)?;
+        // ZSTD_decodeFrameHeader's dictionary_wrong check.
+        match (header.dict_id, &self.dict) {
+            (0, _) => {}
+            (id, Some(d)) if id == d.id() => {}
+            (id, Some(d)) => {
+                return Err(format!(
+                    "Frame needs dictionary {id}, dictionary {} is loaded",
+                    d.id()
+                ))
+            }
+            (id, None) => return Err(format!("Frame needs dictionary {id}, none is loaded")),
+        }
+        let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
+        scratch.reset();
+        if let Some(e) = self.dict.as_ref().and_then(DecodeDict::entropy) {
+            scratch.load_dict(e);
+        }
+        out.start(frame.window, frame.content_size);
+        self.stage = Stage::Block(frame);
+        Ok(Event::FrameStarted)
+    }
+
+    /// After the frame's last block: check its size, then expect its
+    /// checksum, if it has one.
+    fn blocks_ended(&mut self) -> Result<Event, String> {
+        let Stage::Block(frame) = std::mem::replace(&mut self.stage, Stage::FrameHeader) else {
+            unreachable!("blocks end in Stage::Block");
+        };
+        if let Some(fcs) = frame.content_size {
+            if frame.decoded != fcs {
+                return Err(frame.content_size_mismatch(fcs));
+            }
+        }
+        match frame.checksum {
+            Some(h) => {
+                self.stage = Stage::Checksum {
+                    computed: h.digest() as u32,
+                };
+                Ok(Event::Continue)
+            }
+            None => Ok(Event::FrameEnded),
+        }
+    }
+
+    /// The verdict on input that ends `partial` bytes into the current
+    /// unit, fewer than `unit_len(partial)`: the bytes the one-shot input
+    /// ends with, or those `Decompressor` holds when it finishes. It may
+    /// end only between frames.
+    fn end_of_input(&self, partial: &[u8]) -> Result<(), String> {
+        Err(match &self.stage {
+            Stage::FrameHeader if partial.is_empty() => return Ok(()),
+            // ZSTD_decompressMultiFrame: a frame starts wherever at least
+            // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left
+            // over.
+            Stage::FrameHeader if partial.len() < FRAME_HEADER_PREFIX_LEN => format!(
+                "Input not entirely consumed: {} bytes left, too few for a frame",
+                partial.len()
+            ),
+            Stage::FrameHeader => match parse_frame_header(partial) {
+                Err(e) => frame_header_error(e),
+                Ok(_) => unreachable!("a whole frame header is a unit"),
+            },
+            Stage::Skip { .. } => "Skippable frame extends past end of input".to_string(),
+            Stage::Block(frame) => match locate_block(partial, frame.block_size_max) {
+                Err(e) => e,
+                Ok(_) => unreachable!("a whole block is a unit"),
+            },
+            Stage::Checksum { .. } => "Error reading checksum: truncated".to_string(),
+        })
+    }
+}
+
+/// Block_Header's length.
+const BLOCK_HEADER_LEN: usize = 3;
+
+/// Content_Checksum's length.
+const CHECKSUM_LEN: usize = 4;
+
+fn frame_header_error(e: FrameDecoderError) -> String {
+    format!("Frame header error: {}", e)
+}
+
+/// The length of the frame header that starts `head` (ZSTD_frameHeaderSize),
+/// as far as `parse_frame_header` reads, or `FRAME_HEADER_PREFIX_LEN` while
+/// `head` is shorter than that or does not start a frame.
+fn frame_header_len(head: &[u8]) -> usize {
+    let Some(&[m0, m1, m2, m3, descriptor]) = head.get(..FRAME_HEADER_PREFIX_LEN) else {
+        return FRAME_HEADER_PREFIX_LEN;
+    };
+    let magic = u32::from_le_bytes([m0, m1, m2, m3]);
+    if (0x184D2A50..=0x184D2A5F).contains(&magic) {
+        return SKIPPABLE_FRAME_HEADER_LEN;
+    }
+    if magic != ZSTD_MAGIC {
+        return FRAME_HEADER_PREFIX_LEN;
+    }
+    let d = FrameDescriptor(descriptor);
+    FRAME_HEADER_PREFIX_LEN
+        + usize::from(!d.single_segment_flag())
+        + d.dictionary_id_bytes().unwrap_or(0) as usize
+        + d.frame_content_size_bytes().unwrap_or(0) as usize
+}
+
+/// The block at the start of `src`, in a frame whose Block_Maximum_Size is
+/// `block_size_max`: its header and content.
+fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]), String> {
+    let (block, header_len) = parse_block_header(src, block_size_max)?;
+    let content = src
+        .get(header_len..header_len + block.content_size as usize)
+        .ok_or_else(|| "Block content extends past end of input".to_string())?;
+    Ok((block, content))
+}
+
+/// Decode `block` with `content` into `out`, a block of `frame`.
+fn decode_block(
+    block: &BlockHeader,
+    content: &[u8],
+    frame: &mut Frame,
     scratch: &mut DecoderScratch,
-    output: &mut Vec<u8>,
-    min_parallel_blocks: usize,
+    out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
-    // Any window the header takes: this decoder keeps no window buffer,
-    // so the window only bounds the blocks and the match offsets.
-    let window_size = header.window_size()?;
-    // Block_Maximum_Size (RFC 8878 lines 557-564), the bound
-    // `parse_block_header` puts on every Block_Size, `split_block` on a
-    // compressed block's literals and `execute_with_copies` on what its
-    // sequences decode to.
-    let block_size_max = window_size.min(MAX_BLOCK_SIZE as u64) as usize;
-    let prefix = Prefix {
-        start: output.len(),
-        // A window past the address space bounds no offset.
-        window: usize::try_from(window_size).unwrap_or(usize::MAX),
+    let (dst, ext) = out.block_dst()?;
+    // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
+    // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
+    // bytes (`parse_block_header`), within the room `Dst` has, from input
+    // apart from it; on success each arm wrote the block up to `end`.
+    let bytes = unsafe {
+        let at = dst.base.add(dst.op);
+        let end = match block.block_type {
+            BlockType::Raw => {
+                ptr::copy_nonoverlapping(content.as_ptr(), at, content.len());
+                dst.op + content.len()
+            }
+            BlockType::RLE => {
+                let len = block.decompressed_size as usize;
+                ptr::write_bytes(at, content[0], len);
+                dst.op + len
+            }
+            BlockType::Compressed => {
+                decompress_block(content, frame.block_size_max, scratch, dst, ext, simd)?
+            }
+            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
+        };
+        out.commit(end)
     };
-    let mut frame = FrameContent::new(prefix, header.descriptor.content_checksum_flag());
-
-    if let Some(fcs) = header.frame_content_size() {
-        // Room for the whole frame plus what the sequence executors reserve
-        // past a block's start, so that no block has to grow the buffer
-        // (and move everything decoded). A content size past what the
-        // blocks can decode to fails the size check below, so it gets no
-        // room beyond that.
-        let content = fcs.min(blocks_decoded_bound(&data[*pos..], block_size_max));
-        let want = usize::try_from(content)
-            .ok()
-            .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
-            .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
-        output
-            .try_reserve(want)
-            .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))?;
-    }
-
-    #[cfg(feature = "parallel")]
-    let decoded = parallel::decode_frame_blocks(
-        data,
-        pos,
-        block_size_max,
-        &mut frame,
-        output,
-        min_parallel_blocks,
-        simd,
-    )?;
-    #[cfg(not(feature = "parallel"))]
-    let decoded = {
-        let _ = min_parallel_blocks;
-        false
-    };
-    if !decoded {
-        decode_blocks(data, pos, block_size_max, scratch, &mut frame, output, simd)?;
-    }
-
-    if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame.prefix.start) as u64;
-        if decoded != fcs {
-            return Err(format!(
-                "Frame content size mismatch: header says {}, decoded {}",
-                fcs, decoded
-            ));
-        }
-    }
-
-    if let Some(computed) = frame.checksum(output) {
-        let stored = data
-            .get(*pos..*pos + 4)
-            .ok_or_else(|| "Error reading checksum: truncated".to_string())?;
-        *pos += 4;
-        let stored = u32::from_le_bytes(stored.try_into().unwrap());
-        if stored != computed {
-            return Err(format!(
-                "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
-                stored, computed
-            ));
-        }
-    }
-    Ok(())
+    frame.block_decoded(bytes)
 }
 
-/// A frame's content in the output: where it starts, how far back its
-/// matches reach and, when the frame has a Content_Checksum, the XXH64 of
-/// what has been decoded (ZSTD_decompressFrame's `xxhState`).
-struct FrameContent {
-    /// Output position of the frame's first byte, and its Window_Size.
+/// The one-shot driver's `FrameOut`: frames decode straight into one
+/// `Vec`, each block after the last, so a frame's history is all in it.
+struct VecOut<'d> {
+    output: Vec<u8>,
+    /// The current frame's.
     prefix: Prefix,
-    checksum: Option<Xxh64>,
-    /// Output position up to which `checksum` has been fed.
-    fed: usize,
+    /// The dictionary content every frame's history starts with, empty
+    /// without a dictionary.
+    dict: &'d [u8],
 }
 
-impl FrameContent {
-    fn new(prefix: Prefix, has_checksum: bool) -> Self {
-        Self {
-            prefix,
-            checksum: has_checksum.then(Xxh64::new),
-            fed: prefix.start,
+impl VecOut<'_> {
+    /// The history before the current frame: the dictionary content.
+    fn ext(&self) -> ExtHistory {
+        ExtHistory {
+            end: self.dict.as_ptr_range().end,
+            len: self.dict.len(),
+            dict: true,
         }
     }
+}
 
-    /// Feed the checksum what has been decoded since the last call. The
-    /// block loops call this after each block, while it is in cache.
-    fn feed(&mut self, output: &[u8]) {
-        if let Some(h) = &mut self.checksum {
-            h.update(&output[self.fed..]);
-            self.fed = output.len();
-        }
+impl FrameOut for VecOut<'_> {
+    fn start(&mut self, window: usize, _content_size: Option<u64>) {
+        self.prefix = Prefix {
+            start: self.output.len(),
+            window,
+        };
     }
 
-    /// The Content_Checksum of the frame decoded into `output`: the low
-    /// half of the XXH64 of every byte from `base`, whatever the block
-    /// loops fed.
-    fn checksum(&mut self, output: &[u8]) -> Option<u32> {
-        self.feed(output);
-        self.checksum.as_ref().map(|h| h.digest() as u32)
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
+        let dst = self
+            .prefix
+            .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+        Ok((dst, self.ext()))
     }
+
+    unsafe fn commit(&mut self, end: usize) -> &[u8] {
+        let start = self.output.len();
+        // The bytes up to `end` are written, and `end` is within the room
+        // `Prefix::dst` reserved.
+        self.output.set_len(self.prefix.start + end);
+        &self.output[start..]
+    }
+}
+
+/// Reserve room in `output` for a frame of `content_size` bytes whose blocks
+/// start `blocks`, plus what a block's destination reserves past its start,
+/// so that no block has to grow the buffer (and move everything decoded). A
+/// content size past what the blocks can decode to fails the size check, so
+/// it gets no room beyond that.
+fn reserve_frame(
+    output: &mut Vec<u8>,
+    content_size: Option<u64>,
+    blocks: &[u8],
+    block_size_max: usize,
+) -> Result<(), String> {
+    let Some(fcs) = content_size else {
+        return Ok(());
+    };
+    let content = fcs.min(blocks_decoded_bound(blocks, block_size_max));
+    let want = usize::try_from(content)
+        .ok()
+        .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
+        .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
+    output
+        .try_reserve(want)
+        .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))
 }
 
 /// The most the blocks at the start of `data` decode to: the sum of each
@@ -3910,11 +4478,8 @@ impl FrameContent {
 fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     let mut rest = data;
     let mut bound = 0u64;
-    while let Ok((block, header_len)) = parse_block_header(rest, block_size_max) {
-        let Some(next) = rest.get(header_len + block.content_size as usize..) else {
-            break;
-        };
-        rest = next;
+    while let Ok((block, content)) = locate_block(rest, block_size_max) {
+        rest = &rest[BLOCK_HEADER_LEN + content.len()..];
         bound = bound.saturating_add(match block.block_type {
             BlockType::Compressed => block_size_max as u64,
             _ => u64::from(block.decompressed_size),
@@ -3926,43 +4491,9 @@ fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     bound
 }
 
-/// The serial block loop of `decode_frame`: decode every block of the
-/// frame at `data[*pos..]` into `output`.
-fn decode_blocks(
-    data: &[u8],
-    pos: &mut usize,
-    block_size_max: usize,
-    scratch: &mut DecoderScratch,
-    frame: &mut FrameContent,
-    output: &mut Vec<u8>,
-    simd: Level,
-) -> Result<(), String> {
-    loop {
-        let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
-        *pos += header_len;
-        let content = data
-            .get(*pos..*pos + block.content_size as usize)
-            .ok_or_else(|| "Block content extends past end of input".to_string())?;
-        *pos += content.len();
-
-        match block.block_type {
-            BlockType::Raw => output.extend_from_slice(content),
-            BlockType::RLE => {
-                output.resize(output.len() + block.decompressed_size as usize, content[0])
-            }
-            BlockType::Compressed => {
-                decompress_block(content, block_size_max, scratch, frame.prefix, output, simd)?
-            }
-            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
-        }
-        frame.feed(output);
-
-        if block.last_block {
-            break;
-        }
-    }
-    Ok(())
-}
+// ============================================================
+// Block decoder
+// ============================================================
 
 /// A compressed block's sections, located from their headers
 /// (ZSTD_decodeLiteralsBlock's and ZSTD_decodeSeqHeaders' size parsing).
@@ -4024,14 +4555,16 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
 }
 
 /// Decode the block's literals into `target` (cleared first) and append
-/// `WILDCOPY_OVERLENGTH` bytes of slack.
+/// `WILDCOPY_OVERLENGTH` bytes of slack. Treeless literals use `repeat`
+/// when given, else `huf`'s table.
 fn decode_block_literals(
     parts: &BlockParts<'_>,
     huf: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     target: &mut Vec<u8>,
 ) -> Result<(), String> {
     target.clear();
-    let used = decode_literals(&parts.literals, huf, parts.literals_src, target)?;
+    let used = decode_literals(&parts.literals, huf, repeat, parts.literals_src, target)?;
     assert!(
         parts.literals.regenerated_size == target.len() as u32,
         "Wrong number of literals: {}, Should have been: {}",
@@ -4043,37 +4576,55 @@ fn decode_block_literals(
     Ok(())
 }
 
-fn decompress_block(
+/// Decode compressed block `raw` into `dst`, after `ext`, in a frame whose
+/// Block_Maximum_Size is `block_size_max`; returns the block's end.
+///
+/// # Safety
+/// `dst` and `ext` meet their contracts.
+unsafe fn decompress_block(
     raw: &[u8],
     block_size_max: usize,
     workspace: &mut DecoderScratch,
-    prefix: Prefix,
-    output: &mut Vec<u8>,
+    dst: Dst,
+    ext: ExtHistory,
     simd: Level,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let parts = split_block(raw, block_size_max)?;
-    decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
+    let dict = workspace.dict.as_deref();
+    let repeat = dict
+        .filter(|_| workspace.huf_from_dict)
+        .map(|d| &d.huf.table);
+    decode_block_literals(
+        &parts,
+        &mut workspace.huf,
+        repeat,
+        &mut workspace.literals_buffer,
+    )?;
+    workspace.huf_from_dict &= !matches!(parts.literals.ls_type, LiteralsSectionType::Compressed);
     let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
     let seq_section = parts.sequences;
     let raw = parts.sequences_src;
 
     if seq_section.num_sequences != 0 {
-        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        let from_dict = &mut workspace.fse_from_dict;
+        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse, from_dict)?;
+        let fse: [&FSETable; 3] = std::array::from_fn(|t| match dict {
+            Some(d) if from_dict[t] => d.fse.table(t),
+            _ => workspace.fse.table(t),
+        });
         let seqs = SeqInput {
             num_sequences: seq_section.num_sequences,
             bit_stream: &raw[table_bytes..],
-            fse: &workspace.fse,
+            fse,
             literals: &workspace.literals_buffer,
         };
-        execute_with_copies(
-            simd,
-            &workspace.fse.offsets,
-            seqs,
-            &mut workspace.offset_hist,
-            block_size_max,
-            prefix,
-            output,
-        )?;
+        let (offsets, hist) = (fse[1], &mut workspace.offset_hist);
+        if ext.len == 0 {
+            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+        } else {
+            let seqs = ExtSeqInput { seqs, ext };
+            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
+        }
     } else {
         if !raw.is_empty() {
             return Err(format!(
@@ -4081,10 +4632,12 @@ fn decompress_block(
                 raw.len() as isize * 8
             ));
         }
-        output.extend_from_slice(&workspace.literals_buffer[..literals_len]);
+        // `split_block` held the literals to `block_size_max`, within the
+        // room `dst` has.
+        let literals = &workspace.literals_buffer[..literals_len];
+        ptr::copy_nonoverlapping(literals.as_ptr(), dst.base.add(dst.op), literals.len());
+        Ok(dst.op + literals.len())
     }
-
-    Ok(())
 }
 
 // ============================================================
@@ -4108,6 +4661,10 @@ mod parallel {
     /// Frames with fewer blocks take the fused serial path.
     pub(super) const MIN_BLOCKS: usize = 4;
 
+    /// The "block" that defined a table the frame starts with: a
+    /// dictionary's (`init` of `decode_frame_blocks`).
+    const START: usize = usize::MAX;
+
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
         Raw(&'a [u8]),
@@ -4119,10 +4676,11 @@ mod parallel {
         parts: BlockParts<'a>,
         /// For Huffman-coded literals, the block whose tree description
         /// they use: this block for Compressed literals, the last earlier
-        /// block with Compressed literals for Treeless ones.
+        /// block with Compressed literals for Treeless ones, or `START`.
         huf_def: Option<usize>,
         /// For LL, OF and ML (`SEQ_TABLES` order), the block whose mode
-        /// defined the table this block uses. Unused without sequences.
+        /// defined the table this block uses, or `START`. Unused without
+        /// sequences.
         fse_def: [usize; 3],
     }
 
@@ -4136,22 +4694,21 @@ mod parallel {
 
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
-    /// decoder's scratch tables carry them from block to block.
+    /// decoder's scratch tables carry them from block to block, from the
+    /// tables in `init`.
     fn plan_frame<'a>(
         data: &'a [u8],
         pos: &mut usize,
         block_size_max: usize,
+        init: &DecoderScratch,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = None;
-        let mut fse_def: [Option<usize>; 3] = [None; 3];
+        let mut huf_def = (init.huf_table().max_num_bits != 0).then_some(START);
+        let mut fse_def: [Option<usize>; 3] =
+            std::array::from_fn(|t| (!init.fse_table(t).decode().is_empty()).then_some(START));
         loop {
-            let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
-            *pos += header_len;
-            let content = data
-                .get(*pos..*pos + block.content_size as usize)
-                .ok_or_else(|| "Block content extends past end of input".to_string())?;
-            *pos += content.len();
+            let (block, content) = locate_block(&data[*pos..], block_size_max)?;
+            *pos += BLOCK_HEADER_LEN + content.len();
             let i = plans.len();
             plans.push(match block.block_type {
                 BlockType::Raw => Plan::Raw(content),
@@ -4264,17 +4821,24 @@ mod parallel {
         }
     }
 
-    /// Stage 2 for compressed block `i`.
+    /// Stage 2 for compressed block `i`, of a frame starting with the
+    /// tables in `init`.
     fn decode_block(
         slot: &mut Slot,
         i: usize,
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
+        init: &DecoderScratch,
     ) -> Result<(), String> {
         if let Some(d) = plan.huf_def {
             if d == i {
                 // `decode_block_literals` builds it from this block.
                 slot.huf_from = None;
+            } else if d == START {
+                if slot.huf_from != Some(d) {
+                    slot.huf.table.copy_from(init.huf_table());
+                    slot.huf_from = Some(d);
+                }
             } else if slot.huf_from != Some(d) {
                 slot.huf_from = None;
                 // The same arguments as the defining block's own build in
@@ -4289,7 +4853,7 @@ mod parallel {
                 slot.huf_from = Some(d);
             }
         }
-        decode_block_literals(&plan.parts, &mut slot.huf, &mut slot.literals)?;
+        decode_block_literals(&plan.parts, &mut slot.huf, None, &mut slot.literals)?;
         if plan.huf_def == Some(i) {
             slot.huf_from = Some(i);
         }
@@ -4323,7 +4887,11 @@ mod parallel {
                 slot.fse_from[t] = Some(i);
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                if d == START {
+                    slot.fse.table_mut(t).copy_from(init.fse_table(t));
+                } else {
+                    build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                }
                 slot.fse_from[t] = Some(d);
             }
         }
@@ -4529,10 +5097,10 @@ mod parallel {
         slot: &mut Slot,
         hist: &mut [u32; 3],
         block_size_max: usize,
-        prefix: Prefix,
-        output: &mut Vec<u8>,
+        out: &mut VecOut<'_>,
         simd: Level,
     ) -> Result<(), String> {
+        let output = &mut out.output;
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
             Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
@@ -4547,15 +5115,20 @@ mod parallel {
                     seqs: &slot.seqs,
                     literals: &slot.literals,
                 };
-                execute_with_copies(
-                    simd,
-                    &slot.fse.offsets,
-                    seqs,
-                    hist,
-                    block_size_max,
-                    prefix,
-                    output,
-                )?;
+                let (dst, ext) = out.block_dst()?;
+                let offsets = &slot.fse.offsets;
+                // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
+                // contracts, and on success the block's bytes up to `end`
+                // are written.
+                unsafe {
+                    let end = if ext.len == 0 {
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    } else {
+                        let seqs = ExtDecodedSeqs { seqs, ext };
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    };
+                    out.commit(end);
+                }
             }
         }
         Ok(())
@@ -4570,72 +5143,69 @@ mod parallel {
 
     impl BlockSequences for DecodedSeqs<'_> {
         #[inline(always)]
-        fn execute<W: WildCopy>(
+        unsafe fn execute<W: WildCopy>(
             self,
             w: W,
             offset_hist: &mut [u32; 3],
-            prefix: Prefix,
-            out: &mut Vec<u8>,
-        ) -> Result<(), String> {
-            let prefix_start = prefix.start;
-            let base = out.len();
-            out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-            // SAFETY: `prefix_start <= base`, and the capacity holds
-            // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
-            // the extent `execute_sequences` may write.
-            let end = unsafe {
-                execute_sequences(
-                    w,
-                    self.seqs,
-                    self.literals,
-                    offset_hist,
-                    out.as_mut_ptr().add(prefix_start),
-                    base - prefix_start,
-                    prefix.window,
-                )?
-            };
-            // SAFETY: on success every byte up to `prefix_start + end` is
-            // initialized, within the reserved capacity.
-            unsafe { out.set_len(prefix_start + end) };
-            Ok(())
+            dst: Dst,
+        ) -> Result<usize, String> {
+            execute_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
         }
     }
 
-    /// Execute decoded sequences from `op` in the buffer at `out` (the
-    /// frame start) with Window_Size `window`; returns the block's end.
-    /// Same contract as `run_sequences`.
+    /// `DecodedSeqs` whose matches reach on into `ext` before the segment,
+    /// in their own instantiation of the loop, as `ExtSeqInput`.
+    struct ExtDecodedSeqs<'a> {
+        seqs: DecodedSeqs<'a>,
+        ext: ExtHistory,
+    }
+
+    impl BlockSequences for ExtDecodedSeqs<'_> {
+        #[inline(always)]
+        unsafe fn execute<W: WildCopy>(
+            self,
+            w: W,
+            offset_hist: &mut [u32; 3],
+            dst: Dst,
+        ) -> Result<usize, String> {
+            execute_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
+        }
+    }
+
+    /// Execute decoded sequences into `dst` from `dst.op` on; returns the
+    /// block's end. Same contract as `run_sequences`.
     ///
     /// # Safety
-    /// `out..out + op` is initialized and
-    /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
+    /// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
+    /// `EXT`.
     #[inline(always)]
-    unsafe fn execute_sequences<W: WildCopy>(
+    unsafe fn execute_sequences<W: WildCopy, const EXT: bool>(
         w: W,
-        seqs: &[RawSeq],
-        literals: &[u8],
+        DecodedSeqs { seqs, literals }: DecodedSeqs<'_>,
+        ext: ExtHistory,
         offset_hist: &mut [u32; 3],
-        out: *mut u8,
-        op: usize,
-        window: usize,
+        dst: Dst,
     ) -> Result<usize, String> {
+        let out = dst.base;
         let mut hist = offset_hist.map(|o| o as usize);
         let lit = literals.as_ptr();
         // In bounds by the contract, and `literals` ends with
         // `WILDCOPY_OVERLENGTH` bytes of slack.
         let mut cur = SeqCursor {
-            op: out.add(op),
+            op: out.add(dst.op),
             lit,
         };
         let lim = SeqLimits {
-            oend_w: out.add(op + MAX_BLOCK_SIZE),
+            oend_w: out.add(dst.op + MAX_BLOCK_SIZE),
             lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
             prefix: out,
-            window,
+            ext,
+            window: dst.window,
         };
         for s in seqs {
             let ll = s.ll as usize;
             let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence(w, &mut cur, &lim, ll, s.ml as usize, offset)
+            exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
                 .map_err(seq_error_message)?;
         }
         // Last literals; both cursors only advanced within their buffers.
@@ -4648,23 +5218,25 @@ mod parallel {
         Ok(cur.op as usize + rest - out as usize)
     }
 
-    /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
-    /// current rayon pool. Returns `Ok(false)` without consuming input when
-    /// the frame has fewer than `min_blocks` blocks.
+    /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
+    /// current rayon pool, starting from the tables and repeat offsets in
+    /// `init` (a dictionary's, or none). Returns `Ok(false)` without
+    /// consuming input when the frame has fewer than `min_blocks` blocks.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
-        block_size_max: usize,
-        frame: &mut FrameContent,
-        output: &mut Vec<u8>,
+        frame: &mut Frame,
+        init: &DecoderScratch,
+        out: &mut VecOut<'_>,
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
         if min_blocks == usize::MAX {
             return Ok(false);
         }
+        let block_size_max = frame.block_size_max;
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max)?;
+        let plans = plan_frame(data, &mut end, block_size_max, init)?;
         if plans.len() < min_blocks {
             return Ok(false);
         }
@@ -4684,7 +5256,7 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
-        let mut hist = [1u32, 4, 8];
+        let mut hist = init.offset_hist;
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -4700,7 +5272,7 @@ mod parallel {
                     // of waiting forever.
                     let _done = MarkDone(&cell.done, i + 1);
                     let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans);
+                    slot.result = decode_block(&mut slot, i, cp, plans, init);
                 });
             };
             for i in 0..ring.len() {
@@ -4711,7 +5283,7 @@ mod parallel {
                 let mut slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans);
+                        slot.result = decode_block(&mut slot, i, cp, plans, init);
                         slot
                     }
                     Plan::Compressed(_) => {
@@ -4725,7 +5297,7 @@ mod parallel {
                                 Some(Plan::Compressed(np)) if next.claim(i + 1) => {
                                     let _done = MarkDone(&next.done, i + 2);
                                     let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans);
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans, init);
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
@@ -4736,18 +5308,11 @@ mod parallel {
                     }
                     _ => cell.slot.lock().unwrap(),
                 };
-                execute_block(
-                    plan,
-                    &mut slot,
-                    &mut hist,
-                    block_size_max,
-                    frame.prefix,
-                    output,
-                    simd,
-                )?;
+                let start = out.output.len();
+                execute_block(plan, &mut slot, &mut hist, block_size_max, out, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
-                frame.feed(output);
+                frame.block_decoded(&out.output[start..])?;
             }
             Ok::<(), String>(())
         })?;
@@ -5121,11 +5686,12 @@ mod tests {
     /// descriptions of random codes (raw and FSE-compressed, 2 to 256
     /// symbols, 6- to 12-bit), every truncation of them, single-byte
     /// corruptions and random bytes: the same outcome, and on success the
-    /// same length, weights, statistics and table log, except that the
-    /// descriptions of 12-bit codes, which libzstd accepts, are rejected
-    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7). Hundreds of the
-    /// corrupted and random inputs are valid descriptions, and over 150
-    /// describe 12-bit codes.
+    /// same length, weights, statistics and table log, except for two
+    /// kinds libzstd accepts and we reject: descriptions of 12-bit codes
+    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7), and weight FSE tables
+    /// listing a symbol past 11, the highest weight (R3-2). Hundreds of the
+    /// corrupted and random inputs are valid descriptions, over 150
+    /// describe 12-bit codes, and over 10 list such a symbol.
     #[test]
     fn huf_stats_match_libzstd() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -5135,13 +5701,24 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
-        let mut log12 = 0;
+        // The FSE-compressed weights of `src` list a symbol past 11.
+        let wide = |src: &[u8]| {
+            let header = usize::from(src[0]);
+            header < 128
+                && src.get(1..1 + header).is_some_and(|desc| {
+                    parse_fse_header(desc, 6).is_ok_and(|(_, counts, _)| counts.len() > 12)
+                })
+        };
+        let (mut log12, mut wide_tables) = (0, 0);
         let mut check = |src: &[u8]| {
             let ours = huf_stats_ours(src);
             let c = huf_stats_c(src);
             if matches!(c, Some((.., 12))) {
                 assert_eq!(ours, None, "input {src:02x?}");
                 log12 += 1;
+            } else if c.is_some() && wide(src) {
+                assert_eq!(ours, None, "input {src:02x?}");
+                wide_tables += 1;
             } else {
                 assert_eq!(ours, c, "input {src:02x?}");
             }
@@ -5179,8 +5756,8 @@ mod tests {
             random_ok += check(&src);
         }
         assert!(
-            bad_ok > 500 && random_ok > 1000 && log12 > 150,
-            "{bad_ok} {random_ok} accepted, {log12} of 12 bits"
+            bad_ok > 500 && random_ok > 1000 && log12 > 150 && wide_tables > 10,
+            "{bad_ok} {random_ok} accepted, {log12} of 12 bits, {wide_tables} wide"
         );
     }
 
@@ -5354,13 +5931,12 @@ mod tests {
     struct CopyProbe;
 
     impl BlockSequences for CopyProbe {
-        fn execute<W: WildCopy>(
+        unsafe fn execute<W: WildCopy>(
             self,
             _: W,
             _: &mut [u32; 3],
-            _: Prefix,
-            _: &mut Vec<u8>,
-        ) -> Result<(), String> {
+            _: Dst,
+        ) -> Result<usize, String> {
             let name = std::any::type_name::<W>();
             Err(name.rsplit("::").next().unwrap_or(name).to_string())
         }
@@ -5384,16 +5960,10 @@ mod tests {
                 start: 0,
                 window: usize::MAX,
             };
-            execute_with_copies(
-                level,
-                t,
-                CopyProbe,
-                &mut [1, 4, 8],
-                0,
-                prefix,
-                &mut Vec::new(),
-            )
-            .unwrap_err()
+            let mut out = Vec::new();
+            let dst = prefix.dst(&mut out, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+            // SAFETY: `Prefix::dst` meets the `Dst` contract.
+            unsafe { execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, dst) }.unwrap_err()
         };
         let mut t = FSETable::new(MAX_OFFSET_CODE);
         for (level, plain, short) in levels {
@@ -5409,6 +5979,99 @@ mod tests {
             assert_eq!(pick(level, &t), short, "RLE 3");
             t.build_rle(10, of.base, of.bits);
             assert_eq!(pick(level, &t), plain, "RLE 10");
+        }
+    }
+
+    /// Compressed block of one sequence in RLE-mode tables: no literals,
+    /// then `ml` bytes (3..=34) copied from `offset` back.
+    fn one_match_block(offset: u32, ml: u8) -> Vec<u8> {
+        let value = offset + 3;
+        let code = 31 - value.leading_zeros();
+        let mut body = vec![0x00, 1, 0x54, 0, code as u8, ml - 3];
+        let stream = (1u64 << code) | u64::from(value - (1 << code));
+        body.extend_from_slice(&stream.to_le_bytes()[..code as usize / 8 + 1]);
+        body
+    }
+
+    /// A match reaches back through the segment into `ExtHistory` up to
+    /// its first byte and no further, wholly inside it or running on into
+    /// the segment, still bounded by Window_Size; without history it stops
+    /// at the segment, as in one-shot decoding. Into a dictionary it may
+    /// reach past Window_Size, while the segment before it holds at most
+    /// Window_Size bytes.
+    #[test]
+    fn match_reaches_into_ext_history() {
+        let ext: Vec<u8> = (0..64).collect();
+        let seg: Vec<u8> = (100..110).collect();
+        let mut levels = vec![Level::fallback()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if let Level::Avx2(w) = Level::new() {
+            levels.push(Level::Avx2(w));
+        }
+        // (offset, match length, ext bytes, window, accepted from history,
+        // from a dictionary); the match follows the 10 segment bytes.
+        let cases = [
+            (10, 4, 64, 1 << 20, true, true),
+            (11, 4, 64, 1 << 20, true, true),
+            (11, 30, 64, 1 << 20, true, true),
+            (20, 4, 64, 1 << 20, true, true),
+            (20, 34, 64, 1 << 20, true, true),
+            (74, 4, 64, 1 << 20, true, true),
+            (74, 34, 64, 1 << 20, true, true),
+            (75, 4, 64, 1 << 20, false, false),
+            (11, 4, 0, 1 << 20, false, false),
+            (11, 4, 1, 1 << 20, true, true),
+            (12, 4, 1, 1 << 20, false, false),
+            (60, 4, 64, 60, true, true),
+            (60, 4, 64, 59, false, true),
+            (11, 4, 64, 10, false, true),
+            (74, 4, 64, 10, false, true),
+            (74, 34, 64, 10, false, true),
+            (75, 4, 64, 10, false, false),
+            (10, 4, 64, 9, false, false),
+            (60, 4, 64, 9, false, false),
+        ];
+        for simd in levels {
+            for (offset, ml, ext_len, window, accept, accept_dict) in cases {
+                for dict in [false, true] {
+                    let name = format!(
+                        "offset {offset} ml {ml} ext {ext_len} window {window} dict {dict}"
+                    );
+                    let ext = &ext[ext.len() - ext_len..];
+                    let mut out = seg.clone();
+                    out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+                    let dst = Dst {
+                        base: out.as_mut_ptr(),
+                        op: out.len(),
+                        window,
+                    };
+                    let history = ExtHistory {
+                        end: ext.as_ptr_range().end,
+                        len: ext.len(),
+                        dict,
+                    };
+                    let block = one_match_block(offset as u32, ml);
+                    let mut scratch = DecoderScratch::new();
+                    // SAFETY: `out` holds the segment with the room `Dst`
+                    // needs reserved, and `ext` is the history.
+                    let got = unsafe {
+                        decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd)
+                            .map(|end| {
+                                out.set_len(end);
+                                out
+                            })
+                    };
+                    if !(if dict { accept_dict } else { accept }) {
+                        assert!(got.is_err(), "{name}: accepted");
+                        continue;
+                    }
+                    let mut want = [ext, &seg[..]].concat();
+                    for _ in 0..ml {
+                        want.push(want[want.len() - offset]);
+                    }
+                    assert_eq!(got.as_deref(), Ok(&want[ext.len()..]), "{name}");
+                }
+            }
         }
     }
 

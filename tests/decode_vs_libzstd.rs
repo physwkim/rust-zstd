@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS};
+use common::{assert_stream_parity, datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS};
 
 #[test]
 fn decodes_libzstd_streams_byte_exact() {
@@ -71,6 +71,7 @@ fn truncated_streams_return_err_without_panic() {
                 assert_eq!(rust_zstd::decompress(&compressed).unwrap(), data);
                 for cut in 0..compressed.len() {
                     let prefix = &compressed[..cut];
+                    assert_stream_parity(&format!("{name} level {level} cut {cut}"), prefix);
                     let result = std::panic::catch_unwind(|| rust_zstd::decompress(prefix));
                     let result = result.unwrap_or_else(|_| {
                         panic!(
@@ -119,6 +120,7 @@ fn corrupted_streams_never_panic() {
                         pos,
                         flip
                     );
+                    assert_stream_parity(&format!("level {level} byte {pos} xor {flip:#x}"), &bad);
                 }
             }
         }

@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use rust_zstd::decode::{decompress_with_options, DecodeOptions};
+use rust_zstd::Decompressor;
 use std::path::{Path, PathBuf};
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -340,4 +342,80 @@ pub fn assert_gate(what: &str, src: &[u8], ours: &[u8], lib: &[u8]) {
     if let Err(e) = gate(what, src, ours, lib) {
         panic!("{e}");
     }
+}
+
+/// Input chunk sizes the streaming decoder is checked at: 1, 7 and 4096
+/// bytes, and the whole input in one piece.
+pub const STREAM_CHUNKS: [usize; 4] = [1, 7, 4096, usize::MAX];
+
+/// Decode `input` with `Decompressor::decompress_stream`, handing it at most
+/// `chunk` bytes of input and `room` bytes to write in each call, until it
+/// has read all of the input and written out all it decoded, then
+/// `finish`.
+pub fn decompress_streaming(
+    input: &[u8],
+    chunk: usize,
+    room: usize,
+    opts: &DecodeOptions,
+) -> Result<Vec<u8>, String> {
+    let mut d = Decompressor::with_options(opts);
+    let mut content = Vec::new();
+    let mut out = vec![0u8; room];
+    let mut pos = 0usize;
+    loop {
+        let src = &input[pos..input.len().min(pos.saturating_add(chunk))];
+        let (mut read, mut written) = (0, 0);
+        let hint = d.decompress_stream(src, &mut read, &mut out, &mut written)?;
+        content.extend_from_slice(&out[..written]);
+        pos += read;
+        if read == 0 && written == 0 && hint != 0 {
+            assert!(
+                src.is_empty(),
+                "no progress with {} bytes to read",
+                src.len()
+            );
+            break;
+        }
+    }
+    d.finish()?;
+    Ok(content)
+}
+
+/// The output room `assert_stream_parity_at` gives with input chunks of
+/// `chunk` bytes.
+pub fn stream_room(chunk: usize) -> usize {
+    chunk.min(1 << 16)
+}
+
+/// `decompress_streaming` of `input` at each of `chunks`, with as much
+/// output room up to 64 KiB, has the outcome of `decompress_with_options`,
+/// serial, at both SIMD levels: the same content or the same error.
+pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
+    fn outcome(r: &Result<Vec<u8>, String>) -> String {
+        match r {
+            Ok(content) => format!("{} bytes", content.len()),
+            Err(e) => format!("error {e:?}"),
+        }
+    }
+    for simd in [false, true] {
+        let opts = DecodeOptions {
+            min_parallel_blocks: usize::MAX,
+            simd,
+        };
+        let want = decompress_with_options(input, &opts);
+        for &chunk in chunks {
+            let got = decompress_streaming(input, chunk, stream_room(chunk), &opts);
+            assert!(
+                got == want,
+                "{name} simd={simd} chunk {chunk}: streaming gives {} where one-shot gives {}",
+                outcome(&got),
+                outcome(&want)
+            );
+        }
+    }
+}
+
+/// `assert_stream_parity_at` at `STREAM_CHUNKS`.
+pub fn assert_stream_parity(name: &str, input: &[u8]) {
+    assert_stream_parity_at(name, input, &STREAM_CHUNKS);
 }
