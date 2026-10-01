@@ -104,7 +104,8 @@ impl LdmParams {
     }
 
     /// `ZSTD_ldm_adjustParameters(params, cParams)` for the frame's final
-    /// compression parameters.
+    /// compression parameters. A hash log, explicit or derived, whose table
+    /// cannot be allocated panics: above 27 where `usize` is 32 bits.
     pub fn adjusted(mut self, cparams: &CParams) -> Self {
         let strategy = cparams.strategy as u32;
         self.window_log = cparams.window_log;
@@ -139,6 +140,13 @@ impl LdmParams {
             self.bucket_size_log = strategy.clamp(LDM_BUCKET_SIZE_LOG, BUCKETSIZELOG_MAX);
         }
         self.bucket_size_log = self.bucket_size_log.min(self.hash_log);
+        // libzstd's 32-bit table size wraps past 2^32 bytes and its writes
+        // run out of bounds (R1-15): refuse a table that cannot exist.
+        assert!(
+            self.hash_log <= HASHLOG_ALLOC_MAX,
+            "ldm_hash_log {} over {HASHLOG_ALLOC_MAX}: its table would exceed isize::MAX bytes",
+            self.hash_log
+        );
         self
     }
 }
@@ -300,6 +308,15 @@ struct LdmEntry {
     offset: u32,
     checksum: u32,
 }
+
+/// The largest hash log whose table fits in `max_bytes`.
+const fn hash_log_fitting(max_bytes: usize) -> u32 {
+    (max_bytes / size_of::<LdmEntry>()).ilog2()
+}
+
+/// The largest hash log whose table can be allocated, a `Vec` holding at
+/// most `isize::MAX` bytes: 27 where `usize` is 32 bits.
+pub(crate) const HASHLOG_ALLOC_MAX: u32 = hash_log_fitting(isize::MAX as usize);
 
 /// `ldmState_t` with its window: the hash table persists across the
 /// blocks (or jobs) of a frame.
@@ -1073,6 +1090,32 @@ mod tests {
                 let [h, m, b, r] = args;
                 let ours = std::panic::catch_unwind(|| LdmParams::requested(h, m, b, r)).is_ok();
                 assert_eq!(ours, c_accepts(param, v), "{param:?} {v}");
+            }
+        }
+    }
+
+    /// A hash log whose table cannot be allocated, explicit or derived from
+    /// the rate and window logs, panics in `adjusted` (R1-15): above 27
+    /// where `usize` is 32 bits, never on 64 bits.
+    #[test]
+    fn unallocatable_hash_log_panics() {
+        // 2^27 8-byte entries are 1 GiB, 2^28 are 2 GiB.
+        assert_eq!(hash_log_fitting(i32::MAX as usize), 27);
+        assert_eq!(
+            HASHLOG_ALLOC_MAX >= ZSTD_HASHLOG_MAX,
+            cfg!(target_pointer_width = "64")
+        );
+        let cp = cparams(Strategy::Fast, ZSTD_WINDOWLOG_MAX);
+        for log in ZSTD_HASHLOG_MIN..=ZSTD_HASHLOG_MAX {
+            let explicit = LdmParams::requested(log, 0, 0, 0);
+            let derived =
+                (log < cp.window_log).then(|| LdmParams::requested(0, 0, 0, cp.window_log - log));
+            for p in [Some(explicit), derived].into_iter().flatten() {
+                let adjusted = std::panic::catch_unwind(|| p.adjusted(&cp));
+                match adjusted {
+                    Ok(a) => assert!(log <= HASHLOG_ALLOC_MAX && a.hash_log == log, "{p:?}"),
+                    Err(_) => assert!(log > HASHLOG_ALLOC_MAX, "{p:?}"),
+                }
             }
         }
     }

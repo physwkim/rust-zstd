@@ -121,7 +121,9 @@ pub struct CompressOptions {
     /// `ZSTD_c_ldmHashLog`: `0` derives it (window log minus hash rate
     /// log, within `6..=30`), else `6..=30`. A hash rate log above the
     /// window log derives 6, where libzstd's unsigned subtraction wraps
-    /// and derives 30 (an 8 GiB table).
+    /// and derives 30 (an 8 GiB table). Where `usize` is 32 bits, a hash
+    /// log above 27 (a table over `isize::MAX` bytes) panics before any
+    /// output when long distance matching is enabled.
     pub ldm_hash_log: u32,
     /// `ZSTD_c_ldmMinMatch`: `0` derives it (64, 32 for `btultra` and up),
     /// else `4..=4096`.
@@ -222,8 +224,10 @@ impl CompressOptions {
     /// panicking where `ZSTD_CCtx_setParameter` returns
     /// `parameter_outOfBound`: [`Compressor::compress`] calls it before
     /// writing anything, so an out-of-range option is rejected the same way
-    /// whatever the input. The other options have no rejected values: the
-    /// level, job size and overlap log clamp as libzstd clamps them.
+    /// whatever the input. So is an LDM hash log whose table cannot be
+    /// allocated ([`LdmParams::adjusted`]). The other options have no
+    /// rejected values: the level, job size and overlap log clamp as
+    /// libzstd clamps them.
     fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
         assert!(
             self.block_splitter_level <= presplit::BLOCK_SPLITTER_LEVEL_MAX,
@@ -1453,9 +1457,34 @@ mod tests {
         );
     }
 
-    /// Every option libzstd rejects panics before [`Compressor::compress`]
-    /// writes to `out`, on empty, one-byte and multi-block input, single-
-    /// and multithreaded, and its bound is libzstd's.
+    /// Options changed by `set` panic with a message starting with `name`
+    /// before [`Compressor::compress`] writes to `out`, on empty, one-byte
+    /// and multi-block input, single- and multithreaded.
+    fn assert_panics_before_output(name: &str, set: impl Fn(&mut CompressOptions)) {
+        let big = vec![b'x'; JOBSIZE_MIN + (300 << 10)];
+        for job_size in [None, Some(JOBSIZE_MIN)] {
+            for src in [&[][..], b"a", &big] {
+                let mut opts = CompressOptions {
+                    job_size,
+                    ..Default::default()
+                };
+                set(&mut opts);
+                let mut cx = Compressor::new(opts);
+                let mut out = b"prefix".to_vec();
+                let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.compress(src, &mut out)
+                }))
+                .expect_err(name);
+                let msg = err.downcast_ref::<String>().map_or("", |m| m);
+                let what = format!("{name} job_size {job_size:?} len {}", src.len());
+                assert!(msg.starts_with(name), "{what}: {msg}");
+                assert!(out == b"prefix", "{what}: out written");
+            }
+        }
+    }
+
+    /// Every option libzstd rejects panics before any output, and its bound
+    /// is libzstd's.
     #[test]
     fn out_of_range_option_panics_before_output() {
         use crate::compress::common::testutil::{c_accepts, c_bounds};
@@ -1472,27 +1501,21 @@ mod tests {
             ("ldm_bucket_size_log 9", |o| o.ldm_bucket_size_log = 9),
             ("ldm_hash_rate_log 26", |o| o.ldm_hash_rate_log = 26),
         ];
-        let big = vec![b'x'; JOBSIZE_MIN + (300 << 10)];
         for (name, set) in bad {
-            for job_size in [None, Some(JOBSIZE_MIN)] {
-                for src in [&[][..], b"a", &big] {
-                    let mut opts = CompressOptions {
-                        job_size,
-                        ..Default::default()
-                    };
-                    set(&mut opts);
-                    let mut cx = Compressor::new(opts);
-                    let mut out = b"prefix".to_vec();
-                    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cx.compress(src, &mut out)
-                    }))
-                    .expect_err(name);
-                    let msg = err.downcast_ref::<String>().map_or("", |m| m);
-                    let what = format!("{name} job_size {job_size:?} len {}", src.len());
-                    assert!(msg.starts_with(name), "{what}: {msg}");
-                    assert!(out == b"prefix", "{what}: out written");
-                }
-            }
+            assert_panics_before_output(name, set);
+        }
+    }
+
+    /// An LDM hash log whose table cannot be allocated panics before any
+    /// output (R1-15): `28..=30` where `usize` is 32 bits, none on 64 bits.
+    #[test]
+    fn unallocatable_ldm_hash_log_panics_before_output() {
+        let too_big = (ZSTD_HASHLOG_MIN..=ZSTD_HASHLOG_MAX).filter(|&l| l > ldm::HASHLOG_ALLOC_MAX);
+        for log in too_big {
+            assert_panics_before_output(&format!("ldm_hash_log {log}"), |o| {
+                o.ldm = ParamSwitch::Enable;
+                o.ldm_hash_log = log;
+            });
         }
     }
 
