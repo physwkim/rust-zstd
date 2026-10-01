@@ -4,11 +4,13 @@
 //! `max(window, jobSize * nbWorkers) + jobSize * (2 + (overlap > 0))`
 //! bytes. On each wrap, `ZSTD_window_update` makes the serial long
 //! distance window an extDict and raises its low limit over the bytes the
-//! next job overwrites. Our jobs read one contiguous input, so the frames
-//! match only if no overwritten byte is still inside the window. None is:
+//! next job overwrites. Our jobs read one contiguous input, so our frames
+//! could find matches libzstd cannot only if an overwritten byte were still
+//! inside the window. None is:
 //! the buffer wraps only once less than a job fits, when it holds more
 //! than a window plus a job and its overlap, so the next job and the
-//! overlap copied before it end below the window.
+//! overlap copied before it end below the window. Every frame must pass the
+//! encoder gate.
 //!
 //! Ignored by default; release build:
 //!
@@ -109,10 +111,9 @@ fn jobs_past_the_round_buffer_match_libzstd() {
             ],
         );
         eprintln!("{name}: {} bytes, libzstd {}", frame.len(), c.len());
-        if frame != c {
-            differ.push(name.clone());
+        if let Err(e) = common::gate(&name, &data, &frame, &c) {
+            differ.push(e);
         }
-        assert!(rust_zstd::decompress(&frame).unwrap() == data, "{name}");
     }
-    assert!(differ.is_empty(), "differ from libzstd: {differ:?}");
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
 }

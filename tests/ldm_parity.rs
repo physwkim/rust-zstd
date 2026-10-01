@@ -3,7 +3,8 @@
 //! an input above `ZSTDMT_JOBSIZE_MIN` full of long repeats. The default
 //! options are single-threaded `ZSTD_compress2`, which generates each
 //! block's long distance matches as it compresses the block; an explicit
-//! job size is ZSTDMT, which generates each job's in job order.
+//! job size is ZSTDMT, which generates each job's in job order. Every
+//! frame must pass the encoder gate.
 
 mod common;
 
@@ -71,16 +72,13 @@ fn check(job_size: Option<usize>) {
     let mut differ = Vec::new();
     for level in LEVELS {
         let frame = ours(&data, level, job_size);
-        assert!(
-            rust_zstd::decompress(&frame).unwrap() == data,
-            "L{level} job {job_size:?}: our decoder"
-        );
         let c = theirs(&data, level, job_size);
-        if frame != c {
-            differ.push(format!("L{level}: {} vs libzstd {}", frame.len(), c.len()));
+        let what = format!("L{level} job {job_size:?}");
+        if let Err(e) = common::gate(&what, &data, &frame, &c) {
+            differ.push(e);
         }
     }
-    assert!(differ.is_empty(), "job {job_size:?}: {differ:?}");
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
 #[test]

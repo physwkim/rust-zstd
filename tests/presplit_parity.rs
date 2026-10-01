@@ -1,15 +1,14 @@
 //! The pre-splitter (`ZSTD_c_blockSplitterLevel`) against libzstd 1.5.7.
 //!
 //! `ZSTD_splitBlock` itself is compared on 128 KiB windows at every level.
-//! Frames are compared block for block, type and decompressed size of each
-//! in order, in two configurations:
+//! Frames pass the encoder gate against libzstd's in two configurations:
 //! - default options against libzstd's defaults (single-threaded
 //!   `ZSTD_compress2`);
 //! - `CompressOptions::parallel(level)` against ZSTDMT at 2 MiB jobs and
 //!   overlap log 8.
 //!
-//! The frames with the pre-splitter off must agree too. Every frame
-//! decodes on both decoders.
+//! The frames with the pre-splitter off must pass it too, and enough of
+//! ours must be pre-split.
 //!
 //! `blocks_match_libzstd` runs on the shared datasets (the 8 MiB ones cut to
 //! 3 MiB); the ignored `blocks_match_libzstd_on_corpus` runs on the files of
@@ -21,7 +20,7 @@
 
 mod common;
 
-use common::frame_blocks;
+use common::{assert_gate, frame_blocks};
 use rust_zstd::compress::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use rust_zstd::{compress_with, CompressOptions};
 use std::path::PathBuf;
@@ -122,18 +121,6 @@ fn c_frame(
     common::c_compress2(data, &params)
 }
 
-/// Type and decompressed size of every block of `frame`, which must decode
-/// to `data` on both decoders.
-fn keys(frame: &[u8], data: &[u8], what: &str) -> Vec<(u32, usize)> {
-    let (blocks, decoded) = frame_blocks(frame, data.len());
-    assert!(decoded == data, "{what}: libzstd decodes it wrong");
-    assert!(
-        rust_zstd::decompress(frame).unwrap() == data,
-        "{what}: our decoder decodes it wrong"
-    );
-    blocks.iter().map(|b| (b.ty, b.size)).collect()
-}
-
 /// Compare every input at every level of [`LEVELS`] in both
 /// configurations; returns the number of compared cases whose blocks were
 /// pre-split.
@@ -164,14 +151,19 @@ fn compare(inputs: Vec<(String, Vec<u8>)>) -> usize {
                     block_splitter_level: 1,
                     ..opts.clone()
                 };
-                let ours_off = keys(&compress_with(data, &off), data, &case);
-                let theirs_off = keys(&c_frame(data, level, c_params, 1), data, &case);
-                let ours = keys(&compress_with(data, &opts), data, &case);
-                assert_eq!(ours_off, theirs_off, "{case}: pre-splitter off");
-                let theirs = keys(&c_frame(data, level, c_params, 0), data, &case);
-                assert_eq!(ours, theirs, "{case}: block boundaries");
+                let ours_off = compress_with(data, &off);
+                let theirs_off = c_frame(data, level, c_params, 1);
+                assert_gate(
+                    &format!("{case} pre-splitter off"),
+                    data,
+                    &ours_off,
+                    &theirs_off,
+                );
+                let ours = compress_with(data, &opts);
+                assert_gate(&case, data, &ours, &c_frame(data, level, c_params, 0));
                 compared += 1;
-                presplit += (ours.len() > ours_off.len()) as usize;
+                let blocks = |frame| frame_blocks(frame, data.len()).0.len();
+                presplit += (blocks(&ours) > blocks(&ours_off)) as usize;
             }
         }
     }

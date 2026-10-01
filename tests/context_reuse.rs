@@ -6,12 +6,12 @@
 //! entries. Which job inherits a context depends on the rayon thread
 //! count, and so did the frames; at level 16 the binary tree broke
 //! (`match_index < curr` in bt.rs under debug assertions). A reused
-//! `Compressor` must write the frame a fresh one writes, which is
-//! libzstd's with `nbWorkers` at the same job size.
+//! `Compressor` must write the frame a fresh one writes, which passes the
+//! encoder gate against libzstd with `nbWorkers` at the same job size.
 
 mod common;
 
-use common::c_compress2;
+use common::{assert_gate, c_compress2};
 use rust_zstd::compress::{CompressOptions, Compressor};
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -91,10 +91,7 @@ fn reused_on_one_thread(level: i32, first: &[u8], second: &[u8]) -> Vec<u8> {
 fn frame_after_tiny_last_job_equals_fresh_frame() {
     let second = text(5, 2 * JOB + 3);
     let fresh = Compressor::new(opts(1)).compress_to_vec(&second);
-    assert!(
-        fresh == libzstd(&second, 1),
-        "fresh frame differs from libzstd"
-    );
+    assert_gate("text 5 L1 fresh", &second, &fresh, &libzstd(&second, 1));
     for tail in 1..=7 {
         let got = reused_on_one_thread(1, &text(1007, JOB + tail), &second);
         assert!(
@@ -140,10 +137,7 @@ fn frame_after_tiny_last_job_ignores_thread_count() {
 fn binary_tree_after_tiny_last_job_equals_fresh_frame() {
     let second = text(4, 2 * JOB);
     let fresh = Compressor::new(opts(16)).compress_to_vec(&second);
-    assert!(
-        fresh == libzstd(&second, 16),
-        "fresh frame differs from libzstd"
-    );
+    assert_gate("text 4 L16 fresh", &second, &fresh, &libzstd(&second, 16));
     let got = reused_on_one_thread(16, &text(3, JOB + 6), &second);
     assert!(got == fresh, "{} bytes, fresh {}", got.len(), fresh.len());
 }

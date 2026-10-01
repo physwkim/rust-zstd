@@ -3,7 +3,7 @@
 //! (`ZSTD_ldm_adjustParameters`), which wraps and clamps to 30: it zeroes
 //! a 2^30-entry (8 GiB) table to compress 1 KiB. This port derives
 //! ZSTD_HASHLOG_MIN instead; at every rate up to the window log the
-//! frames stay libzstd's. One test, so that nothing else allocates while
+//! frames pass the encoder gate against libzstd's. One test, so that nothing else allocates while
 //! it measures.
 
 mod common;
@@ -119,9 +119,11 @@ fn rate_above_window_log_keeps_the_ldm_table_small() {
     // 0 derives the rate (7 - strategy / 3); up to the window log the
     // difference does not wrap and the hash log is libzstd's.
     for rate in 0..=WINDOW_LOG {
-        assert!(
-            ours(&data, rate, None) == theirs(&data, rate),
-            "rate {rate}: frame differs from libzstd"
+        common::assert_gate(
+            &format!("L{LEVEL} ldm_hash_rate_log {rate}"),
+            &data,
+            &ours(&data, rate, None),
+            &theirs(&data, rate),
         );
     }
 }

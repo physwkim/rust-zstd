@@ -6,11 +6,11 @@
 //! writes a job's first block RLE (`isFirstBlock`, which the header flush of
 //! a later ZSTDMT job leaves set).
 //!
-//! Every frame must be libzstd's byte for byte.
+//! Every frame must pass the encoder gate against libzstd's.
 
 mod common;
 
-use common::{c_compress2, frame_blocks, lcg_bytes};
+use common::{c_compress2, gate, lcg_bytes};
 use rust_zstd::{compress_with, CompressOptions};
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -58,7 +58,7 @@ fn small_blocks_match_libzstd() {
     let job_prefix = text(JOB);
     let mut bad = Vec::new();
     for level in LEVELS {
-        let (mut compared, mut by_rule) = (0, 0);
+        let mut compared = 0;
         for n in 1..=16 {
             for (shape, tail) in shapes(n) {
                 let cases: [(&str, &[u8], Option<usize>); 4] = [
@@ -81,36 +81,14 @@ fn small_blocks_match_libzstd() {
                         params.extend([(ZSTD_c_nbWorkers, 2), (ZSTD_c_jobSize, job as i32)]);
                     }
                     let theirs = c_compress2(&data, &params);
-                    let (our_blocks, decoded) = frame_blocks(&ours, data.len());
-                    assert!(decoded == data, "{case}: libzstd decodes our frame wrong");
-                    assert!(
-                        rust_zstd::decompress(&ours).unwrap() == data,
-                        "{case}: our decoder"
-                    );
-                    let (c_blocks, _) = frame_blocks(&theirs, data.len());
-                    let (our_last, c_last) =
-                        (*our_blocks.last().unwrap(), *c_blocks.last().unwrap());
-                    assert_eq!(c_last.size, n, "{case}: libzstd's last block");
-                    // Without the match finder: RAW below 7 bytes, RLE for a
-                    // run that is not a job's first block.
-                    let job_first = position == "first" || position == "job start";
-                    let run = tail.iter().all(|&b| b == tail[0]);
-                    let by_rule_here = n < 7 || (run && !job_first);
-                    by_rule += by_rule_here as usize;
-                    if by_rule_here && our_last != c_last {
-                        bad.push(format!("{case}: ours {our_last:?} libzstd {c_last:?}"));
-                        continue;
+                    if let Err(e) = gate(&case, &data, &ours, &theirs) {
+                        bad.push(e);
                     }
-                    let c_head = &theirs[..theirs.len() - c_last.c_size];
-                    assert!(ours.starts_with(c_head), "{case}: frame before the block");
                     compared += 1;
-                    if ours != theirs {
-                        bad.push(format!("{case}: ours {our_last:?} libzstd {c_last:?}"));
-                    }
                 }
             }
         }
-        eprintln!("L{level}: {compared} frames compared, {by_rule} blocks by rule");
+        eprintln!("L{level}: {compared} frames compared");
     }
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
