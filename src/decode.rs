@@ -3031,6 +3031,7 @@ enum SeqError {
     NotEnoughLiterals,
     BlockTooLarge,
     OffsetTooFar,
+    OffsetBeforeDict,
     OffsetPastWindow,
 }
 
@@ -3041,6 +3042,7 @@ fn seq_error_message(e: SeqError) -> String {
         SeqError::NotEnoughLiterals => "Sequence needs more literals than the block has".into(),
         SeqError::BlockTooLarge => "Block content exceeds block size limit".into(),
         SeqError::OffsetTooFar => "Match offset reaches before the frame start".into(),
+        SeqError::OffsetBeforeDict => "Match offset reaches before the dictionary start".into(),
         SeqError::OffsetPastWindow => "Match offset exceeds Window_Size".into(),
     }
 }
@@ -3614,9 +3616,9 @@ unsafe fn copy_literals<W: WildCopy>(w: W, op: *mut u8, lit: *const u8, ll: usiz
 /// `exec_sequence` for the sequence `(ll, ml, offset)` at `op` whose match
 /// starts before the current segment, `avail` bytes of which precede the
 /// match's destination (ZSTD_execSequence's extDict branch): it starts in
-/// `ext`, or before it, which is `OffsetTooFar` (offset 0 included). A
-/// match that runs past the end of `ext` continues from the segment's
-/// first byte.
+/// `ext`, or before it, which is `OffsetBeforeDict` when `ext` is a
+/// dictionary and `OffsetTooFar` otherwise, as offset 0 is. A match that
+/// runs past the end of `ext` continues from the segment's first byte.
 ///
 /// # Safety
 /// `exec_sequence`'s checks before its segment-start check hold, and so
@@ -3633,8 +3635,15 @@ unsafe fn exec_sequence_ext<W: WildCopy>(
     ext: ExtHistory,
 ) -> Result<(), SeqError> {
     // `offset > avail` here unless it is 0.
-    if offset == 0 || offset - avail > ext.len {
+    if offset == 0 {
         return Err(SeqError::OffsetTooFar);
+    }
+    if offset - avail > ext.len {
+        return Err(if ext.dict {
+            SeqError::OffsetBeforeDict
+        } else {
+            SeqError::OffsetTooFar
+        });
     }
     copy_literals(w, op, lit, ll);
     let dst = op.add(ll);
@@ -5908,7 +5917,7 @@ mod tests {
     /// the segment, still bounded by Window_Size; without history it stops
     /// at the segment, as in one-shot decoding. Into a dictionary it may
     /// reach past Window_Size, while the segment before it holds at most
-    /// Window_Size bytes.
+    /// Window_Size bytes. Each rejection names the bound it crossed.
     #[test]
     fn match_reaches_into_ext_history() {
         let ext: Vec<u8> = (0..64).collect();
@@ -5918,31 +5927,35 @@ mod tests {
         if let Level::Avx2(w) = Level::new() {
             levels.push(Level::Avx2(w));
         }
-        // (offset, match length, ext bytes, window, accepted from history,
+        const OK: Option<&str> = None;
+        const FRAME: Option<&str> = Some("Match offset reaches before the frame start");
+        const DICT: Option<&str> = Some("Match offset reaches before the dictionary start");
+        const WINDOW: Option<&str> = Some("Match offset exceeds Window_Size");
+        // (offset, match length, ext bytes, window, error from history,
         // from a dictionary); the match follows the 10 segment bytes.
         let cases = [
-            (10, 4, 64, 1 << 20, true, true),
-            (11, 4, 64, 1 << 20, true, true),
-            (11, 30, 64, 1 << 20, true, true),
-            (20, 4, 64, 1 << 20, true, true),
-            (20, 34, 64, 1 << 20, true, true),
-            (74, 4, 64, 1 << 20, true, true),
-            (74, 34, 64, 1 << 20, true, true),
-            (75, 4, 64, 1 << 20, false, false),
-            (11, 4, 0, 1 << 20, false, false),
-            (11, 4, 1, 1 << 20, true, true),
-            (12, 4, 1, 1 << 20, false, false),
-            (60, 4, 64, 60, true, true),
-            (60, 4, 64, 59, false, true),
-            (11, 4, 64, 10, false, true),
-            (74, 4, 64, 10, false, true),
-            (74, 34, 64, 10, false, true),
-            (75, 4, 64, 10, false, false),
-            (10, 4, 64, 9, false, false),
-            (60, 4, 64, 9, false, false),
+            (10, 4, 64, 1 << 20, OK, OK),
+            (11, 4, 64, 1 << 20, OK, OK),
+            (11, 30, 64, 1 << 20, OK, OK),
+            (20, 4, 64, 1 << 20, OK, OK),
+            (20, 34, 64, 1 << 20, OK, OK),
+            (74, 4, 64, 1 << 20, OK, OK),
+            (74, 34, 64, 1 << 20, OK, OK),
+            (75, 4, 64, 1 << 20, FRAME, DICT),
+            (11, 4, 0, 1 << 20, FRAME, FRAME),
+            (11, 4, 1, 1 << 20, OK, OK),
+            (12, 4, 1, 1 << 20, FRAME, DICT),
+            (60, 4, 64, 60, OK, OK),
+            (60, 4, 64, 59, WINDOW, OK),
+            (11, 4, 64, 10, WINDOW, OK),
+            (74, 4, 64, 10, WINDOW, OK),
+            (74, 34, 64, 10, WINDOW, OK),
+            (75, 4, 64, 10, WINDOW, DICT),
+            (10, 4, 64, 9, WINDOW, WINDOW),
+            (60, 4, 64, 9, WINDOW, WINDOW),
         ];
         for simd in levels {
-            for (offset, ml, ext_len, window, accept, accept_dict) in cases {
+            for (offset, ml, ext_len, window, error, error_dict) in cases {
                 for dict in [false, true] {
                     let name = format!(
                         "offset {offset} ml {ml} ext {ext_len} window {window} dict {dict}"
@@ -5971,8 +5984,8 @@ mod tests {
                                 out
                             })
                     };
-                    if !(if dict { accept_dict } else { accept }) {
-                        assert!(got.is_err(), "{name}: accepted");
+                    if let Some(e) = if dict { error_dict } else { error } {
+                        assert_eq!(got.err().as_deref(), Some(e), "{name}");
                         continue;
                     }
                     let mut want = [ext, &seg[..]].concat();
