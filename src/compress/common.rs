@@ -522,8 +522,8 @@ pub mod testutil {
                     "block {start}..{end} seq {i}: offset {off} at {pos} reaches below the origin {origin}"
                 );
                 assert!(
-                    off <= 1usize << cp.window_log,
-                    "block {start}..{end} seq {i}: offset {off} exceeds the window"
+                    off < 1usize << cp.window_log,
+                    "block {start}..{end} seq {i}: offset {off} reaches the window size"
                 );
                 if pos - off < start {
                     stats.cross_block_matches += 1;

@@ -46,7 +46,7 @@ enum Found {
 /// * (I2) candidates: a table entry is used only when
 ///   `prefix_lowest_index <= idx < ip` (`idxl1`: `< ip1`), see
 ///   [`candidate_valid`].
-/// * (I3) repcodes: on entry `offset_1/2 <= ip - window_low(ip)`; afterwards
+/// * (I3) repcodes: on entry `offset_1/2 <= ip - lowest_match_index(ip)`; afterwards
 ///   `offset_1 = ip - idx` with (I2) and `offset_2` is a former `offset_1`.
 ///   A repcode is only applied at positions `p >=` the `ip` it was derived
 ///   at, hence `1 <= p - offset < p` (`0` means disabled and reads `p`).
@@ -66,7 +66,9 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
     assert!(istart <= iend && iend <= src.end());
     assert!((1..=32).contains(&hbits_l) && (1..=32).contains(&hbits_s));
     // presumes that, if there is a dictionary, it must be using Attach mode
-    let prefix_lowest_index = ms.lowest_prefix_index(iend);
+    // C bounds the block by `ZSTD_getLowestPrefixIndex(endIndex)`; the
+    // bound of its last position holds for every position.
+    let prefix_lowest_index = ms.lowest_match_index(iend - 1);
     let prefix_lowest = prefix_lowest_index;
     // C: ilimit = iend - HASH_READ_SIZE, possibly below istart (see fast.rs).
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
@@ -80,7 +82,7 @@ fn compress_block_generic<const MLS: u32, C: MatchCount>(
     let mut offset_2 = rep[1];
     let (mut offset_saved1, mut offset_saved2) = (0u32, 0u32);
     {
-        let window_low = ms.lowest_prefix_index(ip);
+        let window_low = ms.lowest_match_index(ip);
         let max_rep = (ip - window_low) as u32;
         if offset_2 > max_rep {
             offset_saved2 = offset_2;

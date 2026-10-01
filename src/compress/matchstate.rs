@@ -30,8 +30,8 @@
 //! (`ZSTD_overflowCorrectIfNeeded`), so inputs of any size compress.
 //!
 //! A candidate index `c` is usable at index `cur` only if
-//! `c >= window_low` and `cur - c <= (1 << window_log)`; see
-//! [`MatchState::lowest_prefix_index`].
+//! `c >= window_low` and `cur - c < (1 << window_log)`; see
+//! [`Window::lowest_match_index`].
 //!
 //! The tables share one allocation ([`Workspace`], the table area of
 //! `ZSTD_cwksp`), so the allocator sees one request per context rather
@@ -253,6 +253,19 @@ impl Window {
         if block_end_idx > max_dist {
             self.low = self.low.max(block_end_idx - max_dist);
         }
+    }
+
+    /// The lowest index a match from index `cur` may reference in a window
+    /// of `window_size` bytes: none below `low`, and none `window_size` or
+    /// more back, since every offset must be smaller than Window_Size (RFC
+    /// 8878 §3.1.1.4, rfc8878.txt:1204-1206). Every finder and the long
+    /// distance matcher bound their candidates and repcodes by this one
+    /// rule; libzstd's `ZSTD_getLowestPrefixIndex` lets most of its finders
+    /// reach exactly `window_size` back. Non-decreasing in `cur`, so the
+    /// bound of a range's last position holds for the whole range.
+    #[inline(always)]
+    pub fn lowest_match_index(&self, cur: usize, window_size: usize) -> usize {
+        self.low.max((cur + 1).saturating_sub(window_size))
     }
 
     /// `ZSTD_initStats_ultra`'s window move: `base -= len`, `dictLimit` and
@@ -1078,19 +1091,12 @@ impl MatchState {
         self.ws.tables()
     }
 
-    /// `ZSTD_getLowestPrefixIndex(ms, cur, windowLog)` without a dictionary:
-    /// the lowest index a match may reference from index `cur`.
+    /// The lowest index a match may reference from index `cur`: the
+    /// window's [`Window::lowest_match_index`] for `1 << window_log` bytes.
     #[inline]
-    pub fn lowest_prefix_index(&self, cur: usize) -> usize {
-        let max_distance = 1usize << self.cparams.window_log;
-        let window_low = self.window.low;
-        debug_assert!(cur >= window_low);
-        // C: `curr - lowestValid > maxDistance`
-        if cur - window_low > max_distance {
-            cur - max_distance
-        } else {
-            window_low
-        }
+    pub fn lowest_match_index(&self, cur: usize) -> usize {
+        self.window
+            .lowest_match_index(cur, 1usize << self.cparams.window_log)
     }
 }
 
@@ -1182,6 +1188,32 @@ mod tests {
         let mut w = Window::new(0, false);
         w.correct_overflow(0, max_dist, at(idx));
         assert_eq!(w.index(at(idx)), (1 << 19) + 2);
+    }
+
+    /// A match reaches back at most `window_size - 1` bytes and never below
+    /// `low`, on either side of the distance where the window size binds
+    /// and after `enforce_max_dist` raised `low` to exactly a window below.
+    #[test]
+    fn lowest_match_index_stops_one_short_of_the_window() {
+        let size = 1 << 10;
+        let mut window = Window::new(0, false);
+        let low = window.low();
+        for (cur, lowest) in [
+            (low, low),
+            (low + size - 1, low),
+            (low + size, low + 1),
+            (low + size + 1, low + 2),
+        ] {
+            assert_eq!(window.lowest_match_index(cur, size), lowest, "{cur}");
+        }
+        window.enforce_max_dist(5000, size);
+        let raised = window.index(5000) - size;
+        assert_eq!(window.low(), raised);
+        assert_eq!(
+            window.lowest_match_index(window.index(5000), size),
+            raised + 1
+        );
+        assert_eq!(window.lowest_match_index(raised, size), raised);
     }
 
     /// `ZSTD_reduceTable` / `_btlazy2`: indices below the correction plus
