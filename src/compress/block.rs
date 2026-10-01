@@ -6,20 +6,20 @@
 //! change only when a COMPRESSED block is emitted. [`CommittedBlockState`]
 //! keeps that state in a private field; the entropy stage reads it through
 //! [`CommittedBlockState::prev`] and produces a fresh [`BlockState`], and the
-//! private `commit` in [`compress_block`] is the only path that installs it
-//! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
-//! discard the candidate, including its repeat offsets.
+//! private `end_block`, which every written block goes through, is the only
+//! path that installs it (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
+//! RAW and RLE blocks discard the candidate, including its repeat offsets.
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, EnteredBlock, MatchState};
+use super::matchstate::{Block, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
 use super::split::{resolve_off_codes, BlockSplitter, Partition};
 use super::{bt, dfast, fast, lazy, opt};
 use crate::constants::*;
-use crate::fse::{self, FseState};
+use crate::fse::{self, FseState, FseTableState};
 use crate::huf::{self, HufState};
 use std::ops::Range;
 
@@ -59,7 +59,7 @@ impl BlockState {
 }
 
 /// `prevCBlock`: the committed cross-block state. Replaced only by the
-/// private `commit`, exactly when a COMPRESSED block is written.
+/// private `end_block`, exactly when a COMPRESSED block is written.
 pub struct CommittedBlockState {
     prev: BlockState,
 }
@@ -74,9 +74,22 @@ impl CommittedBlockState {
         &self.prev
     }
 
-    /// `ZSTD_blockState_confirmRepcodesAndEntropyTables`.
-    fn commit(&mut self, next: BlockState) {
-        self.prev = next;
+    /// The end of every written block, with `next` its candidate state if
+    /// it was written COMPRESSED: commit it
+    /// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`), then, whatever
+    /// the block's type, demote a dictionary's `Valid` offset table to
+    /// `Check` (`ZSTD_compressBlock_internal`'s `out:`,
+    /// `ZSTD_compressSeqStore_singleBlock` for each block a split writes):
+    /// the dictionary checked that it codes every offset of a first block,
+    /// `dictContentSize + 128 KiB`, and a later block reaches further.
+    fn end_block(&mut self, next: Option<BlockState>) {
+        if let Some(next) = next {
+            self.prev = next;
+        }
+        self.prev.fse.of = match std::mem::take(&mut self.prev.fse.of) {
+            FseTableState::Valid(table) => FseTableState::Check(table),
+            of => of,
+        };
     }
 }
 
@@ -148,6 +161,18 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
     out.extend_from_slice(compressed);
 }
 
+/// `ZSTD_dictTableLoadMethod_e`: which positions of loaded content the
+/// fast and dfast tables get. The other strategies insert every position
+/// either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableLoad {
+    /// `ZSTD_dtlm_fast`: every third position, as a context loads content.
+    Fast,
+    /// `ZSTD_dtlm_full`: also the positions between them where their slot
+    /// is empty, as a CDict loads its content once for many frames.
+    Full,
+}
+
 /// `ZSTD_loadDictionaryContent` for a job's raw-content prefix
 /// ([`super::job_prefix`]): `data[range]` enters the window
 /// ([`MatchState::enter_prefix`]) and its indexed suffix, unless
@@ -156,18 +181,34 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 /// which `window_low` keeps valid. `range` is in positions of `data`,
 /// starting at the window's origin.
 pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
-    let Some(prefix) = ms.enter_prefix(range) else {
-        return;
-    };
+    if let Some(prefix) = ms.enter_prefix(range) {
+        fill_tables(ms, data, prefix, TableLoad::Fast);
+    }
+}
+
+/// [`load_prefix`] for dictionary content, which the window keeps valid
+/// until the input passes the window size ([`MatchState::enter_dict`]),
+/// filling the tables by `load`.
+pub fn load_dict(ms: &mut MatchState, data: &[u8], range: Range<usize>, load: TableLoad) {
+    if let Some(content) = ms.enter_dict(range) {
+        fill_tables(ms, data, content, load);
+    }
+}
+
+/// The strategy's table fill of `ZSTD_loadDictionaryContent` over entered
+/// content.
+fn fill_tables(ms: &mut MatchState, data: &[u8], content: EnteredPrefix, load: TableLoad) {
     let src = ms.view(data);
-    match ms.cparams.strategy {
-        Strategy::Fast => fast::load_prefix(ms, src, prefix),
-        Strategy::DFast => dfast::load_prefix(ms, src, prefix),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::load_prefix(ms, src, prefix)
+    match (ms.cparams.strategy, load) {
+        (Strategy::Fast, TableLoad::Fast) => fast::load_prefix(ms, src, content),
+        (Strategy::Fast, TableLoad::Full) => fast::load_dict_full(ms, src, content),
+        (Strategy::DFast, TableLoad::Fast) => dfast::load_prefix(ms, src, content),
+        (Strategy::DFast, TableLoad::Full) => dfast::load_dict_full(ms, src, content),
+        (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2, _) => {
+            lazy::load_prefix(ms, src, content)
         }
-        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            bt::load_prefix(ms, src, prefix)
+        (Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2, _) => {
+            bt::load_prefix(ms, src, content)
         }
     }
 }
@@ -403,15 +444,17 @@ fn entropy_and_emit(
 
     if !is_first_block && c_size < RLE_MAX_LENGTH && is_rle(data) {
         write_rle_block(out, data[0], data.len(), is_last);
+        state.end_block(None);
         return BlockKind::Rle;
     }
     match next {
         None => {
             write_raw_block(out, data, is_last);
+            state.end_block(None);
             BlockKind::Raw
         }
         Some(next) => {
-            state.commit(next);
+            state.end_block(Some(next));
             write_compressed_block(out, cbuf, is_last);
             BlockKind::Compressed
         }
@@ -444,6 +487,7 @@ fn emit_block(
 ) -> bool {
     let Some((store, rep)) = built else {
         write_raw_block(out, &src[block], is_last);
+        state.end_block(None);
         return false;
     };
     let parts = match parts {
@@ -1025,6 +1069,65 @@ mod tests {
         assert!(lowest(cap + 1000) < src.len() - cap + 64);
     }
 
+    /// `ZSTD_dtlm_full` keeps every slot `ZSTD_dtlm_fast` writes, as each
+    /// third position overwrites its slot either way, and gives empty slots
+    /// the positions between them: fast's table and dfast's large one gain
+    /// entries, dfast's small table is unchanged.
+    #[test]
+    fn full_table_load_fills_only_empty_slots() {
+        let data = crate::compress::common::testutil::synthetic_text(100_000, 5);
+        for level in [1, 3] {
+            let cp = CParams::for_level(level, 1 << 20);
+            let load = |how| {
+                let mut ms = MatchState::new(cp, 0);
+                load_dict(&mut ms, &data, 0..data.len(), how);
+                let (hash, chain, _) = ms.tables();
+                (hash.to_vec(), chain.to_vec(), ms.index(0))
+            };
+            let (fast_hash, fast_chain, base) = load(TableLoad::Fast);
+            let (full_hash, full_chain, _) = load(TableLoad::Full);
+            for (&f, &g) in fast_hash.iter().zip(&full_hash) {
+                assert!(f == 0 || f == g, "L{level}: slot {f} became {g}");
+                assert!(
+                    f != 0 || g == 0 || !(g as usize - base).is_multiple_of(3),
+                    "L{level}"
+                );
+            }
+            let count = |t: &[u32]| t.iter().filter(|&&e| e != 0).count();
+            assert!(count(&full_hash) > count(&fast_hash), "L{level}");
+            assert_eq!(fast_chain, full_chain, "L{level}");
+        }
+    }
+
+    /// A dictionary's `Valid` offset table is `Check` after any written
+    /// block, compressed with it as the candidate's or not; its other
+    /// tables stay `Valid`.
+    #[test]
+    fn end_block_demotes_a_valid_offset_table() {
+        use crate::fse::{FseCTable, FseRepeat};
+        let valid = || FseTableState::Valid(FseCTable::build(&[16, 16], 1, 5));
+        let dict = BlockState {
+            fse: FseState {
+                ll: valid(),
+                of: valid(),
+                ml: valid(),
+            },
+            ..BlockState::initial()
+        };
+        let repeats = |s: &CommittedBlockState| {
+            let f = &s.prev().fse;
+            (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
+        };
+        let demoted = (FseRepeat::Valid, FseRepeat::Check, FseRepeat::Valid);
+        for next in [None, Some(dict.clone())] {
+            let mut state = CommittedBlockState::new(dict.clone());
+            state.end_block(next);
+            assert_eq!(repeats(&state), demoted);
+            state.end_block(None);
+            assert_eq!(repeats(&state), demoted);
+        }
+    }
+
     /// Builds a block and its sequence store one partition at a time,
     /// executing each sequence against the finder's repeat offsets.
     struct Builder {
@@ -1164,6 +1267,7 @@ mod tests {
             Some(b.src.len() as u64),
             cparams.window_log,
             false,
+            0,
         );
         frame.extend_from_slice(&blocks);
         assert_eq!(crate::decompress(&frame).unwrap(), b.src);

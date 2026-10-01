@@ -19,9 +19,9 @@
 
 use super::block::{self, InputEnd, JobBlocks};
 use super::{
-    begin_job, block_sizing, multithreaded, split, write_epilogue, write_frame_header,
-    write_raw_block, CommittedBlockState, CompressError, CompressOptions, Compressor, Context,
-    JobLdm,
+    begin_job, block_sizing, default_search_method, multithreaded, split, write_epilogue,
+    write_frame_header, write_raw_block, CommittedBlockState, CompressError, CompressOptions,
+    Compressor, Context, JobLdm,
 };
 use crate::constants::ZSTD_BLOCKSIZE_MAX;
 use crate::xxhash::Xxh64;
@@ -126,12 +126,13 @@ impl Frame {
         debug_assert!(!multithreaded(opts, size));
         let (cparams, ldm_params) = opts.frame_params(size);
         let mut header = Vec::new();
-        write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum);
+        write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum, 0);
         let sizing = block_sizing(opts, &cparams, false, header.len());
         let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
         let frequently = opts.overflow_correct_frequently;
-        let (ms, scratch, _) = ctx.reset(cparams, 0, ldm, size, frequently);
-        let (blocks, state) = begin_job(ms, scratch, &[], 0..0, sizing, true, true);
+        let method = default_search_method(&cparams);
+        let (ms, scratch, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
+        let (blocks, state) = begin_job(ms, scratch, &[], 0..0, None, sizing, true, true);
         let keep = 1usize << cparams.window_log;
         Self {
             ctx,
@@ -286,7 +287,9 @@ impl Compressor {
     /// pledged size (the call consumes none of it) or ends short of it;
     /// [`CompressError::Unsupported`] for a `job_size` frame that is not
     /// one first `End` call or pledged at most `JOBSIZE_MIN`
-    /// (multithreaded streaming is not implemented). After an error every
+    /// (multithreaded streaming is not implemented), and for any frame of
+    /// options with a [`CompressOptions::dict`] (streaming with a
+    /// dictionary is not implemented). After an error every
     /// call returns [`CompressError::StageWrong`] until
     /// [`Compressor::reset_stream`].
     ///
@@ -324,6 +327,9 @@ impl Compressor {
             }
             match &mut self.stream.stage {
                 Stage::Failed => return Err(CompressError::StageWrong),
+                Stage::Idle if self.opts.dict.is_some() => {
+                    return Err(CompressError::Unsupported("dictionary"));
+                }
                 Stage::Ended => {
                     // ZSTD_CCtx_reset(zcs, ZSTD_reset_session_only)
                     self.stream.stage = Stage::Idle;
@@ -341,7 +347,7 @@ impl Compressor {
                         return Err(CompressError::SrcSizeWrong { pledged, consumed });
                     }
                     let mut out = std::mem::take(&mut self.stream.out);
-                    self.compress_frame(rest, &mut out);
+                    self.compress_frame(rest, None, &mut out);
                     self.stream.out = out;
                     *src_pos = src.len();
                     self.stream.stage = Stage::Ended;

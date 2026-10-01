@@ -17,6 +17,7 @@ pub mod block;
 pub mod bt;
 pub mod common;
 pub mod dfast;
+pub mod dict;
 mod error;
 pub mod fast;
 pub mod lazy;
@@ -35,20 +36,22 @@ use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
 };
+use dict::FrameDict;
+pub use dict::{CompressDict, DictContentType};
 pub use error::CompressError;
-use lazy::default_search_method;
+use lazy::{default_search_method, SearchMethod};
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
 use matchstate::{needed_space, MatchState};
+use params::{CParamMode, ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use params::{CParams, ParamSwitch, Strategy};
-use params::{ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use seqstore::{Seq, SeqStore};
 use std::ops::Range;
-use std::sync::Mutex;
 #[cfg(feature = "parallel")]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Condvar,
 };
+use std::sync::{Arc, Mutex};
 pub use stream::{Encoder, EndDirective};
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
@@ -168,6 +171,14 @@ pub struct CompressOptions {
     /// that macro set to 1.
     #[doc(hidden)]
     pub overflow_correct_frequently: bool,
+    /// `ZSTD_CCtx_refCDict`: compress every frame with this dictionary, as
+    /// `ZSTD_compress2` does: its level supersedes `level`, the frame
+    /// header carries its ID, and the frame is one job whatever
+    /// `job_size` says (ZSTDMT with a dictionary is not supported yet).
+    /// Streaming with a dictionary is not supported yet either:
+    /// [`Compressor::compress_stream`] and [`Encoder`] fail with
+    /// [`CompressError::Unsupported`]. See [`CompressDict`] and [`dict`].
+    pub dict: Option<Arc<CompressDict>>,
 }
 
 impl Default for CompressOptions {
@@ -185,6 +196,7 @@ impl Default for CompressOptions {
             split_after_sequences: ParamSwitch::Auto,
             block_splitter_level: 0,
             overflow_correct_frequently: false,
+            dict: None,
         }
     }
 }
@@ -220,9 +232,20 @@ impl CompressOptions {
     }
 
     /// `ZSTD_getCParamsFromCCtxParams` and `ZSTD_resolveEnableLdm` for an
-    /// input of `src_size` bytes: the frame's compression parameters and,
-    /// when long distance matching resolves to enabled, its parameters
-    /// (`ZSTD_ldm_adjustParameters`).
+    /// input of `src_size` bytes without a dictionary: the frame's
+    /// compression parameters and, when long distance matching resolves to
+    /// enabled, its parameters (`ZSTD_ldm_adjustParameters`).
+    fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
+        let (cparams, ldm) = self.frame_cparams(self.level, src_size, 0, CParamMode::NoAttachDict);
+        (cparams, ldm.map(|requested| requested.adjusted(&cparams)))
+    }
+
+    /// `ZSTD_getCParamsFromCCtxParams` and `ZSTD_resolveEnableLdm` at
+    /// `level` for an input of `src_size` bytes and a dictionary of
+    /// `dict_size` bytes used in `mode`: the frame's compression parameters
+    /// and, when long distance matching resolves to enabled, the requested
+    /// parameters, which `ZSTD_ldm_adjustParameters` completes for the
+    /// parameters the frame is compressed with ([`LdmParams::adjusted`]).
     ///
     /// Also the one place options are checked against libzstd's bounds,
     /// panicking where `ZSTD_CCtx_setParameter` returns
@@ -232,7 +255,13 @@ impl CompressOptions {
     /// allocated ([`LdmParams::adjusted`]). The other options have no
     /// rejected values: the level, job size and overlap log clamp as
     /// libzstd clamps them.
-    fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
+    fn frame_cparams(
+        &self,
+        level: i32,
+        src_size: usize,
+        dict_size: usize,
+        mode: CParamMode,
+    ) -> (CParams, Option<LdmParams>) {
         assert!(
             self.block_splitter_level <= presplit::BLOCK_SPLITTER_LEVEL_MAX,
             "block_splitter_level {} out of range 0..={}",
@@ -245,10 +274,11 @@ impl CompressOptions {
             self.ldm_bucket_size_log,
             self.ldm_hash_rate_log,
         );
-        let mut cparams = CParams::for_level(self.level, src_size);
+        let src = Some(src_size as u64);
+        let mut cparams = CParams::for_level_with(level, src, dict_size, mode);
         if self.ldm == ParamSwitch::Enable {
             cparams.window_log = LDM_DEFAULT_WINDOW_LOG;
-            cparams = cparams.adjust(src_size);
+            cparams = cparams.adjust_with(src, dict_size, mode);
         }
         let enabled = match self.ldm {
             // wlog >= 27, strategy >= btopt
@@ -256,7 +286,7 @@ impl CompressOptions {
             ParamSwitch::Enable => true,
             ParamSwitch::Disable => false,
         };
-        (cparams, enabled.then(|| requested.adjusted(&cparams)))
+        (cparams, enabled.then_some(requested))
     }
 }
 
@@ -282,6 +312,26 @@ pub fn compress_to_vec(data: &[u8]) -> Vec<u8> {
 /// [`Compressor`].
 pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
     Compressor::new(opts.clone()).compress_to_vec(data)
+}
+
+/// Compress `data` into a zstd frame with the dictionary `dict`, at its
+/// level (`ZSTD_compress2` with `ZSTD_CCtx_refCDict`): see
+/// [`CompressOptions::dict`]. Decoding needs the same dictionary.
+pub fn compress_with_dict(data: &[u8], dict: &CompressDict) -> Vec<u8> {
+    let mut out = Vec::new();
+    let opts = CompressOptions::default();
+    let dict = FrameDict::of(dict, data.len(), &opts);
+    Compressor::new(opts).compress_frame(data, Some(&dict), &mut out);
+    out
+}
+
+/// Compress `data` into a zstd frame with `opts` and the raw-content
+/// prefix `prefix` (`ZSTD_compress2` with `ZSTD_CCtx_refPrefix`), through a
+/// one-off [`Compressor`]: see [`Compressor::compress_with_prefix`].
+pub fn compress_with_prefix(data: &[u8], prefix: &[u8], opts: &CompressOptions) -> Vec<u8> {
+    let mut out = Vec::new();
+    Compressor::new(opts.clone()).compress_with_prefix(data, prefix, &mut out);
+    out
 }
 
 /// A reusable `ZSTD_CCtx`: the options plus ZSTDMT's pool of contexts
@@ -326,7 +376,8 @@ enum JobLdm<'a> {
 impl Context {
     /// `ZSTD_resetCCtx_internal` for an input of `pledged` bytes (the
     /// frame's, or a later ZSTDMT job's own) whose window starts at
-    /// position `origin`, with the overflow correction knob `frequently`.
+    /// position `origin`, with tables for the lazy finder `method` and the
+    /// overflow correction knob `frequently`.
     /// The match state's reset decides from what libzstd's workspace would
     /// need ([`needed_space`]) whether the workspace is resized; a resize
     /// frees the block buffers and the long distance matching tables too
@@ -335,12 +386,12 @@ impl Context {
     fn reset<'a>(
         &'a mut self,
         cparams: CParams,
+        method: SearchMethod,
         origin: usize,
         ldm: JobLdm<'a>,
         pledged: usize,
         frequently: bool,
     ) -> (&'a mut MatchState, &'a mut BlockScratch, BlockLdm<'a>) {
-        let method = default_search_method(&cparams);
         let ldm_params = match &ldm {
             JobLdm::Internal(params) => Some(params),
             JobLdm::Off | JobLdm::External(_) => None,
@@ -481,12 +532,49 @@ impl Compressor {
     /// progress is abandoned first, as `ZSTD_compress2` resets the session.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         self.reset_stream();
-        self.compress_frame(src, out);
+        match self.opts.dict.clone() {
+            Some(dict) => {
+                let dict = FrameDict::of(&dict, src.len(), &self.opts);
+                self.compress_frame(src, Some(&dict), out);
+            }
+            None => self.compress_frame(src, None, out),
+        }
     }
 
-    /// [`Compressor::compress`] without the session reset.
-    fn compress_frame(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        let (cparams, ldm_params) = self.opts.frame_params(src.len());
+    /// Append one frame holding `src` to `out`, compressed with the
+    /// raw-content prefix `prefix` before it (`ZSTD_CCtx_refPrefix`, a
+    /// dictionary of content only, for this frame alone): the parameters
+    /// are sized for `src` and the prefix, the frame header carries no
+    /// dictionary ID, and decoding needs the same prefix as a raw-content
+    /// dictionary. A prefix under 8 bytes is ignored. Replaces
+    /// [`CompressOptions::dict`] for this frame. A streaming frame in
+    /// progress is abandoned first, as for [`Compressor::compress`].
+    pub fn compress_with_prefix(&mut self, src: &[u8], prefix: &[u8], out: &mut Vec<u8>) {
+        self.reset_stream();
+        let dict = FrameDict::prefix(prefix, src.len(), &self.opts);
+        self.compress_frame(src, Some(&dict), out);
+    }
+
+    /// Append one frame holding `src`, with `dict` if given, to `out`. A
+    /// dictionary's content goes before `src` and the frame is one job (see
+    /// [`dict`]).
+    fn compress_frame(&mut self, src: &[u8], dict: Option<&FrameDict>, out: &mut Vec<u8>) {
+        let (frame_cparams, cparams, ldm_params) = match dict {
+            Some(dict) => dict.params(),
+            None => {
+                let (cparams, ldm) = self.opts.frame_params(src.len());
+                (cparams, cparams, ldm)
+            }
+        };
+        let joined;
+        let data = match dict.map(FrameDict::content) {
+            Some(content) if !content.is_empty() => {
+                joined = [content, src].concat();
+                &joined[..]
+            }
+            _ => src,
+        };
+        let src_start = data.len() - src.len();
         out.reserve(src.len() + 64);
         let header_start = out.len();
         write_frame_header(
@@ -494,19 +582,21 @@ impl Compressor {
             Some(src.len() as u64),
             cparams.window_log,
             self.opts.checksum,
+            dict.map_or(0, FrameDict::id),
         );
         let header_len = out.len() - header_start;
         // XXH64_update over the input in job order, before each job is
         // compressed (ZSTDMT_serialState_update, ZSTD_compressContinue).
         let mut checksum = self.opts.checksum.then(Xxh64::new);
 
+        let method = dict.map_or_else(|| default_search_method(&cparams), FrameDict::search_method);
         if src.is_empty() {
             // ZSTD_compress2 resets a context for the empty frame too.
             let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
             let frequently = self.opts.overflow_correct_frequently;
             self.contexts.expand(1);
             self.contexts.with_context(|ctx| {
-                ctx.reset(cparams, 0, ldm, 0, frequently);
+                ctx.reset(cparams, method, 0, ldm, 0, frequently);
             });
             write_raw_block(out, &[], true);
             write_epilogue(out, checksum);
@@ -515,11 +605,16 @@ impl Compressor {
 
         let ldm_on = ldm_params.is_some();
         let overlap = overlap_size(&cparams, self.opts.overlap_log, ldm_on);
-        let job_size = job_size_for(self.opts.job_size, &cparams, ldm_on, overlap);
-        let split = split::block_splitter_enabled(self.opts.split_after_sequences, &cparams);
-        let jobs = job_ranges(src.len(), job_size);
+        // A frame with a dictionary is one job.
+        let requested = self.opts.job_size.filter(|_| dict.is_none());
+        let job_size = job_size_for(requested, &cparams, ldm_on, overlap);
+        let split = split::block_splitter_enabled(self.opts.split_after_sequences, &frame_cparams);
+        let jobs: Vec<_> = job_ranges(src.len(), job_size)
+            .into_iter()
+            .map(|job| src_start + job.start..src_start + job.end)
+            .collect();
         let n_jobs = jobs.len();
-        let mt = multithreaded(&self.opts, src.len());
+        let mt = dict.is_none() && multithreaded(&self.opts, src.len());
         let sizing = block_sizing(&self.opts, &cparams, mt, header_len);
         let pipelined = cfg!(feature = "parallel");
         // ZSTDMT_serialState: every job's long distance matches from the one
@@ -538,10 +633,10 @@ impl Compressor {
             // ZSTDMT_serialState_update
             |job, seqs| {
                 if let Some(checksum) = &mut checksum {
-                    checksum.update(&src[job.clone()]);
+                    checksum.update(&data[job.clone()]);
                 }
                 if let Some(state) = &mut serial_ldm {
-                    state.generate_sequences(src, job.clone(), max_seqs, seqs);
+                    state.generate_sequences(data, job.clone(), max_seqs, seqs);
                 }
             },
             |k, job, ctx, seqs, out| {
@@ -551,8 +646,10 @@ impl Compressor {
                     Some(params) => JobLdm::Internal(params),
                 };
                 compress_job(
-                    src,
+                    data,
+                    dict,
                     cparams,
+                    method,
                     ldm,
                     frequently,
                     sizing,
@@ -635,19 +732,24 @@ fn job_bound(len: usize, block_size: usize) -> usize {
 
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
 /// appended to `out`, on `ctx` reset for this job ([`Context::reset`]) with
-/// the long distance matches of `ldm`. Job 0 starts from `repStartValue`
-/// with its first byte as the window start and pledges the whole frame; a
-/// later job pledges itself, its window starts `overlap` bytes before it,
-/// and the job indexes that prefix (`ZSTD_loadDictionaryContent` on the
-/// raw-content prefix), starts with invalidated repeat offsets and no
-/// entropy tables, so its first block cannot reference state the decoder
-/// obtained from the previous job. `sizing` cuts the job into blocks;
-/// `split` runs every block through the post-sequence splitter;
-/// `frequently` is the overflow correction knob (see [`CompressOptions`]).
+/// tables for `method` and the long distance matches of `ldm`. Job 0
+/// starts from `repStartValue` with its first byte as the window start and
+/// pledges the rest of `data`; a later job pledges itself, its window
+/// starts `overlap` bytes before it, and the job indexes that prefix
+/// (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with
+/// invalidated repeat offsets and no entropy tables, so its first block
+/// cannot reference state the decoder obtained from the previous job. The
+/// one job of a frame with `dict` has the dictionary's content before it,
+/// where its window starts, and starts from the dictionary instead
+/// ([`FrameDict::preload`]). `sizing` cuts the job into blocks; `split`
+/// runs every block through the post-sequence splitter; `frequently` is
+/// the overflow correction knob (see [`CompressOptions`]).
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
+    dict: Option<&FrameDict>,
     cparams: CParams,
+    method: SearchMethod,
     ldm: JobLdm,
     frequently: bool,
     sizing: BlockSizing,
@@ -661,10 +763,19 @@ fn compress_job(
     out: &mut Vec<u8>,
 ) {
     // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
-    let prefix = job_prefix(&job, first_job, overlap);
-    let pledged = if first_job { data.len() } else { job.len() };
-    let (ms, scratch, mut ldm) = ctx.reset(cparams, prefix.start, ldm, pledged, frequently);
-    let (mut blocks, mut state) = begin_job(ms, scratch, data, prefix, sizing, first_job, last_job);
+    // A dictionary's content is the one job's prefix instead.
+    let prefix = match dict {
+        Some(_) => 0..job.start,
+        None => job_prefix(&job, first_job, overlap),
+    };
+    let pledged = if first_job {
+        data.len() - job.start
+    } else {
+        job.len()
+    };
+    let (ms, scratch, mut ldm) = ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
+    let (mut blocks, mut state) =
+        begin_job(ms, scratch, data, prefix, dict, sizing, first_job, last_job);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
         ms,
@@ -683,23 +794,32 @@ fn compress_job(
 /// The start of a job on a context just reset for it: a later ZSTDMT job
 /// indexes its raw-content `prefix` of `data` and starts with invalidated
 /// repeat offsets; job 0 (`prefix` empty, whatever `data`) starts from
-/// `repStartValue`. Returns the job's block cursor, its first block at the
-/// prefix end, and its committed block state. One-shot jobs and the
-/// streaming frame both start here.
+/// `repStartValue`; the one job of a frame with `dict` starts from the
+/// dictionary, whose content is `prefix` ([`FrameDict::preload`]). Returns
+/// the job's block cursor, its first block at the prefix end, and its
+/// committed block state. One-shot jobs and the streaming frame both start
+/// here.
+#[allow(clippy::too_many_arguments)]
 fn begin_job(
     ms: &mut MatchState,
     scratch: &mut BlockScratch,
     data: &[u8],
     prefix: Range<usize>,
+    dict: Option<&FrameDict>,
     sizing: BlockSizing,
     first_job: bool,
     last_job: bool,
 ) -> (JobBlocks, CommittedBlockState) {
-    let mut initial = BlockState::initial();
-    if !first_job {
-        block::load_prefix(ms, data, prefix.clone());
-        initial.invalidate_rep_codes();
-    }
+    let initial = match dict {
+        Some(dict) => dict.preload(ms, data),
+        None if !first_job => {
+            block::load_prefix(ms, data, prefix.clone());
+            let mut initial = BlockState::initial();
+            initial.invalidate_rep_codes();
+            initial
+        }
+        None => BlockState::initial(),
+    };
     scratch.reserve(sizing.block_size_max);
     let blocks = JobBlocks::new(sizing, prefix.end, first_job, last_job);
     (blocks, CommittedBlockState::new(initial))
@@ -982,16 +1102,17 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     }
 }
 
-/// `ZSTD_writeFrameHeader` with no dictionary: with a `content_size`,
-/// Single_Segment iff the window covers it, otherwise (or without one, the
-/// `contentSizeFlag` 0 of an unknown pledged size) a Window_Descriptor with
-/// mantissa 0 derived from `window_log`; the Content_Checksum_flag of
-/// `checksum`.
+/// `ZSTD_writeFrameHeader`: with a `content_size`, Single_Segment iff the
+/// window covers it, otherwise (or without one, the `contentSizeFlag` 0 of
+/// an unknown pledged size) a Window_Descriptor with mantissa 0 derived
+/// from `window_log`; the Content_Checksum_flag of `checksum`, and
+/// `dict_id` in the fewest of 1, 2 or 4 bytes, none for 0.
 fn write_frame_header(
     out: &mut Vec<u8>,
     content_size: Option<u64>,
     window_log: u32,
     checksum: bool,
+    dict_id: u32,
 ) {
     out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
     let window_size = 1u64 << window_log;
@@ -1000,10 +1121,18 @@ fn write_frame_header(
         (size >= 256) as u8 + (size >= 65536 + 256) as u8 + (size >= 0xFFFF_FFFF) as u8
     });
     let content_size = content_size.unwrap_or(0);
-    let descriptor = ((checksum as u8) << 2) | ((single_segment as u8) << 5) | (fcs_code << 6);
+    let dict_id_code = (dict_id > 0) as u8 + (dict_id >= 256) as u8 + (dict_id >= 65536) as u8;
+    let descriptor =
+        dict_id_code | ((checksum as u8) << 2) | ((single_segment as u8) << 5) | (fcs_code << 6);
     out.push(descriptor);
     if !single_segment {
         out.push(((window_log - ZSTD_WINDOWLOG_ABSOLUTEMIN) << 3) as u8);
+    }
+    match dict_id_code {
+        0 => {}
+        1 => out.push(dict_id as u8),
+        2 => out.extend_from_slice(&(dict_id as u16).to_le_bytes()),
+        _ => out.extend_from_slice(&dict_id.to_le_bytes()),
     }
     match fcs_code {
         0 => {
@@ -1158,7 +1287,9 @@ mod tests {
                 let mut out = Vec::new();
                 compress_job(
                     &data,
+                    None,
                     cparams,
+                    default_search_method(&cparams),
                     JobLdm::Off,
                     false,
                     block_sizing(&opts, &cparams, true, 0),
@@ -1469,7 +1600,9 @@ mod tests {
                       out: &mut Vec<u8>| {
                     compress_job(
                         src,
+                        None,
                         cparams,
+                        default_search_method(&cparams),
                         JobLdm::External(seqs),
                         false,
                         sizing,
@@ -1728,7 +1861,9 @@ mod tests {
                       out: &mut Vec<u8>| {
                     compress_job(
                         src,
+                        None,
                         cparams,
+                        default_search_method(&cparams),
                         JobLdm::Off,
                         false,
                         sizing,
@@ -1774,11 +1909,13 @@ mod tests {
         let (small, small_ldm) = opts.frame_params(1024);
         let mut ctx = Context::default();
         let ldm = JobLdm::Internal(big_ldm.unwrap());
-        let (_, scratch, _) = ctx.reset(big, 0, ldm, 64 << 20, false);
+        let method = default_search_method(&big);
+        let (_, scratch, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
         scratch.reserve(ZSTD_BLOCKSIZE_MAX);
         for n in 1..=129 {
             let ldm = JobLdm::Internal(small_ldm.unwrap());
-            let (_, scratch, _) = ctx.reset(small, 0, ldm, 1024, false);
+            let method = default_search_method(&small);
+            let (_, scratch, _) = ctx.reset(small, method, 0, ldm, 1024, false);
             let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;
             assert_eq!(kept, n < 129, "reset {n}");
         }
@@ -1792,6 +1929,7 @@ mod tests {
             Some(data.len() as u64),
             cparams.window_log,
             false,
+            0,
         );
         header.len()
     }
@@ -1813,7 +1951,9 @@ mod tests {
         let job = 0..data.len();
         compress_job(
             data,
+            None,
             cparams,
+            default_search_method(&cparams),
             JobLdm::Off,
             false,
             sizing,

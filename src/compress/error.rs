@@ -17,6 +17,16 @@ pub enum CompressError {
     StageWrong,
     /// The option combination is not supported by this call.
     Unsupported(&'static str),
+    /// `dictionary_corrupted`: a structured dictionary's entropy tables or
+    /// repeat offsets do not parse, see [`CompressDict::new`].
+    ///
+    /// [`CompressDict::new`]: super::CompressDict::new
+    DictionaryCorrupted,
+    /// `dictionary_wrong`: [`DictContentType::FullDict`] for a dictionary
+    /// that is not structured.
+    ///
+    /// [`DictContentType::FullDict`]: super::DictContentType::FullDict
+    DictionaryWrong,
 }
 
 impl fmt::Display for CompressError {
@@ -28,6 +38,10 @@ impl fmt::Display for CompressError {
             ),
             CompressError::StageWrong => f.write_str("call not valid at this stream stage"),
             CompressError::Unsupported(what) => write!(f, "unsupported: {what}"),
+            CompressError::DictionaryCorrupted => f.write_str("dictionary is corrupted"),
+            CompressError::DictionaryWrong => {
+                f.write_str("dictionary is not a structured zstd dictionary")
+            }
         }
     }
 }
