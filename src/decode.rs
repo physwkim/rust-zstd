@@ -30,7 +30,8 @@
 //! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
-//! literals and FSE sequences. No dictionary support.
+//! literals and FSE sequences, with or without a dictionary
+//! (`decompress_with_dict`).
 
 #![allow(
     clippy::needless_range_loop,
@@ -46,6 +47,9 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+
+mod dict;
+pub use dict::DecodeDict;
 
 // ============================================================
 // Constants
@@ -118,8 +122,8 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 ///
 /// Supports any number of concatenated zstd frames. Skippable frames are
 /// skipped. Every input byte must belong to a frame: an empty input decodes
-/// to nothing, and bytes after the last frame are an error. Dictionary
-/// frames are not supported.
+/// to nothing, and bytes after the last frame are an error. A frame that
+/// names a dictionary is an error; see `decompress_with_dict`.
 ///
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
@@ -132,6 +136,22 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
 
+/// `decompress` with dictionary `dict` (ZSTD_decompress_usingDict): every
+/// frame starts from its tables and repeat offsets. Its content is not
+/// history yet: a match reaching before the frame start is an error. A
+/// frame that names another nonzero Dictionary_ID is an error
+/// (dictionary_wrong); one with no Dictionary_ID is decoded with `dict`
+/// too.
+///
+/// RFC 8878 lines 442-443 make a frame naming an unregistered ID in the
+/// reserved ranges an error. That is not enforced: registration cannot be
+/// known offline, and the caller supplying the dictionary is the "private
+/// arrangement" of lines 439-440, so a matching ID is accepted in any
+/// range, as libzstd does.
+pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, String> {
+    decompress_with_dict_options(data, Some(dict), &DecodeOptions::default())
+}
+
 /// Decoder paths to force, for testing each of them on any input.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -142,6 +162,17 @@ pub struct DecodeOptions {
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
+}
+
+impl DecodeOptions {
+    /// The SIMD level `simd` selects.
+    fn level(&self) -> Level {
+        if self.simd {
+            Level::new()
+        } else {
+            Level::fallback()
+        }
+    }
 }
 
 impl Default for DecodeOptions {
@@ -165,6 +196,17 @@ impl Default for DecodeOptions {
 /// `decompress` with the paths chosen by `opts`.
 #[doc(hidden)]
 pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
+    decompress_with_dict_options(data, None, opts)
+}
+
+/// `decompress_with_dict`, or `decompress` without `dict`, with the paths
+/// chosen by `opts`.
+#[doc(hidden)]
+pub fn decompress_with_dict_options(
+    data: &[u8],
+    dict: Option<&DecodeDict>,
+    opts: &DecodeOptions,
+) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut scratch: Option<DecoderScratch> = None;
     let mut pos = 0usize;
@@ -191,23 +233,25 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             },
         };
         pos += header_len;
+        // ZSTD_decodeFrameHeader's dictionary_wrong check.
+        match (frame_header.dict_id, dict) {
+            (0, _) => {}
+            (id, Some(d)) if id == d.id() => {}
+            (id, Some(d)) => {
+                return Err(format!(
+                    "Frame needs dictionary {id}, dictionary {} is loaded",
+                    d.id()
+                ))
+            }
+            (id, None) => return Err(format!("Frame needs dictionary {id}, none is loaded")),
+        }
 
         let scratch = scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
-        let simd = if opts.simd {
-            Level::new()
-        } else {
-            Level::fallback()
-        };
-        decode_frame(
-            &frame_header,
-            data,
-            &mut pos,
-            scratch,
-            &mut output,
-            opts.min_parallel_blocks,
-            simd,
-        )?;
+        if let Some(e) = dict.and_then(DecodeDict::entropy) {
+            scratch.load_dict(e);
+        }
+        decode_frame(&frame_header, data, &mut pos, scratch, &mut output, opts)?;
     }
     if pos != data.len() {
         return Err(format!(
@@ -350,6 +394,17 @@ impl FSETable {
             spread: Vec::new(),
             predefined: false,
         }
+    }
+
+    /// Make this table `src`, reusing this one's allocations.
+    fn copy_from(&mut self, src: &FSETable) {
+        debug_assert_eq!(self.max_symbol, src.max_symbol);
+        self.cells.clone_from(&src.cells);
+        self.size = src.size;
+        self.accuracy_log = src.accuracy_log;
+        self.symbol_probabilities
+            .clone_from(&src.symbol_probabilities);
+        self.predefined = src.predefined;
     }
 
     /// The decoding table: `1 << accuracy_log` cells once built, else none.
@@ -849,6 +904,22 @@ impl HuffmanTable {
             sorted: [0; 256],
             fse_table: FSETable::new(255),
         }
+    }
+
+    /// Make this the decoding table `src` is, reusing this one's
+    /// allocations; the weights' FSE table is build scratch and not copied.
+    fn copy_from(&mut self, src: &HuffmanTable) {
+        if src.is_x2 {
+            self.decode_x2.clone_from(&src.decode_x2);
+        } else {
+            self.decode.clone_from(&src.decode);
+        }
+        self.is_x2 = src.is_x2;
+        self.weights = src.weights;
+        self.nb_symbols = src.nb_symbols;
+        self.max_num_bits = src.max_num_bits;
+        self.rank_stats = src.rank_stats;
+        self.sorted = src.sorted;
     }
 
     /// Forget the table. Its cells stay allocated for the next build, which
@@ -2439,6 +2510,8 @@ struct FrameHeader {
     window_descriptor: u8,
     /// Frame_Content_Size, or None when the header omits it.
     frame_content_size: Option<u64>,
+    /// Dictionary_ID, 0 when the header omits it.
+    dict_id: u32,
 }
 
 impl FrameHeader {
@@ -2561,6 +2634,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         descriptor: FrameDescriptor(desc.0),
         frame_content_size: None,
         window_descriptor: 0,
+        dict_id: 0,
     };
 
     if !desc.single_segment_flag() {
@@ -2570,22 +2644,15 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         pos += 1;
     }
 
-    // ZSTD_decodeFrameHeader: no dictionary is loaded, so a frame naming one
-    // (any Dictionary_ID but 0) is dictionary_wrong.
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
     let dict_id = src
         .get(pos..pos + dict_id_len)
         .ok_or_else(|| FrameDecoderError::new("Error reading dictionary id: truncated".into()))?;
     pos += dict_id_len;
-    let dict_id = dict_id
+    frame_header.dict_id = dict_id
         .iter()
         .rev()
         .fold(0u32, |id, &b| id << 8 | u32::from(b));
-    if dict_id != 0 {
-        return Err(FrameDecoderError::new(format!(
-            "Frame needs dictionary {dict_id}, none is loaded"
-        )));
-    }
 
     let fcs_len = desc
         .frame_content_size_bytes()
@@ -2854,6 +2921,15 @@ impl CompressionModes {
 }
 
 impl FSEScratch {
+    /// The table for `SEQ_TABLES[t]`.
+    fn table(&self, t: usize) -> &FSETable {
+        match t {
+            0 => &self.literal_lengths,
+            1 => &self.offsets,
+            _ => &self.match_lengths,
+        }
+    }
+
     /// The table for `SEQ_TABLES[t]`.
     fn table_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
@@ -3777,8 +3853,10 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 /// Decode every block of one frame from `data[*pos..]` straight into
 /// `output`, then check the content size and checksum. Matches reach back
 /// at most Window_Size bytes and never before the frame's own start
-/// (`Prefix`). Frames of at least `min_parallel_blocks` blocks are decoded
-/// by `parallel` when enabled.
+/// (`Prefix`). `scratch` holds the tables the frame
+/// starts with, a dictionary's or none. Frames of at least
+/// `opts.min_parallel_blocks` blocks are decoded by `parallel` when
+/// enabled.
 #[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
@@ -3786,9 +3864,9 @@ fn decode_frame(
     pos: &mut usize,
     scratch: &mut DecoderScratch,
     output: &mut Vec<u8>,
-    min_parallel_blocks: usize,
-    simd: Level,
+    opts: &DecodeOptions,
 ) -> Result<(), String> {
+    let simd = opts.level();
     // Any window the header takes: this decoder keeps no window buffer,
     // so the window only bounds the blocks and the match offsets.
     let window_size = header.window_size()?;
@@ -3825,16 +3903,13 @@ fn decode_frame(
         data,
         pos,
         block_size_max,
+        scratch,
         &mut frame,
         output,
-        min_parallel_blocks,
-        simd,
+        opts,
     )?;
     #[cfg(not(feature = "parallel"))]
-    let decoded = {
-        let _ = min_parallel_blocks;
-        false
-    };
+    let decoded = false;
     if !decoded {
         decode_blocks(data, pos, block_size_max, scratch, &mut frame, output, simd)?;
     }
@@ -4108,6 +4183,10 @@ mod parallel {
     /// Frames with fewer blocks take the fused serial path.
     pub(super) const MIN_BLOCKS: usize = 4;
 
+    /// The "block" that defined a table the frame starts with: a
+    /// dictionary's (`start` of `decode_frame_blocks`).
+    const START: usize = usize::MAX;
+
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
         Raw(&'a [u8]),
@@ -4119,10 +4198,11 @@ mod parallel {
         parts: BlockParts<'a>,
         /// For Huffman-coded literals, the block whose tree description
         /// they use: this block for Compressed literals, the last earlier
-        /// block with Compressed literals for Treeless ones.
+        /// block with Compressed literals for Treeless ones, or `START`.
         huf_def: Option<usize>,
         /// For LL, OF and ML (`SEQ_TABLES` order), the block whose mode
-        /// defined the table this block uses. Unused without sequences.
+        /// defined the table this block uses, or `START`. Unused without
+        /// sequences.
         fse_def: [usize; 3],
     }
 
@@ -4136,15 +4216,18 @@ mod parallel {
 
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
-    /// decoder's scratch tables carry them from block to block.
+    /// decoder's scratch tables carry them from block to block, from the
+    /// tables in `start`.
     fn plan_frame<'a>(
         data: &'a [u8],
         pos: &mut usize,
         block_size_max: usize,
+        start: &DecoderScratch,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = None;
-        let mut fse_def: [Option<usize>; 3] = [None; 3];
+        let mut huf_def = (start.huf.table.max_num_bits != 0).then_some(START);
+        let mut fse_def: [Option<usize>; 3] =
+            std::array::from_fn(|t| (!start.fse.table(t).decode().is_empty()).then_some(START));
         loop {
             let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
             *pos += header_len;
@@ -4264,17 +4347,24 @@ mod parallel {
         }
     }
 
-    /// Stage 2 for compressed block `i`.
+    /// Stage 2 for compressed block `i`, of a frame starting with the
+    /// tables in `start`.
     fn decode_block(
         slot: &mut Slot,
         i: usize,
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
+        start: &DecoderScratch,
     ) -> Result<(), String> {
         if let Some(d) = plan.huf_def {
             if d == i {
                 // `decode_block_literals` builds it from this block.
                 slot.huf_from = None;
+            } else if d == START {
+                if slot.huf_from != Some(d) {
+                    slot.huf.table.copy_from(&start.huf.table);
+                    slot.huf_from = Some(d);
+                }
             } else if slot.huf_from != Some(d) {
                 slot.huf_from = None;
                 // The same arguments as the defining block's own build in
@@ -4323,7 +4413,11 @@ mod parallel {
                 slot.fse_from[t] = Some(i);
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                if d == START {
+                    slot.fse.table_mut(t).copy_from(start.fse.table(t));
+                } else {
+                    build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                }
                 slot.fse_from[t] = Some(d);
             }
         }
@@ -4649,25 +4743,29 @@ mod parallel {
     }
 
     /// Decode the blocks of the frame at `data[*pos..]` into `output` on the
-    /// current rayon pool. Returns `Ok(false)` without consuming input when
-    /// the frame has fewer than `min_blocks` blocks.
+    /// current rayon pool, starting from the tables and repeat offsets in
+    /// `start` (a dictionary's, or none). Returns `Ok(false)` without
+    /// consuming input when the frame has fewer than
+    /// `opts.min_parallel_blocks` blocks.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
         block_size_max: usize,
+        start: &DecoderScratch,
         frame: &mut FrameContent,
         output: &mut Vec<u8>,
-        min_blocks: usize,
-        simd: Level,
+        opts: &DecodeOptions,
     ) -> Result<bool, String> {
+        let min_blocks = opts.min_parallel_blocks;
         if min_blocks == usize::MAX {
             return Ok(false);
         }
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max)?;
+        let plans = plan_frame(data, &mut end, block_size_max, start)?;
         if plans.len() < min_blocks {
             return Ok(false);
         }
+        let simd = opts.level();
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -4684,7 +4782,7 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
-        let mut hist = [1u32, 4, 8];
+        let mut hist = start.offset_hist;
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -4700,7 +4798,7 @@ mod parallel {
                     // of waiting forever.
                     let _done = MarkDone(&cell.done, i + 1);
                     let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans);
+                    slot.result = decode_block(&mut slot, i, cp, plans, start);
                 });
             };
             for i in 0..ring.len() {
@@ -4711,7 +4809,7 @@ mod parallel {
                 let mut slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans);
+                        slot.result = decode_block(&mut slot, i, cp, plans, start);
                         slot
                     }
                     Plan::Compressed(_) => {
@@ -4725,7 +4823,7 @@ mod parallel {
                                 Some(Plan::Compressed(np)) if next.claim(i + 1) => {
                                     let _done = MarkDone(&next.done, i + 2);
                                     let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans);
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans, start);
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
