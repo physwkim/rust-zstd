@@ -34,20 +34,6 @@ checked against RFC 8878 for reference-side bugs.
 
 ## Open Findings
 
-### R1-8: A skippable Frame_Size of 0xFFFFFFF8 or more is rejected like libzstd's `readSkippableFrameSize`
-
-Severity: Low
-
-Class: reference-faithful gap
-
-Rust: `src/decode.rs:2568` (`parse_frame_header`) refuses a skippable frame whose 8-byte header plus Frame_Size wraps a u32 (47488d9, copied from libzstd).
-
-C reference: `decompress/zstd_decompress.c:587` `readSkippableFrameSize` adds `ZSTD_SKIPPABLEHEADERSIZE` to Frame_Size in U32 and returns `frameParameter_unsupported` on a wrap. RFC 8878 §3.1.2 allows any 32-bit Frame_Size ("User_Data can't be bigger than (2^32-1) bytes").
-
-Impact: a valid skippable frame of 4 GiB - 8 bytes or more is rejected.
-
-Decided 2026-10-01: accept it (RFC decoder rule).
-
 ### R2-8: Block path never runs `ZSTD_window_enforceMaxDist` or the `nextToUpdate >= lowLimit` clamp, so `Window::low` stops tracking C's `lowLimit`/`dictLimit`
 
 Severity: Low
@@ -249,7 +235,7 @@ Impact: The pre-splitter's distance and threshold are slightly biased, which can
 
 Decided 2026-10-01 (revised): the port fixes it. `nb_events` counts the positions it samples.
 
-### R2-2: [libzstd+port] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
+### R2-2: [libzstd] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
 
 Severity: Low
 
@@ -264,8 +250,6 @@ Impact: proven by probe (`p3`, `p1`).
 - **1 MiB window:** a compressed block decoding to 131078 bytes (bsm+6) is `Ok` in one-shot and in Rust. Streaming returns `Data corruption detected`.
 
 libzstd gives one RFC-invalid frame two verdicts depending on the API, and a 4-byte RLE block expands to 2 MiB instead of the RFC's 128 KiB.
-
-Port: copies one-shot libzstd. To be fixed (RFC decoder rule): every block's Block_Size and decoded size are at most Block_Maximum_Size.
 
 ### R2-3: [libzstd+port] X2's last-symbol step accepts a Huffman stream that ran out one symbol early, and the made-up byte depends on how libzstd was built
 
@@ -296,7 +280,7 @@ So libzstd gives one frame three outcomes: BMI2 x86-64, non-BMI2 x86-64, and 32-
 
 Port: copies the 64-bit body path. To be fixed with R1-6.
 
-### R2-4: [libzstd+port] Match offsets at or beyond Window_Size are accepted as long as they stay inside the frame
+### R2-4: [libzstd] Match offsets at or beyond Window_Size are accepted as long as they stay inside the frame
 
 Severity: Low
 
@@ -307,8 +291,6 @@ Rust: `src/decode.rs:3403-3404` — `offset.wrapping_sub(1) >= o_lit_end - lim.p
 C reference: `decompress/zstd_decompress_block.c:1052-1054` (also `:930-932`, `:979-981`) — one-shot checks `sequence.offset > oLitEnd - prefixStart`, then against `virtualStart`. Without a dictionary both are the frame start, and there is no window term. RFC 8878 §3.1.1.4 says "all offsets leading to previously decoded data must be smaller than Window_Size", and §3.1.1.3 only requires "previous decoded data, up to a distance of Window_Size".
 
 Impact: proven by probe (`p2`). Setup: Window_Size 1 KiB (and 2 KiB), two raw blocks of 1000 bytes, then one sequence with offset 1024, 1025, 1900 or 2000. One-shot libzstd, streaming libzstd and all Rust paths return `Ok(2010)`; only offset 2001 (before the frame start) is rejected. A frame that relies on this decodes in libzstd and the port, but is invalid for a decoder that keeps only Window_Size bytes, which the RFC allows. `p10` confirms that offsets into a previous frame are rejected on every path.
-
-Port: copies one-shot libzstd. To be fixed (RFC decoder rule): an offset above Window_Size is rejected; offset == Window_Size stays accepted.
 
 ### R2-5: [libzstd] ZSTD_decompressStream accepts a Compressed_Block with Block_Size 0 as an empty block; one-shot rejects it (the port follows one-shot)
 
