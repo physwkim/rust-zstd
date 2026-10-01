@@ -79,8 +79,8 @@ impl DecodeDict {
         &self.content
     }
 
-    pub(super) fn entropy(&self) -> Option<&Arc<DictEntropy>> {
-        self.entropy.as_ref()
+    pub(super) fn entropy(&self) -> Option<&DictEntropy> {
+        self.entropy.as_deref()
     }
 }
 
@@ -137,16 +137,16 @@ impl DecoderScratch {
     /// Start a frame from the dictionary's tables and repeat offsets
     /// (ZSTD_copyDDictParameters with entropyPresent): its tables stay in
     /// use until a block builds its own.
-    pub(super) fn load_dict(&mut self, e: &Arc<DictEntropy>) {
-        self.dict = Some(Arc::clone(e));
+    pub(super) fn load_dict(&mut self, e: &DictEntropy) {
         self.huf_from_dict = true;
         self.fse.source = [SeqTableSource::Dict; 3];
         self.offset_hist = e.rep;
     }
 
-    /// The Huffman table Treeless literals would use now.
-    pub(super) fn huf_table(&self) -> &HuffmanTable {
-        match &self.dict {
+    /// The Huffman table Treeless literals would use now, in a frame that
+    /// started from `dict` if given.
+    pub(super) fn huf_table<'a>(&'a self, dict: Option<&'a DictEntropy>) -> &'a HuffmanTable {
+        match dict {
             Some(d) if self.huf_from_dict => &d.huf.table,
             _ => &self.huf.table,
         }

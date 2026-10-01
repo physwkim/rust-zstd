@@ -48,7 +48,7 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 mod dict;
 pub use dict::DecodeDict;
@@ -262,11 +262,12 @@ fn decompress_frames(
         #[cfg(feature = "parallel")]
         {
             let (frame, init) = dec.frame_start();
+            let dict = dict.and_then(DecodeDict::entropy);
             if parallel::decode_frame_blocks(
                 data,
                 &mut pos,
                 frame,
-                init,
+                parallel::FrameStart { init, dict },
                 &mut out,
                 min_parallel_blocks,
                 simd,
@@ -2504,12 +2505,12 @@ struct DecoderScratch {
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
-    /// The dictionary tables the frame started with (`load_dict`), shared
-    /// rather than copied, as libzstd points its DCtx at the DDict's.
-    dict: Option<Arc<DictEntropy>>,
-    /// The Huffman table in use is `dict`'s, not `huf`'s: true from
-    /// `load_dict` until a block of the frame builds one. The sequence
-    /// tables' counterpart is `SeqTableSource::Dict`.
+    /// The Huffman table in use is that of the dictionary the frame
+    /// started from, not `huf`: true from `load_dict` until a block of the
+    /// frame builds one. The sequence tables' counterpart is
+    /// `SeqTableSource::Dict`. The dictionary's tables are not kept here:
+    /// every call that decodes the frame's blocks is given them, as libzstd
+    /// points its DCtx at the DDict's rather than copying them.
     huf_from_dict: bool,
 }
 
@@ -2522,7 +2523,6 @@ impl DecoderScratch {
             fse: FSEScratch::new(),
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
-            dict: None,
             huf_from_dict: false,
         }
     }
@@ -2530,7 +2530,6 @@ impl DecoderScratch {
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.dict = None;
         self.huf_from_dict = false;
         self.fse.reset();
         self.huf.table.reset();
@@ -4286,7 +4285,8 @@ impl FrameDecoder {
     }
 
     /// Right after `Event::FrameStarted`: the frame, and the scratch with
-    /// the tables and repeat offsets it starts from.
+    /// the tables and repeat offsets it starts from, which select those of
+    /// the dictionary given to `process` if the frame started from one.
     fn frame_start(&mut self) -> (&mut Frame, &DecoderScratch) {
         match (&mut self.stage, &self.scratch) {
             (Stage::Block(frame), Some(scratch)) => (frame, scratch),
@@ -4328,8 +4328,9 @@ impl FrameDecoder {
     }
 
     /// Take the current unit, `unit_len(unit)` bytes, and decode it into
-    /// `out`, a frame header starting the frame from `dict` if given. Not
-    /// for `Stage::Skip`.
+    /// `out`, a frame header starting the frame from `dict` if given. Every
+    /// call of a frame passes the `dict` it started from. Not for
+    /// `Stage::Skip`.
     fn process(
         &mut self,
         unit: &[u8],
@@ -4342,7 +4343,8 @@ impl FrameDecoder {
             Stage::Block(frame) => {
                 let (block, content) = locate_block(unit, frame.block_size_max)?;
                 let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
-                decode_block(&block, content, frame, scratch, out, self.simd)?;
+                let dict = dict.and_then(DecodeDict::entropy);
+                decode_block(&block, content, frame, scratch, dict, out, self.simd)?;
                 if !block.last_block {
                     return Ok(Event::Continue);
                 }
@@ -4494,12 +4496,14 @@ fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]
     Ok((block, content))
 }
 
-/// Decode `block` with `content` into `out`, a block of `frame`.
+/// Decode `block` with `content` into `out`, a block of `frame`, which
+/// started from the tables of `dict` if given.
 fn decode_block(
     block: &BlockHeader,
     content: &[u8],
     frame: &mut Frame,
     scratch: &mut DecoderScratch,
+    dict: Option<&DictEntropy>,
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
@@ -4521,7 +4525,7 @@ fn decode_block(
                 dst.op + len
             }
             BlockType::Compressed => {
-                decompress_block(content, frame.block_size_max, scratch, dst, ext, simd)?
+                decompress_block(content, frame.block_size_max, scratch, dict, dst, ext, simd)?
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         };
@@ -4708,7 +4712,8 @@ fn decode_block_literals(
 }
 
 /// Decode compressed block `raw` into `dst`, after `ext`, in a frame whose
-/// Block_Maximum_Size is `block_size_max`; returns the block's end.
+/// Block_Maximum_Size is `block_size_max` and which started from the
+/// tables of `dict` if given; returns the block's end.
 ///
 /// # Safety
 /// `dst` and `ext` meet their contracts.
@@ -4716,12 +4721,12 @@ unsafe fn decompress_block(
     raw: &[u8],
     block_size_max: usize,
     workspace: &mut DecoderScratch,
+    dict: Option<&DictEntropy>,
     dst: Dst,
     ext: ExtHistory,
     simd: Level,
 ) -> Result<usize, String> {
     let parts = split_block(raw, block_size_max)?;
-    let dict = workspace.dict.as_deref();
     let repeat = dict
         .filter(|_| workspace.huf_from_dict)
         .map(|d| &d.huf.table);
@@ -4789,8 +4794,17 @@ mod parallel {
     pub(super) const MIN_BLOCKS: usize = 4;
 
     /// The "block" that defined a table the frame starts with: a
-    /// dictionary's (`init` of `decode_frame_blocks`).
+    /// dictionary's (`FrameStart`).
     const START: usize = usize::MAX;
+
+    /// The tables and repeat offsets a frame starts from: `init`, the
+    /// decoder's scratch right after the frame header, which may select
+    /// those of `dict`, the dictionary the frame started from.
+    #[derive(Clone, Copy)]
+    pub(super) struct FrameStart<'a> {
+        pub(super) init: &'a DecoderScratch,
+        pub(super) dict: Option<&'a DictEntropy>,
+    }
 
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
@@ -4822,17 +4836,17 @@ mod parallel {
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
     /// decoder's scratch tables carry them from block to block, from the
-    /// tables in `init`.
+    /// tables in `start`.
     fn plan_frame<'a>(
         data: &'a [u8],
         pos: &mut usize,
         block_size_max: usize,
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = (init.huf_table().max_num_bits != 0).then_some(START);
+        let mut huf_def = (start.init.huf_table(start.dict).max_num_bits != 0).then_some(START);
         let mut fse_def: [Option<usize>; 3] = std::array::from_fn(|t| {
-            matches!(init.fse.source[t], SeqTableSource::Dict).then_some(START)
+            matches!(start.init.fse.source[t], SeqTableSource::Dict).then_some(START)
         });
         loop {
             let (block, content) = locate_block(&data[*pos..], block_size_max)?;
@@ -4950,13 +4964,13 @@ mod parallel {
     }
 
     /// Stage 2 for compressed block `i`, of a frame starting with the
-    /// tables in `init`.
+    /// tables in `start`.
     fn decode_block(
         slot: &mut Slot,
         i: usize,
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
     ) -> Result<(), String> {
         if let Some(d) = plan.huf_def {
             if d == i {
@@ -4964,7 +4978,7 @@ mod parallel {
                 slot.huf_from = None;
             } else if d == START {
                 if slot.huf_from != Some(d) {
-                    slot.huf.table.copy_from(init.huf_table());
+                    slot.huf.table.copy_from(start.init.huf_table(start.dict));
                     slot.huf_from = Some(d);
                 }
             } else if slot.huf_from != Some(d) {
@@ -5019,7 +5033,7 @@ mod parallel {
                 slot.fse_from[t] = Some(d);
             }
         }
-        let tables = slot.fse.tables(init.dict.as_deref().map(|d| &d.fse));
+        let tables = slot.fse.tables(start.dict.map(|d| &d.fse));
         decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
     }
 
@@ -5345,15 +5359,14 @@ mod parallel {
 
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool, starting from the tables and repeat offsets in
-    /// `init` (a dictionary's, or none). Returns `Ok(false)` without
-    /// consuming input when the block headers do not show `min_blocks`
-    /// blocks: the frame has fewer, or a header before them fails, which
-    /// the serial decoder then reports.
+    /// `start`. Returns `Ok(false)` without consuming input when the block
+    /// headers do not show `min_blocks` blocks: the frame has fewer, or a
+    /// header before them fails, which the serial decoder then reports.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
         frame: &mut Frame,
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
         out: &mut VecOut<'_>,
         min_blocks: usize,
         simd: Level,
@@ -5372,7 +5385,7 @@ mod parallel {
             }
         }
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max, init)?;
+        let plans = plan_frame(data, &mut end, block_size_max, start)?;
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -5389,8 +5402,8 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
-        let mut hist = init.offset_hist;
-        let dict = init.dict.as_deref().map(|d| &d.fse);
+        let mut hist = start.init.offset_hist;
+        let dict = start.dict.map(|d| &d.fse);
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -5406,7 +5419,7 @@ mod parallel {
                     // of waiting forever.
                     let _done = MarkDone(&cell.done, i + 1);
                     let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans, init);
+                    slot.result = decode_block(&mut slot, i, cp, plans, start);
                 });
             };
             for i in 0..ring.len() {
@@ -5417,7 +5430,7 @@ mod parallel {
                 let mut slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans, init);
+                        slot.result = decode_block(&mut slot, i, cp, plans, start);
                         slot
                     }
                     Plan::Compressed(_) => {
@@ -5431,7 +5444,7 @@ mod parallel {
                                 Some(Plan::Compressed(np)) if next.claim(i + 1) => {
                                     let _done = MarkDone(&next.done, i + 2);
                                     let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans, init);
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans, start);
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
@@ -6320,11 +6333,19 @@ mod tests {
                     // SAFETY: `out` holds the segment with the room `Dst`
                     // needs reserved, and `ext` is the history.
                     let got = unsafe {
-                        decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd)
-                            .map(|end| {
-                                out.set_len(end);
-                                out
-                            })
+                        decompress_block(
+                            &block,
+                            MAX_BLOCK_SIZE,
+                            &mut scratch,
+                            None,
+                            dst,
+                            history,
+                            simd,
+                        )
+                        .map(|end| {
+                            out.set_len(end);
+                            out
+                        })
                     };
                     if let Some(e) = if dict { error_dict } else { error } {
                         assert_eq!(got.err().as_deref(), Some(e), "{name}");
