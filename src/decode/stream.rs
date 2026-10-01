@@ -13,9 +13,9 @@ use std::io::{self, Read};
 /// Frame_Content_Size when that is smaller, and by what it has decoded
 /// to so far.
 ///
-/// Its `decompress` takes whole input, as the function `decompress` does,
-/// and keeps its tables and buffers for the next call
-/// (ZSTD_decompressDCtx).
+/// Its `decompress` and `decompress_with_dict` take whole input, as the
+/// functions of those names do, and keep its tables and buffers for the
+/// next call (ZSTD_decompressDCtx, ZSTD_decompress_usingDDict).
 pub struct Decompressor {
     dec: FrameDecoder,
     /// The start of a unit that came in pieces.
@@ -64,8 +64,31 @@ impl Decompressor {
     /// `decompress_stream` holds, and its error, are dropped, and its next
     /// call starts on a new frame.
     pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, String> {
+        self.decompress_whole(src, None)
+    }
+
+    /// `decompress` with dictionary `dict`, as the function
+    /// `decompress_with_dict` decodes (ZSTD_decompress_usingDDict). Only
+    /// this call uses `dict`: the next one starts from the dictionary it is
+    /// given, or none.
+    ///
+    /// It resets the streaming state before decoding and again after, as
+    /// `decompress` does.
+    pub fn decompress_with_dict(
+        &mut self,
+        src: &[u8],
+        dict: &DecodeDict,
+    ) -> Result<Vec<u8>, String> {
+        self.decompress_whole(src, Some(dict))
+    }
+
+    fn decompress_whole(
+        &mut self,
+        src: &[u8],
+        dict: Option<&DecodeDict>,
+    ) -> Result<Vec<u8>, String> {
         self.reset();
-        let content = decompress_frames(&mut self.dec, src, None);
+        let content = decompress_frames(&mut self.dec, src, dict);
         // An error leaves the frame decoder inside a frame.
         self.reset();
         content

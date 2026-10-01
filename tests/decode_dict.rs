@@ -2,14 +2,16 @@
 //! (formatted) and raw-content dictionaries decode byte-exact on every
 //! decoder path, dictionaries libzstd rejects are rejected, and frames
 //! with the wrong or no dictionary, or offsets reaching past the
-//! dictionary or the window, are errors.
+//! dictionary or the window, are errors. A reused `Decompressor` gives
+//! the same verdicts.
 
 mod common;
 
 use common::lcg_bytes;
 use rust_zstd::decode::{
-    decompress_with_dict, decompress_with_dict_options, DecodeDict, DecodeOptions,
+    decompress_with_dict, decompress_with_dict_options, DecodeDict, DecodeOptions, Decompressor,
 };
+use std::cell::RefCell;
 use zstd::zstd_safe::zstd_sys as sys;
 
 use sys::ZSTD_cParameter as P;
@@ -209,23 +211,50 @@ fn paths() -> [(DecodeOptions, &'static str); 4] {
     ]
 }
 
-/// `frame` decodes to `src` with `dict` on every path.
+thread_local! {
+    /// A decompressor for each of `paths()`, reused by every check of a
+    /// test, so that each call follows others with other dictionaries,
+    /// none, or errors.
+    static REUSED: RefCell<Vec<Decompressor>> = RefCell::new(
+        paths().iter().map(|(opts, _)| Decompressor::with_options(opts)).collect(),
+    );
+}
+
+/// `frame` decoded with `dict` by the reused decompressor of path `k`.
+fn reused(k: usize, frame: &[u8], dict: Option<&DecodeDict>) -> Result<Vec<u8>, String> {
+    REUSED.with_borrow_mut(|d| match dict {
+        Some(dict) => d[k].decompress_with_dict(frame, dict),
+        None => d[k].decompress(frame),
+    })
+}
+
+/// `frame` decodes to `src` with `dict` on every path, fresh and reused.
 fn assert_decodes(what: &str, frame: &[u8], dict: &DecodeDict, src: &[u8]) {
-    for (opts, path) in paths() {
-        match decompress_with_dict_options(frame, Some(dict), &opts) {
-            Ok(out) => assert!(out == src, "{what} ({path}): wrong output"),
-            Err(e) => panic!("{what} ({path}): {e}"),
+    for (k, (opts, path)) in paths().into_iter().enumerate() {
+        for (got, how) in [
+            (decompress_with_dict_options(frame, Some(dict), &opts), ""),
+            (reused(k, frame, Some(dict)), ", reused"),
+        ] {
+            match got {
+                Ok(out) => assert!(out == src, "{what} ({path}{how}): wrong output"),
+                Err(e) => panic!("{what} ({path}{how}): {e}"),
+            }
         }
     }
 }
 
-/// `frame` fails with `dict` on every path, with an error containing
-/// `want`.
+/// `frame` fails with `dict` on every path, fresh and reused, with an
+/// error containing `want`.
 fn assert_rejects(what: &str, frame: &[u8], dict: Option<&DecodeDict>, want: &str) {
-    for (opts, path) in paths() {
-        match decompress_with_dict_options(frame, dict, &opts) {
-            Ok(_) => panic!("{what} ({path}): decoded"),
-            Err(e) => assert!(e.contains(want), "{what} ({path}): {e}"),
+    for (k, (opts, path)) in paths().into_iter().enumerate() {
+        for (got, how) in [
+            (decompress_with_dict_options(frame, dict, &opts), ""),
+            (reused(k, frame, dict), ", reused"),
+        ] {
+            match got {
+                Ok(_) => panic!("{what} ({path}{how}): decoded"),
+                Err(e) => assert!(e.contains(want), "{what} ({path}{how}): {e}"),
+            }
         }
     }
 }
@@ -339,6 +368,67 @@ fn frame_without_dict_id_uses_supplied_dict() {
         );
         assert_decodes(&format!("{name}: no dict id"), &frame, &dict, &src);
         assert!(rust_zstd::decompress(&frame).map_or(true, |out| out != src));
+    }
+}
+
+/// `src` through `decompress_stream`, with room for all of it, then
+/// `finish`.
+fn stream(d: &mut Decompressor, src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; 1 << 20];
+    let (mut src_pos, mut dst_pos) = (0, 0);
+    while src_pos < src.len() {
+        d.decompress_stream(src, &mut src_pos, &mut out, &mut dst_pos)?;
+    }
+    d.finish()?;
+    out.truncate(dst_pos);
+    Ok(out)
+}
+
+/// A reused `Decompressor` decodes each call with the dictionary that
+/// call gives, or none: the dictionary of an earlier call, which may have
+/// failed, carries over to neither `decompress`, `decompress_stream` nor a
+/// call with another dictionary.
+#[test]
+fn reused_decompressor_takes_each_calls_dict() {
+    let (raw_a, raw_b) = (trained_dict(), entropy_dict());
+    let a = DecodeDict::new(&raw_a).unwrap();
+    let b = DecodeDict::new(&raw_b).unwrap();
+    let content = DecodeDict::new(a.content()).unwrap();
+    let src = records(60, 61);
+    let fa = c_compress_using_dict(&src, &raw_a, 3);
+    let fb = c_compress_using_dict(&src, &raw_b, 19);
+    let fc = c_compress_using_dict(&src, a.content(), 3);
+    // Needs `a` but names no dictionary.
+    let fa_anon = c_compress_dict(
+        &src,
+        &raw_a,
+        &[(P::ZSTD_c_compressionLevel, 3), (P::ZSTD_c_dictIDFlag, 0)],
+    );
+    let plain = zstd::bulk::compress(&src, 3).unwrap();
+    let anon_alone = rust_zstd::decompress(&fa_anon);
+    assert!(anon_alone.as_ref() != Ok(&src), "fa_anon decodes alone");
+    let want = Ok(src.clone());
+    for (opts, path) in paths() {
+        let mut d = Decompressor::with_options(&opts);
+        assert_eq!(d.decompress_with_dict(&fa, &a), want, "{path}: a");
+        assert_eq!(d.decompress(&plain), want, "{path}: plain after a");
+        assert_eq!(d.decompress(&fa_anon), anon_alone, "{path}: anon after a");
+        assert_eq!(d.decompress_with_dict(&fa_anon, &a), want, "{path}: anon");
+        let e = d.decompress(&fa).unwrap_err();
+        assert!(e.contains("none is loaded"), "{path}: a without: {e}");
+        let e = d.decompress_with_dict(&fa, &b).unwrap_err();
+        assert!(e.contains("dictionary"), "{path}: a with b: {e}");
+        assert_eq!(d.decompress_with_dict(&fb, &b), want, "{path}: b");
+        assert_eq!(d.decompress_with_dict(&fc, &content), want, "{path}: c");
+        assert_eq!(d.decompress_with_dict(&fa, &a), want, "{path}: a again");
+        let e = stream(&mut d, &fa).unwrap_err();
+        assert!(e.contains("none is loaded"), "{path}: a streamed: {e}");
+        assert_eq!(
+            d.decompress_with_dict(&fa, &a),
+            want,
+            "{path}: a after stream"
+        );
+        assert_eq!(stream(&mut d, &plain), want, "{path}: plain streamed");
     }
 }
 
