@@ -1,8 +1,9 @@
-//! Block_Maximum_Size = min(Window_Size, 128 KiB) (fParams.blockSizeMax):
-//! hand-built frames at the boundary of each limit libzstd 1.5.7's one-shot
-//! decoder (ZSTD_decompressDCtx) puts on a block decode to the same
-//! accept / reject outcome, and to the same bytes when accepted, serial and
-//! MT at both SIMD levels.
+//! Block_Maximum_Size = min(Window_Size, 128 KiB) (RFC 8878 lines
+//! 557-564): hand-built frames at the boundary of each limit it puts on a
+//! block get the RFC's accept / reject outcome, serial and MT at both SIMD
+//! levels. Each frame also states libzstd 1.5.7's one-shot
+//! (ZSTD_decompressDCtx) outcome, checked, and where both accept the bytes
+//! must match.
 
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 
@@ -157,17 +158,18 @@ fn sequences_block(lits: usize, mls: &[u32]) -> Block {
 
 /// Output capacity given to libzstd. ZSTD_decompressFrame bounds raw and
 /// RLE blocks by the capacity left, and places a block's literals by it
-/// (ZSTD_allocateLiteralsBuffer); this decoder's output grows as needed,
-/// which a capacity well above every frame here stands for.
+/// (ZSTD_allocateLiteralsBuffer); a capacity well above every frame here
+/// keeps its outcomes those of an ample buffer.
 const CAPACITY: usize = 8 << 20;
 
-/// Decode `f` with libzstd's one-shot decoder, check its outcome is
-/// `accept`, and check ours gives the same outcome and bytes.
-fn check(name: &str, f: &[u8], accept: bool) {
+/// Decode `f` serial and MT at both SIMD levels and check the outcome is
+/// `accept`; check libzstd's one-shot outcome is `libzstd`, and where both
+/// accept, that the bytes match.
+fn check_vs(name: &str, f: &[u8], accept: bool, libzstd: bool) {
     let theirs = zstd::bulk::decompress(f, CAPACITY);
     assert_eq!(
         theirs.is_ok(),
-        accept,
+        libzstd,
         "{name}: libzstd {:?}",
         theirs.as_ref().map(Vec::len)
     );
@@ -178,20 +180,23 @@ fn check(name: &str, f: &[u8], accept: bool) {
                 simd,
             };
             let ours = decompress_with_options(f, &options);
-            match (&theirs, &ours) {
-                (Ok(a), Ok(b)) => assert!(
-                    a == b,
-                    "{name} simd={simd} min_parallel_blocks={min_parallel_blocks}: output differs"
-                ),
-                (Err(_), Err(_)) => {}
-                _ => panic!(
-                    "{name} simd={simd} min_parallel_blocks={min_parallel_blocks}: libzstd {:?}, ours {:?}",
-                    theirs.as_ref().map(Vec::len),
-                    ours.as_ref().map(Vec::len)
-                ),
+            let at = format!("{name} simd={simd} min_parallel_blocks={min_parallel_blocks}");
+            assert_eq!(
+                ours.is_ok(),
+                accept,
+                "{at}: ours {:?}",
+                ours.as_ref().map(Vec::len)
+            );
+            if let (Ok(a), Ok(b)) = (&theirs, &ours) {
+                assert!(a == b, "{at}: output differs");
             }
         }
     }
+}
+
+/// `check_vs` for a frame libzstd gives the same outcome.
+fn check(name: &str, f: &[u8], accept: bool) {
+    check_vs(name, f, accept, accept);
 }
 
 /// (Window_Descriptor, Block_Maximum_Size): windows of 1 KiB and 96 KiB,
@@ -245,56 +250,88 @@ fn literals_size_is_at_most_block_maximum_size() {
     }
 }
 
-/// ZSTD_decompressFrame bounds what a compressed block decodes to by where
-/// it keeps the block's literals, Block_Maximum_Size + WILDCOPY_OVERLENGTH
-/// (32) past the block's start when the output has room: a block decoding
-/// to that many bytes is accepted and to one more rejected, whether the
-/// last sequence or the literals after it cross the bound (only
-/// ZSTD_decompressStream bounds it by Block_Maximum_Size).
+/// Block_Maximum_Size bounds what a compressed block decodes to as well
+/// (RFC 8878 lines 566-568): a block decoding to that many bytes is
+/// accepted and to one more rejected, whether the last sequence or the
+/// literals after it cross the bound. libzstd's one-shot decoder bounds it
+/// by where it keeps the literals, Block_Maximum_Size + WILDCOPY_OVERLENGTH
+/// (32) past the block's start, so it takes up to 32 bytes more.
 #[test]
-fn decoded_size_is_at_most_block_maximum_size_plus_wildcopy_overlength() {
+fn decoded_size_is_at_most_block_maximum_size() {
     for (wd, max) in WINDOWS {
-        for (n, accept) in [
-            (max, true),
-            (max + 1, true),
-            (max + 32, true),
-            (max + 33, false),
+        for (n, accept, libzstd) in [
+            (max, true, true),
+            (max + 1, false, true),
+            (max + 32, false, true),
+            (max + 33, false, false),
         ] {
             let ml = (n - 2) as u32;
             let f = around(wd, sequences_block(2, &[ml / 2, ml - ml / 2]));
-            check(&format!("max {max}: sequences decoding to {n}"), &f, accept);
+            check_vs(
+                &format!("max {max}: sequences decoding to {n}"),
+                &f,
+                accept,
+                libzstd,
+            );
             let lits = n / 2;
             let f = around(wd, sequences_block(lits, &[(n - lits) as u32]));
-            check(
+            check_vs(
                 &format!("max {max}: sequence then literals decoding to {n}"),
                 &f,
                 accept,
+                libzstd,
             );
         }
     }
 }
 
-/// ZSTD_decompressFrame bounds raw and RLE blocks by the output capacity
-/// alone, not by Block_Maximum_Size or 128 KiB (only ZSTD_decompressStream
-/// does): up to the 21-bit Block_Size maximum, in windowed frames and in a
-/// single-segment frame whose window is the block.
+/// A raw or RLE block's Block_Size is bounded by Block_Maximum_Size too
+/// (RFC 8878 lines 545-555), in windowed frames and in single-segment
+/// frames, whose window is the content size. libzstd's one-shot decoder
+/// bounds them by its output capacity alone (ZSTD_copyRawBlock,
+/// ZSTD_setRleBlock), up to the 21-bit Block_Size maximum.
 #[test]
-fn raw_and_rle_blocks_are_bounded_by_the_output_alone() {
+fn raw_and_rle_block_size_is_at_most_block_maximum_size() {
     const BLOCK_SIZE_FIELD_MAX: usize = (1 << 21) - 1;
     for (wd, max) in WINDOWS {
-        for n in [max, max + 1, (128 << 10) + 1, BLOCK_SIZE_FIELD_MAX] {
+        for (n, accept) in [
+            (max, true),
+            (max + 1, false),
+            ((128 << 10) + 1, false),
+            (BLOCK_SIZE_FIELD_MAX, false),
+        ] {
             let f = around(wd, Block::Raw(vec![3; n]));
-            check(&format!("max {max}: raw block of {n}"), &f, true);
+            check_vs(&format!("max {max}: raw block of {n}"), &f, accept, true);
             let f = around(wd, Block::Rle(4, n));
-            check(&format!("max {max}: RLE block of {n}"), &f, true);
+            check_vs(&format!("max {max}: RLE block of {n}"), &f, accept, true);
         }
     }
-    for n in [(128 << 10) + 1, BLOCK_SIZE_FIELD_MAX] {
+    for (n, accept) in [
+        (128 << 10, true),
+        ((128 << 10) + 1, false),
+        (BLOCK_SIZE_FIELD_MAX, false),
+    ] {
         let f = frame(&single_segment(n as u32), &[Block::Raw(vec![5; n])]);
-        check(&format!("single segment: raw block of {n}"), &f, true);
+        check_vs(
+            &format!("single segment: raw block of {n}"),
+            &f,
+            accept,
+            true,
+        );
         let f = frame(&single_segment(n as u32), &[Block::Rle(6, n)]);
-        check(&format!("single segment: RLE block of {n}"), &f, true);
+        check_vs(
+            &format!("single segment: RLE block of {n}"),
+            &f,
+            accept,
+            true,
+        );
     }
+    let n = 128 << 10;
+    let f = frame(
+        &single_segment(2 * n as u32),
+        &[Block::Raw(vec![7; n]), Block::Rle(8, n)],
+    );
+    check("single segment: two blocks of 128 KiB", &f, true);
 }
 
 /// A single-segment frame's window is its content size, below 1 KiB too:
