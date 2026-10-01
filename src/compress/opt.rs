@@ -1044,16 +1044,6 @@ fn opt_generic<const OPT_LEVEL: u32>(
         let store_end = cur as usize + 2;
         let mut stretch_pos = cur as usize;
         debug_assert!(store_end < ZSTD_OPT_SIZE);
-        if last_stretch.litlen > 0 {
-            // last "sequence" is unfinished: just a bunch of literals
-            opt[store_end].litlen = last_stretch.litlen;
-            opt[store_end].mlen = 0;
-            opt[store_end - 1] = last_stretch;
-        }
-        // libzstd 1.5.7 runs this unconditionally (a bare block after the
-        // `if`), overwriting the literals-only entry above: trailing
-        // literals of the last stretch are not stored and the next series
-        // parses them again.
         opt[store_end] = last_stretch; // note: litlen will be fixed
         let mut store_start = store_end;
         loop {
