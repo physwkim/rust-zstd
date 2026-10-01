@@ -17,6 +17,7 @@ pub mod block;
 pub mod bt;
 pub mod common;
 pub mod dfast;
+mod error;
 pub mod fast;
 pub mod lazy;
 pub mod ldm;
@@ -33,6 +34,7 @@ use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
 };
+pub use error::CompressError;
 use lazy::default_search_method;
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
 use matchstate::{needed_space, MatchState};
