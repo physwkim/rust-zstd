@@ -181,8 +181,15 @@ impl Default for DecodeOptions {
 /// `decompress` with the paths chosen by `opts`.
 #[doc(hidden)]
 pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
-    let simd = opts.simd_level();
-    let mut dec = FrameDecoder::new(simd);
+    decompress_frames(&mut FrameDecoder::new(opts), data)
+}
+
+/// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
+/// `data`, whole, with `dec`, which stands between frames: a fresh one for
+/// `decompress`, a `Decompressor`'s own for its `decompress`.
+fn decompress_frames(dec: &mut FrameDecoder, data: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "parallel")]
+    let (min_parallel_blocks, simd) = (dec.min_parallel_blocks, dec.simd);
     let mut out = VecOut {
         output: Vec::new(),
         prefix: Prefix {
@@ -219,7 +226,7 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             &mut pos,
             frame,
             &mut out,
-            opts.min_parallel_blocks,
+            min_parallel_blocks,
             simd,
         )? {
             dec.blocks_ended()?;
@@ -4128,14 +4135,21 @@ struct FrameDecoder {
     stage: Stage,
     scratch: Option<DecoderScratch>,
     simd: Level,
+    /// `DecodeOptions::min_parallel_blocks`, for `decompress_frames`: the
+    /// units `Decompressor::decompress_stream` hands it decode on the
+    /// current thread.
+    #[cfg(feature = "parallel")]
+    min_parallel_blocks: usize,
 }
 
 impl FrameDecoder {
-    fn new(simd: Level) -> FrameDecoder {
+    fn new(opts: &DecodeOptions) -> FrameDecoder {
         FrameDecoder {
             stage: Stage::FrameHeader,
             scratch: None,
-            simd,
+            simd: opts.simd_level(),
+            #[cfg(feature = "parallel")]
+            min_parallel_blocks: opts.min_parallel_blocks,
         }
     }
 

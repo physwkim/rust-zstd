@@ -12,6 +12,10 @@ use std::io::{self, Read};
 /// output: a frame decodes in memory bounded by its Window_Size, by its
 /// Frame_Content_Size when that is smaller, and by what it has decoded
 /// to so far.
+///
+/// Its `decompress` takes whole input, as the function `decompress` does,
+/// and keeps its tables and buffers for the next call
+/// (ZSTD_decompressDCtx).
 pub struct Decompressor {
     dec: FrameDecoder,
     /// The start of a unit that came in pieces.
@@ -35,17 +39,36 @@ impl Decompressor {
         Self::with_options(&DecodeOptions::default())
     }
 
-    /// A decompressor on the SIMD level `opts` picks. It decodes on the
-    /// current thread whatever `opts.min_parallel_blocks` says.
+    /// A decompressor on the paths `opts` picks. `decompress_stream`
+    /// decodes on the current thread whatever `opts.min_parallel_blocks`
+    /// says.
     #[doc(hidden)]
     pub fn with_options(opts: &DecodeOptions) -> Self {
         Decompressor {
-            dec: FrameDecoder::new(opts.simd_level()),
+            dec: FrameDecoder::new(opts),
             unit: Vec::new(),
             ring: Ring::default(),
             frame_ended: false,
             failed: None,
         }
+    }
+
+    /// Decompress `src`, whole, as the function `decompress` does, with the
+    /// tables and buffers this decompressor keeps from call to call
+    /// (ZSTD_decompressDCtx). With the `parallel` feature, frames of four
+    /// or more blocks decode on the current rayon pool if the pool `new`
+    /// found had more than one thread.
+    ///
+    /// It resets the streaming state, as `reset` does, before decoding and
+    /// again after, whatever the result: input and output that
+    /// `decompress_stream` holds, and its error, are dropped, and its next
+    /// call starts on a new frame.
+    pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, String> {
+        self.reset();
+        let content = decompress_frames(&mut self.dec, src);
+        // An error leaves the frame decoder inside a frame.
+        self.reset();
+        content
     }
 
     /// Decode the input at `src[*src_pos..]` into `dst[*dst_pos..]`,

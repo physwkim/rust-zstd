@@ -407,6 +407,52 @@ fn repeat_mode_after_predefined_mode() {
     }
 }
 
+/// A frame's first block has no earlier block's tables: Treeless literals
+/// or a Repeat_Mode table there are rejected, after a frame that built
+/// them in the same input, or in the call before on a reused
+/// `Decompressor` (`check`). Each such frame is a later block of a libzstd
+/// frame made the only block of a frame of its own: one with Treeless
+/// literals, or one of raw literals with its modes set to Repeat_Mode.
+#[test]
+fn first_block_reuses_no_table() {
+    // Every block after the first has Treeless literals of 16 letters.
+    let letters: Vec<u8> = lcg_bytes(60_000, 5).iter().map(|b| b'a' + b % 16).collect();
+    let mut found = [0; 2];
+    for (content, repeat) in [(letters, false), (text(60_000), true)] {
+        let f = flushed_frame(&content, &[1000, 1000, 1000, 1000], 1);
+        let list = blocks(&f);
+        let header = &f[..list[0].1.start - 3];
+        let modes = modes_bytes(&f);
+        for (i, (ty, r)) in list.into_iter().enumerate().skip(1) {
+            let mut block = f[r.clone()].to_vec();
+            let treeless = block[0] & 3 == 3;
+            let what = match modes.iter().find(|m| r.contains(&m.0)) {
+                _ if ty != 2 => continue,
+                Some(&(at, _)) if repeat && !treeless => {
+                    block[at - r.start] |= 0xFC;
+                    "Repeat_Mode tables"
+                }
+                _ if !repeat && treeless => "Treeless literals",
+                _ => continue,
+            };
+            found[usize::from(repeat)] += 1;
+            let mut tail = header.to_vec();
+            let block_header = (block.len() as u32) << 3 | 2 << 1 | 1;
+            tail.extend_from_slice(&block_header.to_le_bytes()[..3]);
+            tail.extend_from_slice(&block);
+            let name = format!("block {i} alone, {what}");
+            check(&format!("{name}: its frame"), &f, true);
+            check(&name, &tail, false);
+            check(
+                &format!("{name} after its frame"),
+                &[&f[..], &tail].concat(),
+                false,
+            );
+        }
+    }
+    assert!(found[0] >= 1 && found[1] >= 1, "{found:?}");
+}
+
 /// Copies of 4 bytes from alternately 24 and 40 bytes back: each is one
 /// sequence without literals at levels 4 and up, over 0x7F00 in a block.
 fn alternating_copies(len: usize) -> Vec<u8> {
