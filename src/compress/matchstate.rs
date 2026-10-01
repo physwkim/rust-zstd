@@ -109,6 +109,19 @@ impl Window {
         self.next_src = origin;
     }
 
+    /// The input moved `shift` bytes down (a streaming buffer dropped its
+    /// first `shift` bytes): every position is `shift` lower, every index
+    /// the same, and `low` rises to the first byte kept, so the window
+    /// never covers a dropped byte. The caller keeps the window size
+    /// before the next block, whose `enforce_max_dist` raises `low` at
+    /// least as far, so no frame changes.
+    pub fn rebase(&mut self, shift: usize) {
+        assert!(shift <= self.next_src, "rebase past the window's end");
+        self.low = self.low.max(self.index(shift));
+        self.base = self.base.wrapping_sub(shift);
+        self.next_src -= shift;
+    }
+
     /// The contiguous `ZSTD_window_update`: the input now reaches position
     /// `end`.
     #[inline]
@@ -914,6 +927,11 @@ impl MatchState {
     /// `window`.
     pub fn window(&self) -> &Window {
         &self.window
+    }
+
+    /// [`Window::rebase`]: the input moved `shift` bytes down.
+    pub fn rebase(&mut self, shift: usize) {
+        self.window.rebase(shift);
     }
 
     /// `data` from the window's lowest valid index on, addressed by index.

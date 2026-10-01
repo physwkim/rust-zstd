@@ -582,7 +582,9 @@ pub enum InputEnd {
 /// no call ends a [`InputEnd::Chunk`] the one call would not have.
 pub struct JobBlocks {
     sizing: BlockSizing,
-    /// Position of the job's first byte.
+    /// Position of the job's first byte; once the input moved down past
+    /// it ([`JobBlocks::rebase`]), it lies before the input (wrapping), so
+    /// every offset from it is a `wrapping_sub`.
     job_start: usize,
     first_job: bool,
     last_job: bool,
@@ -612,12 +614,12 @@ impl JobBlocks {
 
     /// Where the next block starts.
     pub fn next_start(&self) -> usize {
-        self.job_start + self.done
+        self.job_start.wrapping_add(self.done)
     }
 
     /// The input moved `shift` bytes down: every position is `shift` lower.
     pub fn rebase(&mut self, shift: usize) {
-        self.job_start -= shift;
+        self.job_start = self.job_start.wrapping_sub(shift);
     }
 
     /// `min(remaining, blockSizeMax)` at `start`, with `remaining` the rest
@@ -625,12 +627,17 @@ impl JobBlocks {
     /// pre-split.
     fn unsplit_size(&self, start: usize, input: InputEnd) -> usize {
         let chunk = self.sizing.chunk_size;
-        let offset = start - self.job_start;
+        let offset = start.wrapping_sub(self.job_start);
         let mut chunk_end = (offset / chunk + 1).saturating_mul(chunk);
         if let InputEnd::Chunk(end) | InputEnd::JobEnd(end) = input {
-            chunk_end = chunk_end.min(end - self.job_start);
+            chunk_end = chunk_end.min(end.wrapping_sub(self.job_start));
         }
         (chunk_end - offset).min(self.sizing.block_size_max)
+    }
+
+    /// Whether `input` makes the next block ready ([`JobBlocks::ready`]).
+    pub fn has_ready(&self, input: InputEnd) -> bool {
+        self.ready(self.next_start(), input)
     }
 
     /// Whether the block at `start` is to be compressed now: there is
@@ -653,7 +660,7 @@ impl JobBlocks {
     /// earlier one is.
     fn input_ended(&mut self, input: InputEnd) {
         if let InputEnd::Chunk(end) = input {
-            self.first_chunk_end = self.first_chunk_end.min(end - self.job_start);
+            self.first_chunk_end = self.first_chunk_end.min(end.wrapping_sub(self.job_start));
         }
     }
 
@@ -662,7 +669,8 @@ impl JobBlocks {
     /// `producedCSize` counts the frame header only after the call that
     /// wrote it, so job 0's `savings` owe it from its second chunk on.
     fn savings(&self, start: usize, gained: i64) -> i64 {
-        let owes_header = self.first_job && start - self.job_start >= self.first_chunk_end;
+        let owes_header =
+            self.first_job && start.wrapping_sub(self.job_start) >= self.first_chunk_end;
         let header = if owes_header {
             self.sizing.header_len
         } else {
@@ -738,7 +746,7 @@ impl JobBlocks {
     /// Account the next block, `block`, written as `written` bytes.
     fn wrote(&mut self, block: &Range<usize>, written: usize) {
         debug_assert_eq!(block.start, self.next_start());
-        self.done = block.end - self.job_start;
+        self.done = block.end.wrapping_sub(self.job_start);
         self.gained += block.len() as i64 - written as i64;
     }
 }
