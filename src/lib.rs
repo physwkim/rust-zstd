@@ -12,4 +12,4 @@ mod xxhash;
 pub use compress::{
     compress, compress_to_vec, compress_with, CompressOptions, Compressor, ParamSwitch,
 };
-pub use decode::{decompress, Decompressor};
+pub use decode::{decompress, DecompressReader, Decompressor};

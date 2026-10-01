@@ -3,6 +3,7 @@
 //! into buffers of any size.
 
 use super::*;
+use std::io::{self, Read};
 
 /// A zstd decompressor that takes the input and gives the content in pieces
 /// of any size (ZSTD_decompressStream). It decodes with the same
@@ -164,6 +165,68 @@ impl Decompressor {
     /// The input bytes it takes to finish the current unit, at least 1.
     fn hint(&self) -> usize {
         (self.dec.unit_len(&self.unit) - self.unit.len()).max(1)
+    }
+}
+
+/// An `io::Read` of the content of the frames `inner` reads, decoded one
+/// after another by a `Decompressor`. It fails with `InvalidData` and the
+/// `Decompressor`'s error where `decompress` fails on the same input,
+/// truncated input included.
+pub struct DecompressReader<R> {
+    inner: R,
+    dec: Decompressor,
+    /// Input from `inner`, `buf[pos..len]` yet to be decoded.
+    buf: Box<[u8]>,
+    pos: usize,
+    len: usize,
+    /// `inner` has ended.
+    eof: bool,
+}
+
+impl<R: Read> DecompressReader<R> {
+    pub fn new(inner: R) -> Self {
+        DecompressReader {
+            inner,
+            dec: Decompressor::new(),
+            // ZSTD_DStreamInSize: a block with its header.
+            buf: vec![0; BLOCK_HEADER_LEN + MAX_BLOCK_SIZE].into_boxed_slice(),
+            pos: 0,
+            len: 0,
+            eof: false,
+        }
+    }
+
+    /// The reader of the frames. Input it has read and not decoded yet is
+    /// dropped.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for DecompressReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+        loop {
+            if self.pos == self.len && !self.eof {
+                self.len = self.inner.read(&mut self.buf)?;
+                self.pos = 0;
+                self.eof = self.len == 0;
+            }
+            let mut written = 0;
+            self.dec
+                .decompress_stream(&self.buf[..self.len], &mut self.pos, out, &mut written)
+                .map_err(invalid)?;
+            if written != 0 {
+                return Ok(written);
+            }
+            if self.eof {
+                self.dec.finish().map_err(invalid)?;
+                return Ok(0);
+            }
+        }
     }
 }
 

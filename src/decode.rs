@@ -28,7 +28,7 @@
 //! ```
 //!
 //! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`, and
-//! `Decompressor` for input and output in pieces.
+//! `Decompressor` for input and output in pieces, `DecompressReader` over it.
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
 //! literals and FSE sequences. No dictionary support.
@@ -49,7 +49,7 @@ use fearless_simd::{Fallback, Level};
 use std::ptr;
 
 mod stream;
-pub use stream::Decompressor;
+pub use stream::{DecompressReader, Decompressor};
 
 // ============================================================
 // Constants
