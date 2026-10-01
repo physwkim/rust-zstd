@@ -1,6 +1,6 @@
 # rust-zstd
 
-Pure Rust implementation of the [Zstandard](https://facebook.github.io/zstd/) compression format (RFC 8878). Compress and decompress with zero external C dependencies.
+Pure Rust implementation of the [Zstandard](https://facebook.github.io/zstd/) compression format ([RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)). A full codec — one-shot, streaming, dictionaries, multithreaded compression — with no C dependencies, ported from and verified against libzstd 1.5.7.
 
 ## What is Zstandard?
 
@@ -15,23 +15,23 @@ Input bytes
   │
   ▼
 ┌─────────────────────────────────────────────────┐
-│  1. LZ77 Match Finding                         │
+│  1. LZ77 Match Finding                          │
 │     Slide a window over the input and find      │
 │     repeated byte sequences ("matches").        │
 │     Each match is encoded as a back-reference:  │
 │       (literal_length, offset, match_length)    │
 └──────────────────────┬──────────────────────────┘
                        │
-  ▼
+                       ▼
 ┌─────────────────────────────────────────────────┐
 │  2. Huffman Coding (Literals)                   │
 │     Bytes that don't belong to any match are    │
 │     called "literals". They are compressed with │
-│     Huffman coding — frequent bytes get shorter  │
+│     Huffman coding — frequent bytes get shorter │
 │     binary codes, rare bytes get longer ones.   │
 └──────────────────────┬──────────────────────────┘
                        │
-  ▼
+                       ▼
 ┌─────────────────────────────────────────────────┐
 │  3. FSE — Finite State Entropy (Sequences)      │
 │     The sequence of (literal_length, offset,    │
@@ -41,184 +41,165 @@ Input bytes
 │     lookup speed.                               │
 └──────────────────────┬──────────────────────────┘
                        │
-  ▼
-┌─────────────────────────────────────────────────┐
-│  4. Frame / Block Structure                     │
-│     Compressed data is organized into frames,   │
-│     each containing one or more blocks (≤128KB  │
-│     decompressed). Blocks can be:               │
-│       • Raw — stored uncompressed               │
-│       • RLE — single repeated byte              │
-│       • Compressed — Huffman literals + FSE     │
-│         sequences                               │
-└─────────────────────────────────────────────────┘
+                       ▼
+Zstandard frame (header + blocks + optional checksum,
+each block ≤ 128 KB decompressed). Blocks can be:
+  • Raw — stored uncompressed
+  • RLE — one byte repeated
+  • Compressed — the pipeline above
 ```
-
-The decoder reverses this pipeline: parse frame/block headers, decode FSE sequences, decode Huffman literals, then execute the match copy operations to reconstruct the original data.
 
 ## Features
 
-- **Pure Rust** — no C bindings, no `unsafe`, no `libc`
-- **Compress + Decompress** — full codec, not decode-only
-- **Spec-compliant** — output is decodable by any standard zstd decoder (C `libzstd`, Python `zstandard`, etc.)
-- **Compression levels** — libzstd's: negative levels accelerate the fast strategy, 0 is the default (3), positive levels select libzstd's parameter rows
-- **Parallel compression** — optional rayon job-level parallelism as in ZSTDMT (enabled by default; the frame is identical with and without it)
-- **Competitive ratios** — within 0–5% of C zstd, better on some workloads
-- **Fast decoder** — 1.05–68x faster than C zstd across tested datasets
-- **~5400 lines** of Rust (vs ~30,000 lines in C zstd)
+- **Pure Rust** — no C bindings, no build.rs, no `libc`. `unsafe` is confined to the performance-critical inner loops (entropy decoding, match finding); everything else is safe Rust.
+- **Full codec** — one-shot, reusable contexts, streaming with `std::io` adapters, dictionaries, and multithreaded compression (ZSTDMT-equivalent jobs via rayon, enabled by the default `parallel` feature).
+- **libzstd-matched encoder** — all of libzstd 1.5.7's default machinery is ported: the parameter rows for levels 1–22 (and the accelerated fast strategy for negative levels), all five match finders (fast, double-fast, lazy row hashing, binary tree, optimal parser), long-distance matching, and both block splitters. On the test corpus the emitted frames are byte-identical to libzstd 1.5.7's at every level, for single-shot and multithreaded job layouts alike.
+- **Spec-compliant decoder** — accepts and rejects frames per RFC 8878; verified against libzstd across levels, window sizes, truncation and corruption sweeps.
+- **Checksums, skippable frames, concatenated frames** — as in libzstd.
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-zstd-rs = { git = "https://github.com/physwkim/rust-zstd.git" }
+rust-zstd = "0.2"
 ```
 
-Parallel compression is enabled by default. To disable it:
+Parallel compression is enabled by default. To disable it (single-threaded, no rayon dependency):
 
 ```toml
 [dependencies]
-zstd-rs = { git = "https://github.com/physwkim/rust-zstd.git", default-features = false }
+rust-zstd = { version = "0.2", default-features = false }
 ```
 
 ## API
 
-### Compress
+### One-shot
 
 ```rust
-use zstd_rs::compress;
+use rust_zstd::{compress, decompress};
 
-// Compress with a specific level (0-11)
-let compressed = compress(b"Hello, World!", 3);
-
-// Level guide:
-//   < 0   — fast strategy accelerated by -level (fastest)
-//   0     — the default level, 3
-//   1-2   — greedy matching (fast)
-//   3-5   — lazy matching (balanced)
-//   6-8   — lazy matching + deeper search
-//   9-11  — lazy matching + deepest search (best ratio)
+// Levels follow libzstd: 1..=22 (higher = smaller output, slower),
+// 0 = the default level (3), negative = the fast strategy accelerated by -level.
+let frame = compress(b"Hello, World!", 3);
+let original = decompress(&frame).expect("valid zstd frame");
+assert_eq!(original, b"Hello, World!");
 ```
 
-```rust
-use zstd_rs::compress_to_vec;
+`compress_with` takes `CompressOptions` for everything beyond the level — a content checksum, multithreaded job size, long-distance matching and block-splitter knobs:
 
-// Convenience wrapper — compresses at level 1
-let compressed = compress_to_vec(b"Hello, World!");
+```rust
+use rust_zstd::{compress_with, CompressOptions};
+
+let opts = CompressOptions {
+    level: 19,
+    checksum: true,
+    job_size: Some(0), // ZSTDMT with libzstd's automatic job size
+    ..Default::default()
+};
+let frame = compress_with(data, &opts);
 ```
 
-### Decompress
+The frame for a given job size is identical with and without the `parallel` feature; threads change speed, never bytes.
+
+### Reusable contexts
+
+`Compressor` and `Decompressor` keep their tables and buffers across calls, like libzstd's `ZSTD_CCtx`/`ZSTD_DCtx` — this is the fast path when processing many small inputs:
 
 ```rust
-use zstd_rs::decompress;
+use rust_zstd::{Compressor, CompressOptions, Decompressor};
 
-let original = decompress(&compressed).expect("valid zstd frame");
-```
+let mut cctx = Compressor::new(CompressOptions { level: 3, ..Default::default() });
+let mut dctx = Decompressor::new();
+let mut out = Vec::new();
 
-`decompress` supports:
-- Single and concatenated frames
-- Skippable frames (silently skipped)
-- All standard block types (Raw, RLE, Compressed)
-- Huffman and FSE entropy coding
-- Repeat offsets and all sequence modes
-
-### Roundtrip example
-
-```rust
-use zstd_rs::{compress, decompress};
-
-fn main() {
-    let data = b"The quick brown fox jumps over the lazy dog. \
-                  The quick brown fox jumps over the lazy dog.";
-
-    let compressed = compress(data, 3);
-    println!(
-        "compressed {} bytes -> {} bytes ({:.1}x)",
-        data.len(),
-        compressed.len(),
-        data.len() as f64 / compressed.len() as f64
-    );
-
-    let decompressed = decompress(&compressed).unwrap();
-    assert_eq!(&decompressed, data);
-    println!("roundtrip OK");
+for input in inputs {
+    cctx.compress(input, &mut out);
+    let back = dctx.decompress(&out).unwrap();
+    assert_eq!(back, *input);
 }
 ```
 
+`Decompressor::decompress_into(&frame, &mut buf)` reuses the output buffer too, avoiding the per-call allocation.
+
+### Streaming
+
+`Encoder` wraps any `std::io::Write`; `DecompressReader` wraps any `std::io::Read`:
+
+```rust
+use rust_zstd::{Encoder, DecompressReader, CompressOptions};
+use std::io::{Read, Write};
+
+let file = std::fs::File::create("data.zst")?;
+let mut enc = Encoder::new(file, CompressOptions { level: 3, ..Default::default() });
+enc.write_all(&data)?;
+enc.finish()?; // ends the frame, returns the writer
+
+let file = std::fs::File::open("data.zst")?;
+let mut dec = DecompressReader::new(file);
+let mut data = Vec::new();
+dec.read_to_end(&mut data)?;
+```
+
+Under the adapters sit libzstd-style push state machines — `Compressor::compress_stream` (with `Continue`/`Flush`/`End` directives, `ZSTD_compressStream2` shape) and `Decompressor::decompress_stream` — for callers that manage their own buffers. Streaming decompression holds only the window, so arbitrarily large frames decode in bounded memory.
+
+### Dictionaries
+
+Dictionaries trained with the zstd CLI (`zstd --train`) and raw content prefixes both work, on both sides:
+
+```rust
+use rust_zstd::compress::{CompressDict, compress_with_dict};
+use rust_zstd::decode::{DecodeDict, decompress_with_dict};
+
+let cdict = CompressDict::new(&dict_bytes, 3).unwrap();
+let frame = compress_with_dict(data, &cdict);
+
+let ddict = DecodeDict::new(&dict_bytes).unwrap();
+let original = decompress_with_dict(&frame, &ddict).unwrap();
+```
+
+`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Combining a dictionary with the streaming APIs is not yet supported and returns `CompressError::Unsupported`.
+
 ## Performance
 
-Benchmarked against C zstd 1.5.6 on Apple M4, 128 KB test data per dataset:
+Measured against libzstd 1.5.7 on x86-64 (Zen 4), 8 MiB real-data corpora (ELF binary, Rust source, English text and word lists, scientific doubles), one reused context per codec, interleaved timing rounds, median reported:
 
-### Compression ratio (vs C zstd)
-
-| Dataset | Level 1 | Level 3 | Level 7 | Level 11 |
-|---------|---------|---------|---------|----------|
-| zeros   | 0.75x   | 0.76x   | 0.77x   | 0.77x    |
-| text    | 1.04x   | 1.05x   | 1.05x   | 1.05x    |
-| f64     | 1.03x   | 1.01x   | 1.01x   | 1.01x    |
-| mixed   | 1.00x   | 1.00x   | 1.02x   | 1.02x    |
-
-> Values < 1.0 = smaller output than C (better). All datasets within 5% of C zstd.
-
-### Decompression speed
-
-| Dataset | Rust (MB/s) | C (MB/s) | Speedup |
-|---------|------------|----------|---------|
-| zeros   | 33,653     | 492      | 68x     |
-| text    | 1,328      | 484      | 2.7x    |
-| f64     | 494        | 363      | 1.4x    |
-| mixed   | 385        | 368      | 1.05x   |
-
-### Compression speed
-
-| Dataset | Level 1 | Level 3 | Level 7 | Level 11 |
-|---------|---------|---------|---------|----------|
-| zeros   | 57%     | 66%     | 33%     | 19%      |
-| text    | 74%     | 68%     | 44%     | 18%      |
-| f64     | 34%     | 36%     | 67%     | 131%     |
-| mixed   | 23%     | 21%     | 14%     | 20%      |
-
-> Percentage of C zstd compression speed. Match finding is the main bottleneck at lower levels.
+- **Compressed size** — byte-identical to libzstd 1.5.7 at every level 1–22 on the test corpus, so the ratio is libzstd's exactly.
+- **Decompression** — 1.0–1.1x libzstd's speed on the AVX2 path across the corpus and levels. The portable (no-SIMD) path and non-BMI2 targets are a few percent slower.
+- **Compression** — within a few percent of libzstd across levels 1–22 on real data, both single-threaded and multithreaded. Degenerate constant input (all zeros) is the known exception: both codecs exceed 4 GB/s there, but libzstd's RLE fast path is several times faster still.
+- **Small inputs** — with a reused `Decompressor`, decoding 120 B–5 KB frames is at or above libzstd's reused-`DCtx` speed (dictionary frames under ~500 B remain slower).
 
 ## Architecture
 
 ```
 src/
-├── lib.rs          # Public API: compress, compress_to_vec, decompress
-├── compress.rs     # Encoder: match finding, Huffman, FSE, block encoding
-├── decode.rs       # Decoder: frame/block parsing, entropy decoding, sequence execution
-├── fse.rs          # FSE compression tables and sequence encoder
-├── bitstream.rs    # Forward/backward bit writers
-└── constants.rs    # Zstd format constants, predefined tables, code mappings
+├── lib.rs            # Public API
+├── compress/         # Encoder
+│   ├── fast.rs, dfast.rs, lazy.rs, bt.rs, opt.rs   # Match finders, as in libzstd
+│   ├── ldm.rs        # Long-distance matching
+│   ├── presplit.rs, split.rs                       # Block splitters
+│   ├── block.rs, seqstore.rs, params.rs            # Block emission, parameter rows
+│   ├── stream.rs     # Compressor, Encoder, ZSTDMT job pipeline
+│   └── dict.rs       # CompressDict
+├── decode.rs         # Decoder core: frames, blocks, sequence execution
+├── decode/           # Streaming ring, DecodeDict
+├── huf.rs, fse.rs    # Entropy coders (encode side)
+├── bitstream.rs      # Forward/backward bit writers
+└── xxhash.rs         # XXH64 for content checksums
 ```
-
-### Compression pipeline
-
-1. **Match finding** — hash-based (greedy or lazy) across the entire input with cross-block window
-2. **Block splitting** — sequences partitioned into ≤128 KB decompressed blocks
-3. **Repeat offset resolution** — zstd's 3-offset history per RFC 8878 §3.1.2.5
-4. **Literal encoding** — Huffman with canonical codes, Treeless mode for sequential blocks
-5. **Sequence encoding** — FSE tables (predefined or custom) for literal lengths, match lengths, and offsets
-6. **Block assembly** — compressed block if smaller than raw, otherwise raw/RLE fallback
 
 ## Testing
 
 ```bash
-# Run all tests (144 roundtrip tests across 12 levels × 12 datasets)
-cargo test
-
-# Without parallel feature
-cargo test --no-default-features
+cargo test                          # or: cargo nextest run
+cargo test --no-default-features    # without the parallel feature
 ```
+
+The suites round-trip every level across real-data corpora, compare frames byte-for-byte against libzstd 1.5.7 (via the `zstd` dev-dependency), decode libzstd- and rust-zstd-produced frames with both decoders plus ruzstd, and sweep truncated and corrupted inputs for matching accept/reject verdicts.
 
 ## Acknowledgments
 
-The decoder (`decode.rs`) is ported from [ruzstd](https://github.com/KillingSpark/zstd-rs) 0.8.2 by Moritz Borcherding, used under the MIT license. The encoder and all other modules are original implementations based on the [Zstandard specification](https://www.rfc-editor.org/rfc/rfc8878) and C zstd's [educational decoder](https://github.com/facebook/zstd/tree/dev/doc/educational_decoder).
+The decoder began as a port of [ruzstd](https://github.com/KillingSpark/zstd-rs) 0.8.2 by Moritz Borcherding, used under the MIT license. The encoder was developed with reference to [zstd](https://github.com/facebook/zstd) 1.5.7 by Meta Platforms, Inc., whose BSD 3-Clause license is reproduced in `src/LICENSE-ZSTD`.
 
 ## License
 
-BSD-3-Clause
-
-The decoder module (`src/decode.rs`) retains its original MIT license from ruzstd. See the file header for the full license text.
+BSD-3-Clause AND MIT — the encoder follows zstd (BSD 3-Clause), the decoder module retains ruzstd's MIT license. See `src/LICENSE-ZSTD` and the header of `src/decode.rs`.
