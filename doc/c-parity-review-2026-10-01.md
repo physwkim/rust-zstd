@@ -36,20 +36,6 @@ checked against RFC 8878 for reference-side bugs.
 
 ## Open Findings
 
-### R3-1: An FSE table for LL/OF/ML with only one symbol of nonzero probability is accepted
-
-Severity: Low
-
-Class: reference-faithful gap
-
-Rust: `src/decode.rs:638-651` (`read_ncount_body`'s end checks: `remaining != 1`, `charnum > max_sv1`, `bit_count > 32`; it never counts the nonzero symbols). The bypass is reached from `build_sequence_table` (`src/decode.rs:2869-2961`) and from MT `plan_frame` (`src/decode.rs:4351`).
-
-C reference: rfc8878.txt:1372-1373 ("there must be two or more symbols with nonzero probability") and rfc8878.txt:925-927 (FSE_Compressed_Mode "must not be used when only one symbol is present"). libzstd has the same gap at `common/entropy_common.c:179-186`.
-
-Impact: The probe built an LL table in FSE_Compressed mode with symbol 0 = 32 at accuracy log 5. All 4 of our paths decode it, and libzstd decodes it to the same bytes, which equal the RLE-mode control frame. Rejecting it costs our encoder nothing: `select_encoding_type` returns RLE or Basic when `most_frequent == nb_seq` (`src/fse.rs:944-953`), as libzstd does at `compress/zstd_compress_sequences.c:166`. The Huffman-weight table is not affected: a one-symbol weight table already fails with "Too many Huffman weights" on all 4 paths, and libzstd rejects it too.
-
-Decided 2026-10-01: reject it; libzstd never emits such a table.
-
 ### R3-2: How many symbols a Huffman-weight FSE table may list depends on its accuracy log
 
 Severity: Low

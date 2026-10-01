@@ -447,6 +447,13 @@ impl FSETable {
     ) -> Result<usize, String> {
         self.reset();
         let bytes_read = self.read_probabilities(source, max_log)?;
+        // RFC 8878 lines 1372-1373: two or more symbols of nonzero
+        // probability; one alone is RLE_Mode's (lines 925-927). libzstd's
+        // FSE_readNCount does not check this.
+        let nonzero = self.symbol_probabilities.iter().filter(|&&c| c != 0);
+        if nonzero.count() < 2 {
+            return Err("FSE table has fewer than two symbols of nonzero probability".to_string());
+        }
         self.build_decoding_table(codes);
         Ok(bytes_read)
     }
