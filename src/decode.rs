@@ -139,9 +139,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// `decompress` with dictionary `dict` (ZSTD_decompress_usingDict): every
-/// frame starts from its tables and repeat offsets. Its content is not
-/// history yet: a match reaching before the frame start is an error. A
-/// frame that names another nonzero Dictionary_ID is an error
+/// frame starts from its tables and repeat offsets, and its content is the
+/// history before every frame (ZSTD_refDictContent; RFC 8878 lines
+/// 1835-1837), within Window_Size. A frame that names another nonzero
+/// Dictionary_ID is an error
 /// (dictionary_wrong); one with no Dictionary_ID is decoded with `dict`
 /// too.
 ///
@@ -218,6 +219,7 @@ pub fn decompress_with_dict_options(
             start: 0,
             window: 0,
         },
+        dict: dict.map_or(&[], DecodeDict::content),
     };
     let mut pos = 0usize;
     loop {
@@ -4367,13 +4369,26 @@ fn decode_block(
 
 /// The one-shot driver's `FrameOut`: frames decode straight into one
 /// `Vec`, each block after the last, so a frame's history is all in it.
-struct VecOut {
+struct VecOut<'d> {
     output: Vec<u8>,
     /// The current frame's.
     prefix: Prefix,
+    /// The dictionary content every frame's history starts with, empty
+    /// without a dictionary.
+    dict: &'d [u8],
 }
 
-impl FrameOut for VecOut {
+impl VecOut<'_> {
+    /// The history before the current frame: the dictionary content.
+    fn ext(&self) -> ExtHistory {
+        ExtHistory {
+            end: self.dict.as_ptr_range().end,
+            len: self.dict.len(),
+        }
+    }
+}
+
+impl FrameOut for VecOut<'_> {
     fn start(&mut self, window: usize, _content_size: Option<u64>) -> Result<(), String> {
         self.prefix = Prefix {
             start: self.output.len(),
@@ -4386,7 +4401,7 @@ impl FrameOut for VecOut {
         let dst = self
             .prefix
             .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        (dst, ExtHistory::NONE)
+        (dst, self.ext())
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
@@ -5048,10 +5063,10 @@ mod parallel {
         slot: &mut Slot,
         hist: &mut [u32; 3],
         block_size_max: usize,
-        prefix: Prefix,
-        output: &mut Vec<u8>,
+        out: &mut VecOut<'_>,
         simd: Level,
     ) -> Result<(), String> {
+        let output = &mut out.output;
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
             Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
@@ -5066,19 +5081,19 @@ mod parallel {
                     seqs: &slot.seqs,
                     literals: &slot.literals,
                 };
-                let dst = prefix.dst(output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-                // SAFETY: `Prefix::dst` meets the `Dst` contract, and on
-                // success the block's bytes up to `end` are written.
+                let (dst, ext) = out.block_dst();
+                let offsets = &slot.fse.offsets;
+                // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
+                // contracts, and on success the block's bytes up to `end`
+                // are written.
                 unsafe {
-                    let end = execute_with_copies(
-                        simd,
-                        &slot.fse.offsets,
-                        seqs,
-                        hist,
-                        block_size_max,
-                        dst,
-                    )?;
-                    output.set_len(prefix.start + end);
+                    let end = if ext.len == 0 {
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    } else {
+                        let seqs = ExtDecodedSeqs { seqs, ext };
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    };
+                    out.commit(end);
                 }
             }
         }
@@ -5100,7 +5115,26 @@ mod parallel {
             offset_hist: &mut [u32; 3],
             dst: Dst,
         ) -> Result<usize, String> {
-            execute_sequences(w, self.seqs, self.literals, offset_hist, dst)
+            execute_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
+        }
+    }
+
+    /// `DecodedSeqs` whose matches reach on into `ext` before the segment,
+    /// in their own instantiation of the loop, as `ExtSeqInput`.
+    struct ExtDecodedSeqs<'a> {
+        seqs: DecodedSeqs<'a>,
+        ext: ExtHistory,
+    }
+
+    impl BlockSequences for ExtDecodedSeqs<'_> {
+        #[inline(always)]
+        unsafe fn execute<W: WildCopy>(
+            self,
+            w: W,
+            offset_hist: &mut [u32; 3],
+            dst: Dst,
+        ) -> Result<usize, String> {
+            execute_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
         }
     }
 
@@ -5108,12 +5142,13 @@ mod parallel {
     /// block's end. Same contract as `run_sequences`.
     ///
     /// # Safety
-    /// `dst` meets the `Dst` contract.
+    /// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
+    /// `EXT`.
     #[inline(always)]
-    unsafe fn execute_sequences<W: WildCopy>(
+    unsafe fn execute_sequences<W: WildCopy, const EXT: bool>(
         w: W,
-        seqs: &[RawSeq],
-        literals: &[u8],
+        DecodedSeqs { seqs, literals }: DecodedSeqs<'_>,
+        ext: ExtHistory,
         offset_hist: &mut [u32; 3],
         dst: Dst,
     ) -> Result<usize, String> {
@@ -5130,13 +5165,13 @@ mod parallel {
             oend_w: out.add(dst.op + MAX_BLOCK_SIZE),
             lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
             prefix: out,
-            ext: ExtHistory::NONE,
+            ext,
             window: dst.window,
         };
         for s in seqs {
             let ll = s.ll as usize;
             let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence::<W, false>(w, &mut cur, &lim, ll, s.ml as usize, offset)
+            exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
                 .map_err(seq_error_message)?;
         }
         // Last literals; both cursors only advanced within their buffers.
@@ -5158,7 +5193,7 @@ mod parallel {
         pos: &mut usize,
         frame: &mut Frame,
         init: &DecoderScratch,
-        out: &mut VecOut,
+        out: &mut VecOut<'_>,
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
@@ -5240,15 +5275,7 @@ mod parallel {
                     _ => cell.slot.lock().unwrap(),
                 };
                 let start = out.output.len();
-                execute_block(
-                    plan,
-                    &mut slot,
-                    &mut hist,
-                    block_size_max,
-                    out.prefix,
-                    &mut out.output,
-                    simd,
-                )?;
+                execute_block(plan, &mut slot, &mut hist, block_size_max, out, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
                 frame.block_decoded(&out.output[start..])?;
