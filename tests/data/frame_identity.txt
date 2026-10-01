@@ -194,7 +194,7 @@ text      1000 L7   def Lazy2         555 4e6a32d9fbe157f6
 text      1000 L8   def Lazy2         555 4e6a32d9fbe157f6
 text      1000 L9   def BtLazy2       555 4e6a32d9fbe157f6
 text     16384 L1   def Fast         6868 4e750c19692f044a
-text     16384 L10  def BtLazy2      6501 2547e2fb870e9a55
+text     16384 L10  def BtLazy2      6498 c4987603bbc1d77b
 text     16384 L11  def BtOpt        6408 6000706b4bdab243
 text     16384 L12  def BtOpt        6418 cbfd6693207be0d7
 text     16384 L13  def BtUltra      6373 21770b29ba03a35e
@@ -207,11 +207,11 @@ text     16384 L5   def Lazy         6520 79ba0f494f55d62b
 text     16384 L6   def Lazy2        6501 6ffce043d1cf56a3
 text     16384 L7   def Lazy2        6501 d985c899409f0d62
 text     16384 L8   def Lazy2        6501 d985c899409f0d62
-text     16384 L9   def BtLazy2      6501 2547e2fb870e9a55
+text     16384 L9   def BtLazy2      6498 c4987603bbc1d77b
 text     16385 L1   def Fast         7188 8128e984fbd1a1cc
 text     16385 L10  def Lazy2        6502 abc6f4f88dee613c
-text     16385 L11  def BtLazy2      6500 1eaa010231766472
-text     16385 L12  def BtLazy2      6500 1eaa010231766472
+text     16385 L11  def BtLazy2      6499 baaabb698933316f
+text     16385 L12  def BtLazy2      6499 baaabb698933316f
 text     16385 L13  def BtOpt        6409 0156f4008bfdfcd1
 text     16385 L14  def BtOpt        6419 bb91888b0e70cc2f
 text     16385 L15  def BtOpt        6419 bb91888b0e70cc2f
@@ -225,8 +225,8 @@ text     16385 L8   def Lazy2        6505 8f0f2e932673dd66
 text     16385 L9   def Lazy2        6502 97f1954294b78b8f
 text    131072 L1   def Fast        51967 7f6ffb83dfff87d5
 text    131072 L10  def Lazy2       45554 e498b99a6c0e4fd0
-text    131072 L11  def BtLazy2     45443 1135940f8a17cc2e
-text    131072 L12  def BtLazy2     45463 213c782f65329b99
+text    131072 L11  def BtLazy2     45443 3eb0e29e69658e2e
+text    131072 L12  def BtLazy2     45461 cdf3d711ef01ed61
 text    131072 L13  def BtOpt       43384 c7a252365cfce9d4
 text    131072 L14  def BtOpt       43114 99955a33381295bd
 text    131072 L15  def BtOpt       43114 3328dd647e337183
@@ -240,8 +240,8 @@ text    131072 L8   def Lazy2       45938 54cf807954c0cb6d
 text    131072 L9   def Lazy2       45705 9b61fe8309d165da
 text    131073 L1   def Fast        50398 17cd06b32a42fb01
 text    131073 L10  def Lazy2       45519 29b151553d211dc6
-text    131073 L11  def BtLazy2     45466 a73bc10d8952c0da
-text    131073 L12  def BtLazy2     45467 23f4b4e7b0418ede
+text    131073 L11  def BtLazy2     45466 272dd441360a2849
+text    131073 L12  def BtLazy2     45465 a53b01dd60b335c6
 text    131073 L13  def BtOpt       43117 d804b7160941fff5
 text    131073 L14  def BtOpt       43118 bfea5d324aa435f8
 text    131073 L15  def BtOpt       43118 5df31b1c194444ea
@@ -255,8 +255,8 @@ text    131073 L8   def Lazy2       45821 68f772f275e4bc77
 text    131073 L9   def Lazy2       45579 4a3d2b8fc6e7cddd
 text    262144 L1   def Fast        99264 060e7b5d3fd53a99
 text    262144 L10  def Lazy2       88444 055554cffae6c6e9
-text    262144 L11  def BtLazy2     88153 f0131c341cabcff5
-text    262144 L12  def BtLazy2     88008 00f10594bce21e36
+text    262144 L11  def BtLazy2     88153 5070ac0d03989ed8
+text    262144 L12  def BtLazy2     88006 adc572ceeac09a5a
 text    262144 L13  def BtOpt       83358 eb72074b9581fab2
 text    262144 L14  def BtOpt       83358 a5c360d9ddf543fd
 text    262144 L15  def BtOpt       83359 a4be7d2459782544

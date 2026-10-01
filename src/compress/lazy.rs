@@ -13,7 +13,7 @@ use super::common::{
     byte, candidate_valid, count, prefetch, prefetch_l1, read32, read64, tget, tset, MatchCount,
     Src, HASH_READ_SIZE,
 };
-use super::matchstate::{Block, EnteredPrefix, MatchState};
+use super::matchstate::{Block, EnteredPrefix, MatchState, Window};
 use super::params::{CParams, Strategy};
 use super::seqstore::{
     offbase_is_offset, offbase_to_offset, offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE,
@@ -222,7 +222,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
         let chain_size = 1usize << ms.cparams.chain_log;
         let chain_mask = chain_size - 1;
         let curr = ip;
-        let low_limit = ms.lowest_prefix_index(curr);
+        let low_limit = ms.lowest_match_index(curr);
         let min_chain = curr.saturating_sub(chain_size);
         let mut nb_attempts = 1u32 << ms.cparams.search_log;
         let mut ml = 4 - 1;
@@ -294,8 +294,8 @@ const BT_DUMMY: usize = usize::MAX;
 struct BtParams {
     /// `btMask = (1 << (chainLog - 1)) - 1`.
     bt_mask: usize,
-    /// `window.lowLimit` (`ms.window_low()`).
-    window_valid: usize,
+    /// The block's window (`ms.window()`).
+    window: Window,
     /// `1 << windowLog`.
     max_distance: usize,
 }
@@ -304,20 +304,18 @@ impl BtParams {
     fn of(ms: &MatchState) -> Self {
         BtParams {
             bt_mask: (1usize << (ms.cparams.chain_log - 1)) - 1,
-            window_valid: ms.window_low(),
+            window: *ms.window(),
             max_distance: 1usize << ms.cparams.window_log,
         }
     }
 
-    /// `curr - windowValid > maxDistance ? curr - maxDistance :
-    /// windowValid`, i.e. [`MatchState::lowest_prefix_index`].
+    /// [`MatchState::lowest_match_index`] while the tables are borrowed.
+    /// C's strict `matchIndex > windowLow` already kept btlazy2 off
+    /// `curr - maxDistance`, but also off `lowLimit` itself, which this
+    /// admits.
     #[inline(always)]
-    fn window_low(self, curr: usize) -> usize {
-        if curr > self.window_valid + self.max_distance {
-            curr - self.max_distance
-        } else {
-            self.window_valid
-        }
+    fn lowest_match_index(self, curr: usize) -> usize {
+        self.window.lowest_match_index(curr, self.max_distance)
     }
 }
 
@@ -348,7 +346,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
 
     /// `ZSTD_insertDUBT1` (`ZSTD_noDict`): sort the unsorted node `curr`
     /// into the tree, comparing at most `nb_compares` candidates and not
-    /// descending past `bt_low`.
+    /// descending past a node below `unsort_low`.
     ///
     /// # Safety
     /// `curr < iend <= src.end()`; `bt.len() == 2 * (p.bt_mask + 1)`.
@@ -360,7 +358,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         curr: usize,
         iend: usize,
         mut nb_compares: u32,
-        bt_low: usize,
+        unsort_low: usize,
     ) {
         let p = self.p;
         let bt_mask = p.bt_mask;
@@ -372,13 +370,12 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         // The node is unsorted: its first slot links to the next candidate,
         // its second (the unsorted mark's chain) is already saved.
         let mut match_index = tget(bt, smaller_ptr);
-        let window_low = p.window_low(curr);
-        debug_assert!(window_low < curr);
+        let window_low = p.lowest_match_index(curr);
 
-        // C: `matchIndex > windowLow`; every tree link points below the node
-        // holding it, so `match_index < curr` holds and the check only turns
-        // a misused state into a miss.
-        while nb_compares > 0 && candidate_valid(match_index, window_low + 1, curr) {
+        // Every tree link points below the node holding it, so `match_index
+        // < curr` holds and the upper bound only turns a misused state into
+        // a miss.
+        while nb_compares > 0 && candidate_valid(match_index, window_low, curr) {
             let next = 2 * (match_index & bt_mask);
             let mut match_length = common_smaller.min(common_larger);
             // `match_index + match_length < ip + match_length < iend`: the
@@ -395,7 +392,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
                 // match is smaller than current
                 tset(bt, smaller_ptr, match_index);
                 common_smaller = match_length;
-                if match_index <= bt_low {
+                if match_index < unsort_low {
                     smaller_ptr = BT_DUMMY;
                     break;
                 }
@@ -405,7 +402,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
                 // match is larger than current
                 tset(bt, larger_ptr, match_index);
                 common_larger = match_length;
-                if match_index <= bt_low {
+                if match_index < unsort_low {
                     larger_ptr = BT_DUMMY;
                     break;
                 }
@@ -440,10 +437,12 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         let p = self.p;
         let bt_mask = p.bt_mask;
         let curr = ip;
-        let window_low = p.window_low(curr);
-        debug_assert!(window_low < curr);
+        let window_low = p.lowest_match_index(curr);
         let bt_low = curr.saturating_sub(bt_mask);
-        let unsort_limit = bt_low.max(window_low);
+        // C's `unsortLimit = MAX(btLow, windowLow)` on strict compares: the
+        // candidates above `btLow`, whose nodes no later index overwrote,
+        // and within the window.
+        let unsort_low = (bt_low + 1).max(window_low);
         let mut nb_compares = 1u32 << cp.search_log;
         let mut nb_candidates = nb_compares;
         let mut previous_candidate = 0usize;
@@ -453,12 +452,11 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         let mut match_index = tget(hash_table, h);
 
         // reach end of unsorted candidates list; the chain of unsorted marks
-        // becomes a reversed chain back to the head. C tests `matchIndex >
-        // unsortLimit` only; hash and tree entries are always `< curr`, and
-        // the upper bound keeps the positions `insert_dubt1` reads inside
-        // `src` for a misused state too.
+        // becomes a reversed chain back to the head. Hash and tree entries
+        // are always `< curr`; the upper bound keeps the positions
+        // `insert_dubt1` reads inside `src` for a misused state too.
         let mut node = 2 * (match_index & bt_mask);
-        while candidate_valid(match_index, unsort_limit + 1, curr)
+        while candidate_valid(match_index, unsort_low, curr)
             && tget(bt, node + 1) == DUBT_UNSORTED_MARK
             && nb_candidates > 1
         {
@@ -470,7 +468,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         }
 
         // nullify last candidate if it's still unsorted
-        if candidate_valid(match_index, unsort_limit + 1, curr)
+        if candidate_valid(match_index, unsort_low, curr)
             && tget(bt, node + 1) == DUBT_UNSORTED_MARK
         {
             tset(bt, node, 0);
@@ -483,7 +481,7 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
             let next_candidate = tget(bt, 2 * (match_index & bt_mask) + 1);
             // Every stacked candidate passed `candidate_valid(.., curr)`
             // above: `match_index < ip < iend`.
-            self.insert_dubt1(bt, src, match_index, iend, nb_candidates, unsort_limit);
+            self.insert_dubt1(bt, src, match_index, iend, nb_candidates, unsort_low);
             match_index = next_candidate;
             nb_candidates += 1;
         }
@@ -499,8 +497,8 @@ impl<M: MatchCount, const MLS: u32> BtSearch<M, MLS> {
         match_index = tget(hash_table, h);
         tset(hash_table, h, curr);
 
-        // As in `insert_dubt1`: C tests `matchIndex > windowLow` only.
-        while nb_compares > 0 && candidate_valid(match_index, window_low + 1, curr) {
+        // As in `insert_dubt1`.
+        while nb_compares > 0 && candidate_valid(match_index, window_low, curr) {
             let next = 2 * (match_index & bt_mask);
             let mut match_length = common_smaller.min(common_larger);
             // `match_index + match_length < ip + match_length < iend`, as in
@@ -1092,7 +1090,7 @@ impl<M: TagMask + MatchCount, const MLS: u32, const ROW_LOG: u32> Search
         lazy_skipping: bool,
     ) -> usize {
         let curr = ip;
-        let low_limit = ms.lowest_prefix_index(curr);
+        let low_limit = ms.lowest_match_index(curr);
         // nb of searches is capped at nb entries per row
         let capped_search_log = ms.cparams.search_log.min(ROW_LOG);
         let group_width = M::group_width(Self::ROW_ENTRIES as u32);
@@ -1232,7 +1230,7 @@ fn lazy_generic<S: Search>(
     }
     {
         let curr = ip;
-        let window_low = ms.lowest_prefix_index(curr);
+        let window_low = ms.lowest_match_index(curr);
         let max_rep = (curr - window_low) as u32;
         if offset_2 > max_rep {
             offset_saved2 = offset_2;
