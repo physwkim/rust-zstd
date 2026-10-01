@@ -1,8 +1,10 @@
 //! Frame headers that claim more than their blocks hold, in window or in
 //! content size: the decoder's largest single allocation stays far below
 //! the claim, and the accept / reject outcome is libzstd 1.5.7's one-shot
-//! one (ZSTD_decompressDCtx), serial and MT at both SIMD levels. One test,
-//! so that nothing else allocates while it measures.
+//! one (ZSTD_decompressDCtx), serial and MT at both SIMD levels, and
+//! streaming. One test, so that nothing else allocates while it measures.
+
+mod common;
 
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -85,7 +87,9 @@ fn largest_allocation(name: &str, f: &[u8]) -> usize {
             );
         }
     }
-    largest
+    LARGEST.store(0, Ordering::Relaxed);
+    common::assert_stream_parity(name, f);
+    largest.max(LARGEST.load(Ordering::Relaxed))
 }
 
 #[test]

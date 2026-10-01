@@ -17,6 +17,7 @@ pub mod block;
 pub mod bt;
 pub mod common;
 pub mod dfast;
+mod error;
 pub mod fast;
 pub mod lazy;
 pub mod ldm;
@@ -26,13 +27,15 @@ pub mod params;
 pub mod presplit;
 pub mod seqstore;
 pub mod split;
+mod stream;
 
 use crate::constants::*;
 use crate::xxhash::Xxh64;
 use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
-    ZSTD_BLOCKHEADERSIZE,
+    InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
 };
+pub use error::CompressError;
 use lazy::default_search_method;
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
 use matchstate::{needed_space, MatchState};
@@ -46,6 +49,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Condvar,
 };
+pub use stream::{Encoder, EndDirective};
 
 /// `ZSTDMT_JOBSIZE_MIN`: lower bound of an explicit job size.
 pub const JOBSIZE_MIN: usize = 512 << 10;
@@ -294,6 +298,8 @@ pub struct Compressor {
     /// once a multithreaded frame has used it. Outside any context's
     /// workspace, its tables only grow, as `ZSTDMT_serialState_reset`'s.
     serial_ldm: Option<LdmState>,
+    /// The streaming session ([`Compressor::compress_stream`]).
+    stream: stream::Session,
 }
 
 /// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
@@ -364,6 +370,32 @@ impl Context {
         };
         (ms, &mut self.scratch, ldm)
     }
+
+    /// The match state, block buffers and single-context long distance
+    /// matches (`ldm` set) of the job [`Context::reset`] last started,
+    /// for a job compressed over several calls.
+    fn resume(&mut self, ldm: bool) -> (&mut MatchState, &mut BlockScratch, BlockLdm<'_>) {
+        let ms = self.ms.as_mut().expect("context never reset");
+        let ldm = match &mut self.ldm_state {
+            Some(state) if ldm => BlockLdm::Internal(state),
+            _ => BlockLdm::Off,
+        };
+        (ms, &mut self.scratch, ldm)
+    }
+
+    /// The input of the job [`Context::resume`] continues moved `shift`
+    /// bytes down ([`Window::rebase`]).
+    ///
+    /// [`Window::rebase`]: matchstate::Window::rebase
+    fn rebase(&mut self, shift: usize, ldm: bool) {
+        self.ms.as_mut().expect("context never reset").rebase(shift);
+        if ldm {
+            self.ldm_state
+                .as_mut()
+                .expect("ldm never reset")
+                .rebase(shift);
+        }
+    }
 }
 
 /// `ZSTDMT_CCtxPool`: the contexts jobs run on, last in first out. A job
@@ -389,14 +421,23 @@ impl ContextPool {
     /// (`ZSTDMT_releaseCCtx`) unless the pool is full. A context `f` unwinds
     /// from is dropped, never reused.
     fn with_context<R>(&self, f: impl FnOnce(&mut Context) -> R) -> R {
-        let free = self.free.lock().unwrap().pop();
-        let mut ctx = free.unwrap_or_default();
+        let mut ctx = self.take();
         let r = f(&mut ctx);
+        self.give_back(ctx);
+        r
+    }
+
+    /// `ZSTDMT_getCCtx`: the last context given back, or a new one.
+    fn take(&self) -> Context {
+        self.free.lock().unwrap().pop().unwrap_or_default()
+    }
+
+    /// `ZSTDMT_releaseCCtx`: keep `ctx` unless the pool is full.
+    fn give_back(&self, ctx: Context) {
         let mut free = self.free.lock().unwrap();
         if free.len() < self.capacity {
             free.push(ctx);
         }
-        r
     }
 }
 
@@ -406,6 +447,7 @@ impl Compressor {
             opts,
             contexts: ContextPool::default(),
             serial_ldm: None,
+            stream: stream::Session::default(),
         }
     }
 
@@ -435,14 +477,21 @@ impl Compressor {
         ms.map(MatchState::workspace_size).collect()
     }
 
-    /// Append one frame holding `src` to `out`.
+    /// Append one frame holding `src` to `out`. A streaming frame in
+    /// progress is abandoned first, as `ZSTD_compress2` resets the session.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
+        self.reset_stream();
+        self.compress_frame(src, out);
+    }
+
+    /// [`Compressor::compress`] without the session reset.
+    fn compress_frame(&mut self, src: &[u8], out: &mut Vec<u8>) {
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();
         write_frame_header(
             out,
-            src.len() as u64,
+            Some(src.len() as u64),
             cparams.window_log,
             self.opts.checksum,
         );
@@ -615,18 +664,45 @@ fn compress_job(
     let prefix = job_prefix(&job, first_job, overlap);
     let pledged = if first_job { data.len() } else { job.len() };
     let (ms, scratch, mut ldm) = ctx.reset(cparams, prefix.start, ldm, pledged, frequently);
-    let mut initial = BlockState::initial();
-    if !first_job {
-        block::load_prefix(ms, data, prefix);
-        initial.invalidate_rep_codes();
-    }
-    let mut state = CommittedBlockState::new(initial);
-    scratch.reserve(sizing.block_size_max);
+    let (mut blocks, mut state) = begin_job(ms, scratch, data, prefix, sizing, first_job, last_job);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
-        ms, data, job, sizing, first_job, last_job, split, &mut state, scratch, &mut ldm, out,
+        ms,
+        data,
+        &mut blocks,
+        InputEnd::JobEnd(job.end),
+        split,
+        &mut state,
+        scratch,
+        &mut ldm,
+        out,
         pipelined,
     );
+}
+
+/// The start of a job on a context just reset for it: a later ZSTDMT job
+/// indexes its raw-content `prefix` of `data` and starts with invalidated
+/// repeat offsets; job 0 (`prefix` empty, whatever `data`) starts from
+/// `repStartValue`. Returns the job's block cursor, its first block at the
+/// prefix end, and its committed block state. One-shot jobs and the
+/// streaming frame both start here.
+fn begin_job(
+    ms: &mut MatchState,
+    scratch: &mut BlockScratch,
+    data: &[u8],
+    prefix: Range<usize>,
+    sizing: BlockSizing,
+    first_job: bool,
+    last_job: bool,
+) -> (JobBlocks, CommittedBlockState) {
+    let mut initial = BlockState::initial();
+    if !first_job {
+        block::load_prefix(ms, data, prefix.clone());
+        initial.invalidate_rep_codes();
+    }
+    scratch.reserve(sizing.block_size_max);
+    let blocks = JobBlocks::new(sizing, prefix.end, first_job, last_job);
+    (blocks, CommittedBlockState::new(initial))
 }
 
 /// Run `f` over every job, in job order, appending to `out`, each job on a
@@ -906,17 +982,24 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     }
 }
 
-/// `ZSTD_writeFrameHeader` with no dictionary: Single_Segment iff the
-/// window covers the whole content, otherwise a Window_Descriptor with
-/// mantissa 0 derived from `window_log`, and the Content_Checksum_flag of
+/// `ZSTD_writeFrameHeader` with no dictionary: with a `content_size`,
+/// Single_Segment iff the window covers it, otherwise (or without one, the
+/// `contentSizeFlag` 0 of an unknown pledged size) a Window_Descriptor with
+/// mantissa 0 derived from `window_log`; the Content_Checksum_flag of
 /// `checksum`.
-fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32, checksum: bool) {
+fn write_frame_header(
+    out: &mut Vec<u8>,
+    content_size: Option<u64>,
+    window_log: u32,
+    checksum: bool,
+) {
     out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
     let window_size = 1u64 << window_log;
-    let single_segment = window_size >= content_size;
-    let fcs_code = (content_size >= 256) as u8
-        + (content_size >= 65536 + 256) as u8
-        + (content_size >= 0xFFFF_FFFF) as u8;
+    let single_segment = content_size.is_some_and(|size| window_size >= size);
+    let fcs_code = content_size.map_or(0, |size| {
+        (size >= 256) as u8 + (size >= 65536 + 256) as u8 + (size >= 0xFFFF_FFFF) as u8
+    });
+    let content_size = content_size.unwrap_or(0);
     let descriptor = ((checksum as u8) << 2) | ((single_segment as u8) << 5) | (fcs_code << 6);
     out.push(descriptor);
     if !single_segment {
@@ -1704,7 +1787,12 @@ mod tests {
     /// The frame header length of `data` with `cparams`.
     fn header_len(data: &[u8], cparams: &CParams) -> usize {
         let mut header = Vec::new();
-        write_frame_header(&mut header, data.len() as u64, cparams.window_log, false);
+        write_frame_header(
+            &mut header,
+            Some(data.len() as u64),
+            cparams.window_log,
+            false,
+        );
         header.len()
     }
 

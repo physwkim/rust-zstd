@@ -27,12 +27,42 @@ checked against RFC 8878 for reference-side bugs.
 - No legacy v0.1-v0.7 frame decoding (R1-7).
 - No `ZSTD_c_literalCompressionMode` (experimental in libzstd); literals
   follow its auto rule, so default frames are unaffected (R2-16).
+- Empty input decodes to empty output, as one-shot libzstd does, although
+  RFC 8878 says compressed data has at least one frame (R3-3).
 - libzstd bugs are not copied (user decision 2026-10-01). Frames may
   therefore differ from libzstd's. The merge gate is a round trip through
   rust-zstd, libzstd and ruzstd plus a size no larger than stock libzstd's
   within a small tolerance; byte comparison with libzstd is a diagnostic.
 
 ## Open Findings
+
+### R3-1: An FSE table for LL/OF/ML with only one symbol of nonzero probability is accepted
+
+Severity: Low
+
+Class: reference-faithful gap
+
+Rust: `src/decode.rs:638-651` (`read_ncount_body`'s end checks: `remaining != 1`, `charnum > max_sv1`, `bit_count > 32`; it never counts the nonzero symbols). The bypass is reached from `build_sequence_table` (`src/decode.rs:2869-2961`) and from MT `plan_frame` (`src/decode.rs:4351`).
+
+C reference: rfc8878.txt:1372-1373 ("there must be two or more symbols with nonzero probability") and rfc8878.txt:925-927 (FSE_Compressed_Mode "must not be used when only one symbol is present"). libzstd has the same gap at `common/entropy_common.c:179-186`.
+
+Impact: The probe built an LL table in FSE_Compressed mode with symbol 0 = 32 at accuracy log 5. All 4 of our paths decode it, and libzstd decodes it to the same bytes, which equal the RLE-mode control frame. Rejecting it costs our encoder nothing: `select_encoding_type` returns RLE or Basic when `most_frequent == nb_seq` (`src/fse.rs:944-953`), as libzstd does at `compress/zstd_compress_sequences.c:166`. The Huffman-weight table is not affected: a one-symbol weight table already fails with "Too many Huffman weights" on all 4 paths, and libzstd rejects it too.
+
+Decided 2026-10-01: reject it; libzstd never emits such a table.
+
+### R3-2: How many symbols a Huffman-weight FSE table may list depends on its accuracy log
+
+Severity: Low
+
+Class: reference-faithful gap
+
+Rust: `src/decode.rs:935-943` (`fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11)`).
+
+C reference: rfc8878.txt:1432-1436 (decoding more symbols than expected is corruption) and :1541-1543 (Weight ranges 0..Max_Number_of_Bits, and the 11-bit cap makes that 0..11). The ported rule is libzstd's workspace-size artefact: `common/huf.h:181` (`HUF_READ_STATS_WORKSPACE_SIZE_U32 = FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX-1)`), `common/fse_decompress.c:273`, and the workspaces passed at `decompress/huf_decompress.c:400` and `:1203`.
+
+Impact: The weight alphabet is 0..11, but how many symbols a table may list depends on its accuracy log. Probe results, identical on all 4 paths and in libzstd: at log 5, a highest listed symbol of 12, 20 or 91 (each with probability 1, never decoded) is accepted and 92 is rejected; at log 6, 11 is accepted and 12 is rejected. No reading of the RFC gives a log-dependent bound.
+
+Decided 2026-10-01: cap the weight-table alphabet at symbol 11 at every accuracy log; the workspace-formula rule goes.
 
 ## libzstd bugs
 
@@ -372,3 +402,12 @@ are libzstd bugs; six are RFC 8878 violations that the port shares
 (`[libzstd+port]`): block size limits only in streaming, X2's exhausted
 stream, offsets at or past Window_Size in both directions, 4-stream size 4,
 and 12-bit Huffman codes.
+
+2026-10-01, round R3 (main 3d94b0f). Four panels: decode verdicts against
+RFC 8878; finder window and index rules; LDM and the MT pipeline; entropy
+coding and the pre-splitter. Three Low findings, all from the decode
+panel (R3-1 to R3-3, probe-confirmed on all four decode paths and against
+libzstd). The other three panels found nothing: the window panel probed
+reused versus fresh contexts, thread counts and overflow correction; the
+LDM panel ran 1,078 LDM config sequence comparisons against libzstd; the
+entropy panel read the code side by side with libzstd.

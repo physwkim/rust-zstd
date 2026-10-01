@@ -27,7 +27,8 @@
 //! SOFTWARE.
 //! ```
 //!
-//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`
+//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`, and
+//! `Decompressor` for input and output in pieces, `DecompressReader` over it.
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
 //! literals and FSE sequences, with or without a dictionary
@@ -52,6 +53,9 @@ use std::sync::Arc;
 mod dict;
 pub use dict::DecodeDict;
 use dict::DictEntropy;
+
+mod stream;
+pub use stream::{DecompressReader, Decompressor};
 
 // ============================================================
 // Constants
@@ -3128,6 +3132,11 @@ struct Dst {
 struct ExtHistory {
     end: *const u8,
     len: usize,
+    /// The bytes are a dictionary's content, which a match may reach past
+    /// Window_Size while the frame has decoded at most Window_Size bytes
+    /// (RFC 8878 lines 1838-1844), the segment then starting at the
+    /// frame's first byte. Any other history is bounded by Window_Size.
+    dict: bool,
 }
 
 impl ExtHistory {
@@ -3135,6 +3144,7 @@ impl ExtHistory {
     const NONE: ExtHistory = ExtHistory {
         end: ptr::null(),
         len: 0,
+        dict: false,
     };
 }
 
@@ -3424,6 +3434,7 @@ struct SeqCursor {
 /// `WILDCOPY_OVERLENGTH`, the literals end less `WILDCOPY_OVERLENGTH`, and
 /// how far back a match may copy from: the current segment's first byte,
 /// then the history before it, and Window_Size (`Dst`).
+#[derive(Clone, Copy)]
 struct SeqLimits {
     oend_w: *mut u8,
     lit_limit: *const u8,
@@ -3539,7 +3550,10 @@ fn exec_sequence<W: WildCopy, const EXT: bool>(
     // the segment-start check with `min` it cost AVX2 words_1M decode 2-6%,
     // and after that check 2.5-3.7% of cycles, against 0.6-2.4% here.
     if offset > lim.window {
-        return Err(SeqError::OffsetPastWindow);
+        if !EXT {
+            return Err(SeqError::OffsetPastWindow);
+        }
+        return exec_sequence_past_window(w, cur, lim, ll, ml, offset);
     }
     // Addresses are compared as integers: `ll` and `ml` are below 2^32
     // and pointers are below 2^63, so these sums cannot wrap.
@@ -3592,6 +3606,32 @@ fn exec_sequence<W: WildCopy, const EXT: bool>(
         cur.op = op.add(ll + ml);
     }
     Ok(())
+}
+
+/// `exec_sequence` for a match past Window_Size, which only a dictionary
+/// takes: one in `lim.ext`, while the segment holds at most Window_Size
+/// bytes before the match (`ExtHistory::dict`). The match is then bounded
+/// by the dictionary's first byte alone.
+#[cold]
+#[inline(never)]
+fn exec_sequence_past_window<W: WildCopy>(
+    w: W,
+    cur: &mut SeqCursor,
+    lim: &SeqLimits,
+    ll: usize,
+    ml: usize,
+    offset: usize,
+) -> Result<(), SeqError> {
+    // As in `exec_sequence`, the sum cannot wrap.
+    let avail = cur.op as usize + ll - lim.prefix as usize;
+    if !lim.ext.dict || avail > lim.window {
+        return Err(SeqError::OffsetPastWindow);
+    }
+    let lim = SeqLimits {
+        window: usize::MAX,
+        ..*lim
+    };
+    exec_sequence::<W, true>(w, cur, &lim, ll, ml, offset)
 }
 
 /// Copy `ll` literals from `lit` to `op`, overshooting by up to 31 bytes.
@@ -4091,11 +4131,13 @@ impl Frame {
 trait FrameOut {
     /// Make ready for a frame whose matches reach at most `window` bytes
     /// back, and which decodes to `content_size` bytes if that is known.
-    fn start(&mut self, window: usize, content_size: Option<u64>) -> Result<(), String>;
+    /// Neither claim allocates: only what the blocks decode to does.
+    fn start(&mut self, window: usize, content_size: Option<u64>);
 
     /// The destination of the frame's next block and the history before
-    /// its segment, which meet the `Dst` and `ExtHistory` contracts.
-    fn block_dst(&mut self) -> (Dst, ExtHistory);
+    /// its segment, which meet the `Dst` and `ExtHistory` contracts, or an
+    /// error if there is no room for it.
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String>;
 
     /// Take the block written to the last `block_dst` up to `end` (from its
     /// `base`), and return the block's bytes.
@@ -4128,9 +4170,9 @@ impl FrameDecoder {
         }
     }
 
-    /// Between frames, where the input may end.
-    fn between_frames(&self) -> bool {
-        matches!(self.stage, Stage::FrameHeader)
+    /// Inside a skippable frame's User_Data.
+    fn skipping(&self) -> bool {
+        matches!(self.stage, Stage::Skip { .. })
     }
 
     /// Right after `Event::FrameStarted`: the frame, and the scratch with
@@ -4235,7 +4277,7 @@ impl FrameDecoder {
         if let Some(e) = self.dict.as_ref().and_then(DecodeDict::entropy) {
             scratch.load_dict(e);
         }
-        out.start(frame.window, frame.content_size)?;
+        out.start(frame.window, frame.content_size);
         self.stage = Stage::Block(frame);
         Ok(Event::FrameStarted)
     }
@@ -4340,7 +4382,7 @@ fn decode_block(
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
-    let (dst, ext) = out.block_dst();
+    let (dst, ext) = out.block_dst()?;
     // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
     // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
     // bytes (`parse_block_header`), within the room `Dst` has, from input
@@ -4384,24 +4426,24 @@ impl VecOut<'_> {
         ExtHistory {
             end: self.dict.as_ptr_range().end,
             len: self.dict.len(),
+            dict: false,
         }
     }
 }
 
 impl FrameOut for VecOut<'_> {
-    fn start(&mut self, window: usize, _content_size: Option<u64>) -> Result<(), String> {
+    fn start(&mut self, window: usize, _content_size: Option<u64>) {
         self.prefix = Prefix {
             start: self.output.len(),
             window,
         };
-        Ok(())
     }
 
-    fn block_dst(&mut self) -> (Dst, ExtHistory) {
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
         let dst = self
             .prefix
             .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        (dst, self.ext())
+        Ok((dst, self.ext()))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
@@ -5081,7 +5123,7 @@ mod parallel {
                     seqs: &slot.seqs,
                     literals: &slot.literals,
                 };
-                let (dst, ext) = out.block_dst();
+                let (dst, ext) = out.block_dst()?;
                 let offsets = &slot.fse.offsets;
                 // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
                 // contracts, and on success the block's bytes up to `end`
@@ -5950,7 +5992,9 @@ mod tests {
     /// A match reaches back through the segment into `ExtHistory` up to
     /// its first byte and no further, wholly inside it or running on into
     /// the segment, still bounded by Window_Size; without history it stops
-    /// at the segment, as in one-shot decoding.
+    /// at the segment, as in one-shot decoding. Into a dictionary it may
+    /// reach past Window_Size, while the segment before it holds at most
+    /// Window_Size bytes.
     #[test]
     fn match_reaches_into_ext_history() {
         let ext: Vec<u8> = (0..64).collect();
@@ -5960,58 +6004,69 @@ mod tests {
         if let Level::Avx2(w) = Level::new() {
             levels.push(Level::Avx2(w));
         }
-        // (offset, match length, ext bytes, window, accepted)
+        // (offset, match length, ext bytes, window, accepted from history,
+        // from a dictionary); the match follows the 10 segment bytes.
         let cases = [
-            (10, 4, 64, 1 << 20, true),
-            (11, 4, 64, 1 << 20, true),
-            (11, 30, 64, 1 << 20, true),
-            (20, 4, 64, 1 << 20, true),
-            (20, 34, 64, 1 << 20, true),
-            (74, 4, 64, 1 << 20, true),
-            (74, 34, 64, 1 << 20, true),
-            (75, 4, 64, 1 << 20, false),
-            (11, 4, 0, 1 << 20, false),
-            (11, 4, 1, 1 << 20, true),
-            (12, 4, 1, 1 << 20, false),
-            (60, 4, 64, 60, true),
-            (60, 4, 64, 59, false),
+            (10, 4, 64, 1 << 20, true, true),
+            (11, 4, 64, 1 << 20, true, true),
+            (11, 30, 64, 1 << 20, true, true),
+            (20, 4, 64, 1 << 20, true, true),
+            (20, 34, 64, 1 << 20, true, true),
+            (74, 4, 64, 1 << 20, true, true),
+            (74, 34, 64, 1 << 20, true, true),
+            (75, 4, 64, 1 << 20, false, false),
+            (11, 4, 0, 1 << 20, false, false),
+            (11, 4, 1, 1 << 20, true, true),
+            (12, 4, 1, 1 << 20, false, false),
+            (60, 4, 64, 60, true, true),
+            (60, 4, 64, 59, false, true),
+            (11, 4, 64, 10, false, true),
+            (74, 4, 64, 10, false, true),
+            (74, 34, 64, 10, false, true),
+            (75, 4, 64, 10, false, false),
+            (10, 4, 64, 9, false, false),
+            (60, 4, 64, 9, false, false),
         ];
         for simd in levels {
-            for (offset, ml, ext_len, window, accept) in cases {
-                let name = format!("offset {offset} ml {ml} ext {ext_len} window {window}");
-                let ext = &ext[ext.len() - ext_len..];
-                let mut out = seg.clone();
-                out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-                let dst = Dst {
-                    base: out.as_mut_ptr(),
-                    op: out.len(),
-                    window,
-                };
-                let history = ExtHistory {
-                    end: ext.as_ptr_range().end,
-                    len: ext.len(),
-                };
-                let block = one_match_block(offset as u32, ml);
-                let mut scratch = DecoderScratch::new();
-                // SAFETY: `out` holds the segment with the room `Dst` needs
-                // reserved, and `ext` is the history.
-                let got = unsafe {
-                    decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd).map(
-                        |end| {
-                            out.set_len(end);
-                            out
-                        },
-                    )
-                };
-                if !accept {
-                    assert!(got.is_err(), "{name}: accepted");
-                    continue;
+            for (offset, ml, ext_len, window, accept, accept_dict) in cases {
+                for dict in [false, true] {
+                    let name = format!(
+                        "offset {offset} ml {ml} ext {ext_len} window {window} dict {dict}"
+                    );
+                    let ext = &ext[ext.len() - ext_len..];
+                    let mut out = seg.clone();
+                    out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+                    let dst = Dst {
+                        base: out.as_mut_ptr(),
+                        op: out.len(),
+                        window,
+                    };
+                    let history = ExtHistory {
+                        end: ext.as_ptr_range().end,
+                        len: ext.len(),
+                        dict,
+                    };
+                    let block = one_match_block(offset as u32, ml);
+                    let mut scratch = DecoderScratch::new();
+                    // SAFETY: `out` holds the segment with the room `Dst`
+                    // needs reserved, and `ext` is the history.
+                    let got = unsafe {
+                        decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd)
+                            .map(|end| {
+                                out.set_len(end);
+                                out
+                            })
+                    };
+                    if !(if dict { accept_dict } else { accept }) {
+                        assert!(got.is_err(), "{name}: accepted");
+                        continue;
+                    }
+                    let mut want = [ext, &seg[..]].concat();
+                    for _ in 0..ml {
+                        want.push(want[want.len() - offset]);
+                    }
+                    assert_eq!(got.as_deref(), Ok(&want[ext.len()..]), "{name}");
                 }
-                let mut want = [ext, &seg[..]].concat();
-                for _ in 0..ml {
-                    want.push(want[want.len() - offset]);
-                }
-                assert_eq!(got.as_deref(), Ok(&want[ext.len()..]), "{name}");
             }
         }
     }
