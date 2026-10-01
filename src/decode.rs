@@ -881,7 +881,7 @@ impl HuffmanTable {
         }
     }
 
-    /// Code length of `symbol` (RFC 8878 §4.2.1.1, rfc8878.txt:1550:
+    /// Code length of `symbol` (RFC 8878 §4.2.1, rfc8878.txt:1550:
     /// Number_of_Bits = Max_Number_of_Bits + 1 - Weight); `symbol` is one
     /// the built table decodes, so its weight is not 0.
     #[inline(always)]
