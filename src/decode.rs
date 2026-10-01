@@ -253,12 +253,7 @@ fn decompress_frames(
         }
         pos += len;
         let (frame, _) = dec.frame_start();
-        reserve_frame(
-            &mut out.output,
-            frame.content_size,
-            &data[pos..],
-            frame.block_size_max,
-        )?;
+        reserve_frame(&mut out.output, frame, &data[pos..])?;
         #[cfg(feature = "parallel")]
         {
             let (frame, init) = dec.frame_start();
@@ -2768,7 +2763,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
 
 /// Parse the block header at the start of `src`, in a frame whose
 /// Block_Maximum_Size is `block_size_max`.
-fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, usize), String> {
+fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, String> {
     let buf: [u8; 3] = src
         .get(..3)
         .ok_or_else(|| "Error reading block header: truncated".to_string())?
@@ -2810,15 +2805,12 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader,
         BlockType::Reserved => 0,
     };
 
-    Ok((
-        BlockHeader {
-            last_block,
-            block_type,
-            decompressed_size,
-            content_size,
-        },
-        3,
-    ))
+    Ok(BlockHeader {
+        last_block,
+        block_type,
+        decompressed_size,
+        content_size,
+    })
 }
 
 // ============================================================
@@ -4161,7 +4153,7 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 
 /// Where a `FrameDecoder` stands in its input (ZSTD_decompressContinue's
 /// ZSTDds_* stages). Each stage but `Skip` takes one unit: a frame header,
-/// a block with its header, or a Content_Checksum, whole
+/// a block header, a block's content, or a Content_Checksum, whole
 /// (`FrameDecoder::unit_len`).
 enum Stage {
     /// Between frames: the next unit is a frame header, or a skippable
@@ -4170,8 +4162,13 @@ enum Stage {
     /// `left` bytes of a skippable frame's User_Data still to skip, in
     /// pieces of any size.
     Skip { left: u64 },
-    /// The blocks of a frame.
-    Block(Frame),
+    /// The blocks of a frame: the next unit is a block header
+    /// (ZSTDds_decodeBlockHeader), or with `header`, the content of the
+    /// block it heads (ZSTDds_decompressBlock).
+    Block {
+        frame: Frame,
+        header: Option<BlockHeader>,
+    },
     /// The frame's Content_Checksum, which must equal `computed`.
     Checksum { computed: u32 },
 }
@@ -4227,6 +4224,15 @@ impl Frame {
             Some(fcs) if self.decoded > fcs => Err(self.content_size_mismatch(fcs)),
             _ => Ok(()),
         }
+    }
+
+    /// Frame_Content_Size says the frame fits in one block. An encoder may
+    /// still have split it into several, but its content is too small to
+    /// decode in parallel, and reserving room for all of it costs at most
+    /// one block more than its blocks can decode to.
+    fn fits_one_block(&self) -> bool {
+        self.content_size
+            .is_some_and(|fcs| fcs <= self.block_size_max as u64)
     }
 
     fn content_size_mismatch(&self, fcs: u64) -> String {
@@ -4295,25 +4301,25 @@ impl FrameDecoder {
     /// the dictionary given to `process` if the frame started from one.
     fn frame_start(&mut self) -> (&mut Frame, &DecoderScratch) {
         match (&mut self.stage, &self.scratch) {
-            (Stage::Block(frame), Some(scratch)) => (frame, scratch),
+            (Stage::Block { frame, .. }, Some(scratch)) => (frame, scratch),
             _ => unreachable!("a started frame has blocks and a scratch"),
         }
     }
 
     /// How many bytes the current unit takes, `head` being its first bytes
     /// so far, which may be fewer, or more: a frame header's length follows
-    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes and a block's from its
-    /// header, so with fewer the length is what it takes to learn it. The
-    /// bytes of a skippable frame left to skip, in `Stage::Skip`.
+    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes, so with fewer the
+    /// length is what it takes to learn it. The bytes of a skippable frame
+    /// left to skip, in `Stage::Skip`.
     fn unit_len(&self, head: &[u8]) -> usize {
         match &self.stage {
             Stage::FrameHeader => frame_header_len(head),
             Stage::Skip { left } => usize::try_from(*left).unwrap_or(usize::MAX),
-            Stage::Block(frame) => match parse_block_header(head, frame.block_size_max) {
-                Ok((block, header_len)) => header_len + block.content_size as usize,
-                // Too short to tell, or rejected once whole.
-                Err(_) => BLOCK_HEADER_LEN,
-            },
+            Stage::Block { header: None, .. } => BLOCK_HEADER_LEN,
+            Stage::Block {
+                header: Some(block),
+                ..
+            } => block.content_size as usize,
             Stage::Checksum { .. } => CHECKSUM_LEN,
         }
     }
@@ -4346,11 +4352,14 @@ impl FrameDecoder {
         match &mut self.stage {
             Stage::FrameHeader => self.frame_header(unit, out, dict),
             Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
-            Stage::Block(frame) => {
-                let (block, content) = locate_block(unit, frame.block_size_max)?;
+            Stage::Block { frame, header } => {
+                let Some(block) = header.take() else {
+                    *header = Some(parse_block_header(unit, frame.block_size_max)?);
+                    return Ok(Event::Continue);
+                };
                 let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
                 let dict = dict.and_then(DecodeDict::entropy);
-                decode_block(&block, content, frame, scratch, dict, out, self.simd)?;
+                decode_block(&block, unit, frame, scratch, dict, out, self.simd)?;
                 if !block.last_block {
                     return Ok(Event::Continue);
                 }
@@ -4407,14 +4416,18 @@ impl FrameDecoder {
             scratch.load_dict(e);
         }
         out.start(frame.window, frame.content_size);
-        self.stage = Stage::Block(frame);
+        self.stage = Stage::Block {
+            frame,
+            header: None,
+        };
         Ok(Event::FrameStarted)
     }
 
     /// After the frame's last block: check its size, then expect its
     /// checksum, if it has one.
     fn blocks_ended(&mut self) -> Result<Event, String> {
-        let Stage::Block(frame) = std::mem::replace(&mut self.stage, Stage::FrameHeader) else {
+        let Stage::Block { frame, .. } = std::mem::replace(&mut self.stage, Stage::FrameHeader)
+        else {
             unreachable!("blocks end in Stage::Block");
         };
         if let Some(fcs) = frame.content_size {
@@ -4452,10 +4465,16 @@ impl FrameDecoder {
                 Ok(_) => unreachable!("a whole frame header is a unit"),
             },
             Stage::Skip { .. } => "Skippable frame extends past end of input".to_string(),
-            Stage::Block(frame) => match locate_block(partial, frame.block_size_max) {
+            Stage::Block {
+                frame,
+                header: None,
+            } => match parse_block_header(partial, frame.block_size_max) {
                 Err(e) => e,
-                Ok(_) => unreachable!("a whole block is a unit"),
+                Ok(_) => unreachable!("a whole block header is a unit"),
             },
+            Stage::Block {
+                header: Some(_), ..
+            } => BLOCK_CONTENT_TRUNCATED.to_string(),
             Stage::Checksum { .. } => "Error reading checksum: truncated".to_string(),
         })
     }
@@ -4463,6 +4482,8 @@ impl FrameDecoder {
 
 /// Block_Header's length.
 const BLOCK_HEADER_LEN: usize = 3;
+
+const BLOCK_CONTENT_TRUNCATED: &str = "Block content extends past end of input";
 
 /// Content_Checksum's length.
 const CHECKSUM_LEN: usize = 4;
@@ -4495,10 +4516,10 @@ fn frame_header_len(head: &[u8]) -> usize {
 /// The block at the start of `src`, in a frame whose Block_Maximum_Size is
 /// `block_size_max`: its header and content.
 fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]), String> {
-    let (block, header_len) = parse_block_header(src, block_size_max)?;
+    let block = parse_block_header(src, block_size_max)?;
     let content = src
-        .get(header_len..header_len + block.content_size as usize)
-        .ok_or_else(|| "Block content extends past end of input".to_string())?;
+        .get(BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + block.content_size as usize)
+        .ok_or_else(|| BLOCK_CONTENT_TRUNCATED.to_string())?;
     Ok((block, content))
 }
 
@@ -4586,21 +4607,20 @@ impl FrameOut for VecOut<'_> {
     }
 }
 
-/// Reserve room in `output` for a frame of `content_size` bytes whose blocks
-/// start `blocks`, plus what a block's destination reserves past its start,
-/// so that no block has to grow the buffer (and move everything decoded). A
-/// content size past what the blocks can decode to fails the size check, so
-/// it gets no room beyond that.
-fn reserve_frame(
-    output: &mut Vec<u8>,
-    content_size: Option<u64>,
-    blocks: &[u8],
-    block_size_max: usize,
-) -> Result<(), String> {
-    let Some(fcs) = content_size else {
+/// Reserve room in `output` for `frame`, whose blocks start `blocks`, plus
+/// what a block's destination reserves past its start, so that no block
+/// has to grow the buffer (and move everything decoded). A content size
+/// past what the blocks can decode to fails the size check, so it gets no
+/// room beyond that, unless the frame fits in one block.
+fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(), String> {
+    let Some(fcs) = frame.content_size else {
         return Ok(());
     };
-    let content = fcs.min(blocks_decoded_bound(blocks, block_size_max));
+    let content = if frame.fits_one_block() {
+        fcs
+    } else {
+        fcs.min(blocks_decoded_bound(blocks, frame.block_size_max))
+    };
     let want = usize::try_from(content)
         .ok()
         .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
@@ -5365,9 +5385,10 @@ mod parallel {
 
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool, starting from the tables and repeat offsets in
-    /// `start`. Returns `Ok(false)` without consuming input when the block
-    /// headers do not show `min_blocks` blocks: the frame has fewer, or a
-    /// header before them fails, which the serial decoder then reports.
+    /// `start`. Returns `Ok(false)` without consuming input when the frame
+    /// fits in one block, or the block headers do not show `min_blocks`
+    /// blocks: the frame has fewer, or a header before them fails, which
+    /// the serial decoder then reports.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
@@ -5377,7 +5398,7 @@ mod parallel {
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
-        if min_blocks == usize::MAX {
+        if min_blocks == usize::MAX || frame.fits_one_block() {
             return Ok(false);
         }
         let block_size_max = frame.block_size_max;
