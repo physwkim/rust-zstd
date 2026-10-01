@@ -23,6 +23,8 @@ checked against RFC 8878 for reference-side bugs.
 - Huffman streams keep the strict end-mark and end-of-stream verdict of
   libzstd without its BMI2 fast path (R1-4).
 - No legacy v0.1-v0.7 frame decoding (R1-7).
+- No `ZSTD_c_literalCompressionMode` (experimental in libzstd); literals
+  follow its auto rule, so default frames are unaffected (R2-16).
 - libzstd bugs that change frames or verdicts are copied for parity (R1-6,
   R1-11, R1-17, R1-18, R1-22), except R1-16: an LDM hash rate log
   above the adjusted window log derives ZSTD_HASHLOG_MIN, not libzstd's
@@ -110,20 +112,6 @@ Impact: Probe-proven (`scratchpad/probe/src/bin/shrink.rs`). Setup: L19, one reu
 | ours | +18.0 MiB | +18.7 MiB | +18.7 MiB | +18.7 MiB |
 
 At frame 129 libzstd releases about 80 MiB; ours never does. Not probed: at L22 the large-input tables (chainLog 27, hashLog 25) come to about 640 MiB, kept for the life of the `Compressor`. Output frames are unaffected.
-
-### R2-16: no `ZSTD_c_literalCompressionMode`; only the auto rule exists
-
-Severity: Low
-
-Class: unimplemented feature
-
-Rust: `src/huf.rs:1070` — `fn literals_compression_is_disabled(cparams: &CParams) -> bool { cparams.strategy == Strategy::Fast && cparams.target_length > 0 }`. `CompressOptions` (`src/compress/mod.rs`) has no literal-compression-mode field, even though the crate has a `ParamSwitch` type. Found by reading.
-
-C reference: `compress/zstd_compress_internal.h:685-697` — `ZSTD_literalsCompressionIsDisabled` switches on `literalCompressionMode`: `ZSTD_ps_enable` returns 0, `ZSTD_ps_disable` returns 1, and `ZSTD_ps_auto` applies the rule above.
-
-Impact: A caller cannot force raw literals (disable) or force Huffman literals (enable) the way libzstd lets them. With the default (auto), frames are identical, because levels 1 and 2 have targetLength 0 and the only difference is at negative levels, where both sides apply the same rule. With a non-default setting, libzstd output cannot be reproduced; for example, `ps_enable` at negative levels makes libzstd Huffman-code literals that the port always leaves raw.
-
-Decision: add a literal compression mode option (libzstd `ZSTD_c_literalCompressionMode`, experimental) or record it as an accepted divergence.
 
 ## libzstd bugs
 
