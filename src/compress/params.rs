@@ -81,6 +81,9 @@ pub const ZSTD_CLEVEL_DEFAULT: i32 = 3;
 pub const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 const ZSTD_TARGETLENGTH_MAX: i32 = 1 << 17;
 const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
+/// `ZSTD_HASHLOG3_MAX`: the largest 3-byte hash table, see
+/// [`CParams::hash_log3`].
+pub const ZSTD_HASHLOG3_MAX: u32 = 17;
 
 /// Strategy column of `ZSTD_defaultCParameters`, including the unported
 /// `BtLazy2` so the table below is a verbatim copy.
@@ -328,7 +331,6 @@ impl CParams {
     /// hash table exists only for `min_match == 3`, with
     /// `min(ZSTD_HASHLOG3_MAX, window_log)` bits; `0` means no table.
     pub fn hash_log3(&self) -> u32 {
-        const ZSTD_HASHLOG3_MAX: u32 = 17;
         if self.strategy.is_opt() && self.min_match == 3 {
             ZSTD_HASHLOG3_MAX.min(self.window_log)
         } else {
