@@ -34,24 +34,6 @@ checked against RFC 8878 for reference-side bugs.
 
 ## Open Findings
 
-### R2-8: Block path never runs `ZSTD_window_enforceMaxDist` or the `nextToUpdate >= lowLimit` clamp, so `Window::low` stops tracking C's `lowLimit`/`dictLimit`
-
-Severity: Low
-
-Class: reference-faithful gap
-
-Rust: `src/compress/matchstate.rs:746` / `:762`. `MatchState::enter` and `enter_block` only call `window.extend_to` and `correct_overflow_if_needed`. `Window::enforce_max_dist` (`matchstate.rs:244`) has one non-test caller, the LDM window (`src/compress/ldm.rs:399`). So once the input is longer than the window, the MatchState's `window.low` stays at its frame-start value (or its overflow-corrected value). Despite that, `BtParams::window_valid` (`src/compress/lazy.rs:297`, `:307`) says it is "`window.lowLimit` (`ms.window_low()`)". This is from reading; no probe input reaches a difference.
-
-C reference: `compress/zstd_compress.c:4630`, `:4633`. Before every block, `ZSTD_compress_frameChunk` calls `ZSTD_window_enforceMaxDist(&ms->window, ip /* block start */, maxDist, ...)`, then `if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;`. In `zstd_compress_internal.h:1281-1284` this raises `lowLimit`, and `dictLimit` with it, to `blockStartIdx - maxDist`. `zstd_lazy.c:96-98` (`ZSTD_insertDUBT1`) reads that raised `lowLimit` as `windowValid`, including for unsorted candidates whose `curr` is in an earlier block.
-
-Impact: frames are the same today. I checked each place the raised value is read:
-- **btlazy2 `ZSTD_insertDUBT1` for an earlier-block candidate:** Rust keeps walking and linking nodes in `(curr - maxDist, blockStart - maxDist]`, where C stores 0. Every later search ends at those nodes anyway, because its `windowLow >= blockStart - maxDist`.
-- **opt `ZSTD_insertBt1`:** its bound comes from `target`, which is never below the block start.
-- **Repcode checks against `dictLimit`:** they are capped by `maxDist` either way.
-- **`nextToUpdate` clamp:** `start_block`'s 384/192 clamp produces the same value, since `maxDist >= 1024`.
-
-What does differ is state: `window.low` (C's `lowLimit`/`dictLimit`), and the value it has after overflow correction. That state becomes visible once a dictionary path lands, because there `loadedDictEnd`, `ZSTD_checkDictValidity` and `prefixLowest` all read the raised `dictLimit`.
-
 ## libzstd bugs
 
 Upstream reports. Where the port still shares one, its Decided or Port
