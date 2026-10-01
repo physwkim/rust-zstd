@@ -133,8 +133,8 @@ pub struct CompressOptions {
     /// explicit hash log, else `7 - strategy / 3`), else `1..=25`
     /// (`1..=24` where `usize` is 32 bits).
     ///
-    /// Out-of-range LDM values panic, where `ZSTD_CCtx_setParameter`
-    /// returns `parameter_outOfBound`.
+    /// Out-of-range LDM values panic before any output, where
+    /// `ZSTD_CCtx_setParameter` returns `parameter_outOfBound`.
     pub ldm_hash_rate_log: u32,
     /// `ZSTD_c_splitAfterSequences`: after the match finder, cut a block
     /// into several where separate entropy tables are estimated to pay for
@@ -150,8 +150,8 @@ pub struct CompressOptions {
     /// (`btopt` and above). `1` disables it; `2` selects the borders
     /// and `3..=6` chunks sampled every 43, 11, 5 and 1 bytes. A block is
     /// split only once its job has saved 3 bytes, so the first block of
-    /// every job is whole. Values above 6 panic (libzstd rejects them
-    /// with `parameter_outOfBound`).
+    /// every job is whole. Values above 6 panic before any output, where
+    /// `ZSTD_CCtx_setParameter` returns `parameter_outOfBound`.
     pub block_splitter_level: u8,
     /// Test knob, libzstd's `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`:
     /// correct the match state's and the long distance matcher's windows
@@ -217,7 +217,20 @@ impl CompressOptions {
     /// input of `src_size` bytes: the frame's compression parameters and,
     /// when long distance matching resolves to enabled, its parameters
     /// (`ZSTD_ldm_adjustParameters`).
+    ///
+    /// Also the one place options are checked against libzstd's bounds,
+    /// panicking where `ZSTD_CCtx_setParameter` returns
+    /// `parameter_outOfBound`: [`Compressor::compress`] calls it before
+    /// writing anything, so an out-of-range option is rejected the same way
+    /// whatever the input. The other options have no rejected values: the
+    /// level, job size and overlap log clamp as libzstd clamps them.
     fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
+        assert!(
+            self.block_splitter_level <= presplit::BLOCK_SPLITTER_LEVEL_MAX,
+            "block_splitter_level {} out of range 0..={}",
+            self.block_splitter_level,
+            presplit::BLOCK_SPLITTER_LEVEL_MAX
+        );
         let requested = LdmParams::requested(
             self.ldm_hash_log,
             self.ldm_min_match,
@@ -1438,6 +1451,49 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    /// Every option libzstd rejects panics before [`Compressor::compress`]
+    /// writes to `out`, on empty, one-byte and multi-block input, single-
+    /// and multithreaded, and its bound is libzstd's.
+    #[test]
+    fn out_of_range_option_panics_before_output() {
+        use crate::compress::common::testutil::{c_accepts, c_bounds};
+        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter::ZSTD_c_experimentalParam20;
+
+        let (lo, hi) = c_bounds(ZSTD_c_experimentalParam20);
+        assert_eq!((lo, hi), (0, presplit::BLOCK_SPLITTER_LEVEL_MAX as i32));
+        assert!(!c_accepts(ZSTD_c_experimentalParam20, hi + 1));
+        type Set = fn(&mut CompressOptions);
+        let bad: [(&str, Set); 5] = [
+            ("block_splitter_level 7", |o| o.block_splitter_level = 7),
+            ("ldm_hash_log 31", |o| o.ldm_hash_log = 31),
+            ("ldm_min_match 3", |o| o.ldm_min_match = 3),
+            ("ldm_bucket_size_log 9", |o| o.ldm_bucket_size_log = 9),
+            ("ldm_hash_rate_log 26", |o| o.ldm_hash_rate_log = 26),
+        ];
+        let big = vec![b'x'; JOBSIZE_MIN + (300 << 10)];
+        for (name, set) in bad {
+            for job_size in [None, Some(JOBSIZE_MIN)] {
+                for src in [&[][..], b"a", &big] {
+                    let mut opts = CompressOptions {
+                        job_size,
+                        ..Default::default()
+                    };
+                    set(&mut opts);
+                    let mut cx = Compressor::new(opts);
+                    let mut out = b"prefix".to_vec();
+                    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cx.compress(src, &mut out)
+                    }))
+                    .expect_err(name);
+                    let msg = err.downcast_ref::<String>().map_or("", |m| m);
+                    let what = format!("{name} job_size {job_size:?} len {}", src.len());
+                    assert!(msg.starts_with(name), "{what}: {msg}");
+                    assert!(out == b"prefix", "{what}: out written");
+                }
+            }
+        }
     }
 
     /// `overlap_size` reads an overlap log as `ZSTD_CCtx_setParameter`

@@ -337,7 +337,7 @@ The one sampled case per class has this shape: the same exhausted stream lands o
 
 So libzstd gives one frame three outcomes: BMI2 x86-64, non-BMI2 x86-64, and 32-bit. The port matches only the second, so on BMI2 hosts and on i686 it returns different bytes, or the opposite verdict, from the system libzstd. This is the missing-symbol counterpart of R1-6 (one extra symbol). R1-4's verdict split does not cover the case where both return Ok with different bytes.
 
-Port: copies the 64-bit body path. To be fixed with R1-6. Its struct comment at `src/decode.rs:1290-1292` says the lookup returns zeros; it re-reads the container.
+Port: copies the 64-bit body path. To be fixed with R1-6.
 
 ### R2-4: [libzstd+port] Match offsets at or beyond Window_Size are accepted as long as they stay inside the frame
 
