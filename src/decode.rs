@@ -31,7 +31,8 @@
 //! `Decompressor` for input and output in pieces, `DecompressReader` over it.
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
-//! literals and FSE sequences. No dictionary support.
+//! literals and FSE sequences, with or without a dictionary
+//! (`decompress_with_dict`).
 
 #![allow(
     clippy::needless_range_loop,
@@ -47,6 +48,11 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+use std::sync::Arc;
+
+mod dict;
+pub use dict::DecodeDict;
+use dict::DictEntropy;
 
 mod stream;
 pub use stream::{DecompressReader, Decompressor};
@@ -122,8 +128,8 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 ///
 /// Supports any number of concatenated zstd frames. Skippable frames are
 /// skipped. Every input byte must belong to a frame: an empty input decodes
-/// to nothing, and bytes after the last frame are an error. Dictionary
-/// frames are not supported.
+/// to nothing, and bytes after the last frame are an error. A frame that
+/// names a dictionary is an error; see `decompress_with_dict`.
 ///
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
@@ -134,6 +140,23 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// bytes (lines 545-569).
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
+}
+
+/// `decompress` with dictionary `dict` (ZSTD_decompress_usingDict): every
+/// frame starts from its tables and repeat offsets, and its content is the
+/// history before every frame (ZSTD_refDictContent; RFC 8878 lines
+/// 1835-1837). A match may reach it past Window_Size while the frame has
+/// decoded at most Window_Size bytes (lines 1838-1844). A frame that names
+/// another nonzero Dictionary_ID is an error (dictionary_wrong); one with
+/// no Dictionary_ID is decoded with `dict` too.
+///
+/// RFC 8878 lines 442-443 make a frame naming an unregistered ID in the
+/// reserved ranges an error. That is not enforced: registration cannot be
+/// known offline, and the caller supplying the dictionary is the "private
+/// arrangement" of lines 439-440, so a matching ID is accepted in any
+/// range, as libzstd does.
+pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, String> {
+    decompress_with_dict_options(data, Some(dict), &DecodeOptions::default())
 }
 
 /// Decoder paths to force, for testing each of them on any input.
@@ -180,14 +203,27 @@ impl Default for DecodeOptions {
 /// `decompress` with the paths chosen by `opts`.
 #[doc(hidden)]
 pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<u8>, String> {
+    decompress_with_dict_options(data, None, opts)
+}
+
+/// `decompress_with_dict`, or `decompress` without `dict`, with the paths
+/// chosen by `opts`.
+#[doc(hidden)]
+pub fn decompress_with_dict_options(
+    data: &[u8],
+    dict: Option<&DecodeDict>,
+    opts: &DecodeOptions,
+) -> Result<Vec<u8>, String> {
     let simd = opts.simd_level();
     let mut dec = FrameDecoder::new(simd);
+    dec.dict = dict.cloned();
     let mut out = VecOut {
         output: Vec::new(),
         prefix: Prefix {
             start: 0,
             window: 0,
         },
+        dict: dict.map_or(&[], DecodeDict::content),
     };
     let mut pos = 0usize;
     loop {
@@ -205,7 +241,7 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             continue;
         }
         pos += len;
-        let frame = dec.frame().expect("a started frame has blocks");
+        let (frame, _) = dec.frame_start();
         reserve_frame(
             &mut out.output,
             frame.content_size,
@@ -213,15 +249,19 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             frame.block_size_max,
         )?;
         #[cfg(feature = "parallel")]
-        if parallel::decode_frame_blocks(
-            data,
-            &mut pos,
-            frame,
-            &mut out,
-            opts.min_parallel_blocks,
-            simd,
-        )? {
-            dec.blocks_ended()?;
+        {
+            let (frame, init) = dec.frame_start();
+            if parallel::decode_frame_blocks(
+                data,
+                &mut pos,
+                frame,
+                init,
+                &mut out,
+                opts.min_parallel_blocks,
+                simd,
+            )? {
+                dec.blocks_ended()?;
+            }
         }
     }
 }
@@ -359,6 +399,17 @@ impl FSETable {
         }
     }
 
+    /// Make this table `src`, reusing this one's allocations.
+    fn copy_from(&mut self, src: &FSETable) {
+        debug_assert_eq!(self.max_symbol, src.max_symbol);
+        self.cells.clone_from(&src.cells);
+        self.size = src.size;
+        self.accuracy_log = src.accuracy_log;
+        self.symbol_probabilities
+            .clone_from(&src.symbol_probabilities);
+        self.predefined = src.predefined;
+    }
+
     /// The decoding table: `1 << accuracy_log` cells once built, else none.
     fn decode(&self) -> &[FSEEntry] {
         &self.cells[..self.size]
@@ -396,6 +447,13 @@ impl FSETable {
     ) -> Result<usize, String> {
         self.reset();
         let bytes_read = self.read_probabilities(source, max_log)?;
+        // RFC 8878 lines 1372-1373: two or more symbols of nonzero
+        // probability; one alone is RLE_Mode's (lines 925-927). libzstd's
+        // FSE_readNCount does not check this.
+        let nonzero = self.symbol_probabilities.iter().filter(|&&c| c != 0);
+        if nonzero.count() < 2 {
+            return Err("FSE table has fewer than two symbols of nonzero probability".to_string());
+        }
         self.build_decoding_table(codes);
         Ok(bytes_read)
     }
@@ -678,14 +736,6 @@ fn fse_cell_state(symbol_next: &mut [u16; 256], symbol: usize, table_log: u32) -
     )
 }
 
-/// Size in u32 words of FSE_decompress_wksp's workspace for a table of
-/// `table_log` over symbols `0..=max_symbol` (FSE_DECOMPRESS_WKSP_SIZE_U32).
-const fn fse_decompress_wksp_u32(table_log: usize, max_symbol: usize) -> usize {
-    let dtable = 1 + (1 << table_log);
-    let build = (2 * (max_symbol + 1) + (1 << table_log) + 8).div_ceil(4);
-    dtable + 1 + build + 256 / 2 + 1
-}
-
 /// Decode the weights of a Huffman tree description from an FSE bitstream
 /// with two interleaved states (FSE_decompress_usingDTable_generic): four
 /// symbols per reload while the stream lasts, then one at a time until it
@@ -840,6 +890,11 @@ struct HuffmanTable {
     rank_stats: [u32; HUF_TABLELOG_MAX as usize + 1],
     /// Symbols ordered by weight (libzstd symbols, sortedSymbol).
     sorted: [u8; 256],
+    /// The weights' FSE table, over weights 0..=HUF_TABLELOG_MAX at every
+    /// accuracy log: a description listing a higher symbol is corrupt (RFC
+    /// 8878 lines 1432-1436, 1541-1543), which `read_ncount_body`'s symbol
+    /// bound enforces. libzstd's bound instead depends on the log
+    /// (HUF_READ_STATS_WORKSPACE_SIZE_U32).
     fse_table: FSETable,
 }
 
@@ -854,8 +909,24 @@ impl HuffmanTable {
             max_num_bits: 0,
             rank_stats: [0; HUF_TABLELOG_MAX as usize + 1],
             sorted: [0; 256],
-            fse_table: FSETable::new(255),
+            fse_table: FSETable::new(HUF_TABLELOG_MAX as u8),
         }
+    }
+
+    /// Make this the decoding table `src` is, reusing this one's
+    /// allocations; the weights' FSE table is build scratch and not copied.
+    fn copy_from(&mut self, src: &HuffmanTable) {
+        if src.is_x2 {
+            self.decode_x2.clone_from(&src.decode_x2);
+        } else {
+            self.decode.clone_from(&src.decode);
+        }
+        self.is_x2 = src.is_x2;
+        self.weights = src.weights;
+        self.nb_symbols = src.nb_symbols;
+        self.max_num_bits = src.max_num_bits;
+        self.rank_stats = src.rank_stats;
+        self.sorted = src.sorted;
     }
 
     /// Forget the table. Its cells stay allocated for the next build, which
@@ -936,18 +1007,6 @@ impl HuffmanTable {
                 ));
             };
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
-            // FSE_decompress_wksp's table must fit HUF_readStats's workspace
-            // (HUF_READ_STATS_WORKSPACE_SIZE_U32), sized for 6-bit tables
-            // over weights 0..=11 (libzstd's HUF_TABLELOG_MAX - 1).
-            let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
-            let log = usize::from(self.fse_table.accuracy_log);
-            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
-                return Err(format!(
-                    "Huffman weights table of log {} over {} symbols is too large",
-                    log,
-                    max_symbol + 1
-                ));
-            }
             let out = self.weights.first_chunk_mut::<255>().unwrap();
             let nb_weights = fse_decompress_weights(&self.fse_table, &src[ncount..], out)?;
             Ok((1 + header, nb_weights))
@@ -2364,6 +2423,14 @@ struct DecoderScratch {
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
+    /// The dictionary tables the frame started with (`load_dict`), shared
+    /// rather than copied, as libzstd points its DCtx at the DDict's.
+    dict: Option<Arc<DictEntropy>>,
+    /// The Huffman table in use is `dict`'s, not `huf`'s: true from
+    /// `load_dict` until a block of the frame builds one.
+    huf_from_dict: bool,
+    /// The same for the LL, OF, ML tables (`SEQ_TABLES` order).
+    fse_from_dict: [bool; 3],
 }
 
 impl DecoderScratch {
@@ -2379,12 +2446,18 @@ impl DecoderScratch {
             },
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
+            dict: None,
+            huf_from_dict: false,
+            fse_from_dict: [false; 3],
         }
     }
 
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
+        self.dict = None;
+        self.huf_from_dict = false;
+        self.fse_from_dict = [false; 3];
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
@@ -2447,6 +2520,8 @@ struct FrameHeader {
     window_descriptor: u8,
     /// Frame_Content_Size, or None when the header omits it.
     frame_content_size: Option<u64>,
+    /// Dictionary_ID, 0 when the header omits it.
+    dict_id: u32,
 }
 
 impl FrameHeader {
@@ -2569,6 +2644,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         descriptor: FrameDescriptor(desc.0),
         frame_content_size: None,
         window_descriptor: 0,
+        dict_id: 0,
     };
 
     if !desc.single_segment_flag() {
@@ -2578,22 +2654,15 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         pos += 1;
     }
 
-    // ZSTD_decodeFrameHeader: no dictionary is loaded, so a frame naming one
-    // (any Dictionary_ID but 0) is dictionary_wrong.
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
     let dict_id = src
         .get(pos..pos + dict_id_len)
         .ok_or_else(|| FrameDecoderError::new("Error reading dictionary id: truncated".into()))?;
     pos += dict_id_len;
-    let dict_id = dict_id
+    frame_header.dict_id = dict_id
         .iter()
         .rev()
         .fold(0u32, |id, &b| id << 8 | u32::from(b));
-    if dict_id != 0 {
-        return Err(FrameDecoderError::new(format!(
-            "Frame needs dictionary {dict_id}, none is loaded"
-        )));
-    }
 
     let fcs_len = desc
         .frame_content_size_bytes()
@@ -2682,6 +2751,7 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader,
 fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2695,14 +2765,17 @@ fn decode_literals(
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            decompress_literals(section, scratch, source, target)
+            decompress_literals(section, scratch, repeat, source, target)
         }
     }
 }
 
+/// Compressed literals build `scratch`'s table; Treeless ones use `repeat`
+/// when given, else `scratch`'s.
 fn decompress_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2717,28 +2790,24 @@ fn decompress_literals(
     let source = &source[0..compressed_size];
     let mut bytes_read = 0usize;
 
-    match section.ls_type {
+    let table = match section.ls_type {
         LiteralsSectionType::Compressed => {
             bytes_read += scratch
                 .table
                 .build_decoder(source, regenerated_size, num_streams == 4)?
                 as usize;
+            &scratch.table
         }
-        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
-            return Err("Uninitialized Huffman table for treeless literals".to_string());
-        }
-        _ => {}
+        _ => repeat.unwrap_or(&scratch.table),
+    };
+    if table.max_num_bits == 0 {
+        return Err("Uninitialized Huffman table for treeless literals".to_string());
     }
 
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    huf_decompress(
-        &mut target[start..],
-        source,
-        num_streams == 4,
-        &scratch.table,
-    )?;
+    huf_decompress(&mut target[start..], source, num_streams == 4, table)?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
@@ -2863,6 +2932,15 @@ impl CompressionModes {
 
 impl FSEScratch {
     /// The table for `SEQ_TABLES[t]`.
+    fn table(&self, t: usize) -> &FSETable {
+        match t {
+            0 => &self.literal_lengths,
+            1 => &self.offsets,
+            _ => &self.match_lengths,
+        }
+    }
+
+    /// The table for `SEQ_TABLES[t]`.
     fn table_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
             0 => &mut self.literal_lengths,
@@ -2874,10 +2952,13 @@ impl FSEScratch {
 
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
+/// Repeat mode keeps a table `from_dict` names in use; any other mode
+/// builds `scratch`'s and clears `from_dict`.
 fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
+    from_dict: &mut [bool; 3],
 ) -> Result<usize, String> {
     let modes = section
         .modes
@@ -2885,12 +2966,16 @@ fn build_sequence_tables(
 
     let mut bytes_read = 0;
     for (t, mode) in modes.all().into_iter().enumerate() {
-        bytes_read += build_sequence_table(
-            mode,
-            &source[bytes_read..],
-            scratch.table_mut(t),
-            &SEQ_TABLES[t],
-        )?;
+        let repeat = matches!(mode, ModeType::Repeat);
+        if !(repeat && from_dict[t]) {
+            bytes_read += build_sequence_table(
+                mode,
+                &source[bytes_read..],
+                scratch.table_mut(t),
+                &SEQ_TABLES[t],
+            )?;
+        }
+        from_dict[t] &= repeat;
     }
     Ok(bytes_read)
 }
@@ -3162,7 +3247,8 @@ unsafe fn execute_avx2<W: WildCopy, S: BlockSequences>(
 struct SeqInput<'a> {
     num_sequences: u32,
     bit_stream: &'a [u8],
-    fse: &'a FSEScratch,
+    /// LL, OF, ML tables (`SEQ_TABLES` order).
+    fse: [&'a FSETable; 3],
     literals: &'a [u8],
 }
 
@@ -3232,12 +3318,13 @@ unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
         fse,
         literals,
     } = seqs;
-    let ll_dt = fse.literal_lengths.decode();
-    let of_dt = fse.offsets.decode();
-    let ml_dt = fse.match_lengths.decode();
-    let ll_log = u32::from(fse.literal_lengths.accuracy_log);
-    let of_log = u32::from(fse.offsets.accuracy_log);
-    let ml_log = u32::from(fse.match_lengths.accuracy_log);
+    let [ll_t, of_t, ml_t] = fse;
+    let ll_dt = ll_t.decode();
+    let of_dt = of_t.decode();
+    let ml_dt = ml_t.decode();
+    let ll_log = u32::from(ll_t.accuracy_log);
+    let of_log = u32::from(of_t.accuracy_log);
+    let ml_log = u32::from(ml_t.accuracy_log);
     // The state lookups below are unchecked: an initial state is
     // `accuracy_log` bits, and every cell of a table built by
     // `build_decoding_table` or `build_rle` satisfies
@@ -4061,6 +4148,8 @@ struct FrameDecoder {
     stage: Stage,
     scratch: Option<DecoderScratch>,
     simd: Level,
+    /// The dictionary every frame starts from, if any.
+    dict: Option<DecodeDict>,
 }
 
 impl FrameDecoder {
@@ -4069,6 +4158,7 @@ impl FrameDecoder {
             stage: Stage::FrameHeader,
             scratch: None,
             simd,
+            dict: None,
         }
     }
 
@@ -4077,11 +4167,12 @@ impl FrameDecoder {
         matches!(self.stage, Stage::Skip { .. })
     }
 
-    /// The frame whose blocks come next, if they do.
-    fn frame(&mut self) -> Option<&mut Frame> {
-        match &mut self.stage {
-            Stage::Block(frame) => Some(frame),
-            _ => None,
+    /// Right after `Event::FrameStarted`: the frame, and the scratch with
+    /// the tables and repeat offsets it starts from.
+    fn frame_start(&mut self) -> (&mut Frame, &DecoderScratch) {
+        match (&mut self.stage, &self.scratch) {
+            (Stage::Block(frame), Some(scratch)) => (frame, scratch),
+            _ => unreachable!("a started frame has blocks and a scratch"),
         }
     }
 
@@ -4161,7 +4252,23 @@ impl FrameDecoder {
             },
         };
         let frame = Frame::new(&header)?;
-        self.scratch.get_or_insert_with(DecoderScratch::new).reset();
+        // ZSTD_decodeFrameHeader's dictionary_wrong check.
+        match (header.dict_id, &self.dict) {
+            (0, _) => {}
+            (id, Some(d)) if id == d.id() => {}
+            (id, Some(d)) => {
+                return Err(format!(
+                    "Frame needs dictionary {id}, dictionary {} is loaded",
+                    d.id()
+                ))
+            }
+            (id, None) => return Err(format!("Frame needs dictionary {id}, none is loaded")),
+        }
+        let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
+        scratch.reset();
+        if let Some(e) = self.dict.as_ref().and_then(DecodeDict::entropy) {
+            scratch.load_dict(e);
+        }
         out.start(frame.window, frame.content_size);
         self.stage = Stage::Block(frame);
         Ok(Event::FrameStarted)
@@ -4296,13 +4403,27 @@ fn decode_block(
 
 /// The one-shot driver's `FrameOut`: frames decode straight into one
 /// `Vec`, each block after the last, so a frame's history is all in it.
-struct VecOut {
+struct VecOut<'d> {
     output: Vec<u8>,
     /// The current frame's.
     prefix: Prefix,
+    /// The dictionary content every frame's history starts with, empty
+    /// without a dictionary.
+    dict: &'d [u8],
 }
 
-impl FrameOut for VecOut {
+impl VecOut<'_> {
+    /// The history before the current frame: the dictionary content.
+    fn ext(&self) -> ExtHistory {
+        ExtHistory {
+            end: self.dict.as_ptr_range().end,
+            len: self.dict.len(),
+            dict: true,
+        }
+    }
+}
+
+impl FrameOut for VecOut<'_> {
     fn start(&mut self, window: usize, _content_size: Option<u64>) {
         self.prefix = Prefix {
             start: self.output.len(),
@@ -4314,7 +4435,7 @@ impl FrameOut for VecOut {
         let dst = self
             .prefix
             .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        Ok((dst, ExtHistory::NONE))
+        Ok((dst, self.ext()))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
@@ -4434,14 +4555,16 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
 }
 
 /// Decode the block's literals into `target` (cleared first) and append
-/// `WILDCOPY_OVERLENGTH` bytes of slack.
+/// `WILDCOPY_OVERLENGTH` bytes of slack. Treeless literals use `repeat`
+/// when given, else `huf`'s table.
 fn decode_block_literals(
     parts: &BlockParts<'_>,
     huf: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     target: &mut Vec<u8>,
 ) -> Result<(), String> {
     target.clear();
-    let used = decode_literals(&parts.literals, huf, parts.literals_src, target)?;
+    let used = decode_literals(&parts.literals, huf, repeat, parts.literals_src, target)?;
     assert!(
         parts.literals.regenerated_size == target.len() as u32,
         "Wrong number of literals: {}, Should have been: {}",
@@ -4467,20 +4590,35 @@ unsafe fn decompress_block(
     simd: Level,
 ) -> Result<usize, String> {
     let parts = split_block(raw, block_size_max)?;
-    decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
+    let dict = workspace.dict.as_deref();
+    let repeat = dict
+        .filter(|_| workspace.huf_from_dict)
+        .map(|d| &d.huf.table);
+    decode_block_literals(
+        &parts,
+        &mut workspace.huf,
+        repeat,
+        &mut workspace.literals_buffer,
+    )?;
+    workspace.huf_from_dict &= !matches!(parts.literals.ls_type, LiteralsSectionType::Compressed);
     let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
     let seq_section = parts.sequences;
     let raw = parts.sequences_src;
 
     if seq_section.num_sequences != 0 {
-        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        let from_dict = &mut workspace.fse_from_dict;
+        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse, from_dict)?;
+        let fse: [&FSETable; 3] = std::array::from_fn(|t| match dict {
+            Some(d) if from_dict[t] => d.fse.table(t),
+            _ => workspace.fse.table(t),
+        });
         let seqs = SeqInput {
             num_sequences: seq_section.num_sequences,
             bit_stream: &raw[table_bytes..],
-            fse: &workspace.fse,
+            fse,
             literals: &workspace.literals_buffer,
         };
-        let (offsets, hist) = (&workspace.fse.offsets, &mut workspace.offset_hist);
+        let (offsets, hist) = (fse[1], &mut workspace.offset_hist);
         if ext.len == 0 {
             execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)
         } else {
@@ -4523,6 +4661,10 @@ mod parallel {
     /// Frames with fewer blocks take the fused serial path.
     pub(super) const MIN_BLOCKS: usize = 4;
 
+    /// The "block" that defined a table the frame starts with: a
+    /// dictionary's (`init` of `decode_frame_blocks`).
+    const START: usize = usize::MAX;
+
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
         Raw(&'a [u8]),
@@ -4534,10 +4676,11 @@ mod parallel {
         parts: BlockParts<'a>,
         /// For Huffman-coded literals, the block whose tree description
         /// they use: this block for Compressed literals, the last earlier
-        /// block with Compressed literals for Treeless ones.
+        /// block with Compressed literals for Treeless ones, or `START`.
         huf_def: Option<usize>,
         /// For LL, OF and ML (`SEQ_TABLES` order), the block whose mode
-        /// defined the table this block uses. Unused without sequences.
+        /// defined the table this block uses, or `START`. Unused without
+        /// sequences.
         fse_def: [usize; 3],
     }
 
@@ -4551,15 +4694,18 @@ mod parallel {
 
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
-    /// decoder's scratch tables carry them from block to block.
+    /// decoder's scratch tables carry them from block to block, from the
+    /// tables in `init`.
     fn plan_frame<'a>(
         data: &'a [u8],
         pos: &mut usize,
         block_size_max: usize,
+        init: &DecoderScratch,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = None;
-        let mut fse_def: [Option<usize>; 3] = [None; 3];
+        let mut huf_def = (init.huf_table().max_num_bits != 0).then_some(START);
+        let mut fse_def: [Option<usize>; 3] =
+            std::array::from_fn(|t| (!init.fse_table(t).decode().is_empty()).then_some(START));
         loop {
             let (block, content) = locate_block(&data[*pos..], block_size_max)?;
             *pos += BLOCK_HEADER_LEN + content.len();
@@ -4675,17 +4821,24 @@ mod parallel {
         }
     }
 
-    /// Stage 2 for compressed block `i`.
+    /// Stage 2 for compressed block `i`, of a frame starting with the
+    /// tables in `init`.
     fn decode_block(
         slot: &mut Slot,
         i: usize,
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
+        init: &DecoderScratch,
     ) -> Result<(), String> {
         if let Some(d) = plan.huf_def {
             if d == i {
                 // `decode_block_literals` builds it from this block.
                 slot.huf_from = None;
+            } else if d == START {
+                if slot.huf_from != Some(d) {
+                    slot.huf.table.copy_from(init.huf_table());
+                    slot.huf_from = Some(d);
+                }
             } else if slot.huf_from != Some(d) {
                 slot.huf_from = None;
                 // The same arguments as the defining block's own build in
@@ -4700,7 +4853,7 @@ mod parallel {
                 slot.huf_from = Some(d);
             }
         }
-        decode_block_literals(&plan.parts, &mut slot.huf, &mut slot.literals)?;
+        decode_block_literals(&plan.parts, &mut slot.huf, None, &mut slot.literals)?;
         if plan.huf_def == Some(i) {
             slot.huf_from = Some(i);
         }
@@ -4734,7 +4887,11 @@ mod parallel {
                 slot.fse_from[t] = Some(i);
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                if d == START {
+                    slot.fse.table_mut(t).copy_from(init.fse_table(t));
+                } else {
+                    build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
+                }
                 slot.fse_from[t] = Some(d);
             }
         }
@@ -4940,10 +5097,10 @@ mod parallel {
         slot: &mut Slot,
         hist: &mut [u32; 3],
         block_size_max: usize,
-        prefix: Prefix,
-        output: &mut Vec<u8>,
+        out: &mut VecOut<'_>,
         simd: Level,
     ) -> Result<(), String> {
+        let output = &mut out.output;
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
             Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
@@ -4958,19 +5115,19 @@ mod parallel {
                     seqs: &slot.seqs,
                     literals: &slot.literals,
                 };
-                let dst = prefix.dst(output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-                // SAFETY: `Prefix::dst` meets the `Dst` contract, and on
-                // success the block's bytes up to `end` are written.
+                let (dst, ext) = out.block_dst()?;
+                let offsets = &slot.fse.offsets;
+                // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
+                // contracts, and on success the block's bytes up to `end`
+                // are written.
                 unsafe {
-                    let end = execute_with_copies(
-                        simd,
-                        &slot.fse.offsets,
-                        seqs,
-                        hist,
-                        block_size_max,
-                        dst,
-                    )?;
-                    output.set_len(prefix.start + end);
+                    let end = if ext.len == 0 {
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    } else {
+                        let seqs = ExtDecodedSeqs { seqs, ext };
+                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                    };
+                    out.commit(end);
                 }
             }
         }
@@ -4992,7 +5149,26 @@ mod parallel {
             offset_hist: &mut [u32; 3],
             dst: Dst,
         ) -> Result<usize, String> {
-            execute_sequences(w, self.seqs, self.literals, offset_hist, dst)
+            execute_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
+        }
+    }
+
+    /// `DecodedSeqs` whose matches reach on into `ext` before the segment,
+    /// in their own instantiation of the loop, as `ExtSeqInput`.
+    struct ExtDecodedSeqs<'a> {
+        seqs: DecodedSeqs<'a>,
+        ext: ExtHistory,
+    }
+
+    impl BlockSequences for ExtDecodedSeqs<'_> {
+        #[inline(always)]
+        unsafe fn execute<W: WildCopy>(
+            self,
+            w: W,
+            offset_hist: &mut [u32; 3],
+            dst: Dst,
+        ) -> Result<usize, String> {
+            execute_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
         }
     }
 
@@ -5000,12 +5176,13 @@ mod parallel {
     /// block's end. Same contract as `run_sequences`.
     ///
     /// # Safety
-    /// `dst` meets the `Dst` contract.
+    /// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
+    /// `EXT`.
     #[inline(always)]
-    unsafe fn execute_sequences<W: WildCopy>(
+    unsafe fn execute_sequences<W: WildCopy, const EXT: bool>(
         w: W,
-        seqs: &[RawSeq],
-        literals: &[u8],
+        DecodedSeqs { seqs, literals }: DecodedSeqs<'_>,
+        ext: ExtHistory,
         offset_hist: &mut [u32; 3],
         dst: Dst,
     ) -> Result<usize, String> {
@@ -5022,13 +5199,13 @@ mod parallel {
             oend_w: out.add(dst.op + MAX_BLOCK_SIZE),
             lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
             prefix: out,
-            ext: ExtHistory::NONE,
+            ext,
             window: dst.window,
         };
         for s in seqs {
             let ll = s.ll as usize;
             let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence::<W, false>(w, &mut cur, &lim, ll, s.ml as usize, offset)
+            exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
                 .map_err(seq_error_message)?;
         }
         // Last literals; both cursors only advanced within their buffers.
@@ -5042,13 +5219,15 @@ mod parallel {
     }
 
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
-    /// current rayon pool. Returns `Ok(false)` without consuming input when
-    /// the frame has fewer than `min_blocks` blocks.
+    /// current rayon pool, starting from the tables and repeat offsets in
+    /// `init` (a dictionary's, or none). Returns `Ok(false)` without
+    /// consuming input when the frame has fewer than `min_blocks` blocks.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
         frame: &mut Frame,
-        out: &mut VecOut,
+        init: &DecoderScratch,
+        out: &mut VecOut<'_>,
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
@@ -5057,7 +5236,7 @@ mod parallel {
         }
         let block_size_max = frame.block_size_max;
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max)?;
+        let plans = plan_frame(data, &mut end, block_size_max, init)?;
         if plans.len() < min_blocks {
             return Ok(false);
         }
@@ -5077,7 +5256,7 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
-        let mut hist = [1u32, 4, 8];
+        let mut hist = init.offset_hist;
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -5093,7 +5272,7 @@ mod parallel {
                     // of waiting forever.
                     let _done = MarkDone(&cell.done, i + 1);
                     let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans);
+                    slot.result = decode_block(&mut slot, i, cp, plans, init);
                 });
             };
             for i in 0..ring.len() {
@@ -5104,7 +5283,7 @@ mod parallel {
                 let mut slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans);
+                        slot.result = decode_block(&mut slot, i, cp, plans, init);
                         slot
                     }
                     Plan::Compressed(_) => {
@@ -5118,7 +5297,7 @@ mod parallel {
                                 Some(Plan::Compressed(np)) if next.claim(i + 1) => {
                                     let _done = MarkDone(&next.done, i + 2);
                                     let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans);
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans, init);
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
@@ -5130,15 +5309,7 @@ mod parallel {
                     _ => cell.slot.lock().unwrap(),
                 };
                 let start = out.output.len();
-                execute_block(
-                    plan,
-                    &mut slot,
-                    &mut hist,
-                    block_size_max,
-                    out.prefix,
-                    &mut out.output,
-                    simd,
-                )?;
+                execute_block(plan, &mut slot, &mut hist, block_size_max, out, simd)?;
                 drop(slot);
                 spawn_decode(i + ring.len());
                 frame.block_decoded(&out.output[start..])?;
@@ -5515,11 +5686,12 @@ mod tests {
     /// descriptions of random codes (raw and FSE-compressed, 2 to 256
     /// symbols, 6- to 12-bit), every truncation of them, single-byte
     /// corruptions and random bytes: the same outcome, and on success the
-    /// same length, weights, statistics and table log, except that the
-    /// descriptions of 12-bit codes, which libzstd accepts, are rejected
-    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7). Hundreds of the
-    /// corrupted and random inputs are valid descriptions, and over 150
-    /// describe 12-bit codes.
+    /// same length, weights, statistics and table log, except for two
+    /// kinds libzstd accepts and we reject: descriptions of 12-bit codes
+    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7), and weight FSE tables
+    /// listing a symbol past 11, the highest weight (R3-2). Hundreds of the
+    /// corrupted and random inputs are valid descriptions, over 150
+    /// describe 12-bit codes, and over 10 list such a symbol.
     #[test]
     fn huf_stats_match_libzstd() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -5529,13 +5701,24 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
-        let mut log12 = 0;
+        // The FSE-compressed weights of `src` list a symbol past 11.
+        let wide = |src: &[u8]| {
+            let header = usize::from(src[0]);
+            header < 128
+                && src.get(1..1 + header).is_some_and(|desc| {
+                    parse_fse_header(desc, 6).is_ok_and(|(_, counts, _)| counts.len() > 12)
+                })
+        };
+        let (mut log12, mut wide_tables) = (0, 0);
         let mut check = |src: &[u8]| {
             let ours = huf_stats_ours(src);
             let c = huf_stats_c(src);
             if matches!(c, Some((.., 12))) {
                 assert_eq!(ours, None, "input {src:02x?}");
                 log12 += 1;
+            } else if c.is_some() && wide(src) {
+                assert_eq!(ours, None, "input {src:02x?}");
+                wide_tables += 1;
             } else {
                 assert_eq!(ours, c, "input {src:02x?}");
             }
@@ -5573,8 +5756,8 @@ mod tests {
             random_ok += check(&src);
         }
         assert!(
-            bad_ok > 500 && random_ok > 1000 && log12 > 150,
-            "{bad_ok} {random_ok} accepted, {log12} of 12 bits"
+            bad_ok > 500 && random_ok > 1000 && log12 > 150 && wide_tables > 10,
+            "{bad_ok} {random_ok} accepted, {log12} of 12 bits, {wide_tables} wide"
         );
     }
 
