@@ -36,20 +36,6 @@ checked against RFC 8878 for reference-side bugs.
 
 ## Open Findings
 
-### R3-2: How many symbols a Huffman-weight FSE table may list depends on its accuracy log
-
-Severity: Low
-
-Class: reference-faithful gap
-
-Rust: `src/decode.rs:935-943` (`fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11)`).
-
-C reference: rfc8878.txt:1432-1436 (decoding more symbols than expected is corruption) and :1541-1543 (Weight ranges 0..Max_Number_of_Bits, and the 11-bit cap makes that 0..11). The ported rule is libzstd's workspace-size artefact: `common/huf.h:181` (`HUF_READ_STATS_WORKSPACE_SIZE_U32 = FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX-1)`), `common/fse_decompress.c:273`, and the workspaces passed at `decompress/huf_decompress.c:400` and `:1203`.
-
-Impact: The weight alphabet is 0..11, but how many symbols a table may list depends on its accuracy log. Probe results, identical on all 4 paths and in libzstd: at log 5, a highest listed symbol of 12, 20 or 91 (each with probability 1, never decoded) is accepted and 92 is rejected; at log 6, 11 is accepted and 12 is rejected. No reading of the RFC gives a log-dependent bound.
-
-Decided 2026-10-01: cap the weight-table alphabet at symbol 11 at every accuracy log; the workspace-formula rule goes.
-
 ## libzstd bugs
 
 Upstream reports. Where the port still shares one, its Decided or Port

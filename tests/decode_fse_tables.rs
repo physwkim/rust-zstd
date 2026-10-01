@@ -66,3 +66,146 @@ fn one_symbol_fse_table_is_rejected() {
     );
     check("one-symbol LL", &probe, Err("fewer than two symbols"));
 }
+
+extern "C" {
+    // lib/common/fse.h and huf.h; linked from zstd-sys's static libzstd.
+    fn FSE_writeNCount(
+        buffer: *mut u8,
+        buffer_size: usize,
+        normalized_counter: *const i16,
+        max_symbol_value: u32,
+        table_log: u32,
+    ) -> usize;
+    fn HUF_readStats(
+        huff_weight: *mut u8,
+        hw_size: usize,
+        rank_stats: *mut u32,
+        nb_symbols: *mut u32,
+        table_log: *mut u32,
+        src: *const u8,
+        src_size: usize,
+    ) -> usize;
+}
+
+fn is_error(r: usize) -> bool {
+    // SAFETY: a pure function of its argument.
+    unsafe { zstd::zstd_safe::zstd_sys::ZSTD_isError(r) != 0 }
+}
+
+/// The FSE table description, by libzstd's FSE_writeNCount, of accuracy
+/// log `log` in which weight 1 has every cell but one and symbol `listed`
+/// the last (probability "less than 1"), which no state decodes to.
+fn ncount_listing(listed: usize, log: u32) -> Vec<u8> {
+    let mut norm = vec![0i16; listed + 1];
+    norm[1] = (1 << log) - 1;
+    norm[listed] = -1;
+    let mut out = [0u8; 64];
+    // SAFETY: the buffers have the sizes passed.
+    let n = unsafe {
+        FSE_writeNCount(
+            out.as_mut_ptr(),
+            out.len(),
+            norm.as_ptr(),
+            listed as u32,
+            log,
+        )
+    };
+    assert!(!is_error(n), "FSE_writeNCount");
+    out[..n].to_vec()
+}
+
+/// A Huffman tree description of FSE-compressed weights: header byte,
+/// `ncount`, then weight bitstream `stream`.
+fn description(ncount: &[u8], stream: &[u8]) -> Vec<u8> {
+    let len = (ncount.len() + stream.len()) as u8;
+    [&[len][..], ncount, stream].concat()
+}
+
+/// The description with `ncount` and the shortest weight bitstream
+/// HUF_readStats accepts, if any.
+fn accepted_description(ncount: &[u8]) -> Option<Vec<u8>> {
+    (1..=2usize).find_map(|len| {
+        (1u32 << (8 * len - 8)..1 << (8 * len)).find_map(|bits| {
+            let desc = description(ncount, &bits.to_le_bytes()[..len]);
+            let mut weights = [0u8; 256];
+            let mut rank_stats = [0u32; 13];
+            let (mut nb_symbols, mut table_log) = (0u32, 0u32);
+            // SAFETY: the buffers have the sizes HUF_readStats is given.
+            let r = unsafe {
+                HUF_readStats(
+                    weights.as_mut_ptr(),
+                    weights.len(),
+                    rank_stats.as_mut_ptr(),
+                    &mut nb_symbols,
+                    &mut table_log,
+                    desc.as_ptr(),
+                    desc.len(),
+                )
+            };
+            (!is_error(r) && r == desc.len()).then_some(desc)
+        })
+    })
+}
+
+/// A frame (1 KiB window, no content size) of one block holding two
+/// literals coded (one stream) with tree description `desc` into
+/// `stream`, and no sequences.
+fn huffman_frame(desc: &[u8], stream: &[u8]) -> Vec<u8> {
+    const REGEN: u32 = 2;
+    let comp = (desc.len() + stream.len()) as u32;
+    let header = 2 | REGEN << 4 | comp << 14;
+    let mut body = header.to_le_bytes()[..3].to_vec();
+    body.extend_from_slice(desc);
+    body.extend_from_slice(stream);
+    body.push(0);
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    let bh = (body.len() as u32) << 3 | 2 << 1 | 1;
+    f.extend_from_slice(&bh.to_le_bytes()[..3]);
+    f.extend_from_slice(&body);
+    f
+}
+
+/// R3-2: the weights' FSE table may list symbols 0 to 11 only, the
+/// weights a tree can have, at every accuracy log (RFC 8878 lines
+/// 1432-1436, 1541-1543). libzstd's bound depends on the log: of the R3-A
+/// probe shapes it accepts a listed 12, 20 or 91 at log 5 and rejects 12 at
+/// log 6, as its workspace allows.
+#[test]
+fn weight_table_lists_symbols_up_to_11() {
+    for (listed, log, libzstd_accepts) in [
+        (11, 5, true),
+        (11, 6, true),
+        (12, 5, true),
+        (20, 5, true),
+        (91, 5, true),
+        (12, 6, false),
+    ] {
+        let name = format!("weights listing {listed} at log {log}");
+        let ncount = ncount_listing(listed, log);
+        let Some(desc) = accepted_description(&ncount) else {
+            assert!(!libzstd_accepts, "{name}: HUF_readStats rejects it");
+            // Our verdict comes from the table description alone.
+            let f = huffman_frame(&description(&ncount, &[0x81]), &[0x81]);
+            assert!(zstd::bulk::decompress(&f, 64).is_err(), "{name}");
+            check(&name, &f, Err(SYMBOL_PAST_11));
+            continue;
+        };
+        assert!(libzstd_accepts, "{name}: HUF_readStats accepts it");
+        let (f, out) = (1..1u32 << 16)
+            .find_map(|s| {
+                let stream = &s.to_le_bytes()[..if s < 256 { 1 } else { 2 }];
+                let f = huffman_frame(&desc, stream);
+                zstd::bulk::decompress(&f, 64).ok().map(|out| (f, out))
+            })
+            .unwrap_or_else(|| panic!("{name}: no literal stream libzstd decodes"));
+        if listed <= 11 {
+            check(&name, &f, Ok(&out));
+        } else {
+            check(&name, &f, Err(SYMBOL_PAST_11));
+        }
+    }
+}
+
+/// What a weight table listing a symbol past 11 fails with: its counts
+/// stop at symbol 11 with cells left over.
+const SYMBOL_PAST_11: &str = "unassigned";

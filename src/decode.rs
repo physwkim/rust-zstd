@@ -736,14 +736,6 @@ fn fse_cell_state(symbol_next: &mut [u16; 256], symbol: usize, table_log: u32) -
     )
 }
 
-/// Size in u32 words of FSE_decompress_wksp's workspace for a table of
-/// `table_log` over symbols `0..=max_symbol` (FSE_DECOMPRESS_WKSP_SIZE_U32).
-const fn fse_decompress_wksp_u32(table_log: usize, max_symbol: usize) -> usize {
-    let dtable = 1 + (1 << table_log);
-    let build = (2 * (max_symbol + 1) + (1 << table_log) + 8).div_ceil(4);
-    dtable + 1 + build + 256 / 2 + 1
-}
-
 /// Decode the weights of a Huffman tree description from an FSE bitstream
 /// with two interleaved states (FSE_decompress_usingDTable_generic): four
 /// symbols per reload while the stream lasts, then one at a time until it
@@ -898,6 +890,11 @@ struct HuffmanTable {
     rank_stats: [u32; HUF_TABLELOG_MAX as usize + 1],
     /// Symbols ordered by weight (libzstd symbols, sortedSymbol).
     sorted: [u8; 256],
+    /// The weights' FSE table, over weights 0..=HUF_TABLELOG_MAX at every
+    /// accuracy log: a description listing a higher symbol is corrupt (RFC
+    /// 8878 lines 1432-1436, 1541-1543), which `read_ncount_body`'s symbol
+    /// bound enforces. libzstd's bound instead depends on the log
+    /// (HUF_READ_STATS_WORKSPACE_SIZE_U32).
     fse_table: FSETable,
 }
 
@@ -912,7 +909,7 @@ impl HuffmanTable {
             max_num_bits: 0,
             rank_stats: [0; HUF_TABLELOG_MAX as usize + 1],
             sorted: [0; 256],
-            fse_table: FSETable::new(255),
+            fse_table: FSETable::new(HUF_TABLELOG_MAX as u8),
         }
     }
 
@@ -1010,18 +1007,6 @@ impl HuffmanTable {
                 ));
             };
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
-            // FSE_decompress_wksp's table must fit HUF_readStats's workspace
-            // (HUF_READ_STATS_WORKSPACE_SIZE_U32), sized for 6-bit tables
-            // over weights 0..=11 (libzstd's HUF_TABLELOG_MAX - 1).
-            let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
-            let log = usize::from(self.fse_table.accuracy_log);
-            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
-                return Err(format!(
-                    "Huffman weights table of log {} over {} symbols is too large",
-                    log,
-                    max_symbol + 1
-                ));
-            }
             let out = self.weights.first_chunk_mut::<255>().unwrap();
             let nb_weights = fse_decompress_weights(&self.fse_table, &src[ncount..], out)?;
             Ok((1 + header, nb_weights))
@@ -5701,11 +5686,12 @@ mod tests {
     /// descriptions of random codes (raw and FSE-compressed, 2 to 256
     /// symbols, 6- to 12-bit), every truncation of them, single-byte
     /// corruptions and random bytes: the same outcome, and on success the
-    /// same length, weights, statistics and table log, except that the
-    /// descriptions of 12-bit codes, which libzstd accepts, are rejected
-    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7). Hundreds of the
-    /// corrupted and random inputs are valid descriptions, and over 150
-    /// describe 12-bit codes.
+    /// same length, weights, statistics and table log, except for two
+    /// kinds libzstd accepts and we reject: descriptions of 12-bit codes
+    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7), and weight FSE tables
+    /// listing a symbol past 11, the highest weight (R3-2). Hundreds of the
+    /// corrupted and random inputs are valid descriptions, over 150
+    /// describe 12-bit codes, and over 10 list such a symbol.
     #[test]
     fn huf_stats_match_libzstd() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -5715,13 +5701,24 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
-        let mut log12 = 0;
+        // The FSE-compressed weights of `src` list a symbol past 11.
+        let wide = |src: &[u8]| {
+            let header = usize::from(src[0]);
+            header < 128
+                && src.get(1..1 + header).is_some_and(|desc| {
+                    parse_fse_header(desc, 6).is_ok_and(|(_, counts, _)| counts.len() > 12)
+                })
+        };
+        let (mut log12, mut wide_tables) = (0, 0);
         let mut check = |src: &[u8]| {
             let ours = huf_stats_ours(src);
             let c = huf_stats_c(src);
             if matches!(c, Some((.., 12))) {
                 assert_eq!(ours, None, "input {src:02x?}");
                 log12 += 1;
+            } else if c.is_some() && wide(src) {
+                assert_eq!(ours, None, "input {src:02x?}");
+                wide_tables += 1;
             } else {
                 assert_eq!(ours, c, "input {src:02x?}");
             }
@@ -5759,8 +5756,8 @@ mod tests {
             random_ok += check(&src);
         }
         assert!(
-            bad_ok > 500 && random_ok > 1000 && log12 > 150,
-            "{bad_ok} {random_ok} accepted, {log12} of 12 bits"
+            bad_ok > 500 && random_ok > 1000 && log12 > 150 && wide_tables > 10,
+            "{bad_ok} {random_ok} accepted, {log12} of 12 bits, {wide_tables} wide"
         );
     }
 
