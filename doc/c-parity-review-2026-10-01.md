@@ -102,8 +102,6 @@ C reference: `zstd_lazy.c:661`: `ZSTD_insertAndFindFirstIndex` passes `ms->cPara
 
 Impact: Proven with a probe against libzstd 1.5.7 (scratch `probe2`). The setup was a 100000-byte random prefix set with `ZSTD_CCtx_refPrefix`, the same bytes as input, `ZSTD_c_windowLog` 14 and hashLog/chainLog 16. With minMatch 5 or 6 the output is 83656 bytes; with minMatch 7 it is 100031 bytes (no match at all) for greedy, lazy and lazy2 on the hash chain, btlazy2 and btopt. The row finder is unaffected (34490 bytes at minMatch 5, 6 and 7). Every prefix or dictionary match is lost, which violates no RFC rule but is a pure ratio bug. Our port is unreachable today: there is no `min_match` option, and the greedy through btlazy2 rows of the level tables use minMatch 4 or 5 only.
 
-Decided 2026-10-01 (revised): the port fixes it. Both loaders hash `BOUNDED(4, minMatch, 6)` bytes, as the searches do.
-
 ### R1-14: [libzstd] The fast and row-lazy finders form pointers outside the input object (C11 6.5.6p8 undefined behaviour); the attribute on them only silences UBSan
 
 Severity: Low
@@ -208,8 +206,6 @@ Rust: `src/compress/presplit.rs:71` — `self.nb_events = (limit / RATE) as u64;
 C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
 
 Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
-
-Decided 2026-10-01 (revised): the port fixes it. `nb_events` counts the positions it samples.
 
 ### R2-2: [libzstd] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
 
