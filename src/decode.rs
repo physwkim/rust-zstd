@@ -214,22 +214,25 @@ pub fn decompress_with_dict_options(
     dict: Option<&DecodeDict>,
     opts: &DecodeOptions,
 ) -> Result<Vec<u8>, String> {
-    decompress_frames(&mut FrameDecoder::new(opts), data, dict)
+    let mut output = Vec::new();
+    decompress_frames(&mut FrameDecoder::new(opts), data, dict, &mut output)?;
+    Ok(output)
 }
 
 /// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
-/// `data`, whole, each from `dict` if given, with `dec`, which stands
-/// between frames: a fresh one for `decompress`, a `Decompressor`'s own for
-/// its `decompress`.
+/// `data`, whole, each from `dict` if given, onto the end of `output`,
+/// with `dec`, which stands between frames: a fresh one for `decompress`,
+/// a `Decompressor`'s own for its `decompress`.
 fn decompress_frames(
     dec: &mut FrameDecoder,
     data: &[u8],
     dict: Option<&DecodeDict>,
-) -> Result<Vec<u8>, String> {
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     #[cfg(feature = "parallel")]
     let (min_parallel_blocks, simd) = (dec.min_parallel_blocks, dec.simd);
     let mut out = VecOut {
-        output: Vec::new(),
+        output,
         prefix: Prefix {
             start: 0,
             window: 0,
@@ -244,8 +247,7 @@ fn decompress_frames(
         let rest = &data[pos..];
         let len = dec.unit_len(rest);
         if len > rest.len() {
-            dec.end_of_input(rest)?;
-            return Ok(out.output);
+            return dec.end_of_input(rest);
         }
         if dec.process(&rest[..len], &mut out, dict)? != Event::FrameStarted {
             pos += len;
@@ -253,7 +255,7 @@ fn decompress_frames(
         }
         pos += len;
         let (frame, _) = dec.frame_start();
-        reserve_frame(&mut out.output, frame, &data[pos..])?;
+        reserve_frame(out.output, frame, &data[pos..])?;
         #[cfg(feature = "parallel")]
         {
             let (frame, init) = dec.frame_start();
@@ -4564,7 +4566,7 @@ fn decode_block(
 /// The one-shot driver's `FrameOut`: frames decode straight into one
 /// `Vec`, each block after the last, so a frame's history is all in it.
 struct VecOut<'d> {
-    output: Vec<u8>,
+    output: &'d mut Vec<u8>,
     /// The current frame's.
     prefix: Prefix,
     /// The dictionary content every frame's history starts with, empty
@@ -4594,7 +4596,7 @@ impl FrameOut for VecOut<'_> {
     fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
         let dst = self
             .prefix
-            .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+            .dst(self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
         Ok((dst, self.ext()))
     }
 
@@ -5265,7 +5267,7 @@ mod parallel {
         out: &mut VecOut<'_>,
         simd: Level,
     ) -> Result<(), String> {
-        let output = &mut out.output;
+        let output = &mut *out.output;
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
             Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),

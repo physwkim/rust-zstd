@@ -15,7 +15,9 @@ use std::io::{self, Read};
 ///
 /// Its `decompress` and `decompress_with_dict` take whole input, as the
 /// functions of those names do, and keep its tables and buffers for the
-/// next call (ZSTD_decompressDCtx, ZSTD_decompress_usingDDict).
+/// next call (ZSTD_decompressDCtx, ZSTD_decompress_usingDDict);
+/// `decompress_into` and `decompress_into_with_dict` decode into a buffer
+/// the caller keeps too.
 pub struct Decompressor {
     dec: FrameDecoder,
     /// The start of a unit that came in pieces.
@@ -64,7 +66,17 @@ impl Decompressor {
     /// `decompress_stream` holds, and its error, are dropped, and its next
     /// call starts on a new frame.
     pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, String> {
-        self.decompress_whole(src, None)
+        let mut dst = Vec::new();
+        self.decompress_whole(src, None, &mut dst)?;
+        Ok(dst)
+    }
+
+    /// `decompress` into `dst`: it clears `dst`, then fills it with what
+    /// `decompress` returns, or leaves it empty where `decompress` fails.
+    /// The room `dst` has is kept, so a `dst` reused from call to call
+    /// takes no allocation once it has held the largest content.
+    pub fn decompress_into(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), String> {
+        self.decompress_whole(src, None, dst)
     }
 
     /// `decompress` with dictionary `dict`, as the function
@@ -79,19 +91,38 @@ impl Decompressor {
         src: &[u8],
         dict: &DecodeDict,
     ) -> Result<Vec<u8>, String> {
-        self.decompress_whole(src, Some(dict))
+        let mut dst = Vec::new();
+        self.decompress_whole(src, Some(dict), &mut dst)?;
+        Ok(dst)
+    }
+
+    /// `decompress_with_dict` into `dst`, which it clears and fills as
+    /// `decompress_into` does.
+    pub fn decompress_into_with_dict(
+        &mut self,
+        src: &[u8],
+        dict: &DecodeDict,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        self.decompress_whole(src, Some(dict), dst)
     }
 
     fn decompress_whole(
         &mut self,
         src: &[u8],
         dict: Option<&DecodeDict>,
-    ) -> Result<Vec<u8>, String> {
+        dst: &mut Vec<u8>,
+    ) -> Result<(), String> {
         self.reset();
-        let content = decompress_frames(&mut self.dec, src, dict);
-        // An error leaves the frame decoder inside a frame.
+        dst.clear();
+        let result = decompress_frames(&mut self.dec, src, dict, dst);
+        // An error leaves the frame decoder inside a frame, and `dst` with
+        // the content before it.
         self.reset();
-        content
+        if result.is_err() {
+            dst.clear();
+        }
+        result
     }
 
     /// Decode the input at `src[*src_pos..]` into `dst[*dst_pos..]`,

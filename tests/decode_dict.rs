@@ -212,19 +212,34 @@ fn paths() -> [(DecodeOptions, &'static str); 4] {
 }
 
 thread_local! {
-    /// A decompressor for each of `paths()`, reused by every check of a
-    /// test, so that each call follows others with other dictionaries,
-    /// none, or errors.
-    static REUSED: RefCell<Vec<Decompressor>> = RefCell::new(
-        paths().iter().map(|(opts, _)| Decompressor::with_options(opts)).collect(),
+    /// A decompressor for each of `paths()`, and a buffer for its
+    /// `decompress_into` calls, reused by every check of a test, so that
+    /// each call follows others with other dictionaries, none, or errors.
+    static REUSED: RefCell<Vec<(Decompressor, Vec<u8>)>> = RefCell::new(
+        paths()
+            .iter()
+            .map(|(opts, _)| (Decompressor::with_options(opts), Vec::new()))
+            .collect(),
     );
 }
 
 /// `frame` decoded with `dict` by the reused decompressor of path `k`.
 fn reused(k: usize, frame: &[u8], dict: Option<&DecodeDict>) -> Result<Vec<u8>, String> {
-    REUSED.with_borrow_mut(|d| match dict {
-        Some(dict) => d[k].decompress_with_dict(frame, dict),
-        None => d[k].decompress(frame),
+    REUSED.with_borrow_mut(|r| match dict {
+        Some(dict) => r[k].0.decompress_with_dict(frame, dict),
+        None => r[k].0.decompress(frame),
+    })
+}
+
+/// `reused`, decoded into the reused buffer of path `k`.
+fn reused_into(k: usize, frame: &[u8], dict: Option<&DecodeDict>) -> Result<Vec<u8>, String> {
+    REUSED.with_borrow_mut(|r| {
+        let (d, dst) = &mut r[k];
+        let got = match dict {
+            Some(dict) => d.decompress_into_with_dict(frame, dict, dst),
+            None => d.decompress_into(frame, dst),
+        };
+        common::into_result(got, dst)
     })
 }
 
@@ -234,6 +249,7 @@ fn assert_decodes(what: &str, frame: &[u8], dict: &DecodeDict, src: &[u8]) {
         for (got, how) in [
             (decompress_with_dict_options(frame, Some(dict), &opts), ""),
             (reused(k, frame, Some(dict)), ", reused"),
+            (reused_into(k, frame, Some(dict)), ", reused into"),
         ] {
             match got {
                 Ok(out) => assert!(out == src, "{what} ({path}{how}): wrong output"),
@@ -250,6 +266,7 @@ fn assert_rejects(what: &str, frame: &[u8], dict: Option<&DecodeDict>, want: &st
         for (got, how) in [
             (decompress_with_dict_options(frame, dict, &opts), ""),
             (reused(k, frame, dict), ", reused"),
+            (reused_into(k, frame, dict), ", reused into"),
         ] {
             match got {
                 Ok(_) => panic!("{what} ({path}{how}): decoded"),

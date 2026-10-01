@@ -389,22 +389,40 @@ pub fn stream_room(chunk: usize) -> usize {
 }
 
 thread_local! {
-    /// A serial decompressor per SIMD level for every
-    /// `assert_stream_parity_at` call on the thread, so each input decodes
-    /// with the tables and buffers the inputs before it, rejected ones
-    /// included, left.
-    static REUSED: RefCell<[Decompressor; 2]> = RefCell::new([false, true].map(|simd| {
-        Decompressor::with_options(&DecodeOptions {
+    /// A serial decompressor per SIMD level, and the buffer its
+    /// `decompress_into` calls fill, for every `assert_stream_parity_at`
+    /// call on the thread, so each input decodes with the tables and
+    /// buffers the inputs before it, rejected ones included, left.
+    static REUSED: RefCell<[(Decompressor, Vec<u8>); 2]> = RefCell::new([false, true].map(|simd| {
+        let d = Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd,
-        })
+        });
+        (d, Vec::new())
     }));
+}
+
+/// A `decompress_into` result and the `dst` it left, as the result
+/// `decompress` gives, checking that a failed call leaves `dst` empty.
+pub fn into_result(got: Result<(), String>, dst: &[u8]) -> Result<Vec<u8>, String> {
+    match got {
+        Ok(()) => Ok(dst.to_vec()),
+        Err(e) => {
+            assert!(
+                dst.is_empty(),
+                "failed decompress_into left {} bytes",
+                dst.len()
+            );
+            Err(e)
+        }
+    }
 }
 
 /// `decompress_streaming` of `input` at each of `chunks`, with as much
 /// output room up to 64 KiB, has the outcome of `decompress_with_options`,
 /// serial, at both SIMD levels: the same content or the same error. So
-/// does `Decompressor::decompress` on a decompressor every call reuses.
+/// does `Decompressor::decompress` on a decompressor every call reuses,
+/// and its `decompress_into` into a buffer every call reuses.
 pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
     fn outcome(r: &Result<Vec<u8>, String>) -> String {
         match r {
@@ -418,11 +436,22 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
             simd,
         };
         let want = decompress_with_options(input, &opts);
-        let reused = REUSED.with_borrow_mut(|d| d[usize::from(simd)].decompress(input));
+        let (reused, into) = REUSED.with_borrow_mut(|r| {
+            let (d, dst) = &mut r[usize::from(simd)];
+            let reused = d.decompress(input);
+            let into = d.decompress_into(input, dst);
+            (reused, into_result(into, dst))
+        });
         assert!(
             reused == want,
             "{name} simd={simd}: a reused decompressor gives {} where one-shot gives {}",
             outcome(&reused),
+            outcome(&want)
+        );
+        assert!(
+            into == want,
+            "{name} simd={simd}: decompress_into gives {} where one-shot gives {}",
+            outcome(&into),
             outcome(&want)
         );
         for &chunk in chunks {
