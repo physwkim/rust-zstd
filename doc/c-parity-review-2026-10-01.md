@@ -81,7 +81,7 @@ Impact: "One-shot libzstd" is not a single accept/reject function here: the same
 
 Decided 2026-10-01: the port keeps the strict verdict.
 
-### R1-6: [libzstd] X2's last-symbol step consumes both symbols' bits of a 2-symbol cell, so a stream carrying one extra symbol passes the end check that X1 fails (our port copied this)
+### R1-6: [libzstd] X2's last-symbol step consumes both symbols' bits of a 2-symbol cell, so a stream carrying one extra symbol passes the end check that X1 fails
 
 Severity: Low
 
@@ -95,8 +95,6 @@ Rust: `src/decode.rs:1897-1914` — `huf_decode_last_symbol_x2` writes one symbo
 C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` runs `BIT_skipBits(DStream, dt[val].nbBits)` for `length != 1`, and clamps to 64 with the comment "ugly hack; works only because it's the last symbol". `BIT_endOfDStream` then passes (`:1373`, `:1495`). X1's `HUF_decodeSymbolX1` consumes only the symbol's own bits, and the X1 body rejects the same shape (`:592`, `:692`). The choice between the two comes from the timing heuristic `HUF_selectDecoder` (`:1821-1843`, used at `:1930`).
 
 Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
-
-Decided 2026-10-01 (revised): the port fixes it. A Huffman stream must be consumed exactly (RFC 8878 §4.2.2), whichever of X1 and X2 decodes it.
 
 ### R1-10: [libzstd] `ZSTD_deriveSeqStoreChunk` keeps a long length that sits exactly at the chunk end
 
@@ -251,7 +249,7 @@ Impact: proven by probe (`p3`, `p1`).
 
 libzstd gives one RFC-invalid frame two verdicts depending on the API, and a 4-byte RLE block expands to 2 MiB instead of the RFC's 128 KiB.
 
-### R2-3: [libzstd+port] X2's last-symbol step accepts a Huffman stream that ran out one symbol early, and the made-up byte depends on how libzstd was built
+### R2-3: [libzstd] X2's last-symbol step accepts a Huffman stream that ran out one symbol early, and the made-up byte depends on how libzstd was built
 
 Severity: Medium
 
@@ -278,8 +276,6 @@ The one sampled case per class has this shape: the same exhausted stream lands o
 
 So libzstd gives one frame three outcomes: BMI2 x86-64, non-BMI2 x86-64, and 32-bit. The port matches only the second, so on BMI2 hosts and on i686 it returns different bytes, or the opposite verdict, from the system libzstd. This is the missing-symbol counterpart of R1-6 (one extra symbol). R1-4's verdict split does not cover the case where both return Ok with different bytes.
 
-Port: copies the 64-bit body path. To be fixed with R1-6.
-
 ### R2-4: [libzstd] Match offsets at or beyond Window_Size are accepted as long as they stay inside the frame
 
 Severity: Low
@@ -304,7 +300,7 @@ C reference: `decompress/zstd_decompress.c:1319-1336` — when `cBlockSize == 0`
 
 Impact: proven by probe (`p4`) on a frame whose only block is a last `Compressed` block of size 0. One-shot libzstd returns `Data corruption detected`, streaming libzstd returns `Ok(0)`, and Rust returns Err. Only the streaming API goes against the RFC.
 
-### R2-6: [libzstd+port] 4-stream Huffman literals with Regenerated_Size 4 are rejected, although the RFC's (1,1,1,1) split is valid
+### R2-6: [libzstd] 4-stream Huffman literals with Regenerated_Size 4 are rejected, although the RFC's (1,1,1,1) split is valid
 
 Severity: Low
 
@@ -316,9 +312,7 @@ C reference: `decompress/zstd_decompress_block.c:187-190` — `litSize < MIN_LIT
 
 Impact: proven by probe (`p9`). Size_Format 01 with Regenerated_Size 4 and four 1-byte streams, each holding one 1-bit symbol, is rejected by libzstd (one-shot and streaming) and by Rust. Sizes 6, 7 and 9 (last stream 0 or 1 byte) are `Ok` everywhere. An RFC-valid frame of this shape from another encoder is rejected by both.
 
-Port: copies libzstd. To be fixed (RFC decoder rule): Regenerated_Size 4 is accepted.
-
-### R2-7: [libzstd+port] Huffman trees with a 12-bit maximum code length are accepted; RFC 8878 caps codes at 11 bits
+### R2-7: [libzstd] Huffman trees with a 12-bit maximum code length are accepted; RFC 8878 caps codes at 11 bits
 
 Severity: Low
 
@@ -329,8 +323,6 @@ Rust: `src/decode.rs:58-59` — `HUF_TABLELOG_MAX: u32 = 12`, with the comment "
 C reference: `common/huf.h:37` — `HUF_TABLELOG_MAX 12`. `common/entropy_common.c:280` and `:288` — `HUF_readStats_body` only rejects weights or a tableLog above 12. RFC 8878 §4.2.1: "This specification limits the maximum code length to 11 bits."
 
 Impact: proven by probe (`p6`). Direct weights 12..1 with an implied last weight of 1 (sum 4096, Max_Number_of_Bits 12) decode to `Ok(7)` in one-shot libzstd, streaming libzstd and all Rust paths, the same as the 11-bit control. This row is only for the upstream list; the port side is already covered by a user decision.
-
-Port: copies libzstd. To be fixed (RFC decoder rule): Max_Number_of_Bits 12 is rejected.
 
 ### R2-10: [libzstd] `ZSTD_resetCCtx_internal` subtracts two NULL pointers on a CCtx's first use
 
