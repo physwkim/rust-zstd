@@ -1,7 +1,10 @@
 //! Decoder dictionaries (RFC 8878 §5; libzstd zstd_ddict.c and
 //! ZSTD_loadDEntropy of zstd_decompress.c).
 
-use super::{DecoderScratch, FSEScratch, HuffmanScratch, HuffmanTable, ModeType, SEQ_TABLES};
+use super::{
+    DecoderScratch, FSEScratch, FSETable, HuffmanScratch, HuffmanTable, ModeType, SEQ_TABLES,
+};
+use std::sync::Arc;
 
 /// Magic_Number of a formatted dictionary (RFC 8878 line 1809).
 const DICT_MAGIC: u32 = 0xEC30_A437;
@@ -24,7 +27,7 @@ const DICT_MAGIC: u32 = 0xEC30_A437;
 pub struct DecodeDict {
     id: u32,
     content: Vec<u8>,
-    entropy: Option<Box<DictEntropy>>,
+    entropy: Option<Arc<DictEntropy>>,
 }
 
 /// The entropy section of a formatted dictionary, as the tables a frame's
@@ -59,7 +62,7 @@ impl DecodeDict {
         Ok(DecodeDict {
             id,
             content: dict[used..].to_vec(),
-            entropy: Some(Box::new(entropy)),
+            entropy: Some(Arc::new(entropy)),
         })
     }
 
@@ -75,8 +78,8 @@ impl DecodeDict {
         &self.content
     }
 
-    pub(super) fn entropy(&self) -> Option<&DictEntropy> {
-        self.entropy.as_deref()
+    pub(super) fn entropy(&self) -> Option<&Arc<DictEntropy>> {
+        self.entropy.as_ref()
     }
 }
 
@@ -136,12 +139,28 @@ fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), String> {
 
 impl DecoderScratch {
     /// Start a frame from the dictionary's tables and repeat offsets
-    /// (ZSTD_copyDDictParameters with entropyPresent).
-    pub(super) fn load_dict(&mut self, e: &DictEntropy) {
-        self.huf.table.copy_from(&e.huf.table);
-        for t in 0..3 {
-            self.fse.table_mut(t).copy_from(e.fse.table(t));
-        }
+    /// (ZSTD_copyDDictParameters with entropyPresent): its tables stay in
+    /// use until a block builds its own.
+    pub(super) fn load_dict(&mut self, e: &Arc<DictEntropy>) {
+        self.dict = Some(Arc::clone(e));
+        self.huf_from_dict = true;
+        self.fse_from_dict = [true; 3];
         self.offset_hist = e.rep;
+    }
+
+    /// The Huffman table Treeless literals would use now.
+    pub(super) fn huf_table(&self) -> &HuffmanTable {
+        match &self.dict {
+            Some(d) if self.huf_from_dict => &d.huf.table,
+            _ => &self.huf.table,
+        }
+    }
+
+    /// The `SEQ_TABLES[t]` table Repeat mode would use now.
+    pub(super) fn fse_table(&self, t: usize) -> &FSETable {
+        match &self.dict {
+            Some(d) if self.fse_from_dict[t] => d.fse.table(t),
+            _ => self.fse.table(t),
+        }
     }
 }

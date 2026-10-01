@@ -47,9 +47,11 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+use std::sync::Arc;
 
 mod dict;
 pub use dict::DecodeDict;
+use dict::DictEntropy;
 
 // ============================================================
 // Constants
@@ -2427,6 +2429,14 @@ struct DecoderScratch {
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
+    /// The dictionary tables the frame started with (`load_dict`), shared
+    /// rather than copied, as libzstd points its DCtx at the DDict's.
+    dict: Option<Arc<DictEntropy>>,
+    /// The Huffman table in use is `dict`'s, not `huf`'s: true from
+    /// `load_dict` until a block of the frame builds one.
+    huf_from_dict: bool,
+    /// The same for the LL, OF, ML tables (`SEQ_TABLES` order).
+    fse_from_dict: [bool; 3],
 }
 
 impl DecoderScratch {
@@ -2442,12 +2452,18 @@ impl DecoderScratch {
             },
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
+            dict: None,
+            huf_from_dict: false,
+            fse_from_dict: [false; 3],
         }
     }
 
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
+        self.dict = None;
+        self.huf_from_dict = false;
+        self.fse_from_dict = [false; 3];
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
@@ -2741,6 +2757,7 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader,
 fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2754,14 +2771,17 @@ fn decode_literals(
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            decompress_literals(section, scratch, source, target)
+            decompress_literals(section, scratch, repeat, source, target)
         }
     }
 }
 
+/// Compressed literals build `scratch`'s table; Treeless ones use `repeat`
+/// when given, else `scratch`'s.
 fn decompress_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
@@ -2776,28 +2796,24 @@ fn decompress_literals(
     let source = &source[0..compressed_size];
     let mut bytes_read = 0usize;
 
-    match section.ls_type {
+    let table = match section.ls_type {
         LiteralsSectionType::Compressed => {
             bytes_read += scratch
                 .table
                 .build_decoder(source, regenerated_size, num_streams == 4)?
                 as usize;
+            &scratch.table
         }
-        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
-            return Err("Uninitialized Huffman table for treeless literals".to_string());
-        }
-        _ => {}
+        _ => repeat.unwrap_or(&scratch.table),
+    };
+    if table.max_num_bits == 0 {
+        return Err("Uninitialized Huffman table for treeless literals".to_string());
     }
 
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    huf_decompress(
-        &mut target[start..],
-        source,
-        num_streams == 4,
-        &scratch.table,
-    )?;
+    huf_decompress(&mut target[start..], source, num_streams == 4, table)?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
@@ -2942,10 +2958,13 @@ impl FSEScratch {
 
 /// Build (or reuse) the three FSE tables for this block's sequences and
 /// return the number of header bytes consumed (ZSTD_decodeSeqHeaders).
+/// Repeat mode keeps a table `from_dict` names in use; any other mode
+/// builds `scratch`'s and clears `from_dict`.
 fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
+    from_dict: &mut [bool; 3],
 ) -> Result<usize, String> {
     let modes = section
         .modes
@@ -2953,12 +2972,16 @@ fn build_sequence_tables(
 
     let mut bytes_read = 0;
     for (t, mode) in modes.all().into_iter().enumerate() {
-        bytes_read += build_sequence_table(
-            mode,
-            &source[bytes_read..],
-            scratch.table_mut(t),
-            &SEQ_TABLES[t],
-        )?;
+        let repeat = matches!(mode, ModeType::Repeat);
+        if !(repeat && from_dict[t]) {
+            bytes_read += build_sequence_table(
+                mode,
+                &source[bytes_read..],
+                scratch.table_mut(t),
+                &SEQ_TABLES[t],
+            )?;
+        }
+        from_dict[t] &= repeat;
     }
     Ok(bytes_read)
 }
@@ -3162,7 +3185,8 @@ fn execute_avx2<W: WildCopy, S: BlockSequences>(
 struct SeqInput<'a> {
     num_sequences: u32,
     bit_stream: &'a [u8],
-    fse: &'a FSEScratch,
+    /// LL, OF, ML tables (`SEQ_TABLES` order).
+    fse: [&'a FSETable; 3],
     literals: &'a [u8],
 }
 
@@ -3231,12 +3255,13 @@ unsafe fn run_sequences<W: WildCopy>(
         fse,
         literals,
     } = seqs;
-    let ll_dt = fse.literal_lengths.decode();
-    let of_dt = fse.offsets.decode();
-    let ml_dt = fse.match_lengths.decode();
-    let ll_log = u32::from(fse.literal_lengths.accuracy_log);
-    let of_log = u32::from(fse.offsets.accuracy_log);
-    let ml_log = u32::from(fse.match_lengths.accuracy_log);
+    let [ll_t, of_t, ml_t] = fse;
+    let ll_dt = ll_t.decode();
+    let of_dt = of_t.decode();
+    let ml_dt = ml_t.decode();
+    let ll_log = u32::from(ll_t.accuracy_log);
+    let of_log = u32::from(of_t.accuracy_log);
+    let ml_log = u32::from(ml_t.accuracy_log);
     // The state lookups below are unchecked: an initial state is
     // `accuracy_log` bits, and every cell of a table built by
     // `build_decoding_table` or `build_rle` satisfies
@@ -4099,14 +4124,16 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
 }
 
 /// Decode the block's literals into `target` (cleared first) and append
-/// `WILDCOPY_OVERLENGTH` bytes of slack.
+/// `WILDCOPY_OVERLENGTH` bytes of slack. Treeless literals use `repeat`
+/// when given, else `huf`'s table.
 fn decode_block_literals(
     parts: &BlockParts<'_>,
     huf: &mut HuffmanScratch,
+    repeat: Option<&HuffmanTable>,
     target: &mut Vec<u8>,
 ) -> Result<(), String> {
     target.clear();
-    let used = decode_literals(&parts.literals, huf, parts.literals_src, target)?;
+    let used = decode_literals(&parts.literals, huf, repeat, parts.literals_src, target)?;
     assert!(
         parts.literals.regenerated_size == target.len() as u32,
         "Wrong number of literals: {}, Should have been: {}",
@@ -4127,22 +4154,37 @@ fn decompress_block(
     simd: Level,
 ) -> Result<(), String> {
     let parts = split_block(raw, block_size_max)?;
-    decode_block_literals(&parts, &mut workspace.huf, &mut workspace.literals_buffer)?;
+    let dict = workspace.dict.as_deref();
+    let repeat = dict
+        .filter(|_| workspace.huf_from_dict)
+        .map(|d| &d.huf.table);
+    decode_block_literals(
+        &parts,
+        &mut workspace.huf,
+        repeat,
+        &mut workspace.literals_buffer,
+    )?;
+    workspace.huf_from_dict &= !matches!(parts.literals.ls_type, LiteralsSectionType::Compressed);
     let literals_len = workspace.literals_buffer.len() - WILDCOPY_OVERLENGTH;
     let seq_section = parts.sequences;
     let raw = parts.sequences_src;
 
     if seq_section.num_sequences != 0 {
-        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse)?;
+        let from_dict = &mut workspace.fse_from_dict;
+        let table_bytes = build_sequence_tables(&seq_section, raw, &mut workspace.fse, from_dict)?;
+        let fse: [&FSETable; 3] = std::array::from_fn(|t| match dict {
+            Some(d) if from_dict[t] => d.fse.table(t),
+            _ => workspace.fse.table(t),
+        });
         let seqs = SeqInput {
             num_sequences: seq_section.num_sequences,
             bit_stream: &raw[table_bytes..],
-            fse: &workspace.fse,
+            fse,
             literals: &workspace.literals_buffer,
         };
         execute_with_copies(
             simd,
-            &workspace.fse.offsets,
+            fse[1],
             seqs,
             &mut workspace.offset_hist,
             block_size_max,
@@ -4225,9 +4267,9 @@ mod parallel {
         start: &DecoderScratch,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = (start.huf.table.max_num_bits != 0).then_some(START);
+        let mut huf_def = (start.huf_table().max_num_bits != 0).then_some(START);
         let mut fse_def: [Option<usize>; 3] =
-            std::array::from_fn(|t| (!start.fse.table(t).decode().is_empty()).then_some(START));
+            std::array::from_fn(|t| (!start.fse_table(t).decode().is_empty()).then_some(START));
         loop {
             let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
             *pos += header_len;
@@ -4362,7 +4404,7 @@ mod parallel {
                 slot.huf_from = None;
             } else if d == START {
                 if slot.huf_from != Some(d) {
-                    slot.huf.table.copy_from(&start.huf.table);
+                    slot.huf.table.copy_from(start.huf_table());
                     slot.huf_from = Some(d);
                 }
             } else if slot.huf_from != Some(d) {
@@ -4379,7 +4421,7 @@ mod parallel {
                 slot.huf_from = Some(d);
             }
         }
-        decode_block_literals(&plan.parts, &mut slot.huf, &mut slot.literals)?;
+        decode_block_literals(&plan.parts, &mut slot.huf, None, &mut slot.literals)?;
         if plan.huf_def == Some(i) {
             slot.huf_from = Some(i);
         }
@@ -4414,7 +4456,7 @@ mod parallel {
             } else if slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
                 if d == START {
-                    slot.fse.table_mut(t).copy_from(start.fse.table(t));
+                    slot.fse.table_mut(t).copy_from(start.fse_table(t));
                 } else {
                     build_table_from(compressed(&plans[d]), t, slot.fse.table_mut(t))?;
                 }
