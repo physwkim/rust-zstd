@@ -11,6 +11,6 @@ mod xxhash;
 
 pub use compress::{
     compress, compress_to_vec, compress_with, CompressError, CompressOptions, Compressor,
-    ParamSwitch,
+    EndDirective, ParamSwitch,
 };
 pub use decode::decompress;

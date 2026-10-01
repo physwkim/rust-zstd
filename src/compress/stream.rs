@@ -1,0 +1,405 @@
+//! Streaming compression: `ZSTD_compressStream2` over the one-shot frame
+//! driver.
+//!
+//! A streaming frame is one job on one context, started by the same
+//! [`Context::reset`] and [`begin_job`] as a one-shot frame's job 0 and
+//! cut into blocks by the same resumable [`compress_blocks`]. Its input
+//! collects in a buffer that holds the window before the next block plus
+//! the input not yet compressed; `Continue` compresses only the blocks no
+//! later input can change, so a frame without `Flush` is the one-shot
+//! frame of the same input and pledged size, however the input is cut.
+//! `Flush` ends a chunk (`ZSTD_compressContinue`): no block crosses it.
+//!
+//! libzstd keeps `windowSize + blockSize` of input in a ring (`inBuff`)
+//! and reaches the bytes before the wrap as an `extDict` segment. The
+//! finders here address one contiguous slice, so the buffer instead keeps
+//! up to twice that and, when full, moves its last window down to the
+//! start ([`Context::rebase`] keeps every index): one extra copy of the
+//! input, amortized, and the same matches as the one-shot frame.
+
+use super::block::{self, InputEnd, JobBlocks};
+use super::{
+    begin_job, block_sizing, multithreaded, split, write_epilogue, write_frame_header,
+    write_raw_block, CommittedBlockState, CompressError, CompressOptions, Compressor, Context,
+    JobLdm,
+};
+use crate::xxhash::Xxh64;
+
+/// `ZSTD_EndDirective`: what a [`Compressor::compress_stream`] call does
+/// once its input is consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndDirective {
+    /// `ZSTD_e_continue`: compress what can be, buffer the rest.
+    Continue,
+    /// `ZSTD_e_flush`: compress and emit everything buffered, ending the
+    /// current block early.
+    Flush,
+    /// `ZSTD_e_end`: flush and end the frame (last block, checksum); the
+    /// next call starts a new frame.
+    End,
+}
+
+/// The streaming session of a [`Compressor`].
+#[derive(Default)]
+pub(super) struct Session {
+    /// `pledgedSrcSizePlusOne - 1` for the next frame; reset when a frame
+    /// ends.
+    pledged: Option<u64>,
+    stage: Stage,
+    /// Compressed bytes `out[flushed..]` not yet copied to the caller.
+    out: Vec<u8>,
+    flushed: usize,
+}
+
+#[derive(Default)]
+enum Stage {
+    /// `zcss_init`: no frame; the next call starts one.
+    #[default]
+    Idle,
+    /// A frame is in progress.
+    Frame(Box<Frame>),
+    /// The frame is complete; `out` may still hold its tail.
+    Ended,
+    /// A call failed; the frame is abandoned until
+    /// [`Compressor::reset_stream`].
+    Failed,
+}
+
+impl Session {
+    /// Copy pending output into `dst[*dst_pos..]`; whether all of it fit.
+    fn flush_to(&mut self, dst: &mut [u8], dst_pos: &mut usize) -> bool {
+        let n = (dst.len() - *dst_pos).min(self.out.len() - self.flushed);
+        dst[*dst_pos..*dst_pos + n].copy_from_slice(&self.out[self.flushed..self.flushed + n]);
+        *dst_pos += n;
+        self.flushed += n;
+        if self.flushed < self.out.len() {
+            return false;
+        }
+        self.out.clear();
+        self.flushed = 0;
+        true
+    }
+
+    fn pending(&self) -> usize {
+        self.out.len() - self.flushed
+    }
+}
+
+/// The size a frame of `pledged` bytes resolves its parameters for:
+/// `ZSTD_CONTENTSIZE_UNKNOWN` for an unknown one, the row of the largest
+/// inputs without a window shrink.
+fn frame_size(pledged: Option<u64>) -> usize {
+    pledged.map_or(usize::MAX, |p| usize::try_from(p).unwrap_or(usize::MAX))
+}
+
+/// One streaming frame: its context and job state, and the input buffer.
+struct Frame {
+    ctx: Context,
+    /// Single-context long distance matching is on.
+    ldm: bool,
+    split: bool,
+    blocks: JobBlocks,
+    state: CommittedBlockState,
+    checksum: Option<Xxh64>,
+    pledged: Option<u64>,
+    consumed: u64,
+    /// The frame header until the first block is written.
+    header: Option<Vec<u8>>,
+    /// Input: the window before `blocks.next_start()`, then the input not
+    /// yet compressed.
+    buf: Vec<u8>,
+    /// The window size, kept before the next block when the buffer moves.
+    keep: usize,
+    /// The buffer length that moves it.
+    cap: usize,
+    block_size_max: usize,
+}
+
+impl Frame {
+    /// `ZSTD_CCtx_init_compressStream2` on `ctx` for `pledged` bytes, or an
+    /// unknown size: the parameters `ZSTD_compressBegin_internal` resolves
+    /// for it, which a one-shot frame of that size resolves too.
+    fn begin(opts: &CompressOptions, pledged: Option<u64>, mut ctx: Context) -> Self {
+        let size = frame_size(pledged);
+        debug_assert!(!multithreaded(opts, size));
+        let (cparams, ldm_params) = opts.frame_params(size);
+        let mut header = Vec::new();
+        write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum);
+        let sizing = block_sizing(opts, &cparams, false, header.len());
+        let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
+        let frequently = opts.overflow_correct_frequently;
+        let (ms, scratch, _) = ctx.reset(cparams, 0, ldm, size, frequently);
+        let (blocks, state) = begin_job(ms, scratch, &[], 0..0, sizing, true, true);
+        let keep = 1usize << cparams.window_log;
+        Self {
+            ctx,
+            ldm: ldm_params.is_some(),
+            split: split::block_splitter_enabled(opts.split_after_sequences, &cparams),
+            blocks,
+            state,
+            checksum: opts.checksum.then(Xxh64::new),
+            pledged,
+            consumed: 0,
+            header: Some(header),
+            buf: Vec::new(),
+            keep,
+            cap: 2 * (keep + sizing.block_size_max),
+            block_size_max: sizing.block_size_max,
+        }
+    }
+
+    /// Buffer as much of `input` as fits and return how much; a full
+    /// buffer first moves its last window down.
+    fn accept(&mut self, input: &[u8]) -> usize {
+        if self.buf.len() == self.cap {
+            // Only blocks no later input can change are left: at most
+            // `block_size_max + 1` bytes follow the next block start.
+            let shift = self.blocks.next_start() - self.keep;
+            self.buf.copy_within(shift.., 0);
+            self.buf.truncate(self.buf.len() - shift);
+            self.ctx.rebase(shift, self.ldm);
+            self.blocks.rebase(shift);
+        }
+        let take = input.len().min(self.cap - self.buf.len());
+        let input = &input[..take];
+        if self.buf.capacity() < self.buf.len() + take {
+            let want = (2 * self.buf.capacity()).clamp(self.buf.len() + take, self.cap);
+            self.buf.reserve_exact(want - self.buf.len());
+        }
+        self.buf.extend_from_slice(input);
+        if let Some(checksum) = &mut self.checksum {
+            checksum.update(input);
+        }
+        self.consumed += take as u64;
+        take
+    }
+
+    /// Whether buffered input is not yet compressed.
+    fn holds_input(&self) -> bool {
+        self.blocks.next_start() < self.buf.len()
+    }
+
+    /// `ZSTD_nextInputSizeHint`: the input that would complete the next
+    /// block.
+    fn input_hint(&self) -> usize {
+        let held = self.buf.len() - self.blocks.next_start();
+        (self.block_size_max + 1).saturating_sub(held).max(1)
+    }
+
+    /// Compress the blocks of the buffered input that `input` makes ready,
+    /// the frame header before the first.
+    fn compress(&mut self, input: InputEnd, out: &mut Vec<u8>) {
+        if !self.blocks.has_ready(input) {
+            return;
+        }
+        if let Some(header) = self.header.take() {
+            out.extend_from_slice(&header);
+        }
+        #[cfg(feature = "parallel")]
+        let _in_job = super::InJob::enter();
+        let (ms, scratch, mut ldm) = self.ctx.resume(self.ldm);
+        block::compress_blocks(
+            ms,
+            &self.buf,
+            &mut self.blocks,
+            input,
+            self.split,
+            &mut self.state,
+            scratch,
+            &mut ldm,
+            out,
+            cfg!(feature = "parallel"),
+        );
+    }
+
+    /// `ZSTD_compressEnd`'s size control: the input is not the pledged
+    /// size.
+    fn size_wrong(&self) -> Option<CompressError> {
+        let pledged = self.pledged.filter(|&p| p != self.consumed)?;
+        let consumed = self.consumed;
+        Some(CompressError::SrcSizeWrong { pledged, consumed })
+    }
+
+    /// `ZSTD_compressEnd`: the buffered input as the frame's last blocks,
+    /// or, with none left, `ZSTD_writeEpilogue`'s empty last block; then
+    /// the checksum. Returns the context.
+    fn finish(mut self, out: &mut Vec<u8>) -> Context {
+        let end = InputEnd::JobEnd(self.buf.len());
+        if self.blocks.has_ready(end) {
+            self.compress(end, out);
+        } else {
+            if let Some(header) = self.header.take() {
+                out.extend_from_slice(&header);
+            }
+            write_raw_block(out, &[], true);
+        }
+        write_epilogue(out, self.checksum);
+        self.ctx
+    }
+}
+
+impl Compressor {
+    /// `ZSTD_CCtx_setPledgedSrcSize`: the next frame's input size, written
+    /// to its header and checked as it arrives; `None` (the default) is
+    /// unknown. Only before a frame starts, else
+    /// [`CompressError::StageWrong`].
+    pub fn set_pledged_src_size(&mut self, size: Option<u64>) -> Result<(), CompressError> {
+        match self.stream.stage {
+            Stage::Idle => {
+                self.stream.pledged = size;
+                Ok(())
+            }
+            _ => Err(CompressError::StageWrong),
+        }
+    }
+
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)`: abandon the streaming
+    /// frame in progress, its pending output and the pledged size; the
+    /// options stay.
+    pub fn reset_stream(&mut self) {
+        let session = std::mem::take(&mut self.stream);
+        if let Stage::Frame(frame) = session.stage {
+            self.contexts.give_back(frame.ctx);
+        }
+    }
+
+    /// `ZSTD_compressStream2`: consume `src[*src_pos..]` and write
+    /// compressed bytes to `dst[*dst_pos..]`, advancing both positions.
+    /// The first call of a frame starts it with the pledged size
+    /// ([`Compressor::set_pledged_src_size`]); a first call with
+    /// [`EndDirective::End`] compresses its whole input as one frame, as
+    /// [`Compressor::compress`] does, and that is the pledged size.
+    ///
+    /// Returns, for `Flush` and `End`, a lower bound of the bytes still to
+    /// write: `0` once the flush, or the frame, is complete, else the call
+    /// is to be repeated with room in `dst`. For `Continue`, the input that
+    /// would complete the next block.
+    ///
+    /// Without `Flush`, the frame is the one [`Compressor::compress`]
+    /// writes for the same input when its size was pledged, however the
+    /// input is cut into calls; without a pledged size, the header has no
+    /// content size and the parameters are those of an unknown size.
+    ///
+    /// Errors: [`CompressError::SrcSizeWrong`] when the input passes the
+    /// pledged size (the call consumes none of it) or ends short of it;
+    /// [`CompressError::Unsupported`] for a `job_size` frame that is not
+    /// one first `End` call or pledged at most `JOBSIZE_MIN`
+    /// (multithreaded streaming is not implemented). After an error every
+    /// call returns [`CompressError::StageWrong`] until
+    /// [`Compressor::reset_stream`].
+    ///
+    /// Panics if a position is past its buffer's end.
+    pub fn compress_stream(
+        &mut self,
+        src: &[u8],
+        src_pos: &mut usize,
+        dst: &mut [u8],
+        dst_pos: &mut usize,
+        end_op: EndDirective,
+    ) -> Result<usize, CompressError> {
+        assert!(*src_pos <= src.len(), "src_pos past src");
+        assert!(*dst_pos <= dst.len(), "dst_pos past dst");
+        let result = self.stream_loop(src, src_pos, dst, dst_pos, end_op);
+        if result.is_err() {
+            if let Stage::Frame(frame) = std::mem::replace(&mut self.stream.stage, Stage::Failed) {
+                self.contexts.give_back(frame.ctx);
+            }
+        }
+        result
+    }
+
+    fn stream_loop(
+        &mut self,
+        src: &[u8],
+        src_pos: &mut usize,
+        dst: &mut [u8],
+        dst_pos: &mut usize,
+        end_op: EndDirective,
+    ) -> Result<usize, CompressError> {
+        loop {
+            if !self.stream.flush_to(dst, dst_pos) {
+                break;
+            }
+            match &mut self.stream.stage {
+                Stage::Failed => return Err(CompressError::StageWrong),
+                Stage::Ended => {
+                    // ZSTD_CCtx_reset(zcs, ZSTD_reset_session_only)
+                    self.stream.stage = Stage::Idle;
+                    self.stream.pledged = None;
+                    if end_op == EndDirective::End && *src_pos == src.len() {
+                        return Ok(0);
+                    }
+                }
+                Stage::Idle if end_op == EndDirective::End => {
+                    // The first call ends the frame: ZSTD_compressEnd over
+                    // the whole input, the one-shot frame (ZSTD_compress2).
+                    let rest = &src[*src_pos..];
+                    if let Some(pledged) = self.stream.pledged.filter(|&p| p != rest.len() as u64) {
+                        let consumed = rest.len() as u64;
+                        return Err(CompressError::SrcSizeWrong { pledged, consumed });
+                    }
+                    let mut out = std::mem::take(&mut self.stream.out);
+                    self.compress_frame(rest, &mut out);
+                    self.stream.out = out;
+                    *src_pos = src.len();
+                    self.stream.stage = Stage::Ended;
+                }
+                Stage::Idle => {
+                    if multithreaded(&self.opts, frame_size(self.stream.pledged)) {
+                        let what = "job_size streaming over JOBSIZE_MIN or of unknown size";
+                        return Err(CompressError::Unsupported(what));
+                    }
+                    self.contexts.expand(1);
+                    let ctx = self.contexts.take();
+                    let frame = Frame::begin(&self.opts, self.stream.pledged, ctx);
+                    self.stream.stage = Stage::Frame(Box::new(frame));
+                }
+                Stage::Frame(frame) => {
+                    let out = &mut self.stream.out;
+                    if *src_pos < src.len() {
+                        let rest = src.len() - *src_pos;
+                        if let Some(pledged) =
+                            frame.pledged.filter(|&p| frame.consumed + rest as u64 > p)
+                        {
+                            let consumed = frame.consumed + rest as u64;
+                            return Err(CompressError::SrcSizeWrong { pledged, consumed });
+                        }
+                        *src_pos += frame.accept(&src[*src_pos..]);
+                        frame.compress(InputEnd::Open(frame.buf.len()), out);
+                        continue;
+                    }
+                    match end_op {
+                        EndDirective::Continue => break,
+                        EndDirective::Flush if frame.holds_input() => {
+                            frame.compress(InputEnd::Chunk(frame.buf.len()), out);
+                        }
+                        EndDirective::Flush => break,
+                        EndDirective::End => {
+                            if let Some(e) = frame.size_wrong() {
+                                return Err(e);
+                            }
+                            let Stage::Frame(frame) =
+                                std::mem::replace(&mut self.stream.stage, Stage::Ended)
+                            else {
+                                unreachable!()
+                            };
+                            let ctx = frame.finish(&mut self.stream.out);
+                            self.contexts.give_back(ctx);
+                        }
+                    }
+                }
+            }
+        }
+        let pending = self.stream.pending();
+        let unconsumed = *src_pos < src.len();
+        Ok(match (&self.stream.stage, end_op) {
+            (Stage::Frame(frame), EndDirective::Continue) if pending == 0 => frame.input_hint(),
+            (Stage::Frame(_), EndDirective::End) => pending.max(1),
+            (Stage::Frame(frame), EndDirective::Flush) if unconsumed || frame.holds_input() => {
+                pending.max(1)
+            }
+            _ if unconsumed => pending.max(1),
+            _ => pending,
+        })
+    }
+}
