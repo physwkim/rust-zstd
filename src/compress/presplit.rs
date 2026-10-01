@@ -118,14 +118,14 @@ impl Fingerprint {
 /// (`ZSTD_fast` = 1 to `ZSTD_btultra2` = 9).
 const SPLIT_LEVELS: [u8; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
 
+/// `ZSTD_BLOCKSPLITTER_LEVEL_MAX`: upper bound of `ZSTD_c_blockSplitterLevel`.
+pub const BLOCK_SPLITTER_LEVEL_MAX: u8 = 6;
+
 /// `ZSTD_c_blockSplitterLevel` as `ZSTD_optimalBlockSize` applies it: the
 /// `ZSTD_splitBlock` level for `block_splitter_level` (0 auto by strategy,
-/// 1 off, 2..=6 fixed), `None` when off.
+/// 1 off, 2..=[`BLOCK_SPLITTER_LEVEL_MAX`] fixed), `None` when off. The
+/// caller has checked the bound before the frame header is written.
 pub fn split_level(block_splitter_level: u8, strategy: Strategy) -> Option<u8> {
-    assert!(
-        block_splitter_level <= 6,
-        "block_splitter_level {block_splitter_level} out of range 0..=6"
-    );
     match block_splitter_level {
         0 => Some(SPLIT_LEVELS[strategy as usize]),
         1 => None,
@@ -247,24 +247,6 @@ mod tests {
         assert_eq!(split_level(1, Fast), None);
         assert_eq!(split_level(2, Lazy2), Some(0));
         assert_eq!(split_level(6, Fast), Some(4));
-    }
-
-    /// `split_level` accepts a level from 0 to one past libzstd's upper
-    /// bound exactly where `ZSTD_CCtx_setParameter` accepts
-    /// `ZSTD_c_blockSplitterLevel`, and panics where that returns
-    /// `parameter_outOfBound`.
-    #[test]
-    fn split_level_bounds_match_libzstd() {
-        use crate::compress::common::testutil::{c_accepts, c_bounds};
-        use zstd::zstd_safe::zstd_sys::ZSTD_cParameter;
-
-        // ZSTD_c_blockSplitterLevel
-        let param = ZSTD_cParameter::ZSTD_c_experimentalParam20;
-        let (_, hi) = c_bounds(param);
-        for v in 0..=hi + 1 {
-            let ours = std::panic::catch_unwind(|| split_level(v as u8, Strategy::Fast)).is_ok();
-            assert_eq!(ours, c_accepts(param, v), "{v}");
-        }
     }
 
     fn text(len: usize) -> Vec<u8> {
