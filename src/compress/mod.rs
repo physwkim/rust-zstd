@@ -31,7 +31,7 @@ use crate::constants::*;
 use crate::xxhash::Xxh64;
 use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
-    ZSTD_BLOCKHEADERSIZE,
+    InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
 };
 use lazy::default_search_method;
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
@@ -623,8 +623,17 @@ fn compress_job(
     let mut state = CommittedBlockState::new(initial);
     scratch.reserve(sizing.block_size_max);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
+    let mut blocks = JobBlocks::new(sizing, job.start, first_job, last_job);
     block::compress_blocks(
-        ms, data, job, sizing, first_job, last_job, split, &mut state, scratch, &mut ldm, out,
+        ms,
+        data,
+        &mut blocks,
+        InputEnd::JobEnd(job.end),
+        split,
+        &mut state,
+        scratch,
+        &mut ldm,
+        out,
         pipelined,
     );
 }
