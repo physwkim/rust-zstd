@@ -145,10 +145,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 /// `decompress` with dictionary `dict` (ZSTD_decompress_usingDict): every
 /// frame starts from its tables and repeat offsets, and its content is the
 /// history before every frame (ZSTD_refDictContent; RFC 8878 lines
-/// 1835-1837), within Window_Size. A frame that names another nonzero
-/// Dictionary_ID is an error
-/// (dictionary_wrong); one with no Dictionary_ID is decoded with `dict`
-/// too.
+/// 1835-1837). A match may reach it past Window_Size while the frame has
+/// decoded at most Window_Size bytes (lines 1838-1844). A frame that names
+/// another nonzero Dictionary_ID is an error (dictionary_wrong); one with
+/// no Dictionary_ID is decoded with `dict` too.
 ///
 /// RFC 8878 lines 442-443 make a frame naming an unregistered ID in the
 /// reserved ranges an error. That is not enforced: registration cannot be
@@ -4426,7 +4426,7 @@ impl VecOut<'_> {
         ExtHistory {
             end: self.dict.as_ptr_range().end,
             len: self.dict.len(),
-            dict: false,
+            dict: true,
         }
     }
 }
