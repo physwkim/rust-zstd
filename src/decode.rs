@@ -27,7 +27,8 @@
 //! SOFTWARE.
 //! ```
 //!
-//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`
+//! Public API: `decompress(data: &[u8]) -> Result<Vec<u8>, String>`, and
+//! `Decompressor` for input and output in pieces.
 //!
 //! Supports raw blocks, RLE blocks, and compressed blocks with Huffman
 //! literals and FSE sequences. No dictionary support.
@@ -46,6 +47,9 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
+
+mod stream;
+pub use stream::Decompressor;
 
 // ============================================================
 // Constants
@@ -4032,11 +4036,13 @@ impl Frame {
 trait FrameOut {
     /// Make ready for a frame whose matches reach at most `window` bytes
     /// back, and which decodes to `content_size` bytes if that is known.
-    fn start(&mut self, window: usize, content_size: Option<u64>) -> Result<(), String>;
+    /// Neither claim allocates: only what the blocks decode to does.
+    fn start(&mut self, window: usize, content_size: Option<u64>);
 
     /// The destination of the frame's next block and the history before
-    /// its segment, which meet the `Dst` and `ExtHistory` contracts.
-    fn block_dst(&mut self) -> (Dst, ExtHistory);
+    /// its segment, which meet the `Dst` and `ExtHistory` contracts, or an
+    /// error if there is no room for it.
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String>;
 
     /// Take the block written to the last `block_dst` up to `end` (from its
     /// `base`), and return the block's bytes.
@@ -4066,9 +4072,9 @@ impl FrameDecoder {
         }
     }
 
-    /// Between frames, where the input may end.
-    fn between_frames(&self) -> bool {
-        matches!(self.stage, Stage::FrameHeader)
+    /// Inside a skippable frame's User_Data.
+    fn skipping(&self) -> bool {
+        matches!(self.stage, Stage::Skip { .. })
     }
 
     /// The frame whose blocks come next, if they do.
@@ -4156,7 +4162,7 @@ impl FrameDecoder {
         };
         let frame = Frame::new(&header)?;
         self.scratch.get_or_insert_with(DecoderScratch::new).reset();
-        out.start(frame.window, frame.content_size)?;
+        out.start(frame.window, frame.content_size);
         self.stage = Stage::Block(frame);
         Ok(Event::FrameStarted)
     }
@@ -4261,7 +4267,7 @@ fn decode_block(
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
-    let (dst, ext) = out.block_dst();
+    let (dst, ext) = out.block_dst()?;
     // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
     // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
     // bytes (`parse_block_header`), within the room `Dst` has, from input
@@ -4297,19 +4303,18 @@ struct VecOut {
 }
 
 impl FrameOut for VecOut {
-    fn start(&mut self, window: usize, _content_size: Option<u64>) -> Result<(), String> {
+    fn start(&mut self, window: usize, _content_size: Option<u64>) {
         self.prefix = Prefix {
             start: self.output.len(),
             window,
         };
-        Ok(())
     }
 
-    fn block_dst(&mut self) -> (Dst, ExtHistory) {
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
         let dst = self
             .prefix
             .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        (dst, ExtHistory::NONE)
+        Ok((dst, ExtHistory::NONE))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
