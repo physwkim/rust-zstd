@@ -2971,6 +2971,7 @@ impl FSEScratch {
     /// The table blocks decode `SEQ_TABLES[t]` codes with, `dict` being
     /// the tables of the dictionary the frame started from; none yet while
     /// its `decode()` is empty.
+    #[inline]
     fn table<'s>(&'s self, t: usize, dict: Option<&'s FSEScratch>) -> &'s FSETable {
         match (self.source[t], dict) {
             (SeqTableSource::Own, _) => self.own(t),
@@ -2983,6 +2984,7 @@ impl FSEScratch {
     }
 
     /// The LL, OF, ML tables (`SEQ_TABLES` order) blocks decode with.
+    #[inline]
     fn tables<'s>(&'s self, dict: Option<&'s FSEScratch>) -> [&'s FSETable; 3] {
         std::array::from_fn(|t| self.table(t, dict))
     }
