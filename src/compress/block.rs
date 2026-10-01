@@ -635,7 +635,7 @@ impl JobBlocks {
         (chunk_end - offset).min(self.sizing.block_size_max)
     }
 
-    /// Whether `input` makes the next block ready ([`JobBlocks::ready`]).
+    /// Whether `input` makes the next block ready (`JobBlocks::ready`).
     pub fn has_ready(&self, input: InputEnd) -> bool {
         self.ready(self.next_start(), input)
     }
