@@ -1280,10 +1280,6 @@ fn huf_fill_x2_level2(
 // HUF_decompress4X1_usingDTable_internal_body).
 // ------------------------------------------------------------
 
-/// Fewest literals for which the 4-stream layout is legal
-/// (libzstd MIN_LITERALS_FOR_4_STREAMS).
-const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HufStreamStatus {
     /// At least 57 bits are loaded; keep decoding without checks.
@@ -1530,12 +1526,6 @@ impl HufStreams {
                 src.len()
             ));
         }
-        if dst_size < MIN_LITERALS_FOR_4_STREAMS {
-            return Err(format!(
-                "Huffman 4-stream output too small: {} bytes",
-                dst_size
-            ));
-        }
         let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
         let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
         let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
@@ -1544,6 +1534,11 @@ impl HufStreams {
         }
         let istart = [6, 6 + len1, 6 + len1 + len2, 6 + len1 + len2 + len3];
         let iend = [istart[1], istart[2], istart[3], src.len()];
+        // RFC 8878 §3.1.1.3.1.6 (rfc8878.txt:796-799): the first three
+        // streams decode (Regenerated_Size+3)/4 bytes each and the last one
+        // the rest, so a size is valid exactly when that rest is not
+        // negative: 4 splits 1,1,1,1, 5 would leave -1. libzstd's
+        // MIN_LITERALS_FOR_4_STREAMS (6) also rejects 0, 3 and 4 (R2-6).
         let segment = dst_size.div_ceil(4);
         if 3 * segment > dst_size {
             return Err("Huffman 4-stream segments exceed output".to_string());
@@ -5109,6 +5104,49 @@ mod tests {
             sections > 1200 && fast > 300 && mutants_ok > 1000,
             "{sections} sections, {fast} fast, {mutants_ok} mutants accepted"
         );
+    }
+
+    /// 4-stream sections of every Regenerated_Size up to 9 under a code of
+    /// two 1-bit symbols: the RFC's split ((size + 3) / 4 bytes for the
+    /// first three streams, the rest for the last) is valid exactly when
+    /// the rest is not negative, so sizes 1, 2 and 5 fail and 0, 3 and 4
+    /// decode, under X1 and X2 alike (R2-6).
+    #[test]
+    fn huf_four_streams_follow_rfc_split() {
+        // One raw weight: symbol 0 of weight 1, the implied symbol 1 too.
+        let desc = [128u8, 0x10];
+        for size in 0..=9usize {
+            let segment = size.div_ceil(4);
+            let last = size as isize - 3 * segment as isize;
+            let want: Vec<u8> = (0..size).map(|i| (i % 3 == 1) as u8).collect();
+            let mut streams: Vec<Vec<u8>> = Vec::new();
+            for s in 0..4 {
+                let len = if s < 3 { segment } else { last.max(0) as usize };
+                let begin = (s * segment).min(size);
+                // The end mark, then each symbol's 1-bit code, read from
+                // the top bit down.
+                let mut byte = 1u8;
+                for &b in &want[begin..(begin + len).min(size)] {
+                    byte = byte << 1 | b;
+                }
+                streams.push(vec![byte]);
+            }
+            let mut section = desc.to_vec();
+            for st in &streams[..3] {
+                section.extend_from_slice(&(st.len() as u16).to_le_bytes());
+            }
+            for st in &streams {
+                section.extend_from_slice(st);
+            }
+            for x2 in [false, true] {
+                let got = huf_decode_forced(&section, size, true, x2);
+                if last < 0 {
+                    assert!(got.is_err(), "size {size} x2 {x2}");
+                } else {
+                    assert_eq!(got.as_deref(), Ok(&want[..]), "size {size} x2 {x2}");
+                }
+            }
+        }
     }
 
     /// `read_weights` + `weight_stats` against HUF_readStats on libzstd's
