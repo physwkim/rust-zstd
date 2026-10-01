@@ -817,9 +817,10 @@ impl EnteredBlock {
 
 /// The indexed suffix of a raw-content prefix inside the window, more
 /// than [`HASH_READ_SIZE`] positions, its overflow check done and
-/// `next_to_update` at its start. Only [`MatchState::enter_prefix`] makes
-/// one, and the strategies' `load_prefix` take it, so no prefix reaches the
-/// tables without entering the window first.
+/// `next_to_update` at its start. Only [`MatchState::enter_prefix`] and
+/// [`MatchState::enter_dict`] make one, and the strategies' table fills
+/// take it, so no prefix reaches the tables without entering the window
+/// first.
 #[derive(Debug)]
 pub struct EnteredPrefix(Range<usize>);
 

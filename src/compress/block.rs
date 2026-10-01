@@ -12,7 +12,7 @@
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, EnteredBlock, MatchState};
+use super::matchstate::{Block, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -148,6 +148,18 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
     out.extend_from_slice(compressed);
 }
 
+/// `ZSTD_dictTableLoadMethod_e`: which positions of loaded content the
+/// fast and dfast tables get. The other strategies insert every position
+/// either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableLoad {
+    /// `ZSTD_dtlm_fast`: every third position, as a context loads content.
+    Fast,
+    /// `ZSTD_dtlm_full`: also the positions between them where their slot
+    /// is empty, as a CDict loads its content once for many frames.
+    Full,
+}
+
 /// `ZSTD_loadDictionaryContent` for a job's raw-content prefix
 /// ([`super::job_prefix`]): `data[range]` enters the window
 /// ([`MatchState::enter_prefix`]) and its indexed suffix, unless
@@ -156,18 +168,34 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 /// which `window_low` keeps valid. `range` is in positions of `data`,
 /// starting at the window's origin.
 pub fn load_prefix(ms: &mut MatchState, data: &[u8], range: Range<usize>) {
-    let Some(prefix) = ms.enter_prefix(range) else {
-        return;
-    };
+    if let Some(prefix) = ms.enter_prefix(range) {
+        fill_tables(ms, data, prefix, TableLoad::Fast);
+    }
+}
+
+/// [`load_prefix`] for dictionary content, which the window keeps valid
+/// until the input passes the window size ([`MatchState::enter_dict`]),
+/// filling the tables by `load`.
+pub fn load_dict(ms: &mut MatchState, data: &[u8], range: Range<usize>, load: TableLoad) {
+    if let Some(content) = ms.enter_dict(range) {
+        fill_tables(ms, data, content, load);
+    }
+}
+
+/// The strategy's table fill of `ZSTD_loadDictionaryContent` over entered
+/// content.
+fn fill_tables(ms: &mut MatchState, data: &[u8], content: EnteredPrefix, load: TableLoad) {
     let src = ms.view(data);
-    match ms.cparams.strategy {
-        Strategy::Fast => fast::load_prefix(ms, src, prefix),
-        Strategy::DFast => dfast::load_prefix(ms, src, prefix),
-        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
-            lazy::load_prefix(ms, src, prefix)
+    match (ms.cparams.strategy, load) {
+        (Strategy::Fast, TableLoad::Fast) => fast::load_prefix(ms, src, content),
+        (Strategy::Fast, TableLoad::Full) => fast::load_dict_full(ms, src, content),
+        (Strategy::DFast, TableLoad::Fast) => dfast::load_prefix(ms, src, content),
+        (Strategy::DFast, TableLoad::Full) => dfast::load_dict_full(ms, src, content),
+        (Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2, _) => {
+            lazy::load_prefix(ms, src, content)
         }
-        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
-            bt::load_prefix(ms, src, prefix)
+        (Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2, _) => {
+            bt::load_prefix(ms, src, content)
         }
     }
 }
@@ -942,6 +970,36 @@ mod tests {
         assert!(lowest(cap) >= src.len() - cap);
         assert!(lowest(cap - 1) > src.len() - cap);
         assert!(lowest(cap + 1000) < src.len() - cap + 64);
+    }
+
+    /// `ZSTD_dtlm_full` keeps every slot `ZSTD_dtlm_fast` writes, as each
+    /// third position overwrites its slot either way, and gives empty slots
+    /// the positions between them: fast's table and dfast's large one gain
+    /// entries, dfast's small table is unchanged.
+    #[test]
+    fn full_table_load_fills_only_empty_slots() {
+        let data = crate::compress::common::testutil::synthetic_text(100_000, 5);
+        for level in [1, 3] {
+            let cp = CParams::for_level(level, 1 << 20);
+            let load = |how| {
+                let mut ms = MatchState::new(cp, 0);
+                load_dict(&mut ms, &data, 0..data.len(), how);
+                let (hash, chain, _) = ms.tables();
+                (hash.to_vec(), chain.to_vec(), ms.index(0))
+            };
+            let (fast_hash, fast_chain, base) = load(TableLoad::Fast);
+            let (full_hash, full_chain, _) = load(TableLoad::Full);
+            for (&f, &g) in fast_hash.iter().zip(&full_hash) {
+                assert!(f == 0 || f == g, "L{level}: slot {f} became {g}");
+                assert!(
+                    f != 0 || g == 0 || !(g as usize - base).is_multiple_of(3),
+                    "L{level}"
+                );
+            }
+            let count = |t: &[u32]| t.iter().filter(|&&e| e != 0).count();
+            assert!(count(&full_hash) > count(&fast_hash), "L{level}");
+            assert_eq!(fast_chain, full_chain, "L{level}");
+        }
     }
 
     /// Builds a block and its sequence store one partition at a time,

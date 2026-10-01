@@ -390,8 +390,17 @@ fn compress_block_level<C: MatchCount>(
     }
 }
 
-/// `ZSTD_fillDoubleHashTableForCCtx(ms, end, ZSTD_dtlm_fast)`.
-fn fill_double_hash_table<const MLS: u32>(ms: &mut MatchState, src: Src, start: usize, end: usize) {
+/// `ZSTD_fillDoubleHashTableForCCtx(ms, end, dtlm)`: `ZSTD_dtlm_fast`
+/// without `FULL`, `ZSTD_dtlm_full` with it. The CDict's
+/// `ZSTD_fillDoubleHashTableForCDict` writes the same slots: its short
+/// cache tag is the low byte of a hash 8 bits wider, whose high bits are
+/// this hash.
+fn fill_double_hash_table<const MLS: u32, const FULL: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    start: usize,
+    end: usize,
+) {
     const FAST_HASH_FILL_STEP: usize = 3;
     let hbits_l = ms.cparams.hash_log;
     let hbits_s = ms.cparams.chain_log;
@@ -402,25 +411,42 @@ fn fill_double_hash_table<const MLS: u32>(ms: &mut MatchState, src: Src, start: 
     assert_eq!(hash_small.len(), 1usize << hbits_s);
     let mut ip = start;
     // C: for (; ip + fastHashFillStep - 1 <= iend; ip += fastHashFillStep)
-    // with iend = end - HASH_READ_SIZE. Only i == 0 is loaded for
-    // ZSTD_dtlm_fast: both tables get every fastHashFillStep position.
+    // with iend = end - HASH_READ_SIZE. Both tables get every
+    // fastHashFillStep position; ZSTD_dtlm_full also gives the large
+    // table the two after it where their entry is empty.
     while ip + FAST_HASH_FILL_STEP - 1 + HASH_READ_SIZE <= end {
         // SAFETY: ip + 10 <= end <= src.end(); hashes < their table sizes.
         unsafe {
             tset(hash_small, hash_ptr::<MLS>(src, ip, hbits_s), ip);
             tset(hash_long, hash_ptr::<8>(src, ip, hbits_l), ip);
         }
+        if FULL {
+            for i in 1..FAST_HASH_FILL_STEP {
+                // SAFETY: as above, ip + i + 8 <= ip + 10 <= end.
+                unsafe {
+                    let h = hash_ptr::<8>(src, ip + i, hbits_l);
+                    if tget(hash_long, h) == 0 {
+                        tset(hash_long, h, ip + i);
+                    }
+                }
+            }
+        }
         ip += FAST_HASH_FILL_STEP;
     }
 }
 
 /// [`fill_double_hash_table`] for `ms.cparams.min_match`.
-fn fill_double_hash_table_from(ms: &mut MatchState, src: Src, start: usize, end: usize) {
+fn fill_double_hash_table_from<const FULL: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    start: usize,
+    end: usize,
+) {
     match ms.cparams.min_match {
-        5 => fill_double_hash_table::<5>(ms, src, start, end),
-        6 => fill_double_hash_table::<6>(ms, src, start, end),
-        7 => fill_double_hash_table::<7>(ms, src, start, end),
-        _ => fill_double_hash_table::<4>(ms, src, start, end),
+        5 => fill_double_hash_table::<5, FULL>(ms, src, start, end),
+        6 => fill_double_hash_table::<6, FULL>(ms, src, start, end),
+        7 => fill_double_hash_table::<7, FULL>(ms, src, start, end),
+        _ => fill_double_hash_table::<4, FULL>(ms, src, start, end),
     }
 }
 
@@ -431,7 +457,18 @@ fn fill_double_hash_table_from(ms: &mut MatchState, src: Src, start: usize, end:
 pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
     let end = ms.prefix_indices(prefix).end;
     assert!(end <= src.end());
-    fill_double_hash_table_from(ms, src, ms.next_to_update, end);
+    fill_double_hash_table_from::<false>(ms, src, ms.next_to_update, end);
+    ms.next_to_update = end;
+}
+
+/// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)`
+/// for entered dictionary content, into untagged tables: [`load_prefix`]
+/// that also inserts the two positions after each third one into the
+/// large table where their entry is empty.
+pub fn load_dict_full(ms: &mut MatchState, src: Src, content: EnteredPrefix) {
+    let end = ms.prefix_indices(content).end;
+    assert!(end <= src.end());
+    fill_double_hash_table_from::<true>(ms, src, ms.next_to_update, end);
     ms.next_to_update = end;
 }
 
@@ -440,7 +477,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
 /// insert every third position from `ms.next_to_update` up to `end` into
 /// both tables, leaving `next_to_update` where it is.
 pub fn fill_double_hash_table_to(ms: &mut MatchState, src: Src, end: usize) {
-    fill_double_hash_table_from(ms, src, ms.next_to_update, end);
+    fill_double_hash_table_from::<false>(ms, src, ms.next_to_update, end);
 }
 
 #[cfg(test)]
