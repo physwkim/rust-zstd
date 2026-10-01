@@ -539,36 +539,22 @@ struct Finders<'a> {
 
 /// `ZSTD_selectBtGetAllMatches(ms, dictMode)`: the finder for `mls =
 /// BOUNDED(3, minMatch, 6)` and this CPU's SIMD level, in its `ZSTD_extDict`
-/// variant while dictionary content is in the window
-/// ([`Window::has_ext_dict`](super::matchstate::Window::has_ext_dict)).
-fn select_get_all_matches(min_match: u32, level: Level, ext: bool) -> GetAllMatches {
+/// variant with `EXT`.
+fn select_get_all_matches<const EXT: bool>(min_match: u32, level: Level) -> GetAllMatches {
     let mls = min_match.clamp(3, 6);
-    match (level, ext) {
+    match level {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        (Level::Avx2(_), false) => match mls {
-            3 => get_all_matches_avx2::<3, false>,
-            4 => get_all_matches_avx2::<4, false>,
-            5 => get_all_matches_avx2::<5, false>,
-            _ => get_all_matches_avx2::<6, false>,
+        Level::Avx2(_) => match mls {
+            3 => get_all_matches_avx2::<3, EXT>,
+            4 => get_all_matches_avx2::<4, EXT>,
+            5 => get_all_matches_avx2::<5, EXT>,
+            _ => get_all_matches_avx2::<6, EXT>,
         },
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        (Level::Avx2(_), true) => match mls {
-            3 => get_all_matches_avx2::<3, true>,
-            4 => get_all_matches_avx2::<4, true>,
-            5 => get_all_matches_avx2::<5, true>,
-            _ => get_all_matches_avx2::<6, true>,
-        },
-        (_, false) => match mls {
-            3 => get_all_matches_scalar::<3, false>,
-            4 => get_all_matches_scalar::<4, false>,
-            5 => get_all_matches_scalar::<5, false>,
-            _ => get_all_matches_scalar::<6, false>,
-        },
-        (_, true) => match mls {
-            3 => get_all_matches_scalar::<3, true>,
-            4 => get_all_matches_scalar::<4, true>,
-            5 => get_all_matches_scalar::<5, true>,
-            _ => get_all_matches_scalar::<6, true>,
+        _ => match mls {
+            3 => get_all_matches_scalar::<3, EXT>,
+            4 => get_all_matches_scalar::<4, EXT>,
+            5 => get_all_matches_scalar::<5, EXT>,
+            _ => get_all_matches_scalar::<6, EXT>,
         },
     }
 }
@@ -590,14 +576,31 @@ pub fn compress_block(
     out: &mut SeqStore,
     ldm: RawSeqView,
 ) -> usize {
+    // ZSTD_selectBlockCompressor: the extDict variant while dictionary
+    // content is in the window.
+    if ms.window().has_ext_dict() {
+        compress_block_mode::<true>(ms, src, block, rep, out, ldm)
+    } else {
+        compress_block_mode::<false>(ms, src, block, rep, out, ldm)
+    }
+}
+
+/// [`compress_block`] with the `ZSTD_extDict` finders if `EXT`. Out of
+/// line, so that choosing the finder takes no runtime operand in the
+/// no-dictionary parser: one does, and its register allocation changes.
+#[inline(never)]
+fn compress_block_mode<const EXT: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+) -> usize {
     let block = block.range();
     assert_opt_bounds(ms, src, block.end);
     let finders = Finders {
-        get_all_matches: select_get_all_matches(
-            ms.cparams.min_match,
-            simd_level(),
-            ms.window().has_ext_dict(),
-        ),
+        get_all_matches: select_get_all_matches::<EXT>(ms.cparams.min_match, simd_level()),
         ldm,
     };
     let mut state = ms
@@ -1302,7 +1305,7 @@ mod tests {
             let mut state = ms.opt.take().unwrap();
             let mut out = SeqStore::new();
             let finders = Finders {
-                get_all_matches: select_get_all_matches(cp.min_match, simd_level(), false),
+                get_all_matches: select_get_all_matches::<false>(cp.min_match, simd_level()),
                 ldm: RawSeqView::default(),
             };
             let (view, block) = init_stats_ultra(

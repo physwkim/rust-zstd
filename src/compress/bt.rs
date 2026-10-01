@@ -278,6 +278,8 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32, const EXT
     let curr = ip;
     let min_match: u32 = if MLS == 3 { 3 } else { 4 };
     let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
+    let low = ms.window_low();
+    // `window.dictLimit`: the dictionary content is `[low, dict_limit)`.
     let dict_limit = ms.window().dict_limit();
     let bt_low = curr.saturating_sub(bt_mask);
     let window_low = ms.lowest_match_index(curr);
@@ -306,15 +308,18 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32, const EXT
                 rep[rep_code as usize]
             };
             let mut rep_len = 0usize;
-            debug_assert!(curr >= dict_limit);
+            debug_assert!(curr >= low);
             // intentional overflow, discards 0 and -1: `curr > repIndex >=
-            // dictLimit`
-            if (rep_offset.wrapping_sub(1) as usize) < curr - dict_limit {
+            // low`, which is libzstd's `dictLimit` without `EXT`. With it,
+            // libzstd's two branches, `repIndex >= dictLimit` and the
+            // content below it, merge over the one buffer.
+            if (rep_offset.wrapping_sub(1) as usize) < curr - low {
                 let rep_index = curr - rep_offset as usize;
                 // We must validate the repcode offset because when we're using
                 // a dictionary the valid offset range shrinks when the
                 // dictionary goes out of bounds.
                 if rep_index >= window_low
+                    && (!EXT || index_overlap_check(dict_limit, rep_index as u32))
                     && read_min_match(src, ip, min_match)
                         == read_min_match(src, rep_index, min_match)
                 {
@@ -322,22 +327,6 @@ unsafe fn insert_bt_and_get_all_matches<M: MatchCount, const MLS: u32, const EXT
                         src,
                         ip + min_match as usize,
                         rep_index + min_match as usize,
-                        i_limit,
-                    ) + min_match as usize;
-                }
-            } else if EXT {
-                // repIndex < dictLimit || repIndex >= curr
-                let rep_index = (curr as u32).wrapping_sub(rep_offset);
-                // intentional overflow: `curr > repIndex >= windowLow`
-                if (rep_offset.wrapping_sub(1) as usize) < curr - window_low
-                    && index_overlap_check(dict_limit, rep_index)
-                    && read_min_match(src, ip, min_match)
-                        == read_min_match(src, rep_index as usize, min_match)
-                {
-                    rep_len = m.count(
-                        src,
-                        ip + min_match as usize,
-                        rep_index as usize + min_match as usize,
                         i_limit,
                     ) + min_match as usize;
                 }
