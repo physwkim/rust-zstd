@@ -28,6 +28,7 @@ pub mod seqstore;
 pub mod split;
 
 use crate::constants::*;
+use crate::xxhash::Xxh64;
 use block::{
     write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
     ZSTD_BLOCKHEADERSIZE,
@@ -65,6 +66,13 @@ pub struct CompressOptions {
     /// default level 3, and a negative level is the fast strategy
     /// accelerated by `-level` (clamped at `ZSTD_minCLevel`, -131072).
     pub level: i32,
+    /// `ZSTD_c_checksumFlag`: set the header's Content_Checksum_flag and
+    /// end the frame with a Content_Checksum, the low 32 bits of the XXH64
+    /// of the input. `false` (the default) writes none, as `ZSTD_compress2`
+    /// does. With a `job_size` the one checksum still covers the whole
+    /// input and follows the last job's blocks: ZSTDMT hashes each job's
+    /// input in job order (`ZSTDMT_serialState_update`).
+    pub checksum: bool,
     /// Job size in bytes (`ZSTD_c_jobSize`). `None` (the default) compresses
     /// the input as one job, as single-threaded `ZSTD_compress2`
     /// (`ZSTD_c_nbWorkers` 0) does. `Some` selects ZSTDMT: the input is cut
@@ -159,6 +167,7 @@ impl Default for CompressOptions {
     fn default() -> Self {
         Self {
             level: ZSTD_CLEVEL_DEFAULT,
+            checksum: false,
             job_size: None,
             overlap_log: 0,
             ldm: ParamSwitch::Auto,
@@ -342,11 +351,20 @@ impl Compressor {
         let (cparams, ldm_params) = self.opts.frame_params(src.len());
         out.reserve(src.len() + 64);
         let header_start = out.len();
-        write_frame_header(out, src.len() as u64, cparams.window_log);
+        write_frame_header(
+            out,
+            src.len() as u64,
+            cparams.window_log,
+            self.opts.checksum,
+        );
         let header_len = out.len() - header_start;
+        // XXH64_update over the input in job order, before each job is
+        // compressed (ZSTDMT_serialState_update, ZSTD_compressContinue).
+        let mut checksum = self.opts.checksum.then(Xxh64::new);
 
         if src.is_empty() {
             write_raw_block(out, &[], true);
+            write_epilogue(out, checksum);
             return;
         }
 
@@ -374,6 +392,9 @@ impl Compressor {
             pipelined,
             // ZSTDMT_serialState_update
             |job, seqs| {
+                if let Some(checksum) = &mut checksum {
+                    checksum.update(&src[job.clone()]);
+                }
                 if let Some(state) = &mut serial_ldm {
                     state.generate_sequences(src, job.clone(), max_seqs, seqs);
                 }
@@ -410,6 +431,7 @@ impl Compressor {
             },
             out,
         );
+        write_epilogue(out, checksum);
     }
 
     /// One frame holding `src`.
@@ -804,17 +826,18 @@ pub fn overlap_size(cparams: &CParams, overlap_log: u8, ldm: bool) -> usize {
     }
 }
 
-/// `ZSTD_writeFrameHeader` with no dictionary and no checksum:
-/// Single_Segment iff the window covers the whole content, otherwise a
-/// Window_Descriptor with mantissa 0 derived from `window_log`.
-fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32) {
+/// `ZSTD_writeFrameHeader` with no dictionary: Single_Segment iff the
+/// window covers the whole content, otherwise a Window_Descriptor with
+/// mantissa 0 derived from `window_log`, and the Content_Checksum_flag of
+/// `checksum`.
+fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32, checksum: bool) {
     out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
     let window_size = 1u64 << window_log;
     let single_segment = window_size >= content_size;
     let fcs_code = (content_size >= 256) as u8
         + (content_size >= 65536 + 256) as u8
         + (content_size >= 0xFFFF_FFFF) as u8;
-    let descriptor = ((single_segment as u8) << 5) | (fcs_code << 6);
+    let descriptor = ((checksum as u8) << 2) | ((single_segment as u8) << 5) | (fcs_code << 6);
     out.push(descriptor);
     if !single_segment {
         out.push(((window_log - ZSTD_WINDOWLOG_ABSOLUTEMIN) << 3) as u8);
@@ -828,6 +851,14 @@ fn write_frame_header(out: &mut Vec<u8>, content_size: u64, window_log: u32) {
         1 => out.extend_from_slice(&((content_size - 256) as u16).to_le_bytes()),
         2 => out.extend_from_slice(&(content_size as u32).to_le_bytes()),
         _ => out.extend_from_slice(&content_size.to_le_bytes()),
+    }
+}
+
+/// `ZSTD_writeEpilogue` after the last block: the Content_Checksum, when
+/// the frame has one, from the XXH64 of its whole input.
+fn write_epilogue(out: &mut Vec<u8>, checksum: Option<Xxh64>) {
+    if let Some(checksum) = checksum {
+        out.extend_from_slice(&(checksum.digest() as u32).to_le_bytes());
     }
 }
 
@@ -1510,7 +1541,7 @@ mod tests {
     /// The frame header length of `data` with `cparams`.
     fn header_len(data: &[u8], cparams: &CParams) -> usize {
         let mut header = Vec::new();
-        write_frame_header(&mut header, data.len() as u64, cparams.window_log);
+        write_frame_header(&mut header, data.len() as u64, cparams.window_log, false);
         header.len()
     }
 

@@ -41,6 +41,7 @@
 )]
 
 use crate::constants::ZSTD_WINDOWLOG_MAX;
+use crate::xxhash::Xxh64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -111,8 +112,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 
 /// Decompress a zstd-compressed byte slice, returning the uncompressed data.
 ///
-/// Supports one or more concatenated zstd frames. Skippable frames are skipped.
-/// Dictionary frames are not supported.
+/// Supports any number of concatenated zstd frames. Skippable frames are
+/// skipped. Every input byte must belong to a frame: an empty input decodes
+/// to nothing, and bytes after the last frame are an error. Dictionary
+/// frames are not supported.
 ///
 /// With the `parallel` feature, frames of four or more blocks are decoded on
 /// the current rayon pool when it has more than one thread; the output is
@@ -162,25 +165,22 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
     let mut scratch: Option<DecoderScratch> = None;
     let mut pos = 0usize;
 
-    while pos < data.len() {
+    // ZSTD_decompressMultiFrame: a frame starts wherever at least
+    // FRAME_HEADER_PREFIX_LEN bytes remain, and no byte may be left over.
+    while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
         let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
             Ok(parsed) => parsed,
-            Err(e) => {
-                if let Some(skip_len) = e.skip_frame_length() {
+            Err(e) => match e.skip_frame_length() {
+                Some(frame_len) => {
                     let end = pos
-                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
-                        .and_then(|p| p.checked_add(skip_len as usize))
+                        .checked_add(frame_len as usize)
                         .filter(|&end| end <= data.len())
                         .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
                     pos = end;
                     continue;
                 }
-                // If we already have output and hit an error, it might just be trailing data
-                if !output.is_empty() {
-                    break;
-                }
-                return Err(format!("Frame header error: {}", e));
-            }
+                None => return Err(format!("Frame header error: {}", e)),
+            },
         };
         pos += header_len;
 
@@ -200,6 +200,12 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
             opts.min_parallel_blocks,
             simd,
         )?;
+    }
+    if pos != data.len() {
+        return Err(format!(
+            "Input not entirely consumed: {} bytes left, too few for a frame",
+            data.len() - pos
+        ));
     }
 
     Ok(output)
@@ -2254,6 +2260,17 @@ enum ModeType {
 }
 
 impl CompressionModes {
+    /// The Symbol_Compression_Modes byte, whose Reserved bits 1-0 must be
+    /// zero (ZSTD_decodeSeqHeaders' corruption_detected).
+    fn new(byte: u8) -> Result<Self, String> {
+        if byte & 3 != 0 {
+            return Err(format!(
+                "Symbol compression modes {byte:#04x}: reserved bits set"
+            ));
+        }
+        Ok(Self(byte))
+    }
+
     fn decode_mode(m: u8) -> ModeType {
         match m {
             0 => ModeType::Predefined,
@@ -2307,7 +2324,7 @@ impl SequencesHeader {
                     ));
                 }
                 self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes(source[1]));
+                self.modes = Some(CompressionModes::new(source[1])?);
                 bytes_read += 2;
             }
             128..=254 => {
@@ -2326,7 +2343,7 @@ impl SequencesHeader {
                             source.len()
                         ));
                     }
-                    self.modes = Some(CompressionModes(source[2]));
+                    self.modes = Some(CompressionModes::new(source[2])?);
                     bytes_read += 1;
                 }
             }
@@ -2338,7 +2355,7 @@ impl SequencesHeader {
                     ));
                 }
                 self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
-                self.modes = Some(CompressionModes(source[3]));
+                self.modes = Some(CompressionModes::new(source[3])?);
                 bytes_read += 4;
             }
         }
@@ -2489,6 +2506,7 @@ impl FrameHeader {
 
 struct FrameDecoderError {
     msg: String,
+    /// A skippable frame's length, header included.
     skip_length: Option<u32>,
 }
 
@@ -2525,6 +2543,10 @@ impl std::fmt::Display for FrameDecoderError {
 /// Magic number plus Frame_Size of a skippable frame.
 const SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
 
+/// ZSTD_startingInputLength: magic number plus Frame_Header_Descriptor, the
+/// fewest bytes ZSTD_decompressMultiFrame takes for another frame.
+const FRAME_HEADER_PREFIX_LEN: usize = 5;
+
 fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderError> {
     let magic_num = src
         .get(..4)
@@ -2540,7 +2562,16 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
             .ok_or_else(|| {
                 FrameDecoderError::new("Error reading skip frame size: truncated".into())
             })?;
-        return Err(FrameDecoderError::skip(skip_size));
+        // readSkippableFrameSize: the length, header included, must fit in
+        // 32 bits (frameParameter_unsupported), whatever the input size.
+        let frame_len = skip_size
+            .checked_add(SKIPPABLE_FRAME_HEADER_LEN as u32)
+            .ok_or_else(|| {
+                FrameDecoderError::new(format!(
+                    "Skippable frame size {skip_size:#x} unsupported: with its header it overflows 32 bits"
+                ))
+            })?;
+        return Err(FrameDecoderError::skip(frame_len));
     }
 
     if magic_num != ZSTD_MAGIC {
@@ -2554,6 +2585,14 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         FrameDecoderError::new("Error reading frame descriptor: truncated".into())
     })?);
     pos += 1;
+    // ZSTD_getFrameHeader_advanced: bit 3 is reserved and must be zero
+    // (frameParameter_unsupported); bit 4, unused, is ignored.
+    if desc.0 & 0x08 != 0 {
+        return Err(FrameDecoderError::new(format!(
+            "Frame header descriptor {:#04x}: reserved bit set",
+            desc.0
+        )));
+    }
 
     let mut frame_header = FrameHeader {
         descriptor: FrameDescriptor(desc.0),
@@ -2568,14 +2607,22 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
         pos += 1;
     }
 
-    // We don't support dictionaries, but we still need to skip these bytes
+    // ZSTD_decodeFrameHeader: no dictionary is loaded, so a frame naming one
+    // (any Dictionary_ID but 0) is dictionary_wrong.
     let dict_id_len = desc.dictionary_id_bytes().map_err(FrameDecoderError::new)? as usize;
-    if src.len() < pos + dict_id_len {
-        return Err(FrameDecoderError::new(
-            "Error reading dictionary id: truncated".into(),
-        ));
-    }
+    let dict_id = src
+        .get(pos..pos + dict_id_len)
+        .ok_or_else(|| FrameDecoderError::new("Error reading dictionary id: truncated".into()))?;
     pos += dict_id_len;
+    let dict_id = dict_id
+        .iter()
+        .rev()
+        .fold(0u32, |id, &b| id << 8 | u32::from(b));
+    if dict_id != 0 {
+        return Err(FrameDecoderError::new(format!(
+            "Frame needs dictionary {dict_id}, none is loaded"
+        )));
+    }
 
     let fcs_len = desc
         .frame_content_size_bytes()
@@ -3742,9 +3789,10 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 // ============================================================
 
 /// Decode every block of one frame from `data[*pos..]` straight into
-/// `output`, then skip the checksum. Matches may only reach back to the
-/// frame's own start (ZSTD_decompressFrame). Frames of at least
-/// `min_parallel_blocks` blocks are decoded by `parallel` when enabled.
+/// `output`, then check the content size and checksum. Matches may only
+/// reach back to the frame's own start (ZSTD_decompressFrame). Frames of at
+/// least `min_parallel_blocks` blocks are decoded by `parallel` when
+/// enabled.
 #[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
@@ -3764,7 +3812,7 @@ fn decode_frame(
     // `execute_with_copies`, through `decoded_block_max`, on what the block
     // decodes to.
     let block_size_max = window_size.min(u64::from(MAX_BLOCK_SIZE)) as usize;
-    let frame_base = output.len();
+    let mut frame = FrameContent::new(output.len(), header.descriptor.content_checksum_flag());
 
     if let Some(fcs) = header.frame_content_size() {
         // Room for the whole frame plus what a compressed block may write
@@ -3787,7 +3835,7 @@ fn decode_frame(
         data,
         pos,
         block_size_max,
-        frame_base,
+        &mut frame,
         output,
         min_parallel_blocks,
         simd,
@@ -3798,19 +3846,11 @@ fn decode_frame(
         false
     };
     if !decoded {
-        decode_blocks(data, pos, block_size_max, scratch, frame_base, output, simd)?;
-    }
-
-    // Skip the checksum if present; this decoder does not verify it.
-    if header.descriptor.content_checksum_flag() {
-        if data.len() - *pos < 4 {
-            return Err("Error reading checksum: truncated".to_string());
-        }
-        *pos += 4;
+        decode_blocks(data, pos, block_size_max, scratch, &mut frame, output, simd)?;
     }
 
     if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame_base) as u64;
+        let decoded = (output.len() - frame.base) as u64;
         if decoded != fcs {
             return Err(format!(
                 "Frame content size mismatch: header says {}, decoded {}",
@@ -3818,7 +3858,59 @@ fn decode_frame(
             ));
         }
     }
+
+    if let Some(computed) = frame.checksum(output) {
+        let stored = data
+            .get(*pos..*pos + 4)
+            .ok_or_else(|| "Error reading checksum: truncated".to_string())?;
+        *pos += 4;
+        let stored = u32::from_le_bytes(stored.try_into().unwrap());
+        if stored != computed {
+            return Err(format!(
+                "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
+                stored, computed
+            ));
+        }
+    }
     Ok(())
+}
+
+/// A frame's content in the output: where it starts and, when the frame
+/// has a Content_Checksum, the XXH64 of what has been decoded
+/// (ZSTD_decompressFrame's `xxhState`).
+struct FrameContent {
+    /// Output position of the frame's first byte.
+    base: usize,
+    checksum: Option<Xxh64>,
+    /// Output position up to which `checksum` has been fed.
+    fed: usize,
+}
+
+impl FrameContent {
+    fn new(base: usize, has_checksum: bool) -> Self {
+        Self {
+            base,
+            checksum: has_checksum.then(Xxh64::new),
+            fed: base,
+        }
+    }
+
+    /// Feed the checksum what has been decoded since the last call. The
+    /// block loops call this after each block, while it is in cache.
+    fn feed(&mut self, output: &[u8]) {
+        if let Some(h) = &mut self.checksum {
+            h.update(&output[self.fed..]);
+            self.fed = output.len();
+        }
+    }
+
+    /// The Content_Checksum of the frame decoded into `output`: the low
+    /// half of the XXH64 of every byte from `base`, whatever the block
+    /// loops fed.
+    fn checksum(&mut self, output: &[u8]) -> Option<u32> {
+        self.feed(output);
+        self.checksum.as_ref().map(|h| h.digest() as u32)
+    }
 }
 
 /// The most the blocks at the start of `data` decode to: the sum of each
@@ -3851,7 +3943,7 @@ fn decode_blocks(
     pos: &mut usize,
     block_size_max: usize,
     scratch: &mut DecoderScratch,
-    frame_base: usize,
+    frame: &mut FrameContent,
     output: &mut Vec<u8>,
     simd: Level,
 ) -> Result<(), String> {
@@ -3869,10 +3961,11 @@ fn decode_blocks(
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
             BlockType::Compressed => {
-                decompress_block(content, block_size_max, scratch, frame_base, output, simd)?
+                decompress_block(content, block_size_max, scratch, frame.base, output, simd)?
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
+        frame.feed(output);
 
         if block.last_block {
             break;
@@ -4574,7 +4667,7 @@ mod parallel {
         data: &[u8],
         pos: &mut usize,
         block_size_max: usize,
-        frame_base: usize,
+        frame: &mut FrameContent,
         output: &mut Vec<u8>,
         min_blocks: usize,
         simd: Level,
@@ -4660,12 +4753,13 @@ mod parallel {
                     &mut slot,
                     &mut hist,
                     block_size_max,
-                    frame_base,
+                    frame.base,
                     output,
                     simd,
                 )?;
                 drop(slot);
                 spawn_decode(i + ring.len());
+                frame.feed(output);
             }
             Ok::<(), String>(())
         })?;

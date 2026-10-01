@@ -7,8 +7,8 @@ mod common;
 use rust_zstd::compress::JOBSIZE_MIN;
 use rust_zstd::{compress_with, decompress, CompressOptions, ParamSwitch};
 use sys::ZSTD_cParameter::{
-    ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching, ZSTD_c_jobSize, ZSTD_c_nbWorkers,
-    ZSTD_c_overlapLog,
+    ZSTD_c_checksumFlag, ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching,
+    ZSTD_c_jobSize, ZSTD_c_nbWorkers, ZSTD_c_overlapLog,
 };
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -118,6 +118,46 @@ fn job_size_zero_matches_libzstd() {
                 ],
             );
             let name = format!("L{level} ldm {ldm} job_size {job_size} len {len}");
+            assert!(decompress(&ours).unwrap() == src, "{name}: roundtrip");
+            assert!(ours == c, "{name}: frame differs from libzstd");
+        }
+    }
+}
+
+/// `ZSTD_c_checksumFlag` 1 at every level: the Content_Checksum_flag and
+/// the XXH64 of the whole input after the last block, single-threaded and
+/// through ZSTDMT with several jobs (one of them a whole-job multiple of the
+/// input) or one job, as libzstd writes them.
+#[test]
+fn checksum_matches_libzstd() {
+    let data = input((1 << 20) + 17);
+    let cases: [(usize, Option<usize>); 7] = [
+        (0, None),
+        (1, None),
+        (1000, None),
+        (300 << 10, None),
+        (data.len(), Some(512 << 10)),
+        (1 << 20, Some(512 << 10)),
+        (data.len(), Some(0)),
+    ];
+    for level in -5..=22 {
+        for (len, job_size) in cases {
+            let src = &data[..len];
+            let ours = compress_with(
+                src,
+                &CompressOptions {
+                    level,
+                    checksum: true,
+                    job_size,
+                    ..Default::default()
+                },
+            );
+            let mut params = vec![(ZSTD_c_compressionLevel, level), (ZSTD_c_checksumFlag, 1)];
+            if let Some(job_size) = job_size {
+                params.extend([(ZSTD_c_nbWorkers, 2), (ZSTD_c_jobSize, job_size as i32)]);
+            }
+            let c = common::c_compress2(src, &params);
+            let name = format!("L{level} len {len} job_size {job_size:?}");
             assert!(decompress(&ours).unwrap() == src, "{name}: roundtrip");
             assert!(ours == c, "{name}: frame differs from libzstd");
         }
