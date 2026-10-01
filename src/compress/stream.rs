@@ -16,6 +16,8 @@
 //! up to twice that and, when full, moves its last window down to the
 //! start ([`Context::rebase`] keeps every index): one extra copy of the
 //! input, amortized, and the same matches as the one-shot frame.
+//!
+//! [`compress_blocks`]: super::block::compress_blocks
 
 use super::block::{self, InputEnd, JobBlocks};
 use super::{

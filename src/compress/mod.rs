@@ -836,7 +836,7 @@ fn begin_job(
 /// serial loop hands every job `out`. The job function is the same either
 /// way, so the frame is identical.
 ///
-/// Jobs are never rayon tasks: every worker gets one [`JobQueue`] runner
+/// Jobs are never rayon tasks: every worker gets one `JobQueue` runner
 /// (`spawn_broadcast`), which claims jobs in order until none is left. A
 /// thread waiting in a job's block `rayon::join` runs whatever rayon hands
 /// it; were jobs tasks, it could take a queued job and finish its own a
