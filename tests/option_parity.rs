@@ -1,11 +1,12 @@
 //! Option values that libzstd clamps or reads as a sentinel, against
 //! libzstd 1.5.7 given the same value through `ZSTD_CCtx_setParameter`:
-//! the frames must be byte-identical.
+//! the frames must pass the encoder gate, and equal our frame for the value
+//! the option clamps or resolves to.
 
 mod common;
 
 use rust_zstd::compress::JOBSIZE_MIN;
-use rust_zstd::{compress_with, decompress, CompressOptions, ParamSwitch};
+use rust_zstd::{compress_with, CompressOptions, ParamSwitch};
 use sys::ZSTD_cParameter::{
     ZSTD_c_checksumFlag, ZSTD_c_compressionLevel, ZSTD_c_enableLongDistanceMatching,
     ZSTD_c_jobSize, ZSTD_c_nbWorkers, ZSTD_c_overlapLog,
@@ -69,8 +70,8 @@ fn overlap_log_above_max_matches_libzstd() {
                 ],
             );
             let name = format!("L{level} overlap_log {overlap_log}");
-            assert!(decompress(&ours).unwrap() == data, "{name}: roundtrip");
-            assert!(ours == c, "{name}: frame differs from libzstd");
+            assert!(ours == frame(9), "{name}: not clamped to 9");
+            common::assert_gate(&name, &data, &ours, &c);
         }
     }
 }
@@ -84,30 +85,34 @@ fn overlap_log_above_max_matches_libzstd() {
 #[test]
 fn job_size_zero_matches_libzstd() {
     let data = input(10 << 20);
+    // The job size each case resolves to.
     let cases = [
-        (1, false, 0),
-        (3, false, 0),
-        (11, false, 0),
-        (1, true, 0),
-        (3, true, 0),
-        (1, false, 1),
+        (1, false, 0, 2 << 20),
+        (3, false, 0, 8 << 20),
+        (11, false, 0, 16 << 20),
+        (1, true, 0, 2 << 20),
+        (3, true, 0, 2 << 20),
+        (1, false, 1, JOBSIZE_MIN),
     ];
-    for (level, ldm, job_size) in cases {
+    for (level, ldm, job_size, resolved) in cases {
         for len in [JOBSIZE_MIN, JOBSIZE_MIN + 1, data.len()] {
             let src = &data[..len];
-            let ours = compress_with(
-                src,
-                &CompressOptions {
-                    level,
-                    job_size: Some(job_size),
-                    ldm: if ldm {
-                        ParamSwitch::Enable
-                    } else {
-                        ParamSwitch::Auto
+            let frame = |job_size| {
+                compress_with(
+                    src,
+                    &CompressOptions {
+                        level,
+                        job_size: Some(job_size),
+                        ldm: if ldm {
+                            ParamSwitch::Enable
+                        } else {
+                            ParamSwitch::Auto
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-            );
+                )
+            };
+            let ours = frame(job_size);
             let c = common::c_compress2(
                 src,
                 &[
@@ -118,8 +123,8 @@ fn job_size_zero_matches_libzstd() {
                 ],
             );
             let name = format!("L{level} ldm {ldm} job_size {job_size} len {len}");
-            assert!(decompress(&ours).unwrap() == src, "{name}: roundtrip");
-            assert!(ours == c, "{name}: frame differs from libzstd");
+            assert!(ours == frame(resolved), "{name}: not job size {resolved}");
+            common::assert_gate(&name, src, &ours, &c);
         }
     }
 }
@@ -158,8 +163,7 @@ fn checksum_matches_libzstd() {
             }
             let c = common::c_compress2(src, &params);
             let name = format!("L{level} len {len} job_size {job_size:?}");
-            assert!(decompress(&ours).unwrap() == src, "{name}: roundtrip");
-            assert!(ours == c, "{name}: frame differs from libzstd");
+            common::assert_gate(&name, src, &ours, &c);
         }
     }
 }

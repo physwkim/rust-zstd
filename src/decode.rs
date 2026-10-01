@@ -53,10 +53,14 @@ use std::ptr;
 
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const MIN_WINDOW_SIZE: u64 = 1024;
-const MAX_BLOCK_SIZE: u32 = 128 * 1024;
+/// Block_Maximum_Size's 128 KiB cap (RFC 8878 lines 557-564): no block
+/// of any frame has more content or decodes to more, so it is also the
+/// sequence executors' constant output bound.
+const MAX_BLOCK_SIZE: usize = 128 * 1024;
 /// Largest Huffman table log, and so weight, the decoder takes (libzstd
-/// HUF_TABLELOG_MAX): the format caps the log at 11, libzstd's decoder at 12.
-const HUF_TABLELOG_MAX: u32 = 12;
+/// HUF_TABLELOG_MAX is 12): RFC 8878 §4.2.1 (rfc8878.txt:1537-1540) limits
+/// the maximum code length to 11 bits.
+const HUF_TABLELOG_MAX: u32 = 11;
 const ACC_LOG_OFFSET: u8 = 5;
 
 const MAX_LITERAL_LENGTH_CODE: u8 = 35;
@@ -121,9 +125,9 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// the current rayon pool when it has more than one thread; the output is
 /// the same either way.
 ///
-/// The output grows as needed, as one-shot `ZSTD_decompressDCtx` into an
-/// ample buffer does, so that is the reference for which frames decode:
-/// libzstd's verdict on some malformed blocks depends on its buffer size.
+/// Which frames decode follows RFC 8878, not libzstd: every block, raw,
+/// RLE or compressed, holds and decodes to at most Block_Maximum_Size
+/// bytes (lines 545-569).
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
@@ -170,10 +174,14 @@ pub fn decompress_with_options(data: &[u8], opts: &DecodeOptions) -> Result<Vec<
     while data.len() - pos >= FRAME_HEADER_PREFIX_LEN {
         let (frame_header, header_len) = match parse_frame_header(&data[pos..]) {
             Ok(parsed) => parsed,
-            Err(e) => match e.skip_frame_length() {
-                Some(frame_len) => {
+            Err(e) => match e.skip_frame_size() {
+                Some(frame_size) => {
+                    // Up to 2^32 + 7 bytes with the header (RFC 8878 lines
+                    // 1325-1329); on 32-bit targets a sum past usize::MAX is
+                    // past the end of any input too.
                     let end = pos
-                        .checked_add(frame_len as usize)
+                        .checked_add(SKIPPABLE_FRAME_HEADER_LEN)
+                        .and_then(|p| p.checked_add(frame_size as usize))
                         .filter(|&end| end <= data.len())
                         .ok_or_else(|| "Skippable frame extends past end of input".to_string())?;
                     pos = end;
@@ -763,11 +771,10 @@ struct HufEntryX2 {
 unsafe impl bytemuck::Zeroable for HufEntryX2 {}
 unsafe impl bytemuck::Pod for HufEntryX2 {}
 
-/// Table log of the decoding tables of codes up to this many bits (libzstd
-/// HUF_DECODER_FAST_TABLELOG): shorter codes are scaled up to it so that
-/// the 4-stream fast loops index with a constant shift. A 12-bit code keeps
-/// its own log and takes the plain loops.
-const HUF_FAST_TABLE_LOG: u32 = 11;
+/// Table log of every decoding table (libzstd HUF_DECODER_FAST_TABLELOG):
+/// the longest code length, so that codes of any length are scaled up to
+/// it and the 4-stream fast loops index with a constant shift.
+const HUF_FAST_TABLE_LOG: u32 = HUF_TABLELOG_MAX;
 
 /// Relative cost of the single- and double-symbol decoders, indexed by the
 /// compression ratio quantile (libzstd algoTime: table build time, then
@@ -809,11 +816,11 @@ fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
 }
 
 struct HuffmanTable {
-    /// Single-symbol table; when `!is_x2`, the built table, of
-    /// `1 << dt_log()` cells.
+    /// Single-symbol table, `1 << HUF_FAST_TABLE_LOG` cells once the first
+    /// single-symbol build sized it; the built table when `!is_x2`.
     decode: Vec<HuffmanEntry>,
-    /// Double-symbol table; when `is_x2`, the built table, of
-    /// `1 << dt_log()` cells.
+    /// Double-symbol table, sized like `decode` by the first double-symbol
+    /// build; the built table when `is_x2`.
     decode_x2: Vec<HufEntryX2>,
     is_x2: bool,
     /// Weight per symbol (libzstd huffWeight): after a build, the first
@@ -853,13 +860,6 @@ impl HuffmanTable {
         self.fse_table.reset();
     }
 
-    /// Log of the built table (libzstd DTableDesc.tableLog): codes of up to
-    /// HUF_FAST_TABLE_LOG bits are scaled up to it (HUF_rescaleStats, and
-    /// HUF_readDTableX2_wksp's maxTableLog), a 12-bit code keeps its own.
-    fn dt_log(&self) -> u32 {
-        u32::from(self.max_num_bits).max(HUF_FAST_TABLE_LOG)
-    }
-
     /// Read the tree description at the start of `source` (the whole
     /// compressed literals section) and build the decoding table. Four-stream
     /// sections pick the table kind by libzstd's cost model; single-stream
@@ -874,13 +874,26 @@ impl HuffmanTable {
         self.max_num_bits = 0;
         let (bytes_used, nb_weights) = self.read_weights(source)?;
         self.weight_stats(nb_weights)?;
-        self.is_x2 = four_streams && huf_select_x2(dst_size, source.len());
-        if self.is_x2 {
+        self.fill(four_streams && huf_select_x2(dst_size, source.len()));
+        Ok(bytes_used as u32)
+    }
+
+    /// Fill the double-symbol table when `x2`, else the single-symbol one.
+    fn fill(&mut self, x2: bool) {
+        self.is_x2 = x2;
+        if x2 {
             self.fill_x2();
         } else {
             self.fill_x1();
         }
-        Ok(bytes_used as u32)
+    }
+
+    /// Code length of `symbol` (RFC 8878 §4.2.1, rfc8878.txt:1550:
+    /// Number_of_Bits = Max_Number_of_Bits + 1 - Weight); `symbol` is one
+    /// the built table decodes, so its weight is not 0.
+    #[inline(always)]
+    fn code_len(&self, symbol: u8) -> u32 {
+        u32::from(self.max_num_bits) + 1 - u32::from(self.weights[usize::from(symbol)])
     }
 
     /// Read the weights of a tree description (HUF_readStats_body before the
@@ -918,11 +931,10 @@ impl HuffmanTable {
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
             // FSE_decompress_wksp's table must fit HUF_readStats's workspace
             // (HUF_READ_STATS_WORKSPACE_SIZE_U32), sized for 6-bit tables
-            // over the weights below HUF_TABLELOG_MAX.
+            // over weights 0..=11 (libzstd's HUF_TABLELOG_MAX - 1).
             let max_symbol = self.fse_table.symbol_probabilities.len() - 1;
             let log = usize::from(self.fse_table.accuracy_log);
-            let wksp = fse_decompress_wksp_u32(6, HUF_TABLELOG_MAX as usize - 1);
-            if fse_decompress_wksp_u32(log, max_symbol) > wksp {
+            if fse_decompress_wksp_u32(log, max_symbol) > fse_decompress_wksp_u32(6, 11) {
                 return Err(format!(
                     "Huffman weights table of log {} over {} symbols is too large",
                     log,
@@ -977,15 +989,15 @@ impl HuffmanTable {
         Ok(())
     }
 
-    /// Fill the single-symbol table at `dt_log()` bits
+    /// Fill the single-symbol table at `HUF_FAST_TABLE_LOG` bits
     /// (HUF_readDTableX1_wksp with HUF_rescaleStats): each symbol of `n`
-    /// bits owns `1 << (dt_log() - n)` consecutive cells, ordered by code
-    /// length. Scaling the weights up leaves every code length unchanged,
+    /// bits owns `1 << (HUF_FAST_TABLE_LOG - n)` consecutive cells, ordered
+    /// by code length. Scaling the weights up leaves every code length unchanged,
     /// so only the cell counts differ from a `max_bits` table. The weights
     /// tile the table (`weight_stats`): every cell is written.
     fn fill_x1(&mut self) {
         let max_bits = u32::from(self.max_num_bits);
-        let dt_log = self.dt_log();
+        let dt_log = HUF_FAST_TABLE_LOG;
         let rescale = dt_log - max_bits;
         let rank_stats = &self.rank_stats;
 
@@ -1055,10 +1067,10 @@ impl HuffmanTable {
     /// HUF_readStats): sort symbols by weight, compute where each weight's
     /// run starts for every number of already-consumed bits, then tile the
     /// table so that a cell holds two symbols whenever both fit in
-    /// `dt_log()` bits. Every cell is written, as in `fill_x1`.
+    /// `HUF_FAST_TABLE_LOG` bits. Every cell is written, as in `fill_x1`.
     fn fill_x2(&mut self) {
         let table_log = u32::from(self.max_num_bits);
-        let target_log = self.dt_log();
+        let target_log = HUF_FAST_TABLE_LOG;
         let nb_bits_baseline = table_log + 1;
 
         // Highest weight in use; weight 1 is always present.
@@ -1267,10 +1279,6 @@ fn huf_fill_x2_level2(
 // HUF_decompress4X1_usingDTable_internal_body).
 // ------------------------------------------------------------
 
-/// Fewest literals for which the 4-stream layout is legal
-/// (libzstd MIN_LITERALS_FOR_4_STREAMS).
-const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HufStreamStatus {
     /// At least 57 bits are loaded; keep decoding without checks.
@@ -1287,9 +1295,13 @@ enum HufStreamStatus {
 /// Backward bit reader over one Huffman or sequences stream.
 ///
 /// `container` holds the 8 bytes starting at `ptr`; bits are consumed from
-/// its high end (the stream is read from its last byte backwards). Once
-/// `bits_consumed` exceeds the data actually loaded, reads return zeros and
-/// the final `is_finished` check rejects the stream.
+/// its high end (the stream is read from its last byte backwards). Below
+/// 64 bits consumed, a lookup reaching past the container's low end reads
+/// zeros there. From 64 on, lookups shift by `bits_consumed & 63`, as
+/// BIT_lookBitsFast masks its shift, and so re-read the container from its
+/// top. Every Huffman symbol consumes at least one bit, so a lookup at or
+/// past 64 leaves the stream consumed past 64 bits, which `is_finished`
+/// rejects.
 struct BitDStream<'s> {
     src: &'s [u8],
     ptr: usize,
@@ -1457,7 +1469,7 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
     let mut p = 0;
     if end > 3 {
         // Up to 4 symbols per reload: a reload that reports Unfinished
-        // guarantees at least 57 bits, and a symbol takes at most 12.
+        // guarantees at least 57 bits, and a symbol takes at most 11.
         while br.reload() == HufStreamStatus::Unfinished && p < end - 3 {
             let a = huf_decode_symbol_x1(br, dt, dt_log);
             let b = huf_decode_symbol_x1(br, dt, dt_log);
@@ -1477,17 +1489,12 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
     }
 }
 
-/// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body)
-/// with a table of `DT_LOG` bits.
+/// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
 #[inline(never)]
-fn huf_decompress_1x1<const DT_LOG: u32>(
-    out: &mut [u8],
-    src: &[u8],
-    table: &HuffmanTable,
-) -> Result<(), String> {
+fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt = &table.decode[..];
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x1(out, &mut br, dt, DT_LOG);
+    huf_decode_stream_x1(out, &mut br, dt, HUF_FAST_TABLE_LOG);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
@@ -1513,12 +1520,6 @@ impl HufStreams {
                 src.len()
             ));
         }
-        if dst_size < MIN_LITERALS_FOR_4_STREAMS {
-            return Err(format!(
-                "Huffman 4-stream output too small: {} bytes",
-                dst_size
-            ));
-        }
         let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
         let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
         let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
@@ -1527,6 +1528,11 @@ impl HufStreams {
         }
         let istart = [6, 6 + len1, 6 + len1 + len2, 6 + len1 + len2 + len3];
         let iend = [istart[1], istart[2], istart[3], src.len()];
+        // RFC 8878 §3.1.1.3.1.6 (rfc8878.txt:796-799): the first three
+        // streams decode (Regenerated_Size+3)/4 bytes each and the last one
+        // the rest, so a size is valid exactly when that rest is not
+        // negative: 4 splits 1,1,1,1, 5 would leave -1. libzstd's
+        // MIN_LITERALS_FOR_4_STREAMS (6) also rejects 0, 3 and 4 (R2-6).
         let segment = dst_size.div_ceil(4);
         if 3 * segment > dst_size {
             return Err("Huffman 4-stream segments exceed output".to_string());
@@ -1790,30 +1796,20 @@ unsafe fn huf_4x2_fast_loop(args: &mut HufFastArgs, out: &mut [u8], src: &[u8], 
 ///
 /// The output is split into four segments of `(len + 3) / 4` bytes (the
 /// last one holds the remainder); stream `i` produces segment `i`. The fast
-/// loop takes sections with 8 bytes or more per stream and a table of
-/// `HUF_FAST_TABLE_LOG` bits (HUF_DecompressFastArgs_init); the plain loop
+/// loop takes sections with 8 bytes or more per stream; the plain loop
 /// advances all four streams in lockstep, 4 symbols each per reload. Both
 /// finish each stream with `huf_decode_stream_x1`.
 #[inline(never)]
-fn huf_decompress_4x1<const DT_LOG: u32>(
-    out: &mut [u8],
-    src: &[u8],
-    table: &HuffmanTable,
-) -> Result<(), String> {
+fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt = &table.decode[..];
-    if dt.len() != 1 << DT_LOG {
+    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
         return Err("Huffman table is uninitialized".to_string());
     }
-    let dt_log = DT_LOG;
+    let dt_log = HUF_FAST_TABLE_LOG;
     let dst_size = out.len();
     let streams = HufStreams::split(src, dst_size)?;
 
-    let fast = if DT_LOG == HUF_FAST_TABLE_LOG {
-        huf_fast_args_init(&streams, src, dst_size)?
-    } else {
-        None
-    };
-    if let Some(mut args) = fast {
+    if let Some(mut args) = huf_fast_args_init(&streams, src, dst_size)? {
         // SAFETY: `args` comes from `huf_fast_args_init` on this `src` and
         // `out`, and `dt` has exactly `1 << HUF_FAST_TABLE_LOG` cells.
         unsafe { huf_4x1_fast_loop(&mut args, out, src, dt) };
@@ -1896,9 +1892,13 @@ fn huf_decode_symbol_x2(
     op + usize::from(entry.length)
 }
 
-/// Decode the final symbol of a stream (HUF_decodeLastSymbolX2): only the
-/// first symbol of a two-symbol cell is wanted, and the bit count for it
-/// alone is unknown, so consumption is clamped to the container.
+/// Decode the final symbol of a stream: only the first symbol of the cell
+/// is wanted, and it consumes its own code length, as X1 would. RFC 8878
+/// §4.2.2 (rfc8878.txt:1779-1782) requires the bitstream to be consumed
+/// exactly, so neither a second symbol's bits nor a lookup past the
+/// stream's start may pass the end check. libzstd's
+/// HUF_decodeLastSymbolX2 skips the whole cell, clamped to the container,
+/// and skips nothing once the container is spent (R1-6, R2-3).
 #[inline(always)]
 fn huf_decode_last_symbol_x2(
     out: &mut [u8],
@@ -1906,17 +1906,11 @@ fn huf_decode_last_symbol_x2(
     br: &mut BitDStream<'_>,
     dt: &[HufEntryX2],
     dt_log: u32,
+    table: &HuffmanTable,
 ) -> usize {
-    let entry = dt[br.look_bits(dt_log)];
-    out[op] = entry.sequence as u8;
-    if entry.length == 1 {
-        br.skip_bits(u32::from(entry.nb_bits));
-    } else if br.bits_consumed < 64 {
-        br.skip_bits(u32::from(entry.nb_bits));
-        if br.bits_consumed > 64 {
-            br.bits_consumed = 64;
-        }
-    }
+    let symbol = dt[br.look_bits(dt_log)].sequence as u8;
+    out[op] = symbol;
+    br.skip_bits(table.code_len(symbol));
     op + 1
 }
 
@@ -1930,25 +1924,16 @@ fn huf_decode_stream_x2(
     br: &mut BitDStream<'_>,
     dt: &[HufEntryX2],
     dt_log: u32,
+    table: &HuffmanTable,
 ) -> usize {
     if end - op >= 8 {
-        if dt_log <= HUF_FAST_TABLE_LOG {
-            // Up to 10 symbols per reload: 5 cells of at most 11 bits each.
-            while br.reload() == HufStreamStatus::Unfinished && op + 9 < end {
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            }
-        } else {
-            // Up to 8 symbols per reload: 4 cells of at most 12 bits each.
-            while br.reload() == HufStreamStatus::Unfinished && op + 7 < end {
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-                op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            }
+        // Up to 10 symbols per reload: 5 cells of at most 11 bits each.
+        while br.reload() == HufStreamStatus::Unfinished && op + 9 < end {
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
         }
     } else {
         br.reload();
@@ -1965,22 +1950,18 @@ fn huf_decode_stream_x2(
     }
 
     if op < end {
-        op = huf_decode_last_symbol_x2(out, op, br, dt, dt_log);
+        op = huf_decode_last_symbol_x2(out, op, br, dt, dt_log, table);
     }
     op
 }
 
-/// Single-stream literals with the double-symbol table of `DT_LOG` bits
+/// Single-stream literals with the double-symbol table
 /// (HUF_decompress1X2_usingDTable_internal_body).
 #[inline(never)]
-fn huf_decompress_1x2<const DT_LOG: u32>(
-    out: &mut [u8],
-    src: &[u8],
-    table: &HuffmanTable,
-) -> Result<(), String> {
+fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt = &table.decode_x2[..];
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, DT_LOG);
+    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, HUF_FAST_TABLE_LOG, table);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
@@ -1993,25 +1974,16 @@ fn huf_decompress_1x2<const DT_LOG: u32>(
 /// shared loop; the plain loop's trip count is bounded by the last stream.
 /// The fast loop takes the same sections as in `huf_decompress_4x1`.
 #[inline(never)]
-fn huf_decompress_4x2<const DT_LOG: u32>(
-    out: &mut [u8],
-    src: &[u8],
-    table: &HuffmanTable,
-) -> Result<(), String> {
+fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
     let dt = &table.decode_x2[..];
-    if dt.len() != 1 << DT_LOG {
+    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
         return Err("Huffman table is uninitialized".to_string());
     }
-    let dt_log = DT_LOG;
+    let dt_log = HUF_FAST_TABLE_LOG;
     let oend = out.len();
     let streams = HufStreams::split(src, oend)?;
 
-    let fast = if DT_LOG == HUF_FAST_TABLE_LOG {
-        huf_fast_args_init(&streams, src, oend)?
-    } else {
-        None
-    };
-    if let Some(mut args) = fast {
+    if let Some(mut args) = huf_fast_args_init(&streams, src, oend)? {
         // SAFETY: `args` comes from `huf_fast_args_init` on this `src` and
         // `out`, and `dt` has exactly `1 << HUF_FAST_TABLE_LOG` cells.
         unsafe { huf_4x2_fast_loop(&mut args, out, src, dt) };
@@ -2021,7 +1993,7 @@ fn huf_decompress_4x2<const DT_LOG: u32>(
                 return Err("Huffman stream overran its segment".to_string());
             }
             let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
-            huf_decode_stream_x2(out, args.op[s], end, &mut br, dt, dt_log);
+            huf_decode_stream_x2(out, args.op[s], end, &mut br, dt, dt_log, table);
             if !br.is_finished() {
                 return Err("Huffman stream not fully consumed".to_string());
             }
@@ -2073,10 +2045,10 @@ fn huf_decompress_4x2<const DT_LOG: u32>(
         return Err("Huffman stream overran its segment".to_string());
     }
 
-    huf_decode_stream_x2(out, op1, op_start2, &mut b1, dt, dt_log);
-    huf_decode_stream_x2(out, op2, op_start3, &mut b2, dt, dt_log);
-    huf_decode_stream_x2(out, op3, op_start4, &mut b3, dt, dt_log);
-    huf_decode_stream_x2(out, op4, oend, &mut b4, dt, dt_log);
+    huf_decode_stream_x2(out, op1, op_start2, &mut b1, dt, dt_log, table);
+    huf_decode_stream_x2(out, op2, op_start3, &mut b2, dt, dt_log, table);
+    huf_decode_stream_x2(out, op3, op_start4, &mut b3, dt, dt_log, table);
+    huf_decode_stream_x2(out, op4, oend, &mut b4, dt, dt_log, table);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
         return Err("Huffman stream not fully consumed".to_string());
@@ -2506,27 +2478,27 @@ impl FrameHeader {
 
 struct FrameDecoderError {
     msg: String,
-    /// A skippable frame's length, header included.
-    skip_length: Option<u32>,
+    /// A skippable frame's Frame_Size: the length of its User_Data.
+    skip_size: Option<u32>,
 }
 
 impl FrameDecoderError {
     fn new(msg: String) -> Self {
         Self {
             msg,
-            skip_length: None,
+            skip_size: None,
         }
     }
 
-    fn skip(length: u32) -> Self {
+    fn skip(size: u32) -> Self {
         Self {
-            msg: format!("Skippable frame with length {}", length),
-            skip_length: Some(length),
+            msg: format!("Skippable frame with Frame_Size {}", size),
+            skip_size: Some(size),
         }
     }
 
-    fn skip_frame_length(&self) -> Option<u32> {
-        self.skip_length
+    fn skip_frame_size(&self) -> Option<u32> {
+        self.skip_size
     }
 }
 
@@ -2562,16 +2534,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
             .ok_or_else(|| {
                 FrameDecoderError::new("Error reading skip frame size: truncated".into())
             })?;
-        // readSkippableFrameSize: the length, header included, must fit in
-        // 32 bits (frameParameter_unsupported), whatever the input size.
-        let frame_len = skip_size
-            .checked_add(SKIPPABLE_FRAME_HEADER_LEN as u32)
-            .ok_or_else(|| {
-                FrameDecoderError::new(format!(
-                    "Skippable frame size {skip_size:#x} unsupported: with its header it overflows 32 bits"
-                ))
-            })?;
-        return Err(FrameDecoderError::skip(frame_len));
+        return Err(FrameDecoderError::skip(skip_size));
     }
 
     if magic_num != ZSTD_MAGIC {
@@ -2649,7 +2612,9 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
 // Block header parsing
 // ============================================================
 
-fn parse_block_header(src: &[u8]) -> Result<(BlockHeader, usize), String> {
+/// Parse the block header at the start of `src`, in a frame whose
+/// Block_Maximum_Size is `block_size_max`.
+fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, usize), String> {
     let buf: [u8; 3] = src
         .get(..3)
         .ok_or_else(|| "Error reading block header: truncated".to_string())?
@@ -2670,9 +2635,16 @@ fn parse_block_header(src: &[u8]) -> Result<(BlockHeader, usize), String> {
         return Err("Found reserved block type".to_string());
     }
 
-    // Raw and RLE blocks are bounded by the output alone (ZSTD_copyRawBlock,
-    // ZSTD_setRleBlock); `split_block` bounds a compressed one.
     let block_size = u32::from(buf[0] >> 3) | (u32::from(buf[1]) << 5) | (u32::from(buf[2]) << 13);
+    // RFC 8878 lines 545-569: Block_Size, a raw or compressed block's
+    // content size and an RLE block's decoded size alike, is at most
+    // Block_Maximum_Size.
+    if block_size as usize > block_size_max {
+        return Err(format!(
+            "Block size {} exceeds Block_Maximum_Size {}",
+            block_size, block_size_max
+        ));
+    }
 
     let decompressed_size = match block_type {
         BlockType::Raw | BlockType::RLE => block_size,
@@ -2753,26 +2725,30 @@ fn decompress_literals(
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    let out = &mut target[start..];
-
-    // Each decoder is instantiated per table log, so that a 12-bit table
-    // leaves the fast loops out and codes up to 11 bits keep constant shifts.
-    const FAST: u32 = HUF_FAST_TABLE_LOG;
-    const MAX: u32 = HUF_TABLELOG_MAX;
-    let t = &scratch.table;
-    match (num_streams == 4, t.is_x2, t.dt_log() == FAST) {
-        (true, true, true) => huf_decompress_4x2::<FAST>(out, source, t)?,
-        (true, true, false) => huf_decompress_4x2::<MAX>(out, source, t)?,
-        (true, false, true) => huf_decompress_4x1::<FAST>(out, source, t)?,
-        (true, false, false) => huf_decompress_4x1::<MAX>(out, source, t)?,
-        (false, true, true) => huf_decompress_1x2::<FAST>(out, source, t)?,
-        (false, true, false) => huf_decompress_1x2::<MAX>(out, source, t)?,
-        (false, false, true) => huf_decompress_1x1::<FAST>(out, source, t)?,
-        (false, false, false) => huf_decompress_1x1::<MAX>(out, source, t)?,
-    }
+    huf_decompress(
+        &mut target[start..],
+        source,
+        num_streams == 4,
+        &scratch.table,
+    )?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
+}
+
+/// Decode the Huffman streams of a literals section with the built table.
+fn huf_decompress(
+    out: &mut [u8],
+    source: &[u8],
+    four_streams: bool,
+    t: &HuffmanTable,
+) -> Result<(), String> {
+    match (four_streams, t.is_x2) {
+        (true, true) => huf_decompress_4x2(out, source, t),
+        (true, false) => huf_decompress_4x1(out, source, t),
+        (false, true) => huf_decompress_1x2(out, source, t),
+        (false, false) => huf_decompress_1x1(out, source, t),
+    }
 }
 
 // ============================================================
@@ -2820,22 +2796,6 @@ const OF_BITS: [u8; 32] = [
 /// limit so that copies may overshoot by a whole vector
 /// (libzstd WILDCOPY_OVERLENGTH).
 const WILDCOPY_OVERLENGTH: usize = 32;
-
-/// The most bytes a compressed block decodes to in a frame whose
-/// Block_Maximum_Size is `block_size_max`. With room left in dst,
-/// ZSTD_decompressFrame's blocks keep their literals from
-/// `dst + block_size_max + WILDCOPY_OVERLENGTH` on
-/// (ZSTD_allocateLiteralsBuffer), and that is where the sequences' output
-/// must end (`oend` of ZSTD_decompressSequences_body). This decoder's
-/// output grows as needed, so it always has that room.
-const fn decoded_block_max(block_size_max: usize) -> usize {
-    block_size_max + WILDCOPY_OVERLENGTH
-}
-
-/// The sequence executors' output bound, the most any block decodes to;
-/// `execute_with_copies` then holds a block to its own frame's
-/// `decoded_block_max`, which keeps the executors' loops on a constant.
-const DECODED_BLOCK_MAX: usize = decoded_block_max(MAX_BLOCK_SIZE as usize);
 
 /// Copies with offsets at or above this never overlap a 16-byte chunk
 /// (libzstd WILDCOPY_VECLEN).
@@ -3007,6 +2967,7 @@ enum SeqError {
     NotEnoughLiterals,
     BlockTooLarge,
     OffsetTooFar,
+    OffsetPastWindow,
 }
 
 #[cold]
@@ -3016,22 +2977,33 @@ fn seq_error_message(e: SeqError) -> String {
         SeqError::NotEnoughLiterals => "Sequence needs more literals than the block has".into(),
         SeqError::BlockTooLarge => "Block content exceeds block size limit".into(),
         SeqError::OffsetTooFar => "Match offset reaches before the frame start".into(),
+        SeqError::OffsetPastWindow => "Match offset exceeds Window_Size".into(),
     }
+}
+
+/// The output a frame's matches may copy from: back to the frame's first
+/// byte, at output position `start`, and at most `window` bytes, its
+/// Window_Size (RFC 8878 lines 590-593). An offset of exactly Window_Size
+/// is accepted (line 592).
+#[derive(Clone, Copy)]
+struct Prefix {
+    start: usize,
+    window: usize,
 }
 
 /// A block's sequences, executed into the frame by `execute_with_copies`
 /// with the copies it picks.
 trait BlockSequences {
     /// Execute the sequences straight into `out`, whose bytes from
-    /// `prefix_start` on are the frame so far: matches reach back no
-    /// further. `out` is grown by the block limit plus slack up front so
-    /// that all copies use fixed-size chunks and may overshoot; it is
-    /// truncated to the real length on return.
+    /// `prefix.start` on are the frame so far; matches reach back no
+    /// further, nor past `prefix.window`. `out` is grown by the block
+    /// limit plus slack up front so that all copies use fixed-size chunks
+    /// and may overshoot; it is truncated to the real length on return.
     fn execute<W: WildCopy>(
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix_start: usize,
+        prefix: Prefix,
         out: &mut Vec<u8>,
     ) -> Result<(), String>;
 }
@@ -3040,14 +3012,15 @@ trait BlockSequences {
 /// the MT decoder's stage 3 alike: 32-byte ones on the AVX2 level, 16-byte
 /// ones otherwise, and the `ShortOffsets` variants when the block's offsets
 /// table gives many short offsets. Each copy type runs in a function of its
-/// own. The block may decode to `decoded_block_max(block_size_max)` bytes.
+/// own. The block may decode to `block_size_max` bytes (RFC 8878 lines
+/// 566-568).
 fn execute_with_copies<S: BlockSequences>(
     simd: Level,
     offsets: &FSETable,
     seqs: S,
     offset_hist: &mut [u32; 3],
     block_size_max: usize,
-    prefix_start: usize,
+    prefix: Prefix,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let base = out.len();
@@ -3058,25 +3031,25 @@ fn execute_with_copies<S: BlockSequences>(
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Level::Avx2(w) => unsafe {
             if short {
-                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix_start, out)
+                execute_avx2(Avx2ShortOffsets(w), seqs, offset_hist, prefix, out)
             } else {
-                execute_avx2(w, seqs, offset_hist, prefix_start, out)
+                execute_avx2(w, seqs, offset_hist, prefix, out)
             }
         },
         _ if short => execute_portable(
             FallbackShortOffsets(Fallback::new()),
             seqs,
             offset_hist,
-            prefix_start,
+            prefix,
             out,
         ),
-        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix_start, out),
+        _ => execute_portable(Fallback::new(), seqs, offset_hist, prefix, out),
     }?;
     let decoded = out.len() - base;
-    if decoded > decoded_block_max(block_size_max) {
+    if decoded > block_size_max {
         return Err(format!(
-            "Block decodes to {} bytes, past Block_Maximum_Size {} + {}",
-            decoded, block_size_max, WILDCOPY_OVERLENGTH
+            "Block decodes to {} bytes, past Block_Maximum_Size {}",
+            decoded, block_size_max
         ));
     }
     Ok(())
@@ -3087,10 +3060,10 @@ fn execute_portable<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix_start: usize,
+    prefix: Prefix,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix_start, out)
+    seqs.execute(w, offset_hist, prefix, out)
 }
 
 /// `execute_portable` compiled with AVX2.
@@ -3101,10 +3074,10 @@ fn execute_avx2<W: WildCopy, S: BlockSequences>(
     w: W,
     seqs: S,
     offset_hist: &mut [u32; 3],
-    prefix_start: usize,
+    prefix: Prefix,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    seqs.execute(w, offset_hist, prefix_start, out)
+    seqs.execute(w, offset_hist, prefix, out)
 }
 
 /// A compressed block's sequences section after its tables, with the
@@ -3126,15 +3099,16 @@ impl BlockSequences for SeqInput<'_> {
         self,
         w: W,
         offset_hist: &mut [u32; 3],
-        prefix_start: usize,
+        prefix: Prefix,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
+        let prefix_start = prefix.start;
         let base = out.len();
         // Spare capacity only: the block's bytes are written by the copies
         // in `exec_sequence`, so zero-filling them first is wasted work.
-        out.reserve(DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH);
+        out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
         // SAFETY: `prefix_start <= base <= capacity`, and the capacity holds
-        // `DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH` bytes past `base`, which
+        // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`, which
         // is the extent `run_sequences` may write (see its contract).
         let end = unsafe {
             run_sequences(
@@ -3143,11 +3117,12 @@ impl BlockSequences for SeqInput<'_> {
                 offset_hist,
                 out.as_mut_ptr().add(prefix_start),
                 base - prefix_start,
+                prefix.window,
             )?
         };
         // SAFETY: on success `run_sequences` initialized every byte of
         // `prefix_start + (base - prefix_start)..prefix_start + end`, and
-        // `end <= base - prefix_start + DECODED_BLOCK_MAX` keeps the length
+        // `end <= base - prefix_start + MAX_BLOCK_SIZE` keeps the length
         // within the reserved capacity.
         unsafe { out.set_len(prefix_start + end) };
         Ok(())
@@ -3155,14 +3130,15 @@ impl BlockSequences for SeqInput<'_> {
 }
 
 /// Execute the block's sequences into the buffer at `out`, which starts at
-/// the frame's first byte; `op` is where this block starts. Returns the
-/// block's end, at most `op + DECODED_BLOCK_MAX`, with every byte of
+/// the frame's first byte; `op` is where this block starts and `window`
+/// the frame's Window_Size (`Prefix::window`). Returns the
+/// block's end, at most `op + MAX_BLOCK_SIZE`, with every byte of
 /// `op..end` written; bytes past `end` may have been written too, and
 /// nothing before `op` is.
 ///
 /// # Safety
 /// `out..out + op` is initialized and
-/// `out..out + op + DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH` is valid for
+/// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is valid for
 /// writes.
 #[inline(always)]
 unsafe fn run_sequences<W: WildCopy>(
@@ -3171,6 +3147,7 @@ unsafe fn run_sequences<W: WildCopy>(
     offset_hist: &mut [u32; 3],
     out: *mut u8,
     op: usize,
+    window: usize,
 ) -> Result<usize, String> {
     let SeqInput {
         num_sequences,
@@ -3193,7 +3170,7 @@ unsafe fn run_sequences<W: WildCopy>(
         return Err("FSE table is uninitialized".to_string());
     }
     let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
-    let oend = op + DECODED_BLOCK_MAX;
+    let oend = op + MAX_BLOCK_SIZE;
 
     let mut br = BitDStream::new(bit_stream)?;
     // ZSTD_initFseState: LL, OF, ML order, each followed by a reload.
@@ -3229,6 +3206,7 @@ unsafe fn run_sequences<W: WildCopy>(
             oend_w: out.add(oend),
             lit_limit: lit_start.add(literals_len),
             prefix: out,
+            window,
         }
     };
 
@@ -3281,11 +3259,13 @@ struct SeqCursor {
 
 /// Bounds of one block's sequence execution: the output limit less
 /// `WILDCOPY_OVERLENGTH`, the literals end less `WILDCOPY_OVERLENGTH`, and
-/// the earliest byte a match may copy from.
+/// how far back a match may copy from: the frame's first byte and
+/// Window_Size (`Prefix`).
 struct SeqLimits {
     oend_w: *mut u8,
     lit_limit: *const u8,
     prefix: *mut u8,
+    window: usize,
 }
 
 /// Decode one sequence (ZSTD_decodeSequence): literal length, match
@@ -3403,11 +3383,17 @@ fn exec_sequence<W: WildCopy>(
     if offset.wrapping_sub(1) >= o_lit_end - lim.prefix as usize {
         return Err(SeqError::OffsetTooFar);
     }
+    // A branch of its own: folded into the check above with `min`, the
+    // window cost a stack reload and a cmov per sequence, 2-6% of words_1M
+    // decode speed with AVX2.
+    if offset > lim.window {
+        return Err(SeqError::OffsetPastWindow);
+    }
 
-    // SAFETY: the three checks above give, with `ml >= 1`,
+    // SAFETY: the checks above give, with `ml >= 1`,
     //   lit + ll <= lit_limit, which has 32 readable bytes after it,
     //   o_match_end <= oend_w, which has 32 writable bytes after it,
-    //   1 <= offset <= o_lit_end - prefix.
+    //   1 <= offset <= min(o_lit_end - prefix, window).
     // Literals come from another buffer and are read from `lit` and
     // written from `op` with at most 31 bytes of overshoot. The match
     // meets `copy_match`'s contract with `avail = o_lit_end - prefix`:
@@ -3789,10 +3775,10 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 // ============================================================
 
 /// Decode every block of one frame from `data[*pos..]` straight into
-/// `output`, then check the content size and checksum. Matches may only
-/// reach back to the frame's own start (ZSTD_decompressFrame). Frames of at
-/// least `min_parallel_blocks` blocks are decoded by `parallel` when
-/// enabled.
+/// `output`, then check the content size and checksum. Matches reach back
+/// at most Window_Size bytes and never before the frame's own start
+/// (`Prefix`). Frames of at least `min_parallel_blocks` blocks are decoded
+/// by `parallel` when enabled.
 #[inline(never)]
 fn decode_frame(
     header: &FrameHeader,
@@ -3803,27 +3789,31 @@ fn decode_frame(
     min_parallel_blocks: usize,
     simd: Level,
 ) -> Result<(), String> {
-    // Any window the header takes: one-shot ZSTD_decompressDCtx checks
-    // `maxWindowSize` only when streaming, and this decoder keeps no window
-    // buffer, so the window's one use is to bound the blocks.
+    // Any window the header takes: this decoder keeps no window buffer,
+    // so the window only bounds the blocks and the match offsets.
     let window_size = header.window_size()?;
-    // Block_Maximum_Size (fParams.blockSizeMax), the bound `split_block`
-    // puts on every compressed block and its literals, and
-    // `execute_with_copies`, through `decoded_block_max`, on what the block
-    // decodes to.
-    let block_size_max = window_size.min(u64::from(MAX_BLOCK_SIZE)) as usize;
-    let mut frame = FrameContent::new(output.len(), header.descriptor.content_checksum_flag());
+    // Block_Maximum_Size (RFC 8878 lines 557-564), the bound
+    // `parse_block_header` puts on every Block_Size, `split_block` on a
+    // compressed block's literals and `execute_with_copies` on what its
+    // sequences decode to.
+    let block_size_max = window_size.min(MAX_BLOCK_SIZE as u64) as usize;
+    let prefix = Prefix {
+        start: output.len(),
+        // A window past the address space bounds no offset.
+        window: usize::try_from(window_size).unwrap_or(usize::MAX),
+    };
+    let mut frame = FrameContent::new(prefix, header.descriptor.content_checksum_flag());
 
     if let Some(fcs) = header.frame_content_size() {
-        // Room for the whole frame plus what a compressed block may write
-        // past its start, so that no block has to grow the buffer (and
-        // move everything decoded). A content size past what the blocks
-        // can decode to fails the size check below, so it gets no room
-        // beyond that.
+        // Room for the whole frame plus what the sequence executors reserve
+        // past a block's start, so that no block has to grow the buffer
+        // (and move everything decoded). A content size past what the
+        // blocks can decode to fails the size check below, so it gets no
+        // room beyond that.
         let content = fcs.min(blocks_decoded_bound(&data[*pos..], block_size_max));
         let want = usize::try_from(content)
             .ok()
-            .and_then(|n| n.checked_add(DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH))
+            .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
             .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
         output
             .try_reserve(want)
@@ -3850,7 +3840,7 @@ fn decode_frame(
     }
 
     if let Some(fcs) = header.frame_content_size() {
-        let decoded = (output.len() - frame.base) as u64;
+        let decoded = (output.len() - frame.prefix.start) as u64;
         if decoded != fcs {
             return Err(format!(
                 "Frame content size mismatch: header says {}, decoded {}",
@@ -3875,23 +3865,23 @@ fn decode_frame(
     Ok(())
 }
 
-/// A frame's content in the output: where it starts and, when the frame
-/// has a Content_Checksum, the XXH64 of what has been decoded
-/// (ZSTD_decompressFrame's `xxhState`).
+/// A frame's content in the output: where it starts, how far back its
+/// matches reach and, when the frame has a Content_Checksum, the XXH64 of
+/// what has been decoded (ZSTD_decompressFrame's `xxhState`).
 struct FrameContent {
-    /// Output position of the frame's first byte.
-    base: usize,
+    /// Output position of the frame's first byte, and its Window_Size.
+    prefix: Prefix,
     checksum: Option<Xxh64>,
     /// Output position up to which `checksum` has been fed.
     fed: usize,
 }
 
 impl FrameContent {
-    fn new(base: usize, has_checksum: bool) -> Self {
+    fn new(prefix: Prefix, has_checksum: bool) -> Self {
         Self {
-            base,
+            prefix,
             checksum: has_checksum.then(Xxh64::new),
-            fed: base,
+            fed: prefix.start,
         }
     }
 
@@ -3915,18 +3905,18 @@ impl FrameContent {
 
 /// The most the blocks at the start of `data` decode to: the sum of each
 /// raw block's content, RLE block's size and compressed block's
-/// `decoded_block_max`, up to the last block or up to the first one the
-/// input does not hold, where decoding fails.
+/// `block_size_max`, up to the last block or up to the first one the input
+/// does not hold or `parse_block_header` rejects, where decoding fails.
 fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     let mut rest = data;
     let mut bound = 0u64;
-    while let Ok((block, header_len)) = parse_block_header(rest) {
+    while let Ok((block, header_len)) = parse_block_header(rest, block_size_max) {
         let Some(next) = rest.get(header_len + block.content_size as usize..) else {
             break;
         };
         rest = next;
         bound = bound.saturating_add(match block.block_type {
-            BlockType::Compressed => decoded_block_max(block_size_max) as u64,
+            BlockType::Compressed => block_size_max as u64,
             _ => u64::from(block.decompressed_size),
         });
         if block.last_block {
@@ -3948,7 +3938,7 @@ fn decode_blocks(
     simd: Level,
 ) -> Result<(), String> {
     loop {
-        let (block, header_len) = parse_block_header(&data[*pos..])?;
+        let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
         *pos += header_len;
         let content = data
             .get(*pos..*pos + block.content_size as usize)
@@ -3961,7 +3951,7 @@ fn decode_blocks(
                 output.resize(output.len() + block.decompressed_size as usize, content[0])
             }
             BlockType::Compressed => {
-                decompress_block(content, block_size_max, scratch, frame.base, output, simd)?
+                decompress_block(content, block_size_max, scratch, frame.prefix, output, simd)?
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         }
@@ -3988,17 +3978,11 @@ struct BlockParts<'a> {
     sequences_src: &'a [u8],
 }
 
-/// Locate the sections of compressed block `raw` in a frame whose
-/// Block_Maximum_Size is `block_size_max`, which bounds the block and its
-/// literals (ZSTD_decompressBlock_internal, ZSTD_decodeLiteralsBlock).
+/// Locate the sections of compressed block `raw`, which
+/// `parse_block_header` has held to `block_size_max`, in a frame whose
+/// Block_Maximum_Size that is. The literals decode into the block, so they
+/// are held to it too, before anything is sized from their header.
 fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, String> {
-    if raw.len() > block_size_max {
-        return Err(format!(
-            "Compressed block size {} exceeds Block_Maximum_Size {}",
-            raw.len(),
-            block_size_max
-        ));
-    }
     let mut section = LiteralsSection::new();
     let bytes_in_literals_header = section.parse_from_header(raw)?;
     if section.regenerated_size as usize > block_size_max {
@@ -4063,7 +4047,7 @@ fn decompress_block(
     raw: &[u8],
     block_size_max: usize,
     workspace: &mut DecoderScratch,
-    frame_base: usize,
+    prefix: Prefix,
     output: &mut Vec<u8>,
     simd: Level,
 ) -> Result<(), String> {
@@ -4087,7 +4071,7 @@ fn decompress_block(
             seqs,
             &mut workspace.offset_hist,
             block_size_max,
-            frame_base,
+            prefix,
             output,
         )?;
     } else {
@@ -4162,7 +4146,7 @@ mod parallel {
         let mut huf_def = None;
         let mut fse_def: [Option<usize>; 3] = [None; 3];
         loop {
-            let (block, header_len) = parse_block_header(&data[*pos..])?;
+            let (block, header_len) = parse_block_header(&data[*pos..], block_size_max)?;
             *pos += header_len;
             let content = data
                 .get(*pos..*pos + block.content_size as usize)
@@ -4545,7 +4529,7 @@ mod parallel {
         slot: &mut Slot,
         hist: &mut [u32; 3],
         block_size_max: usize,
-        frame_base: usize,
+        prefix: Prefix,
         output: &mut Vec<u8>,
         simd: Level,
     ) -> Result<(), String> {
@@ -4569,7 +4553,7 @@ mod parallel {
                     seqs,
                     hist,
                     block_size_max,
-                    frame_base,
+                    prefix,
                     output,
                 )?;
             }
@@ -4590,13 +4574,14 @@ mod parallel {
             self,
             w: W,
             offset_hist: &mut [u32; 3],
-            prefix_start: usize,
+            prefix: Prefix,
             out: &mut Vec<u8>,
         ) -> Result<(), String> {
+            let prefix_start = prefix.start;
             let base = out.len();
-            out.reserve(DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH);
+            out.reserve(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
             // SAFETY: `prefix_start <= base`, and the capacity holds
-            // `DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH` bytes past `base`,
+            // `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes past `base`,
             // the extent `execute_sequences` may write.
             let end = unsafe {
                 execute_sequences(
@@ -4606,6 +4591,7 @@ mod parallel {
                     offset_hist,
                     out.as_mut_ptr().add(prefix_start),
                     base - prefix_start,
+                    prefix.window,
                 )?
             };
             // SAFETY: on success every byte up to `prefix_start + end` is
@@ -4616,12 +4602,12 @@ mod parallel {
     }
 
     /// Execute decoded sequences from `op` in the buffer at `out` (the
-    /// frame start); returns the block's end. Same contract as
-    /// `run_sequences`.
+    /// frame start) with Window_Size `window`; returns the block's end.
+    /// Same contract as `run_sequences`.
     ///
     /// # Safety
     /// `out..out + op` is initialized and
-    /// `out..out + op + DECODED_BLOCK_MAX + WILDCOPY_OVERLENGTH` is writable.
+    /// `out..out + op + MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` is writable.
     #[inline(always)]
     unsafe fn execute_sequences<W: WildCopy>(
         w: W,
@@ -4630,6 +4616,7 @@ mod parallel {
         offset_hist: &mut [u32; 3],
         out: *mut u8,
         op: usize,
+        window: usize,
     ) -> Result<usize, String> {
         let mut hist = offset_hist.map(|o| o as usize);
         let lit = literals.as_ptr();
@@ -4640,9 +4627,10 @@ mod parallel {
             lit,
         };
         let lim = SeqLimits {
-            oend_w: out.add(op + DECODED_BLOCK_MAX),
+            oend_w: out.add(op + MAX_BLOCK_SIZE),
             lit_limit: lit.add(literals.len() - WILDCOPY_OVERLENGTH),
             prefix: out,
+            window,
         };
         for s in seqs {
             let ll = s.ll as usize;
@@ -4753,7 +4741,7 @@ mod parallel {
                     &mut slot,
                     &mut hist,
                     block_size_max,
-                    frame.base,
+                    frame.prefix,
                     output,
                     simd,
                 )?;
@@ -4826,6 +4814,22 @@ mod tests {
             workspace: *mut u64,
             wksp_size: usize,
         ) -> usize;
+        fn HUF_compress1X_usingCTable(
+            dst: *mut u8,
+            dst_size: usize,
+            src: *const u8,
+            src_size: usize,
+            ctable: *const usize,
+            flags: i32,
+        ) -> usize;
+        fn HUF_compress4X_usingCTable(
+            dst: *mut u8,
+            dst_size: usize,
+            src: *const u8,
+            src_size: usize,
+            ctable: *const usize,
+            flags: i32,
+        ) -> usize;
     }
 
     /// (description length, weights with the implied last one, rank
@@ -4837,7 +4841,7 @@ mod tests {
         let mut rank_stats = [0u32; 13];
         let (mut nb_symbols, mut table_log) = (0u32, 0u32);
         // SAFETY: the buffers have the sizes HUF_readStats is given (rankStats
-        // takes HUF_TABLELOG_MAX + 1 = 13 entries).
+        // takes libzstd's HUF_TABLELOG_MAX + 1 = 13 entries).
         let (r, error) = unsafe {
             let r = HUF_readStats(
                 weights.as_mut_ptr(),
@@ -4862,10 +4866,13 @@ mod tests {
         let (used, nb_weights) = t.read_weights(src).ok()?;
         t.weight_stats(nb_weights).ok()?;
         let n = t.nb_symbols;
+        // libzstd's rankStats has a slot for weight 12 too.
+        let mut rank_stats = t.rank_stats.to_vec();
+        rank_stats.resize(13, 0);
         Some((
             used,
             t.weights[..n].to_vec(),
-            t.rank_stats.to_vec(),
+            rank_stats,
             u32::from(t.max_num_bits),
         ))
     }
@@ -4903,14 +4910,222 @@ mod tests {
         }
     }
 
+    /// libzstd's code of at most `max_bits` bits for `symbols`, and a
+    /// literals section of them: the tree description followed by one or
+    /// four streams (HUF_compress1X/4X_usingCTable). `None` when libzstd
+    /// does not compress them.
+    fn huf_section_c(symbols: &[u8], max_bits: u32, four: bool) -> Option<Vec<u8>> {
+        let mut counts = [0u32; 256];
+        for &s in symbols {
+            counts[usize::from(s)] += 1;
+        }
+        let max_sv = counts.iter().rposition(|&c| c > 0).unwrap() as u32;
+        let mut ctable = [0usize; 258];
+        let mut wksp = [0u64; 2048];
+        let mut out = vec![0u8; 256 + 2 * symbols.len() + 64];
+        // SAFETY: `ctable` holds HUF_CTABLE_SIZE_ST(255) entries, `wksp`
+        // exceeds HUF_WORKSPACE_SIZE and the lengths are the buffers' own.
+        unsafe {
+            let bits = HUF_buildCTable_wksp(
+                ctable.as_mut_ptr(),
+                counts.as_ptr(),
+                max_sv,
+                max_bits,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            assert_eq!(zstd::zstd_safe::zstd_sys::ZSTD_isError(bits), 0);
+            let n = HUF_writeCTable_wksp(
+                out.as_mut_ptr(),
+                256,
+                ctable.as_ptr(),
+                max_sv,
+                bits as u32,
+                wksp.as_mut_ptr(),
+                wksp.len() * 8,
+            );
+            if zstd::zstd_safe::zstd_sys::ZSTD_isError(n) != 0 {
+                return None;
+            }
+            let compress = if four {
+                HUF_compress4X_usingCTable
+            } else {
+                HUF_compress1X_usingCTable
+            };
+            let m = compress(
+                out.as_mut_ptr().add(n),
+                out.len() - n,
+                symbols.as_ptr(),
+                symbols.len(),
+                ctable.as_ptr(),
+                0,
+            );
+            if m == 0 || zstd::zstd_safe::zstd_sys::ZSTD_isError(m) != 0 {
+                return None;
+            }
+            out.truncate(n + m);
+        }
+        Some(out)
+    }
+
+    /// Decode `section` into `dst_size` literals with the single-symbol
+    /// (`x2` false) or the double-symbol table, whatever HUF_selectDecoder
+    /// would pick.
+    fn huf_decode_forced(
+        section: &[u8],
+        dst_size: usize,
+        four: bool,
+        x2: bool,
+    ) -> Result<Vec<u8>, String> {
+        let mut t = HuffmanTable::new();
+        let (used, nb_weights) = t.read_weights(section)?;
+        t.weight_stats(nb_weights)?;
+        t.fill(x2);
+        let mut out = vec![0u8; dst_size];
+        huf_decompress(&mut out, &section[used..], four, &t)?;
+        Ok(out)
+    }
+
+    /// RFC 8878 §4.2.2: a Huffman stream is consumed exactly, so the
+    /// verdict and bytes depend on the section alone, not on whether X1 or
+    /// X2 decodes it (R1-6, R2-3). Over libzstd sections of one and four
+    /// streams, short (plain loops) and long (fast loops): one literal
+    /// fewer leaves a symbol undecoded and one more runs a stream dry, and
+    /// both decoders reject both; random byte and size mutations get the
+    /// same verdict and output from both.
+    #[test]
+    fn huf_x1_x2_same_verdict() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let both = |section: &[u8], dst_size: usize, four: bool| {
+            let x1 = huf_decode_forced(section, dst_size, four, false);
+            let x2 = huf_decode_forced(section, dst_size, four, true);
+            assert_eq!(
+                x1.is_ok(),
+                x2.is_ok(),
+                "four {four} size {dst_size}: X1 {:?} X2 {:?}",
+                x1.as_ref().err(),
+                x2.as_ref().err()
+            );
+            if let (Ok(a), Ok(b)) = (&x1, &x2) {
+                assert!(a == b, "four {four} size {dst_size}: bytes differ");
+            }
+            x1.ok()
+        };
+        let (mut sections, mut mutants_ok, mut fast) = (0, 0, 0);
+        for case in 0..1500 {
+            let n = match case % 5 {
+                0 => 1 + rand() as usize % 40,
+                1 => 40 + rand() as usize % 200,
+                _ => 200 + rand() as usize % 6000,
+            };
+            let alphabet = 2 + rand() % 60;
+            let skew = rand() % 4;
+            let symbols: Vec<u8> = (0..n)
+                .map(|_| {
+                    let mut v = rand() % alphabet;
+                    for _ in 0..skew {
+                        v = v.min(rand() % alphabet);
+                    }
+                    v as u8
+                })
+                .collect();
+            // A code needs two symbols; libzstd sends one as RLE.
+            if symbols.iter().all(|&s| s == symbols[0]) {
+                continue;
+            }
+            let four = case % 2 == 1;
+            let max_bits = 6 + rand() % 6;
+            let Some(section) = huf_section_c(&symbols, max_bits, four) else {
+                continue;
+            };
+            sections += 1;
+            let segment = n.div_ceil(4);
+            fast += usize::from(four && n > 3 * segment && section.len() > 300);
+            assert_eq!(both(&section, n, four).as_deref(), Some(&symbols[..]));
+            // A 4-stream size change keeps the segments only while
+            // ceil(size / 4) stays the same.
+            if !four || (n - 1).div_ceil(4) == segment {
+                assert_eq!(both(&section, n - 1, four), None, "extra symbol");
+            }
+            if !four || (n + 1).div_ceil(4) == segment {
+                assert_eq!(both(&section, n + 1, four), None, "exhausted");
+            }
+            for _ in 0..20 {
+                let mut bad = section.clone();
+                let pos = rand() as usize % bad.len();
+                if rand() % 2 == 0 {
+                    bad[pos] ^= 1 << (rand() % 8);
+                } else {
+                    bad[pos] = rand() as u8;
+                }
+                let size = (n as i64 + i64::from(rand() % 7) - 3).max(1) as usize;
+                mutants_ok += usize::from(both(&bad, size, four).is_some());
+            }
+        }
+        assert!(
+            sections > 1200 && fast > 300 && mutants_ok > 1000,
+            "{sections} sections, {fast} fast, {mutants_ok} mutants accepted"
+        );
+    }
+
+    /// 4-stream sections of every Regenerated_Size up to 9 under a code of
+    /// two 1-bit symbols: the RFC's split ((size + 3) / 4 bytes for the
+    /// first three streams, the rest for the last) is valid exactly when
+    /// the rest is not negative, so sizes 1, 2 and 5 fail and 0, 3 and 4
+    /// decode, under X1 and X2 alike (R2-6).
+    #[test]
+    fn huf_four_streams_follow_rfc_split() {
+        // One raw weight: symbol 0 of weight 1, the implied symbol 1 too.
+        let desc = [128u8, 0x10];
+        for size in 0..=9usize {
+            let segment = size.div_ceil(4);
+            let last = size as isize - 3 * segment as isize;
+            let want: Vec<u8> = (0..size).map(|i| (i % 3 == 1) as u8).collect();
+            let mut streams: Vec<Vec<u8>> = Vec::new();
+            for s in 0..4 {
+                let len = if s < 3 { segment } else { last.max(0) as usize };
+                let begin = (s * segment).min(size);
+                // The end mark, then each symbol's 1-bit code, read from
+                // the top bit down.
+                let mut byte = 1u8;
+                for &b in &want[begin..(begin + len).min(size)] {
+                    byte = byte << 1 | b;
+                }
+                streams.push(vec![byte]);
+            }
+            let mut section = desc.to_vec();
+            for st in &streams[..3] {
+                section.extend_from_slice(&(st.len() as u16).to_le_bytes());
+            }
+            for st in &streams {
+                section.extend_from_slice(st);
+            }
+            for x2 in [false, true] {
+                let got = huf_decode_forced(&section, size, true, x2);
+                if last < 0 {
+                    assert!(got.is_err(), "size {size} x2 {x2}");
+                } else {
+                    assert_eq!(got.as_deref(), Ok(&want[..]), "size {size} x2 {x2}");
+                }
+            }
+        }
+    }
+
     /// `read_weights` + `weight_stats` against HUF_readStats on libzstd's
     /// descriptions of random codes (raw and FSE-compressed, 2 to 256
     /// symbols, 6- to 12-bit), every truncation of them, single-byte
     /// corruptions and random bytes: the same outcome, and on success the
-    /// same length, weights, statistics and table log. Hundreds of the
-    /// corrupted and random inputs are valid descriptions, and over 150 of
-    /// the accepted inputs describe 12-bit codes, which the format excludes
-    /// and libzstd decodes.
+    /// same length, weights, statistics and table log, except that the
+    /// descriptions of 12-bit codes, which libzstd accepts, are rejected
+    /// (RFC 8878 §4.2.1 caps codes at 11 bits; R2-7). Hundreds of the
+    /// corrupted and random inputs are valid descriptions, and over 150
+    /// describe 12-bit codes.
     #[test]
     fn huf_stats_match_libzstd() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -4920,11 +5135,16 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
-        let mut log12_ok = 0;
+        let mut log12 = 0;
         let mut check = |src: &[u8]| {
             let ours = huf_stats_ours(src);
-            assert_eq!(ours, huf_stats_c(src), "input {src:02x?}");
-            log12_ok += usize::from(matches!(ours, Some((.., 12))));
+            let c = huf_stats_c(src);
+            if matches!(c, Some((.., 12))) {
+                assert_eq!(ours, None, "input {src:02x?}");
+                log12 += 1;
+            } else {
+                assert_eq!(ours, c, "input {src:02x?}");
+            }
             usize::from(ours.is_some())
         };
         let (mut raw, mut written, mut bad_ok, mut random_ok) = (0, 0, 0, 0);
@@ -4959,14 +5179,14 @@ mod tests {
             random_ok += check(&src);
         }
         assert!(
-            bad_ok > 500 && random_ok > 1000 && log12_ok > 150,
-            "{bad_ok} {random_ok} accepted, {log12_ok} of 12 bits"
+            bad_ok > 500 && random_ok > 1000 && log12 > 150,
+            "{bad_ok} {random_ok} accepted, {log12} of 12 bits"
         );
     }
 
-    /// Raw 4-bit weights (an odd number of them, and those of a 12-bit
+    /// Raw 4-bit weights (an odd number of them, and those of an 11-bit
     /// code) through the statistics and both fills, each build over the
-    /// previous one: the tables have `max(max_bits, 11)` bits, each symbol
+    /// previous one: the tables have 11 bits, each symbol
     /// of weight `w` owns `1 << (w - 1 + rescale)` single-symbol cells of
     /// `max_bits + 1 - w` bits, in weight order, and each double-symbol
     /// cell holds the single-symbol lookup of its index plus, exactly when
@@ -4979,13 +5199,18 @@ mod tests {
             &[3, 3, 2, 2, 1, 0, 1, 2],
             4,
         );
-        // Weights 12 down to 1 sum to 4095 halves; the implied 13th is 1.
+        // Weights 11 down to 1 sum to 2047 halves; the implied 12th is 1.
         let long: (&[u8], &[u8], u32) = (
-            &[127 + 12, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21],
-            &[12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1],
-            12,
+            &[127 + 11, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10],
+            &[11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1],
+            11,
         );
         let mut t = HuffmanTable::new();
+        // Weights 12 down to 1 describe a 12-bit code (R2-7).
+        let (_, nb_weights) = t
+            .read_weights(&[127 + 12, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21])
+            .unwrap();
+        assert!(t.weight_stats(nb_weights).is_err());
         for (src, weights, max_bits) in [short, long, short] {
             let n = weights.len();
             let (used, nb_weights) = t.read_weights(src).unwrap();
@@ -4995,8 +5220,7 @@ mod tests {
             assert_eq!(&t.weights[..n], weights);
             t.fill_x1();
             t.fill_x2();
-            let log = t.dt_log();
-            assert_eq!(log, max_bits.max(HUF_FAST_TABLE_LOG));
+            let log = HUF_FAST_TABLE_LOG;
             let x1 = &t.decode[..];
             assert_eq!((x1.len(), t.decode_x2.len()), (1 << log, 1 << log));
             let mut cells = vec![0usize; n];
@@ -5134,7 +5358,7 @@ mod tests {
             self,
             _: W,
             _: &mut [u32; 3],
-            _: usize,
+            _: Prefix,
             _: &mut Vec<u8>,
         ) -> Result<(), String> {
             let name = std::any::type_name::<W>();
@@ -5156,8 +5380,20 @@ mod tests {
             levels.push((Level::Avx2(w), "Avx2", "Avx2ShortOffsets"));
         }
         let pick = |level, t: &FSETable| {
-            execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, 0, &mut Vec::new())
-                .unwrap_err()
+            let prefix = Prefix {
+                start: 0,
+                window: usize::MAX,
+            };
+            execute_with_copies(
+                level,
+                t,
+                CopyProbe,
+                &mut [1, 4, 8],
+                0,
+                prefix,
+                &mut Vec::new(),
+            )
+            .unwrap_err()
         };
         let mut t = FSETable::new(MAX_OFFSET_CODE);
         for (level, plain, short) in levels {

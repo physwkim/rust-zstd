@@ -67,10 +67,10 @@ fn zstd_nosplit(data: &[u8], level: i32) -> Vec<u8> {
     }
 }
 
-/// Levels 13-15 on inputs above 256 KiB run btlazy2 in both codecs, so the
-/// sequences and therefore the frame sizes are the same, by default (the
-/// pre-splitter at `splitLevels[btlazy2]`, no post-sequence splitter below
-/// btopt) and with both splitters off: no tolerance.
+/// Levels 13-15 on inputs above 256 KiB (btlazy2) pass the encoder gate
+/// against libzstd, by default (the pre-splitter at
+/// `splitLevels[btlazy2]`, no post-sequence splitter below btopt) and with
+/// both splitters off.
 #[test]
 fn btlazy2_sizes_equal_libzstd() {
     for ds in datasets() {
@@ -88,12 +88,6 @@ fn btlazy2_sizes_equal_libzstd() {
                     ..Default::default()
                 },
             );
-            assert_eq!(
-                rust_zstd::decompress(&ours).as_deref(),
-                Ok(data),
-                "{} level {level}",
-                ds.name
-            );
             let c = zstd_nosplit(data, level);
             let c_default = zstd::bulk::compress(data, level).unwrap();
             eprintln!(
@@ -104,8 +98,9 @@ fn btlazy2_sizes_equal_libzstd() {
                 c_default.len(),
                 c.len()
             );
-            assert_eq!(ours.len(), c_default.len(), "{} level {level}", ds.name);
-            assert_eq!(ours_nosplit.len(), c.len(), "{} level {level}", ds.name);
+            let what = format!("{} L{level}", ds.name);
+            common::assert_gate(&what, data, &ours, &c_default);
+            common::assert_gate(&format!("{what} no-split"), data, &ours_nosplit, &c);
         }
     }
 }

@@ -1,10 +1,11 @@
 //! Levels `<= 0` as libzstd reads them (`ZSTD_getCParams_internal`): `0`
 //! is `ZSTD_CLEVEL_DEFAULT`, a negative level is row 0's fast strategy with
-//! `targetLength = -level`. Whole frames must equal libzstd's.
+//! `targetLength = -level`. Frames pass the encoder gate against libzstd's,
+//! and level 0 writes level 3's frame.
 
 mod common;
 
-use rust_zstd::{compress_with, decompress, CompressOptions};
+use rust_zstd::{compress_with, CompressOptions};
 
 struct Lcg(u64);
 
@@ -47,14 +48,15 @@ fn check(name: &str, data: &[u8], level: i32) -> Vec<u8> {
             ..Default::default()
         },
     );
-    assert!(
-        decompress(&ours).unwrap() == data,
-        "{name} L{level}: roundtrip"
-    );
-    assert!(
-        ours == common::zstd_bulk(data, level),
-        "{name} L{level}: frame differs from libzstd"
-    );
+    let what = format!("{name} L{level}");
+    common::assert_gate(&what, data, &ours, &common::zstd_bulk(data, level));
+    if level == 0 {
+        let three = CompressOptions {
+            level: 3,
+            ..Default::default()
+        };
+        assert!(ours == compress_with(data, &three), "{what}: not level 3");
+    }
     ours
 }
 

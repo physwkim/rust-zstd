@@ -1,8 +1,9 @@
-//! Literals coded with 12-bit Huffman codes, which the format caps at 11
-//! bits and libzstd 1.5.7 decodes (HUF_TABLELOG_MAX = 12): frames built
-//! from libzstd's own Huffman coder, with compressed and treeless literals
-//! of one and four streams, decode as libzstd decodes them at both SIMD
-//! levels, serial and MT.
+//! Literals coded with 12-bit Huffman codes, which RFC 8878 §4.2.1 caps
+//! at 11 bits and libzstd 1.5.7 decodes (HUF_TABLELOG_MAX = 12): frames
+//! built from libzstd's own Huffman coder, with compressed and treeless
+//! literals of one and four streams, are rejected at both SIMD levels,
+//! serial and MT, when any section describes a 12-bit code (R2-7), and
+//! otherwise decode as libzstd decodes them.
 
 mod common;
 
@@ -231,7 +232,8 @@ fn frame(sections: &[Vec<u8>], content_size: usize) -> Vec<u8> {
 
 /// Build a frame from `plan` (code index, literal count, treeless, four
 /// streams), check that libzstd decodes it to the literals, and decode it
-/// at both levels, serial and MT; returns the decoders reached.
+/// at both levels, serial and MT: a frame with a 12-bit code is rejected,
+/// any other one decodes as libzstd does. Returns the decoders checked.
 fn check_frame(
     codes: &[Code],
     cursors: &mut [usize],
@@ -256,25 +258,31 @@ fn check_frame(
     let theirs =
         zstd::bulk::decompress(&f, want.len()).unwrap_or_else(|e| panic!("{plan:?}: libzstd: {e}"));
     assert!(theirs == want, "libzstd's decode differs from the literals");
+    let log12 = paths.iter().any(|p| p.0 == 12);
     for simd in [false, true] {
         for min_parallel_blocks in [usize::MAX, 1] {
             let options = DecodeOptions {
                 min_parallel_blocks,
                 simd,
             };
-            let ours = decompress_with_options(&f, &options)
-                .unwrap_or_else(|e| panic!("{plan:?} simd={simd} mt={min_parallel_blocks}: {e}"));
-            assert!(
-                ours == theirs,
-                "{plan:?} simd={simd} min_parallel_blocks={min_parallel_blocks}: output differs"
-            );
+            let what = format!("{plan:?} simd={simd} mt={min_parallel_blocks}");
+            match decompress_with_options(&f, &options) {
+                Ok(_) if log12 => panic!("{what}: a 12-bit code is accepted"),
+                Ok(ours) => assert!(ours == theirs, "{what}: output differs"),
+                Err(e) if !log12 => panic!("{what}: {e}"),
+                Err(_) => {}
+            }
         }
+    }
+    // A rejected frame's 11-bit sections were not checked.
+    if log12 {
+        paths.retain(|p| p.0 == 12);
     }
     paths
 }
 
 #[test]
-fn twelve_bit_literals_decode_like_libzstd() {
+fn twelve_bit_literals_are_rejected() {
     let mut rng = Lcg(0x5DEE_CE66_D1CE_4E5B);
     let narrow = narrow_symbols(&mut rng, 1 << 20);
     let wide = wide_symbols(&mut rng, 1 << 20);
@@ -287,8 +295,31 @@ fn twelve_bit_literals_decode_like_libzstd() {
     let mut cursors = [0usize; 4];
     let mut paths = Vec::new();
 
-    // Every decoder at log 12, with switches to and from 11-bit tables.
+    // Every decoder at log 11, each table reused by treeless sections.
     let (n12, w12, n11, w11) = (0, 1, 2, 3);
+    paths.extend(check_frame(
+        &codes,
+        &mut cursors,
+        &[
+            (n11, 100_000, false, true),
+            (0, 900, true, false),
+            (0, 30_000, true, true),
+            (w11, 60_000, false, true),
+            (0, 700, true, false),
+            (0, 20_000, true, true),
+            (n11, 700, false, false),
+            (0, 10_000, true, true),
+            (w11, 12, false, true),
+            (0, 1, true, false),
+        ],
+    ));
+
+    // Each 12-bit description alone, and among 11-bit tables.
+    for c in [n12, w12] {
+        for (len, four) in [(700, false), (12, true), (100_000, true)] {
+            paths.extend(check_frame(&codes, &mut cursors, &[(c, len, false, four)]));
+        }
+    }
     paths.extend(check_frame(
         &codes,
         &mut cursors,
@@ -312,13 +343,17 @@ fn twelve_bit_literals_decode_like_libzstd() {
     ));
 
     // Random plans: sizes across the segment and stream-length boundaries
-    // of both loops.
-    for _ in 0..40 {
+    // of both loops; half of them with 11-bit codes only.
+    for f in 0..40 {
         let mut plan = Vec::new();
         for b in 0..1 + rng.next() % 10 {
             let treeless = b > 0 && rng.next().is_multiple_of(2);
             let four = !rng.next().is_multiple_of(3);
-            let c = rng.next() as usize % 4;
+            let c = if f % 2 == 0 {
+                n11 + rng.next() as usize % 2
+            } else {
+                rng.next() as usize % 4
+            };
             let len = match (four, rng.next() % 3) {
                 (false, _) => 1 + rng.next() as usize % 700,
                 (true, 0) => 12 + rng.next() as usize % 256,

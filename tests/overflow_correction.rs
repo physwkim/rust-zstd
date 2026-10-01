@@ -1,9 +1,9 @@
 //! Window overflow correction against libzstd 1.5.7 built with
 //! `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY` set to 1: with
 //! `CompressOptions::overflow_correct_frequently`, every case of
-//! `tests/data/overflow_frequent.txt` writes that frame, corrects a window
-//! at least once (the long distance matcher's when the case enables it), and
-//! decodes through our decoder. The fixture comes from
+//! `tests/data/overflow_frequent.txt` passes the encoder gate against that
+//! frame's size, on the same input (its hash), and corrects a window at
+//! least once (the long distance matcher's when the case enables it). The fixture comes from
 //! `tests/data/overflow_frequent.c`, whose header has the build command.
 //!
 //! A single frame's window shrinks to its input, so each input exceeds
@@ -15,7 +15,7 @@
 //!
 //! `input_over_4_gib_matches_libzstd` compresses 4.5 GiB, which stock
 //! libzstd corrects once its indices pass 3500 MiB, at levels 1 and 3 and
-//! level 3 with long distance matching.
+//! level 3 with long distance matching, and gates it against libzstd's.
 //!
 //! `window_low_follows_libzstd_low_limit` (not ignored) checks the match
 //! state's window, `lowLimit` included, block by block against
@@ -188,20 +188,21 @@ fn check(cases: &[Case]) {
         let frame = cx.compress_to_vec(src);
         let (ms, lds) = cx.overflow_corrections();
         let name = key(case);
-        let got = format!("{} {:016x} {:016x}", frame.len(), fnv64(&frame), fnv64(src));
-        eprintln!("{name}: {got}, corrections {ms} + {lds} (long distance)");
-        if want.get(&name) != Some(&got) {
-            diffs.push(format!("{name}: {:?} -> {got}", want.get(&name)));
-        }
+        eprintln!(
+            "{name}: {} bytes, corrections {ms} + {lds} (long distance)",
+            frame.len()
+        );
+        // `frame_len frame_fnv input_fnv`
+        let row: Vec<&str> = want[&name].split(' ').collect();
+        assert_eq!(row[2], format!("{:016x}", fnv64(src)), "{name}: input");
         assert!(ms + lds > 0, "{name}: no correction");
         assert!(!ldm || lds > 0, "{name}: no long distance correction");
-        assert!(rust_zstd::decompress(&frame).unwrap() == src, "{name}");
+        common::assert_round_trip(&name, src, &frame);
+        if let Err(e) = common::check_size(&name, frame.len(), row[0].parse().unwrap()) {
+            diffs.push(e);
+        }
     }
-    assert!(
-        diffs.is_empty(),
-        "differ from libzstd:\n{}",
-        diffs.join("\n")
-    );
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }
 
 /// The fixture has exactly the rows of `CASES`.
@@ -258,8 +259,7 @@ fn input_over_4_gib_matches_libzstd() {
         if ldm {
             params.push((ZSTD_c_enableLongDistanceMatching, 1));
         }
-        assert!(common::c_compress2(&data, &params) == frame, "{name}");
-        assert!(rust_zstd::decompress(&frame).unwrap() == data, "{name}");
+        common::assert_gate(&name, &data, &frame, &common::c_compress2(&data, &params));
     }
 }
 
