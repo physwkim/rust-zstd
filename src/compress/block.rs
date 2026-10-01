@@ -6,9 +6,9 @@
 //! change only when a COMPRESSED block is emitted. [`CommittedBlockState`]
 //! keeps that state in a private field; the entropy stage reads it through
 //! [`CommittedBlockState::prev`] and produces a fresh [`BlockState`], and the
-//! private `commit` in [`compress_block`] is the only path that installs it
-//! (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). RAW and RLE blocks
-//! discard the candidate, including its repeat offsets.
+//! private `end_block`, which every written block goes through, is the only
+//! path that installs it (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
+//! RAW and RLE blocks discard the candidate, including its repeat offsets.
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
@@ -19,7 +19,7 @@ use super::seqstore::{Seq, SeqStore};
 use super::split::{resolve_off_codes, BlockSplitter, Partition};
 use super::{bt, dfast, fast, lazy, opt};
 use crate::constants::*;
-use crate::fse::{self, FseState};
+use crate::fse::{self, FseState, FseTableState};
 use crate::huf::{self, HufState};
 use std::ops::Range;
 
@@ -59,7 +59,7 @@ impl BlockState {
 }
 
 /// `prevCBlock`: the committed cross-block state. Replaced only by the
-/// private `commit`, exactly when a COMPRESSED block is written.
+/// private `end_block`, exactly when a COMPRESSED block is written.
 pub struct CommittedBlockState {
     prev: BlockState,
 }
@@ -74,9 +74,22 @@ impl CommittedBlockState {
         &self.prev
     }
 
-    /// `ZSTD_blockState_confirmRepcodesAndEntropyTables`.
-    fn commit(&mut self, next: BlockState) {
-        self.prev = next;
+    /// The end of every written block, with `next` its candidate state if
+    /// it was written COMPRESSED: commit it
+    /// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`), then, whatever
+    /// the block's type, demote a dictionary's `Valid` offset table to
+    /// `Check` (`ZSTD_compressBlock_internal`'s `out:`,
+    /// `ZSTD_compressSeqStore_singleBlock` for each block a split writes):
+    /// the dictionary checked that it codes every offset of a first block,
+    /// `dictContentSize + 128 KiB`, and a later block reaches further.
+    fn end_block(&mut self, next: Option<BlockState>) {
+        if let Some(next) = next {
+            self.prev = next;
+        }
+        self.prev.fse.of = match std::mem::take(&mut self.prev.fse.of) {
+            FseTableState::Valid(table) => FseTableState::Check(table),
+            of => of,
+        };
     }
 }
 
@@ -431,15 +444,17 @@ fn entropy_and_emit(
 
     if !is_first_block && c_size < RLE_MAX_LENGTH && is_rle(data) {
         write_rle_block(out, data[0], data.len(), is_last);
+        state.end_block(None);
         return BlockKind::Rle;
     }
     match next {
         None => {
             write_raw_block(out, data, is_last);
+            state.end_block(None);
             BlockKind::Raw
         }
         Some(next) => {
-            state.commit(next);
+            state.end_block(Some(next));
             write_compressed_block(out, cbuf, is_last);
             BlockKind::Compressed
         }
@@ -472,6 +487,7 @@ fn emit_block(
 ) -> bool {
     let Some((store, rep)) = built else {
         write_raw_block(out, &src[block], is_last);
+        state.end_block(None);
         return false;
     };
     let parts = match parts {
@@ -999,6 +1015,35 @@ mod tests {
             let count = |t: &[u32]| t.iter().filter(|&&e| e != 0).count();
             assert!(count(&full_hash) > count(&fast_hash), "L{level}");
             assert_eq!(fast_chain, full_chain, "L{level}");
+        }
+    }
+
+    /// A dictionary's `Valid` offset table is `Check` after any written
+    /// block, compressed with it as the candidate's or not; its other
+    /// tables stay `Valid`.
+    #[test]
+    fn end_block_demotes_a_valid_offset_table() {
+        use crate::fse::{FseCTable, FseRepeat};
+        let valid = || FseTableState::Valid(FseCTable::build(&[16, 16], 1, 5));
+        let dict = BlockState {
+            fse: FseState {
+                ll: valid(),
+                of: valid(),
+                ml: valid(),
+            },
+            ..BlockState::initial()
+        };
+        let repeats = |s: &CommittedBlockState| {
+            let f = &s.prev().fse;
+            (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
+        };
+        let demoted = (FseRepeat::Valid, FseRepeat::Check, FseRepeat::Valid);
+        for next in [None, Some(dict.clone())] {
+            let mut state = CommittedBlockState::new(dict.clone());
+            state.end_block(next);
+            assert_eq!(repeats(&state), demoted);
+            state.end_block(None);
+            assert_eq!(repeats(&state), demoted);
         }
     }
 
