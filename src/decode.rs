@@ -3369,6 +3369,12 @@ fn exec_sequence<W: WildCopy>(
 ) -> Result<(), SeqError> {
     let op = cur.op;
     let lit = cur.lit;
+    // The window has a branch of its own, ahead of the rest: folded into
+    // the frame-start check with `min` it cost AVX2 words_1M decode 2-6%,
+    // and after that check 2.5-3.7% of cycles, against 0.6-2.4% here.
+    if offset > lim.window {
+        return Err(SeqError::OffsetPastWindow);
+    }
     // Addresses are compared as integers: `ll` and `ml` are below 2^32
     // and pointers are below 2^63, so these sums cannot wrap.
     let o_lit_end = op as usize + ll;
@@ -3382,12 +3388,6 @@ fn exec_sequence<W: WildCopy>(
     // Rejects offset 0 as well (it wraps to usize::MAX).
     if offset.wrapping_sub(1) >= o_lit_end - lim.prefix as usize {
         return Err(SeqError::OffsetTooFar);
-    }
-    // A branch of its own: folded into the check above with `min`, the
-    // window cost a stack reload and a cmov per sequence, 2-6% of words_1M
-    // decode speed with AVX2.
-    if offset > lim.window {
-        return Err(SeqError::OffsetPastWindow);
     }
 
     // SAFETY: the checks above give, with `ml >= 1`,
