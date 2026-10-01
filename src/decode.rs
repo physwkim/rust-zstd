@@ -48,7 +48,7 @@ use crate::xxhash::Xxh64;
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
 use std::ptr;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 mod dict;
 pub use dict::DecodeDict;
@@ -214,22 +214,25 @@ pub fn decompress_with_dict_options(
     dict: Option<&DecodeDict>,
     opts: &DecodeOptions,
 ) -> Result<Vec<u8>, String> {
-    decompress_frames(&mut FrameDecoder::new(opts), data, dict)
+    let mut output = Vec::new();
+    decompress_frames(&mut FrameDecoder::new(opts), data, dict, &mut output)?;
+    Ok(output)
 }
 
 /// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
-/// `data`, whole, each from `dict` if given, with `dec`, which stands
-/// between frames: a fresh one for `decompress`, a `Decompressor`'s own for
-/// its `decompress`.
+/// `data`, whole, each from `dict` if given, onto the end of `output`,
+/// with `dec`, which stands between frames: a fresh one for `decompress`,
+/// a `Decompressor`'s own for its `decompress`.
 fn decompress_frames(
     dec: &mut FrameDecoder,
     data: &[u8],
     dict: Option<&DecodeDict>,
-) -> Result<Vec<u8>, String> {
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     #[cfg(feature = "parallel")]
     let (min_parallel_blocks, simd) = (dec.min_parallel_blocks, dec.simd);
     let mut out = VecOut {
-        output: Vec::new(),
+        output,
         prefix: Prefix {
             start: 0,
             window: 0,
@@ -244,8 +247,7 @@ fn decompress_frames(
         let rest = &data[pos..];
         let len = dec.unit_len(rest);
         if len > rest.len() {
-            dec.end_of_input(rest)?;
-            return Ok(out.output);
+            return dec.end_of_input(rest);
         }
         if dec.process(&rest[..len], &mut out, dict)? != Event::FrameStarted {
             pos += len;
@@ -253,20 +255,16 @@ fn decompress_frames(
         }
         pos += len;
         let (frame, _) = dec.frame_start();
-        reserve_frame(
-            &mut out.output,
-            frame.content_size,
-            &data[pos..],
-            frame.block_size_max,
-        )?;
+        reserve_frame(out.output, frame, &data[pos..])?;
         #[cfg(feature = "parallel")]
         {
             let (frame, init) = dec.frame_start();
+            let dict = dict.and_then(DecodeDict::entropy);
             if parallel::decode_frame_blocks(
                 data,
                 &mut pos,
                 frame,
-                init,
+                parallel::FrameStart { init, dict },
                 &mut out,
                 min_parallel_blocks,
                 simd,
@@ -823,10 +821,32 @@ struct HufEntryX2 {
 unsafe impl bytemuck::Zeroable for HufEntryX2 {}
 unsafe impl bytemuck::Pod for HufEntryX2 {}
 
+impl HufEntryX2 {
+    /// `length`, which is 1 or 2 in every built cell, computed so that the
+    /// compiler knows it is: a write position advanced by it then stays in
+    /// a window checked once for several cells.
+    #[inline(always)]
+    fn advance(self) -> usize {
+        1 + usize::from(self.length >> 1 & 1)
+    }
+}
+
 /// Table log of every decoding table (libzstd HUF_DECODER_FAST_TABLELOG):
 /// the longest code length, so that codes of any length are scaled up to
 /// it and the 4-stream fast loops index with a constant shift.
 const HUF_FAST_TABLE_LOG: u32 = HUF_TABLELOG_MAX;
+
+/// The cells of a built decoding table: a lookup of `HUF_FAST_TABLE_LOG`
+/// bits is in range by type.
+type HufCells<T> = [T; 1 << HUF_FAST_TABLE_LOG];
+
+/// `cells` as a built table; a build sizes it once, and every later build
+/// writes every cell.
+fn huf_cells<T>(cells: &[T]) -> Result<&HufCells<T>, String> {
+    cells
+        .try_into()
+        .map_err(|_| "Huffman table is uninitialized".to_string())
+}
 
 /// Relative cost of the single- and double-symbol decoders, indexed by the
 /// compression ratio quantile (libzstd algoTime: table build time, then
@@ -865,6 +885,51 @@ fn huf_select_x2(dst_size: usize, src_size: usize) -> bool {
     let mut time1 = t1 + d1 * d256;
     time1 += time1 >> 5;
     time1 < time0
+}
+
+/// One 8-bit counter per Huffman weight 0..=15, kept in two registers:
+/// `lo` holds weights 0..8 and `hi` weights 8..16, a byte each.
+#[derive(Default)]
+struct WeightLanes {
+    lo: u64,
+    hi: u64,
+}
+
+impl WeightLanes {
+    /// Add `n << (8 * (w % 8))` to the half that holds weight `w`.
+    #[inline(always)]
+    fn add(&mut self, w: u8, n: u64) {
+        let v = n << (8 * (w & 7));
+        if w & 8 == 0 {
+            self.lo = self.lo.wrapping_add(v);
+        } else {
+            self.hi = self.hi.wrapping_add(v);
+        }
+    }
+
+    /// Add one to the counter of weight `w`.
+    #[inline(always)]
+    fn bump(&mut self, w: u8) {
+        const ONE: [[u64; 2]; 16] = {
+            let mut t = [[0; 2]; 16];
+            let mut w = 0;
+            while w < 16 {
+                t[w][w / 8] = 1 << (8 * (w % 8));
+                w += 1;
+            }
+            t
+        };
+        let [lo, hi] = ONE[usize::from(w & 15)];
+        self.lo = self.lo.wrapping_add(lo);
+        self.hi = self.hi.wrapping_add(hi);
+    }
+
+    /// The counter of weight `w`.
+    #[inline(always)]
+    fn get(&self, w: u8) -> u8 {
+        let half = if w & 8 == 0 { self.lo } else { self.hi };
+        (half >> (8 * (w & 7))) as u8
+    }
 }
 
 struct HuffmanTable {
@@ -1012,14 +1077,27 @@ impl HuffmanTable {
     /// `nb_weights` weights read: symbols per weight, the table log, the
     /// implied last weight and a full binary tree.
     fn weight_stats(&mut self, nb_weights: usize) -> Result<(), String> {
+        let weights = &self.weights[..nb_weights];
+        // Weights are at most 15 (4 raw bits) and fewer than 256: count
+        // them in `WeightLanes` rather than in memory, where runs of one
+        // weight would wait on store forwarding.
+        let mut counts = WeightLanes::default();
+        for &w in weights {
+            counts.bump(w);
+        }
+        if (HUF_TABLELOG_MAX as u8 + 1..16).any(|w| counts.get(w) != 0) {
+            let w = weights.iter().find(|&&w| u32::from(w) > HUF_TABLELOG_MAX);
+            return Err(format!(
+                "Weight {} exceeds max {}",
+                w.unwrap(),
+                HUF_TABLELOG_MAX
+            ));
+        }
         let mut rank_stats = [0u32; HUF_TABLELOG_MAX as usize + 1];
         let mut weight_total = 0u32;
-        for &w in &self.weights[..nb_weights] {
-            if u32::from(w) > HUF_TABLELOG_MAX {
-                return Err(format!("Weight {} exceeds max {}", w, HUF_TABLELOG_MAX));
-            }
-            rank_stats[usize::from(w)] += 1;
-            weight_total += (1 << w) >> 1;
+        for (w, n) in rank_stats.iter_mut().enumerate() {
+            *n = u32::from(counts.get(w as u8));
+            weight_total += *n * ((1 << w) >> 1);
         }
         if weight_total == 0 {
             return Err("Missing weights".to_string());
@@ -1050,6 +1128,29 @@ impl HuffmanTable {
         Ok(())
     }
 
+    /// Order the symbols by weight, then by value, into `sorted` (libzstd
+    /// symbols[], sortedSymbol[]) and return where each weight's symbols
+    /// start, followed by the end of the last weight.
+    fn sort_symbols(&mut self) -> [usize; HUF_TABLELOG_MAX as usize + 2] {
+        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 2];
+        // The next slot of each weight, as in `weight_stats`. A slot of 256
+        // only follows the last symbol, and its carry reaches lanes of
+        // higher weights, which have no symbols.
+        let mut next = WeightLanes::default();
+        let mut start = 0usize;
+        for (w, &n) in self.rank_stats.iter().enumerate() {
+            rank_start[w] = start;
+            next.add(w as u8, start as u64);
+            start += n as usize;
+        }
+        rank_start[HUF_TABLELOG_MAX as usize + 1] = start;
+        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
+            self.sorted[usize::from(next.get(w))] = s as u8;
+            next.bump(w);
+        }
+        rank_start
+    }
+
     /// Fill the single-symbol table at `HUF_FAST_TABLE_LOG` bits
     /// (HUF_readDTableX1_wksp with HUF_rescaleStats): each symbol of `n`
     /// bits owns `1 << (HUF_FAST_TABLE_LOG - n)` consecutive cells, ordered
@@ -1060,33 +1161,20 @@ impl HuffmanTable {
         let max_bits = u32::from(self.max_num_bits);
         let dt_log = HUF_FAST_TABLE_LOG;
         let rescale = dt_log - max_bits;
+        let rank_start = self.sort_symbols();
         let rank_stats = &self.rank_stats;
-
-        // Symbols ordered by weight, then by value (libzstd symbols[]).
-        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 1];
-        let mut next = 0usize;
-        for w in 0..=max_bits as usize {
-            rank_start[w] = next;
-            next += rank_stats[w] as usize;
-        }
-        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
-            let r = &mut rank_start[usize::from(w)];
-            self.sorted[*r] = s as u8;
-            *r += 1;
-        }
 
         // Fill the table one weight at a time, so that the run length is a
         // constant of each loop, writing each symbol's cells four to a word
         // (HUF_DEltX1_set4) over the table's bytes.
         self.decode.resize(1 << dt_log, HuffmanEntry::default());
         let cells: &mut [u8] = bytemuck::cast_slice_mut(&mut self.decode[..]);
-        let mut symbol = rank_stats[0] as usize;
         let mut u = 0usize;
         for w in 1..=max_bits as usize {
             let count = rank_stats[w] as usize;
             let length = 1usize << (w - 1 + rescale as usize);
             let num_bits = (max_bits + 1 - w as u32) as u8;
-            let syms = &self.sorted[symbol..symbol + count];
+            let syms = &self.sorted[rank_start[w]..rank_start[w + 1]];
             let d4 = |s: u8| u64::from(u16::from_le_bytes([s, num_bits])) * 0x0001_0001_0001_0001;
             let run = &mut cells[2 * u..2 * (u + count * length)];
             match length {
@@ -1120,7 +1208,6 @@ impl HuffmanTable {
                 }
             }
             u += count * length;
-            symbol += count;
         }
     }
 
@@ -1140,23 +1227,8 @@ impl HuffmanTable {
             max_w -= 1;
         }
 
-        // rank_start[w]: first index of weight w in the sorted list.
-        let mut rank_start = [0usize; HUF_TABLELOG_MAX as usize + 2];
-        let mut next = 0usize;
-        for w in 1..=max_w {
-            rank_start[w] = next;
-            next += self.rank_stats[w] as usize;
-        }
-        rank_start[max_w + 1] = next;
-
-        // Weight-0 symbols go after all others, and are never read.
-        let mut fill = rank_start;
-        fill[0] = next;
-        for (s, &w) in self.weights[..self.nb_symbols].iter().enumerate() {
-            let r = &mut fill[usize::from(w)];
-            self.sorted[*r] = s as u8;
-            *r += 1;
-        }
+        // Weight-0 symbols come first, and are never read.
+        let rank_start = self.sort_symbols();
 
         // rank_val[consumed][w]: first cell of weight w once `consumed` bits
         // of the lookup have been used by a first symbol.
@@ -1517,25 +1589,25 @@ unsafe fn table_entry<T: Copy>(dt: &[T], i: usize) -> T {
 }
 
 #[inline(always)]
-fn huf_decode_symbol_x1(br: &mut BitDStream<'_>, dt: &[HuffmanEntry], dt_log: u32) -> u8 {
-    let entry = dt[br.look_bits(dt_log)];
+fn huf_decode_symbol_x1(br: &mut BitDStream<'_>, dt: &HufCells<HuffmanEntry>) -> u8 {
+    let entry = dt[br.look_bits(HUF_FAST_TABLE_LOG)];
     br.skip_bits(u32::from(entry.num_bits));
     entry.symbol
 }
 
 /// Decode `out.len()` symbols from one stream (HUF_decodeStreamX1).
 #[inline(always)]
-fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEntry], dt_log: u32) {
+fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &HufCells<HuffmanEntry>) {
     let end = out.len();
     let mut p = 0;
     if end > 3 {
         // Up to 4 symbols per reload: a reload that reports Unfinished
         // guarantees at least 57 bits, and a symbol takes at most 11.
         while br.reload() == HufStreamStatus::Unfinished && p < end - 3 {
-            let a = huf_decode_symbol_x1(br, dt, dt_log);
-            let b = huf_decode_symbol_x1(br, dt, dt_log);
-            let c = huf_decode_symbol_x1(br, dt, dt_log);
-            let d = huf_decode_symbol_x1(br, dt, dt_log);
+            let a = huf_decode_symbol_x1(br, dt);
+            let b = huf_decode_symbol_x1(br, dt);
+            let c = huf_decode_symbol_x1(br, dt);
+            let d = huf_decode_symbol_x1(br, dt);
             out[p..p + 4].copy_from_slice(&[a, b, c, d]);
             p += 4;
         }
@@ -1545,7 +1617,7 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
     // Either at most 3 symbols remain with >= 57 bits loaded, or the
     // container already holds the last bytes of the stream.
     while p < end {
-        out[p] = huf_decode_symbol_x1(br, dt, dt_log);
+        out[p] = huf_decode_symbol_x1(br, dt);
         p += 1;
     }
 }
@@ -1553,9 +1625,9 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &[HuffmanEn
 /// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
 #[inline(never)]
 fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    let dt = &table.decode[..];
+    let dt = huf_cells(&table.decode)?;
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x1(out, &mut br, dt, HUF_FAST_TABLE_LOG);
+    huf_decode_stream_x1(out, &mut br, dt);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
@@ -1862,11 +1934,7 @@ unsafe fn huf_4x2_fast_loop(args: &mut HufFastArgs, out: &mut [u8], src: &[u8], 
 /// finish each stream with `huf_decode_stream_x1`.
 #[inline(never)]
 fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    let dt = &table.decode[..];
-    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
-        return Err("Huffman table is uninitialized".to_string());
-    }
-    let dt_log = HUF_FAST_TABLE_LOG;
+    let dt = huf_cells(&table.decode)?;
     let dst_size = out.len();
     let streams = HufStreams::split(src, dst_size)?;
 
@@ -1880,7 +1948,7 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
                 return Err("Huffman stream overran its segment".to_string());
             }
             let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
-            huf_decode_stream_x1(&mut out[args.op[s]..end], &mut br, dt, dt_log);
+            huf_decode_stream_x1(&mut out[args.op[s]..end], &mut br, dt);
             if !br.is_finished() {
                 return Err("Huffman stream not fully consumed".to_string());
             }
@@ -1909,10 +1977,10 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
             let mut w3 = [0u8; 4];
             let mut w4 = [0u8; 4];
             for i in 0..4 {
-                w1[i] = huf_decode_symbol_x1(&mut b1, dt, dt_log);
-                w2[i] = huf_decode_symbol_x1(&mut b2, dt, dt_log);
-                w3[i] = huf_decode_symbol_x1(&mut b3, dt, dt_log);
-                w4[i] = huf_decode_symbol_x1(&mut b4, dt, dt_log);
+                w1[i] = huf_decode_symbol_x1(&mut b1, dt);
+                w2[i] = huf_decode_symbol_x1(&mut b2, dt);
+                w3[i] = huf_decode_symbol_x1(&mut b3, dt);
+                w4[i] = huf_decode_symbol_x1(&mut b4, dt);
             }
             o1[p..p + 4].copy_from_slice(&w1);
             o2[p..p + 4].copy_from_slice(&w2);
@@ -1926,10 +1994,10 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
         }
     }
 
-    huf_decode_stream_x1(&mut o1[p..], &mut b1, dt, dt_log);
-    huf_decode_stream_x1(&mut o2[p..], &mut b2, dt, dt_log);
-    huf_decode_stream_x1(&mut o3[p..], &mut b3, dt, dt_log);
-    huf_decode_stream_x1(&mut o4[p..], &mut b4, dt, dt_log);
+    huf_decode_stream_x1(&mut o1[p..], &mut b1, dt);
+    huf_decode_stream_x1(&mut o2[p..], &mut b2, dt);
+    huf_decode_stream_x1(&mut o3[p..], &mut b3, dt);
+    huf_decode_stream_x1(&mut o4[p..], &mut b4, dt);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
         return Err("Huffman stream not fully consumed".to_string());
@@ -1937,20 +2005,23 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     Ok(())
 }
 
-/// Decode one cell's one or two symbols (HUF_decodeSymbolX2). Always
-/// writes two bytes; the caller keeps `op + 2 <= out.len()`.
+/// Decode `N / 2` cells of one or two symbols each into `w`, the room
+/// they can fill; returns the number of bytes they filled.
 #[inline(always)]
-fn huf_decode_symbol_x2(
-    out: &mut [u8],
-    op: usize,
+fn huf_decode_cells_x2<const N: usize>(
+    w: &mut [u8; N],
     br: &mut BitDStream<'_>,
-    dt: &[HufEntryX2],
-    dt_log: u32,
+    dt: &HufCells<HufEntryX2>,
 ) -> usize {
-    let entry = dt[br.look_bits(dt_log)];
-    out[op..op + 2].copy_from_slice(&entry.sequence.to_le_bytes());
-    br.skip_bits(u32::from(entry.nb_bits));
-    op + usize::from(entry.length)
+    let mut o = 0;
+    for _ in 0..N / 2 {
+        // HUF_decodeSymbolX2: always writes two bytes.
+        let entry = dt[br.look_bits(HUF_FAST_TABLE_LOG)];
+        w[o..o + 2].copy_from_slice(&entry.sequence.to_le_bytes());
+        br.skip_bits(u32::from(entry.nb_bits));
+        o += entry.advance();
+    }
+    o
 }
 
 /// Decode the final symbol of a stream: only the first symbol of the cell
@@ -1965,64 +2036,61 @@ fn huf_decode_last_symbol_x2(
     out: &mut [u8],
     op: usize,
     br: &mut BitDStream<'_>,
-    dt: &[HufEntryX2],
-    dt_log: u32,
+    dt: &HufCells<HufEntryX2>,
     table: &HuffmanTable,
-) -> usize {
-    let symbol = dt[br.look_bits(dt_log)].sequence as u8;
+) {
+    let symbol = dt[br.look_bits(HUF_FAST_TABLE_LOG)].sequence as u8;
     out[op] = symbol;
     br.skip_bits(table.code_len(symbol));
-    op + 1
 }
 
-/// Decode symbols into `out[op..end]` (HUF_decodeStreamX2); returns the
-/// position reached.
+/// Decode symbols into all of `out` (HUF_decodeStreamX2).
 #[inline(always)]
 fn huf_decode_stream_x2(
     out: &mut [u8],
-    mut op: usize,
-    end: usize,
     br: &mut BitDStream<'_>,
-    dt: &[HufEntryX2],
-    dt_log: u32,
+    dt: &HufCells<HufEntryX2>,
     table: &HuffmanTable,
-) -> usize {
-    if end - op >= 8 {
+) {
+    let end = out.len();
+    let mut op = 0;
+    if end >= 8 {
         // Up to 10 symbols per reload: 5 cells of at most 11 bits each.
-        while br.reload() == HufStreamStatus::Unfinished && op + 9 < end {
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        while br.reload() == HufStreamStatus::Unfinished {
+            let Some(w) = out[op..].first_chunk_mut() else {
+                break;
+            };
+            op += huf_decode_cells_x2::<10>(w, br, dt);
         }
     } else {
         br.reload();
     }
 
     if end - op >= 2 {
-        while br.reload() == HufStreamStatus::Unfinished && op + 2 <= end {
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        while br.reload() == HufStreamStatus::Unfinished {
+            let Some(w) = out[op..].first_chunk_mut() else {
+                break;
+            };
+            op += huf_decode_cells_x2::<2>(w, br, dt);
         }
         // The container holds the last bytes of the stream: no reloads.
-        while op + 2 <= end {
-            op = huf_decode_symbol_x2(out, op, br, dt, dt_log);
+        while let Some(w) = out[op..].first_chunk_mut() {
+            op += huf_decode_cells_x2::<2>(w, br, dt);
         }
     }
 
     if op < end {
-        op = huf_decode_last_symbol_x2(out, op, br, dt, dt_log, table);
+        huf_decode_last_symbol_x2(out, op, br, dt, table);
     }
-    op
 }
 
 /// Single-stream literals with the double-symbol table
 /// (HUF_decompress1X2_usingDTable_internal_body).
 #[inline(never)]
 fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    let dt = &table.decode_x2[..];
+    let dt = huf_cells(&table.decode_x2)?;
     let mut br = BitDStream::new(src)?;
-    huf_decode_stream_x2(out, 0, out.len(), &mut br, dt, HUF_FAST_TABLE_LOG, table);
+    huf_decode_stream_x2(out, &mut br, dt, table);
     if !br.is_finished() {
         return Err("Huffman stream not fully consumed".to_string());
     }
@@ -2036,11 +2104,7 @@ fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
 /// The fast loop takes the same sections as in `huf_decompress_4x1`.
 #[inline(never)]
 fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
-    let dt = &table.decode_x2[..];
-    if dt.len() != 1 << HUF_FAST_TABLE_LOG {
-        return Err("Huffman table is uninitialized".to_string());
-    }
-    let dt_log = HUF_FAST_TABLE_LOG;
+    let dt = huf_cells(&table.decode_x2)?;
     let oend = out.len();
     let streams = HufStreams::split(src, oend)?;
 
@@ -2054,7 +2118,7 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
                 return Err("Huffman stream overran its segment".to_string());
             }
             let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
-            huf_decode_stream_x2(out, args.op[s], end, &mut br, dt, dt_log, table);
+            huf_decode_stream_x2(&mut out[args.op[s]..end], &mut br, dt, table);
             if !br.is_finished() {
                 return Err("Huffman stream not fully consumed".to_string());
             }
@@ -2077,26 +2141,18 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     let mut op3 = op_start3;
     let mut op4 = op_start4;
 
-    // 4 cells per stream per iteration, at most 8 bytes each; every stream
-    // stays inside `out` because none can outrun the last one by more than
-    // a factor of two.
+    // 4 cells per stream per iteration, at most 8 bytes; every stream has
+    // those 8 bytes inside `out` because none can outrun the last one by
+    // more than a factor of two.
     if oend - op4 >= 8 {
         let mut end_signal = true;
         while end_signal && op4 + 8 <= oend {
-            for _ in 0..4 {
-                op1 = huf_decode_symbol_x2(out, op1, &mut b1, dt, dt_log);
-            }
-            for _ in 0..4 {
-                op2 = huf_decode_symbol_x2(out, op2, &mut b2, dt, dt_log);
-            }
+            op1 += huf_decode_cells_x2::<8>(out[op1..].first_chunk_mut().unwrap(), &mut b1, dt);
+            op2 += huf_decode_cells_x2::<8>(out[op2..].first_chunk_mut().unwrap(), &mut b2, dt);
             end_signal &= b1.reload_fast() == HufStreamStatus::Unfinished;
             end_signal &= b2.reload_fast() == HufStreamStatus::Unfinished;
-            for _ in 0..4 {
-                op3 = huf_decode_symbol_x2(out, op3, &mut b3, dt, dt_log);
-            }
-            for _ in 0..4 {
-                op4 = huf_decode_symbol_x2(out, op4, &mut b4, dt, dt_log);
-            }
+            op3 += huf_decode_cells_x2::<8>(out[op3..].first_chunk_mut().unwrap(), &mut b3, dt);
+            op4 += huf_decode_cells_x2::<8>(out[op4..].first_chunk_mut().unwrap(), &mut b4, dt);
             end_signal &= b3.reload_fast() == HufStreamStatus::Unfinished;
             end_signal &= b4.reload_fast() == HufStreamStatus::Unfinished;
         }
@@ -2106,10 +2162,10 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
         return Err("Huffman stream overran its segment".to_string());
     }
 
-    huf_decode_stream_x2(out, op1, op_start2, &mut b1, dt, dt_log, table);
-    huf_decode_stream_x2(out, op2, op_start3, &mut b2, dt, dt_log, table);
-    huf_decode_stream_x2(out, op3, op_start4, &mut b3, dt, dt_log, table);
-    huf_decode_stream_x2(out, op4, oend, &mut b4, dt, dt_log, table);
+    huf_decode_stream_x2(&mut out[op1..op_start2], &mut b1, dt, table);
+    huf_decode_stream_x2(&mut out[op2..op_start3], &mut b2, dt, table);
+    huf_decode_stream_x2(&mut out[op3..op_start4], &mut b3, dt, table);
+    huf_decode_stream_x2(&mut out[op4..], &mut b4, dt, table);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
         return Err("Huffman stream not fully consumed".to_string());
@@ -2452,12 +2508,12 @@ struct DecoderScratch {
     offset_hist: [u32; 3],
     /// Literals of the current block plus `WILDCOPY_OVERLENGTH` zero bytes.
     literals_buffer: Vec<u8>,
-    /// The dictionary tables the frame started with (`load_dict`), shared
-    /// rather than copied, as libzstd points its DCtx at the DDict's.
-    dict: Option<Arc<DictEntropy>>,
-    /// The Huffman table in use is `dict`'s, not `huf`'s: true from
-    /// `load_dict` until a block of the frame builds one. The sequence
-    /// tables' counterpart is `SeqTableSource::Dict`.
+    /// The Huffman table in use is that of the dictionary the frame
+    /// started from, not `huf`: true from `load_dict` until a block of the
+    /// frame builds one. The sequence tables' counterpart is
+    /// `SeqTableSource::Dict`. The dictionary's tables are not kept here:
+    /// every call that decodes the frame's blocks is given them, as libzstd
+    /// points its DCtx at the DDict's rather than copying them.
     huf_from_dict: bool,
 }
 
@@ -2470,7 +2526,6 @@ impl DecoderScratch {
             fse: FSEScratch::new(),
             offset_hist: [1, 4, 8],
             literals_buffer: Vec::new(),
-            dict: None,
             huf_from_dict: false,
         }
     }
@@ -2478,7 +2533,6 @@ impl DecoderScratch {
     fn reset(&mut self) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.dict = None;
         self.huf_from_dict = false;
         self.fse.reset();
         self.huf.table.reset();
@@ -2711,7 +2765,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
 
 /// Parse the block header at the start of `src`, in a frame whose
 /// Block_Maximum_Size is `block_size_max`.
-fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, usize), String> {
+fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, String> {
     let buf: [u8; 3] = src
         .get(..3)
         .ok_or_else(|| "Error reading block header: truncated".to_string())?
@@ -2753,15 +2807,12 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<(BlockHeader,
         BlockType::Reserved => 0,
     };
 
-    Ok((
-        BlockHeader {
-            last_block,
-            block_type,
-            decompressed_size,
-            content_size,
-        },
-        3,
-    ))
+    Ok(BlockHeader {
+        last_block,
+        block_type,
+        decompressed_size,
+        content_size,
+    })
 }
 
 // ============================================================
@@ -4104,7 +4155,7 @@ unsafe fn overlap_copy8(dst: *mut u8, src: *const u8, offset: usize) -> (*mut u8
 
 /// Where a `FrameDecoder` stands in its input (ZSTD_decompressContinue's
 /// ZSTDds_* stages). Each stage but `Skip` takes one unit: a frame header,
-/// a block with its header, or a Content_Checksum, whole
+/// a block header, a block's content, or a Content_Checksum, whole
 /// (`FrameDecoder::unit_len`).
 enum Stage {
     /// Between frames: the next unit is a frame header, or a skippable
@@ -4113,8 +4164,13 @@ enum Stage {
     /// `left` bytes of a skippable frame's User_Data still to skip, in
     /// pieces of any size.
     Skip { left: u64 },
-    /// The blocks of a frame.
-    Block(Frame),
+    /// The blocks of a frame: the next unit is a block header
+    /// (ZSTDds_decodeBlockHeader), or with `header`, the content of the
+    /// block it heads (ZSTDds_decompressBlock).
+    Block {
+        frame: Frame,
+        header: Option<BlockHeader>,
+    },
     /// The frame's Content_Checksum, which must equal `computed`.
     Checksum { computed: u32 },
 }
@@ -4170,6 +4226,15 @@ impl Frame {
             Some(fcs) if self.decoded > fcs => Err(self.content_size_mismatch(fcs)),
             _ => Ok(()),
         }
+    }
+
+    /// Frame_Content_Size says the frame fits in one block. An encoder may
+    /// still have split it into several, but its content is too small to
+    /// decode in parallel, and reserving room for all of it costs at most
+    /// one block more than its blocks can decode to.
+    fn fits_one_block(&self) -> bool {
+        self.content_size
+            .is_some_and(|fcs| fcs <= self.block_size_max as u64)
     }
 
     fn content_size_mismatch(&self, fcs: u64) -> String {
@@ -4234,28 +4299,29 @@ impl FrameDecoder {
     }
 
     /// Right after `Event::FrameStarted`: the frame, and the scratch with
-    /// the tables and repeat offsets it starts from.
+    /// the tables and repeat offsets it starts from, which select those of
+    /// the dictionary given to `process` if the frame started from one.
     fn frame_start(&mut self) -> (&mut Frame, &DecoderScratch) {
         match (&mut self.stage, &self.scratch) {
-            (Stage::Block(frame), Some(scratch)) => (frame, scratch),
+            (Stage::Block { frame, .. }, Some(scratch)) => (frame, scratch),
             _ => unreachable!("a started frame has blocks and a scratch"),
         }
     }
 
     /// How many bytes the current unit takes, `head` being its first bytes
     /// so far, which may be fewer, or more: a frame header's length follows
-    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes and a block's from its
-    /// header, so with fewer the length is what it takes to learn it. The
-    /// bytes of a skippable frame left to skip, in `Stage::Skip`.
+    /// from its first `FRAME_HEADER_PREFIX_LEN` bytes, so with fewer the
+    /// length is what it takes to learn it. The bytes of a skippable frame
+    /// left to skip, in `Stage::Skip`.
     fn unit_len(&self, head: &[u8]) -> usize {
         match &self.stage {
             Stage::FrameHeader => frame_header_len(head),
             Stage::Skip { left } => usize::try_from(*left).unwrap_or(usize::MAX),
-            Stage::Block(frame) => match parse_block_header(head, frame.block_size_max) {
-                Ok((block, header_len)) => header_len + block.content_size as usize,
-                // Too short to tell, or rejected once whole.
-                Err(_) => BLOCK_HEADER_LEN,
-            },
+            Stage::Block { header: None, .. } => BLOCK_HEADER_LEN,
+            Stage::Block {
+                header: Some(block),
+                ..
+            } => block.content_size as usize,
             Stage::Checksum { .. } => CHECKSUM_LEN,
         }
     }
@@ -4276,8 +4342,9 @@ impl FrameDecoder {
     }
 
     /// Take the current unit, `unit_len(unit)` bytes, and decode it into
-    /// `out`, a frame header starting the frame from `dict` if given. Not
-    /// for `Stage::Skip`.
+    /// `out`, a frame header starting the frame from `dict` if given. Every
+    /// call of a frame passes the `dict` it started from. Not for
+    /// `Stage::Skip`.
     fn process(
         &mut self,
         unit: &[u8],
@@ -4287,10 +4354,14 @@ impl FrameDecoder {
         match &mut self.stage {
             Stage::FrameHeader => self.frame_header(unit, out, dict),
             Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
-            Stage::Block(frame) => {
-                let (block, content) = locate_block(unit, frame.block_size_max)?;
+            Stage::Block { frame, header } => {
+                let Some(block) = header.take() else {
+                    *header = Some(parse_block_header(unit, frame.block_size_max)?);
+                    return Ok(Event::Continue);
+                };
                 let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
-                decode_block(&block, content, frame, scratch, out, self.simd)?;
+                let dict = dict.and_then(DecodeDict::entropy);
+                decode_block(&block, unit, frame, scratch, dict, out, self.simd)?;
                 if !block.last_block {
                     return Ok(Event::Continue);
                 }
@@ -4347,14 +4418,18 @@ impl FrameDecoder {
             scratch.load_dict(e);
         }
         out.start(frame.window, frame.content_size);
-        self.stage = Stage::Block(frame);
+        self.stage = Stage::Block {
+            frame,
+            header: None,
+        };
         Ok(Event::FrameStarted)
     }
 
     /// After the frame's last block: check its size, then expect its
     /// checksum, if it has one.
     fn blocks_ended(&mut self) -> Result<Event, String> {
-        let Stage::Block(frame) = std::mem::replace(&mut self.stage, Stage::FrameHeader) else {
+        let Stage::Block { frame, .. } = std::mem::replace(&mut self.stage, Stage::FrameHeader)
+        else {
             unreachable!("blocks end in Stage::Block");
         };
         if let Some(fcs) = frame.content_size {
@@ -4392,10 +4467,16 @@ impl FrameDecoder {
                 Ok(_) => unreachable!("a whole frame header is a unit"),
             },
             Stage::Skip { .. } => "Skippable frame extends past end of input".to_string(),
-            Stage::Block(frame) => match locate_block(partial, frame.block_size_max) {
+            Stage::Block {
+                frame,
+                header: None,
+            } => match parse_block_header(partial, frame.block_size_max) {
                 Err(e) => e,
-                Ok(_) => unreachable!("a whole block is a unit"),
+                Ok(_) => unreachable!("a whole block header is a unit"),
             },
+            Stage::Block {
+                header: Some(_), ..
+            } => BLOCK_CONTENT_TRUNCATED.to_string(),
             Stage::Checksum { .. } => "Error reading checksum: truncated".to_string(),
         })
     }
@@ -4403,6 +4484,8 @@ impl FrameDecoder {
 
 /// Block_Header's length.
 const BLOCK_HEADER_LEN: usize = 3;
+
+const BLOCK_CONTENT_TRUNCATED: &str = "Block content extends past end of input";
 
 /// Content_Checksum's length.
 const CHECKSUM_LEN: usize = 4;
@@ -4435,19 +4518,21 @@ fn frame_header_len(head: &[u8]) -> usize {
 /// The block at the start of `src`, in a frame whose Block_Maximum_Size is
 /// `block_size_max`: its header and content.
 fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]), String> {
-    let (block, header_len) = parse_block_header(src, block_size_max)?;
+    let block = parse_block_header(src, block_size_max)?;
     let content = src
-        .get(header_len..header_len + block.content_size as usize)
-        .ok_or_else(|| "Block content extends past end of input".to_string())?;
+        .get(BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + block.content_size as usize)
+        .ok_or_else(|| BLOCK_CONTENT_TRUNCATED.to_string())?;
     Ok((block, content))
 }
 
-/// Decode `block` with `content` into `out`, a block of `frame`.
+/// Decode `block` with `content` into `out`, a block of `frame`, which
+/// started from the tables of `dict` if given.
 fn decode_block(
     block: &BlockHeader,
     content: &[u8],
     frame: &mut Frame,
     scratch: &mut DecoderScratch,
+    dict: Option<&DictEntropy>,
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), String> {
@@ -4469,7 +4554,7 @@ fn decode_block(
                 dst.op + len
             }
             BlockType::Compressed => {
-                decompress_block(content, frame.block_size_max, scratch, dst, ext, simd)?
+                decompress_block(content, frame.block_size_max, scratch, dict, dst, ext, simd)?
             }
             BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
         };
@@ -4481,7 +4566,7 @@ fn decode_block(
 /// The one-shot driver's `FrameOut`: frames decode straight into one
 /// `Vec`, each block after the last, so a frame's history is all in it.
 struct VecOut<'d> {
-    output: Vec<u8>,
+    output: &'d mut Vec<u8>,
     /// The current frame's.
     prefix: Prefix,
     /// The dictionary content every frame's history starts with, empty
@@ -4511,7 +4596,7 @@ impl FrameOut for VecOut<'_> {
     fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
         let dst = self
             .prefix
-            .dst(&mut self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
+            .dst(self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
         Ok((dst, self.ext()))
     }
 
@@ -4524,21 +4609,20 @@ impl FrameOut for VecOut<'_> {
     }
 }
 
-/// Reserve room in `output` for a frame of `content_size` bytes whose blocks
-/// start `blocks`, plus what a block's destination reserves past its start,
-/// so that no block has to grow the buffer (and move everything decoded). A
-/// content size past what the blocks can decode to fails the size check, so
-/// it gets no room beyond that.
-fn reserve_frame(
-    output: &mut Vec<u8>,
-    content_size: Option<u64>,
-    blocks: &[u8],
-    block_size_max: usize,
-) -> Result<(), String> {
-    let Some(fcs) = content_size else {
+/// Reserve room in `output` for `frame`, whose blocks start `blocks`, plus
+/// what a block's destination reserves past its start, so that no block
+/// has to grow the buffer (and move everything decoded). A content size
+/// past what the blocks can decode to fails the size check, so it gets no
+/// room beyond that, unless the frame fits in one block.
+fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(), String> {
+    let Some(fcs) = frame.content_size else {
         return Ok(());
     };
-    let content = fcs.min(blocks_decoded_bound(blocks, block_size_max));
+    let content = if frame.fits_one_block() {
+        fcs
+    } else {
+        fcs.min(blocks_decoded_bound(blocks, frame.block_size_max))
+    };
     let want = usize::try_from(content)
         .ok()
         .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
@@ -4656,7 +4740,8 @@ fn decode_block_literals(
 }
 
 /// Decode compressed block `raw` into `dst`, after `ext`, in a frame whose
-/// Block_Maximum_Size is `block_size_max`; returns the block's end.
+/// Block_Maximum_Size is `block_size_max` and which started from the
+/// tables of `dict` if given; returns the block's end.
 ///
 /// # Safety
 /// `dst` and `ext` meet their contracts.
@@ -4664,12 +4749,12 @@ unsafe fn decompress_block(
     raw: &[u8],
     block_size_max: usize,
     workspace: &mut DecoderScratch,
+    dict: Option<&DictEntropy>,
     dst: Dst,
     ext: ExtHistory,
     simd: Level,
 ) -> Result<usize, String> {
     let parts = split_block(raw, block_size_max)?;
-    let dict = workspace.dict.as_deref();
     let repeat = dict
         .filter(|_| workspace.huf_from_dict)
         .map(|d| &d.huf.table);
@@ -4737,8 +4822,17 @@ mod parallel {
     pub(super) const MIN_BLOCKS: usize = 4;
 
     /// The "block" that defined a table the frame starts with: a
-    /// dictionary's (`init` of `decode_frame_blocks`).
+    /// dictionary's (`FrameStart`).
     const START: usize = usize::MAX;
+
+    /// The tables and repeat offsets a frame starts from: `init`, the
+    /// decoder's scratch right after the frame header, which may select
+    /// those of `dict`, the dictionary the frame started from.
+    #[derive(Clone, Copy)]
+    pub(super) struct FrameStart<'a> {
+        pub(super) init: &'a DecoderScratch,
+        pub(super) dict: Option<&'a DictEntropy>,
+    }
 
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
@@ -4770,17 +4864,17 @@ mod parallel {
     /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
     /// and resolving Treeless / Repeat references the way the serial
     /// decoder's scratch tables carry them from block to block, from the
-    /// tables in `init`.
+    /// tables in `start`.
     fn plan_frame<'a>(
         data: &'a [u8],
         pos: &mut usize,
         block_size_max: usize,
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
     ) -> Result<Vec<Plan<'a>>, String> {
         let mut plans = Vec::new();
-        let mut huf_def = (init.huf_table().max_num_bits != 0).then_some(START);
+        let mut huf_def = (start.init.huf_table(start.dict).max_num_bits != 0).then_some(START);
         let mut fse_def: [Option<usize>; 3] = std::array::from_fn(|t| {
-            matches!(init.fse.source[t], SeqTableSource::Dict).then_some(START)
+            matches!(start.init.fse.source[t], SeqTableSource::Dict).then_some(START)
         });
         loop {
             let (block, content) = locate_block(&data[*pos..], block_size_max)?;
@@ -4898,13 +4992,13 @@ mod parallel {
     }
 
     /// Stage 2 for compressed block `i`, of a frame starting with the
-    /// tables in `init`.
+    /// tables in `start`.
     fn decode_block(
         slot: &mut Slot,
         i: usize,
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
     ) -> Result<(), String> {
         if let Some(d) = plan.huf_def {
             if d == i {
@@ -4912,7 +5006,7 @@ mod parallel {
                 slot.huf_from = None;
             } else if d == START {
                 if slot.huf_from != Some(d) {
-                    slot.huf.table.copy_from(init.huf_table());
+                    slot.huf.table.copy_from(start.init.huf_table(start.dict));
                     slot.huf_from = Some(d);
                 }
             } else if slot.huf_from != Some(d) {
@@ -4967,7 +5061,7 @@ mod parallel {
                 slot.fse_from[t] = Some(d);
             }
         }
-        let tables = slot.fse.tables(init.dict.as_deref().map(|d| &d.fse));
+        let tables = slot.fse.tables(start.dict.map(|d| &d.fse));
         decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
     }
 
@@ -5173,7 +5267,7 @@ mod parallel {
         out: &mut VecOut<'_>,
         simd: Level,
     ) -> Result<(), String> {
-        let output = &mut out.output;
+        let output = &mut *out.output;
         match plan {
             Plan::Raw(content) => output.extend_from_slice(content),
             Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
@@ -5293,20 +5387,20 @@ mod parallel {
 
     /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
     /// current rayon pool, starting from the tables and repeat offsets in
-    /// `init` (a dictionary's, or none). Returns `Ok(false)` without
-    /// consuming input when the block headers do not show `min_blocks`
+    /// `start`. Returns `Ok(false)` without consuming input when the frame
+    /// fits in one block, or the block headers do not show `min_blocks`
     /// blocks: the frame has fewer, or a header before them fails, which
     /// the serial decoder then reports.
     pub(super) fn decode_frame_blocks(
         data: &[u8],
         pos: &mut usize,
         frame: &mut Frame,
-        init: &DecoderScratch,
+        start: FrameStart<'_>,
         out: &mut VecOut<'_>,
         min_blocks: usize,
         simd: Level,
     ) -> Result<bool, String> {
-        if min_blocks == usize::MAX {
+        if min_blocks == usize::MAX || frame.fits_one_block() {
             return Ok(false);
         }
         let block_size_max = frame.block_size_max;
@@ -5320,7 +5414,7 @@ mod parallel {
             }
         }
         let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max, init)?;
+        let plans = plan_frame(data, &mut end, block_size_max, start)?;
         let plans = &plans[..];
 
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -5337,8 +5431,8 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
-        let mut hist = init.offset_hist;
-        let dict = init.dict.as_deref().map(|d| &d.fse);
+        let mut hist = start.init.offset_hist;
+        let dict = start.dict.map(|d| &d.fse);
         rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -5354,7 +5448,7 @@ mod parallel {
                     // of waiting forever.
                     let _done = MarkDone(&cell.done, i + 1);
                     let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans, init);
+                    slot.result = decode_block(&mut slot, i, cp, plans, start);
                 });
             };
             for i in 0..ring.len() {
@@ -5365,7 +5459,7 @@ mod parallel {
                 let mut slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans, init);
+                        slot.result = decode_block(&mut slot, i, cp, plans, start);
                         slot
                     }
                     Plan::Compressed(_) => {
@@ -5379,7 +5473,7 @@ mod parallel {
                                 Some(Plan::Compressed(np)) if next.claim(i + 1) => {
                                     let _done = MarkDone(&next.done, i + 2);
                                     let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans, init);
+                                    slot.result = decode_block(&mut slot, i + 1, np, plans, start);
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
@@ -5916,6 +6010,91 @@ mod tests {
         }
     }
 
+    /// Both tables of libzstd's descriptions of random codes (raw and
+    /// FSE-compressed, 2 to 256 symbols, some of weight 0, 6- to 11-bit),
+    /// each build over the previous one, cell for cell against their
+    /// definition: single-symbol cells in order of weight, then symbol, a
+    /// symbol of weight `w` owning `1 << (w - 1 + rescale)` of them; a
+    /// double-symbol cell is the single-symbol lookup of its index plus,
+    /// exactly when both fit in the table log, the lookup that follows it.
+    #[test]
+    fn huf_tables_match_definition() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let log = HUF_FAST_TABLE_LOG;
+        let mut t = HuffmanTable::new();
+        let (mut raw, mut zero, mut full) = (0, 0, 0);
+        for case in 0..2000 {
+            let nb = 2 + rand() as usize % 255;
+            let skew = rand() % 20;
+            let sparse = rand() % 4;
+            let mut counts: Vec<u32> = (0..nb)
+                .map(|_| {
+                    let c = 1 + (rand() >> (31 - skew % 31)) % 5000;
+                    if rand() % 4 < sparse {
+                        0
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            // Two symbols at least, the last one among them.
+            counts[0] = counts[0].max(1);
+            counts[nb - 1] = counts[nb - 1].max(1);
+            let max_bits = (6 + case % 6).max(highest_bit_set(nb as u32) + 1);
+            let Some(desc) = huf_description_c(&counts, max_bits) else {
+                continue;
+            };
+            let (_, nb_weights) = t.read_weights(&desc).unwrap();
+            t.weight_stats(nb_weights).unwrap();
+            let max = u32::from(t.max_num_bits);
+            let weights = &t.weights[..t.nb_symbols];
+            raw += usize::from(desc[0] >= 128);
+            zero += usize::from(weights.contains(&0));
+            full += usize::from(weights.len() == 256);
+
+            let mut order: Vec<usize> = (0..weights.len()).filter(|&s| weights[s] != 0).collect();
+            order.sort_by_key(|&s| weights[s]);
+            let mut x1 = Vec::new();
+            for s in order {
+                let w = u32::from(weights[s]);
+                let cell = (s as u8, (max + 1 - w) as u8);
+                x1.extend(std::iter::repeat_n(cell, 1 << (w - 1 + log - max)));
+            }
+            let x2: Vec<(u16, u8, u8)> = (0..1 << log)
+                .map(|i| {
+                    let (a, a_bits) = x1[i];
+                    let (b, b_bits) = x1[(i << a_bits) & ((1 << log) - 1)];
+                    if u32::from(a_bits + b_bits) <= log {
+                        (u16::from(a) | u16::from(b) << 8, a_bits + b_bits, 2)
+                    } else {
+                        (u16::from(a), a_bits, 1)
+                    }
+                })
+                .collect();
+
+            t.fill_x1();
+            let got: Vec<(u8, u8)> = t.decode.iter().map(|e| (e.symbol, e.num_bits)).collect();
+            assert_eq!(got, x1, "case {case}: {desc:02x?}");
+            t.fill_x2();
+            let got: Vec<(u16, u8, u8)> = t
+                .decode_x2
+                .iter()
+                .map(|e| (e.sequence, e.nb_bits, e.length))
+                .collect();
+            assert_eq!(got, x2, "case {case}: {desc:02x?}");
+        }
+        assert!(
+            raw > 100 && zero > 500 && full > 3,
+            "{raw} raw, {zero} with weight 0, {full} of 256"
+        );
+    }
+
     /// A table rebuilt over a larger one, an RLE one or one with -1 counts
     /// equals the same table built fresh: builds clear no cells, so none of
     /// the previous table's may show through.
@@ -6183,11 +6362,19 @@ mod tests {
                     // SAFETY: `out` holds the segment with the room `Dst`
                     // needs reserved, and `ext` is the history.
                     let got = unsafe {
-                        decompress_block(&block, MAX_BLOCK_SIZE, &mut scratch, dst, history, simd)
-                            .map(|end| {
-                                out.set_len(end);
-                                out
-                            })
+                        decompress_block(
+                            &block,
+                            MAX_BLOCK_SIZE,
+                            &mut scratch,
+                            None,
+                            dst,
+                            history,
+                            simd,
+                        )
+                        .map(|end| {
+                            out.set_len(end);
+                            out
+                        })
                     };
                     if let Some(e) = if dict { error_dict } else { error } {
                         assert_eq!(got.err().as_deref(), Some(e), "{name}");
