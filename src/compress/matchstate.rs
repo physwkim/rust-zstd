@@ -310,7 +310,7 @@ impl Window {
     /// of `window_size` bytes: none below `low`, and none `window_size` or
     /// more back, since every offset must be smaller than Window_Size (RFC
     /// 8878 §3.1.1.4, rfc8878.txt:1204-1206). While a loaded dictionary is
-    /// valid ([`Window::check_dict_validity`]), every index from `low` on:
+    /// valid (`Window::check_dict_validity`), every index from `low` on:
     /// the dictionary may be referenced at any offset until Window_Size
     /// bytes follow it (§5, rfc8878.txt:1836-1844), and no input byte is
     /// `window_size` back yet (`ZSTD_getLowestMatchIndex`). Every finder and
