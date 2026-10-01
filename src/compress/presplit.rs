@@ -56,9 +56,9 @@ fn hash2<const HASH_LOG: u32>(src: &[u8], n: usize) -> usize {
 
 impl Fingerprint {
     /// `recordFingerprint_generic`: `addEvents_generic` over `src` into a
-    /// cleared fingerprint. `nb_events` counts `(len - 1) / RATE`, one less
-    /// than the samples taken when `RATE` divides `len - 1` unevenly, as in
-    /// libzstd.
+    /// cleared fingerprint. `nb_events` is the number of positions sampled,
+    /// `ceil((len - 1) / RATE)`; libzstd adds `(len - 1) / RATE`, one short
+    /// whenever `RATE` does not divide `len - 1`.
     fn record<const RATE: usize, const HASH_LOG: u32>(&mut self, src: &[u8]) {
         self.events[..1 << HASH_LOG].fill(0);
         // HASHLENGTH - 1 positions at the end start no event.
@@ -68,7 +68,7 @@ impl Fingerprint {
             self.events[hash2::<HASH_LOG>(src, n)] += 1;
             n += RATE;
         }
-        self.nb_events = (limit / RATE) as u64;
+        self.nb_events = limit.div_ceil(RATE) as u64;
     }
 
     /// `HIST_add` into a cleared byte histogram, with `nb_events` the byte
@@ -219,18 +219,21 @@ mod tests {
             .collect()
     }
 
-    /// `addEvents_generic` counts `(len - 1) / RATE` events although it
-    /// samples `ceil((len - 1) / RATE)` positions.
+    /// `nb_events` equals the events recorded at every sampling rate,
+    /// `ceil((len - 1) / RATE)`: 191, 745, 1639 and 8191 for an 8 KiB chunk.
     #[test]
-    fn record_counts_floor_of_limit_over_rate() {
+    fn record_counts_every_sampled_position() {
+        fn check<const RATE: usize, const HASH_LOG: u32>(src: &[u8], want: u64) {
+            let mut fp = Fingerprint::default();
+            fp.record::<RATE, HASH_LOG>(src);
+            let sum: u32 = fp.events.iter().sum();
+            assert_eq!((fp.nb_events, sum as u64), (want, want), "rate {RATE}");
+        }
         let src = noise(CHUNK_SIZE, 1);
-        let mut fp = Fingerprint::default();
-        fp.record::<43, 8>(&src);
-        assert_eq!(fp.nb_events, 190);
-        assert_eq!(fp.events[..256].iter().sum::<u32>(), 191);
-        fp.record::<1, 10>(&src);
-        assert_eq!(fp.nb_events, 8191);
-        assert_eq!(fp.events.iter().sum::<u32>(), 8191);
+        check::<43, 8>(&src, 191);
+        check::<11, 9>(&src, 745);
+        check::<5, 10>(&src, 1639);
+        check::<1, 10>(&src, 8191);
         // hash2 with a hash log above 8 hashes 2 little-endian bytes.
         let h = hash2::<10>(&[0x34, 0x12], 0);
         assert_eq!(h, (0x1234u32.wrapping_mul(KNUTH) >> 22) as usize);
