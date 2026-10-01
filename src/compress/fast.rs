@@ -61,12 +61,21 @@ enum Found {
     Rep { match0: usize, m_length: usize },
     /// Hash-table hit at `ip0` (`goto _offset`).
     Offset,
+    /// Hash-table hit at `ip0` after the advance, in `ZSTD_extDict` mode
+    /// (`EXT`): the hashed next position `ip1` (`hash1`) goes in the table
+    /// after the match if the match covers it.
+    OffsetExt { hash1: usize, ip1: usize },
     /// `while (ip3 < ilimit)` failed (`_cleanup`).
     Cleanup,
 }
 
 /// `ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, srcSize,
-/// mls, useCmov)`, monomorphized over `MLS` and `CMOV`.
+/// mls, useCmov)`, monomorphized over `MLS` and `CMOV`; with `EXT`,
+/// `ZSTD_compressBlock_fast_extDict_generic`, which libzstd runs while a
+/// loaded dictionary is valid. Over the one contiguous window the two
+/// differ only in the table entry of the next position after a match found
+/// past the first position: noDict writes it before the match when
+/// `step <= 4`, extDict after it when the match covers the position.
 ///
 /// Bounds invariants covering every unchecked read below:
 ///
@@ -90,7 +99,7 @@ enum Found {
 /// loop with one more stack reload than when the inliner takes it. The
 /// inliner still puts the AVX2 monomorphs into [`compress_block_avx2`]; one
 /// left out of line stays correct and calls the AVX2 count out of line.
-fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
+fn compress_block_generic<const MLS: u32, const CMOV: bool, const EXT: bool, C: MatchCount>(
     mc: C,
     ms: &mut MatchState,
     src: Src,
@@ -223,6 +232,9 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
                 tset(hash_table, hash0, current0);
 
                 if match4_found::<CMOV>(src, ip0, match_idx, prefix_start) {
+                    if EXT {
+                        break Found::OffsetExt { hash1, ip1: ip2 };
+                    }
                     // Write next hash table entry, since it's already calculated
                     if step <= 4 {
                         // Avoid writing an index if it's >= position where
@@ -259,10 +271,14 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
             }
         };
 
+        let mut ext_next = None;
         let (match0, offcode, mut m_length) = match found {
             Found::Cleanup => break 'start,
             Found::Rep { match0, m_length } => (match0, REPCODE1_TO_OFFBASE, m_length),
-            Found::Offset => {
+            found @ (Found::Offset | Found::OffsetExt { .. }) => {
+                if let Found::OffsetExt { hash1, ip1 } = found {
+                    ext_next = Some((hash1, ip1));
+                }
                 // _offset: requires ip0, idx. Compute the offset code.
                 let mut match0 = match_idx;
                 rep_offset2 = rep_offset1;
@@ -293,6 +309,14 @@ fn compress_block_generic<const MLS: u32, const CMOV: bool, C: MatchCount>(
 
         ip0 += m_length;
         anchor = ip0;
+
+        // extDict: write next hash table entry
+        if let Some((hash1, ip1)) = ext_next {
+            if ip1 < ip0 {
+                // SAFETY: (I4).
+                unsafe { tset(hash_table, hash1, ip1) };
+            }
+        }
 
         // Fill table and check for immediate repcode.
         if ip0 <= ilimit {
@@ -368,27 +392,35 @@ pub fn compress_block(
     out: &mut SeqStore,
 ) -> usize {
     let block = block.range();
+    // ZSTD_selectBlockCompressor: ZSTD_compressBlock_fast_extDict while a
+    // loaded dictionary is valid (ZSTD_matchState_dictMode).
+    let ext = ms.window().loaded_dict_end().is_some();
     match simd_level() {
         // SAFETY: fearless_simd constructs the witness only after detecting
         // AVX2 on this CPU, and BMI2 is detected here.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Level::Avx2(w) if std::arch::is_x86_feature_detected!("bmi2") => unsafe {
-            compress_block_avx2(w, ms, src, block, rep, out)
+            if ext {
+                compress_block_avx2::<true>(w, ms, src, block, rep, out)
+            } else {
+                compress_block_avx2::<false>(w, ms, src, block, rep, out)
+            }
         },
-        _ => compress_block_scalar(ms, src, block, rep, out),
+        _ if ext => compress_block_scalar::<true>(ms, src, block, rep, out),
+        _ => compress_block_scalar::<false>(ms, src, block, rep, out),
     }
 }
 
 /// [`compress_block`] with the 8-byte [`count`](super::common::count).
 #[inline(never)]
-fn compress_block_scalar(
+fn compress_block_scalar<const EXT: bool>(
     ms: &mut MatchState,
     src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
-    compress_block_level(Fallback::new(), ms, src, block, rep, out)
+    compress_block_level::<EXT, _>(Fallback::new(), ms, src, block, rep, out)
 }
 
 /// [`compress_block`] compiled with AVX2, counting 32 bytes per step, and
@@ -402,7 +434,7 @@ fn compress_block_scalar(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(never)]
 #[target_feature(enable = "avx2,bmi2")]
-unsafe fn compress_block_avx2(
+unsafe fn compress_block_avx2<const EXT: bool>(
     mc: Avx2,
     ms: &mut MatchState,
     src: Src,
@@ -410,11 +442,11 @@ unsafe fn compress_block_avx2(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
-    compress_block_level(mc, ms, src, block, rep, out)
+    compress_block_level::<EXT, _>(mc, ms, src, block, rep, out)
 }
 
 #[inline(always)]
-fn compress_block_level<C: MatchCount>(
+fn compress_block_level<const EXT: bool, C: MatchCount>(
     mc: C,
     ms: &mut MatchState,
     src: Src,
@@ -422,17 +454,26 @@ fn compress_block_level<C: MatchCount>(
     rep: &mut [u32; 3],
     out: &mut SeqStore,
 ) -> usize {
+    // ZSTD_compressBlock_fast_extDict uses no cmov.
+    if EXT {
+        return match ms.cparams.min_match {
+            5 => compress_block_generic::<5, false, true, C>(mc, ms, src, block, rep, out),
+            6 => compress_block_generic::<6, false, true, C>(mc, ms, src, block, rep, out),
+            7 => compress_block_generic::<7, false, true, C>(mc, ms, src, block, rep, out),
+            _ => compress_block_generic::<4, false, true, C>(mc, ms, src, block, rep, out),
+        };
+    }
     // use cmov when "candidate in range" branch is likely unpredictable
     let use_cmov = ms.cparams.window_log < 19;
     match (use_cmov, ms.cparams.min_match) {
-        (true, 5) => compress_block_generic::<5, true, C>(mc, ms, src, block, rep, out),
-        (true, 6) => compress_block_generic::<6, true, C>(mc, ms, src, block, rep, out),
-        (true, 7) => compress_block_generic::<7, true, C>(mc, ms, src, block, rep, out),
-        (true, _) => compress_block_generic::<4, true, C>(mc, ms, src, block, rep, out),
-        (false, 5) => compress_block_generic::<5, false, C>(mc, ms, src, block, rep, out),
-        (false, 6) => compress_block_generic::<6, false, C>(mc, ms, src, block, rep, out),
-        (false, 7) => compress_block_generic::<7, false, C>(mc, ms, src, block, rep, out),
-        (false, _) => compress_block_generic::<4, false, C>(mc, ms, src, block, rep, out),
+        (true, 5) => compress_block_generic::<5, true, false, C>(mc, ms, src, block, rep, out),
+        (true, 6) => compress_block_generic::<6, true, false, C>(mc, ms, src, block, rep, out),
+        (true, 7) => compress_block_generic::<7, true, false, C>(mc, ms, src, block, rep, out),
+        (true, _) => compress_block_generic::<4, true, false, C>(mc, ms, src, block, rep, out),
+        (false, 5) => compress_block_generic::<5, false, false, C>(mc, ms, src, block, rep, out),
+        (false, 6) => compress_block_generic::<6, false, false, C>(mc, ms, src, block, rep, out),
+        (false, 7) => compress_block_generic::<7, false, false, C>(mc, ms, src, block, rep, out),
+        (false, _) => compress_block_generic::<4, false, false, C>(mc, ms, src, block, rep, out),
     }
 }
 
