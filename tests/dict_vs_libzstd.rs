@@ -4,8 +4,8 @@
 //! samples at levels 1, 3, 9 and 19, and on a grid of levels and input
 //! sizes across the sizes where libzstd changes how it uses a dictionary.
 //!
-//! The gate on every frame: libzstd decodes it with the dictionary, and it
-//! is at most [`common::size_limit`] of libzstd's frame with the same
+//! The gate on every frame: libzstd and our decoder decode it with the
+//! dictionary, and it is at most [`common::size_limit`] of libzstd's frame with the same
 //! parameters: `ZSTD_compress2` with `ZSTD_CCtx_refCDict`, whose semantics
 //! [`CompressOptions::dict`] follows, and `ZSTD_c_forceAttachDict` =
 //! `ZSTD_dictForceCopy`, the table mode we always use (see
@@ -14,9 +14,8 @@
 //! `ZSTD_dictMatchState` finders, whose parse differs; those frames are
 //! reported beside ours, as are `ZSTD_compress_usingDict` and
 //! `ZSTD_compress_usingCDict`. Raw prefixes are gated against
-//! `ZSTD_CCtx_refPrefix`. Our decoder does not take dictionaries yet, so
-//! libzstd's is the round trip. Streaming with a dictionary is not
-//! implemented and must say so.
+//! `ZSTD_CCtx_refPrefix`. Streaming with a dictionary is not implemented
+//! and must say so.
 
 mod common;
 
@@ -24,6 +23,7 @@ use rust_zstd::compress::{
     compress_with_dict, compress_with_prefix, CompressDict, CompressError, CompressOptions,
     Compressor, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
 };
+use rust_zstd::decode::{decompress_with_dict, DecodeDict};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -320,8 +320,8 @@ fn lib_ref_prefix(src: &[u8], prefix: &[u8], level: i32) -> Vec<u8> {
 }
 
 /// libzstd's decode of `frame` with `dict` (`ZSTD_decompress_usingDict`)
-/// is `src`.
-fn assert_lib_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
+/// and ours ([`assert_ours_decodes`]) are `src`.
+fn assert_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
     let mut dctx = DCtx::create();
     let mut out = Vec::with_capacity(src.len());
     dctx.decompress_using_dict(&mut out, frame, dict)
@@ -332,10 +332,19 @@ fn assert_lib_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
             )
         });
     assert!(out == src, "{what}: libzstd decodes another input");
+    assert_ours_decodes(what, frame, dict, src);
+}
+
+/// Our decode of `frame` with `dict` is `src`.
+fn assert_ours_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
+    let dict = DecodeDict::new(dict).expect("our decoder parses the dictionary");
+    let out = decompress_with_dict(frame, &dict)
+        .unwrap_or_else(|e| panic!("{what}: our decoder rejects the frame: {e}"));
+    assert!(out == src, "{what}: our decoder decodes another input");
 }
 
 /// One dictionary frame through the gate: our frame of `src` with `ours`
-/// round trips through libzstd with `dict`, carries libzstd's dictionary
+/// round trips through libzstd and our decoder with `dict`, carries libzstd's dictionary
 /// ID, and is at most [`common::size_limit`] of libzstd's force-copy frame
 /// with `lib` (else the error is pushed to `failures`). Returns our size,
 /// libzstd's force-copy size and libzstd's default size.
@@ -348,7 +357,7 @@ fn gate(
     failures: &mut Vec<String>,
 ) -> [usize; 3] {
     let frame = compress_with_dict(src, ours);
-    assert_lib_decodes(what, &frame, dict, src);
+    assert_decodes(what, &frame, dict, src);
     let copy = lib.compress(src, Attach::ForceCopy, &[]);
     let attach = lib.compress(src, Attach::Default, &[]);
     assert_eq!(
@@ -511,6 +520,7 @@ fn prefix_frames_pass_the_gate() {
                 dctx.decompress(&mut out, &ours)
                     .unwrap_or_else(|e| panic!("{what}: {}", zstd_safe::get_error_name(e)));
                 assert!(out == *src, "{what}: libzstd decodes another input");
+                assert_ours_decodes(&what, &ours, &prefix, src);
                 let lib = lib_ref_prefix(src, &prefix, level);
                 if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
                     failures.push(e);
@@ -597,7 +607,7 @@ fn dictionary_with_ldm_and_checksum() {
                 ..Default::default()
             })
             .compress_to_vec(&src);
-            assert_lib_decodes(&what, &ours, &dict, &src);
+            assert_decodes(&what, &ours, &dict, &src);
             let params = [
                 (P::ZSTD_c_enableLongDistanceMatching, 1),
                 (P::ZSTD_c_checksumFlag, 1),
@@ -627,7 +637,7 @@ fn dictionary_frames_are_one_job() {
     };
     let one = frame(None);
     assert!(frame(Some(JOBSIZE_MIN)) == one);
-    assert_lib_decodes("job size", &one, &trained, &src);
+    assert_decodes("job size", &one, &trained, &src);
 }
 
 /// A streaming frame of options with a dictionary fails with
