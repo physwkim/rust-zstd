@@ -101,7 +101,7 @@ Class: libzstd bug
 
 C reference: `decompress/huf_decompress.c:1275-1290` — `HUF_decodeLastSymbolX2` runs `BIT_skipBits(DStream, dt[val].nbBits)` for `length != 1`, and clamps to 64 with the comment "ugly hack; works only because it's the last symbol". `BIT_endOfDStream` then passes (`:1373`, `:1495`). X1's `HUF_decodeSymbolX1` consumes only the symbol's own bits, and the X1 body rejects the same shape (`:592`, `:692`). The choice between the two comes from the timing heuristic `HUF_selectDecoder` (`:1821-1843`, used at `:1930`).
 
-Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. Rust copies this exactly, so there is no parity divergence. It is a libzstd accept-set defect that the port inherited.
+Impact: Whether a Huffman stream with one undecoded trailing symbol is corrupt depends on a speed heuristic (the compressed/regenerated size ratio) and on the data, not on the stream itself. The port's X2 last-symbol step consumes only the symbol's own bits, so X1 and X2 both reject such a stream, as RFC 8878 §4.2.2 requires.
 
 ### R1-10: [libzstd] `ZSTD_deriveSeqStoreChunk` keeps a long length that sits exactly at the chunk end
 
@@ -154,7 +154,7 @@ Impact: i686 libzstd 1.5.7 with LDM enabled, level 3 and a 64 KiB input:
 - `ldmHashRateLog=24` on a 1 KiB input (derived hashLog 30) returns a 1034-byte frame after unchecked writes outside the workspace.
 - `ldmHashLog=28` returns error −64 (memory_allocation).
 
-The port panics in the three explicit cases; in the rate case it derives hash log 6 (see Accepted divergences). At hashLog 20 both produce the same 33175-byte frame. Proven by probe: a scratch i686 build of zstd-sys 2.0.16 against the port (not committed).
+The libzstd results come from a probe on a scratch i686 build of zstd-sys 2.0.16 (not committed). The port refuses a hash log above 27 on 32-bit targets, explicit or derived, with a panic in `LdmParams::adjusted` before any output; in the rate case it derives hash log 6 (R1-16).
 
 ### R1-17: [libzstd] ZSTD_ldm_gear_reset never stores its hash, so LDM split points after a chunk start or a match skip come from a stale rolling state
 
@@ -166,19 +166,7 @@ C reference: `lib/compress/zstd_ldm.c:60-85` — the contract says it "feeds [da
 
 Impact: for the first `minMatchLength - 1` bytes (up to 63) after each 1 MiB chunk start and each skip, the stopMask bits depend on `~0` or on pre-skip bytes rather than on the preceding minMatch bytes. Split points, and so inserted entries and found LDM matches, differ from the documented design. Frames stay valid; only ratio is affected.
 
-The bug itself was found by reading. That the port copied it is supported by a probe: 3 MiB input with LDM enabled gives identical frames at L3 (1579911 B) and L19 (1578082 B).
-
-### R1-18: [libzstd] A missing `else` in the ZSTD_compressBlock_opt_generic backtrack discards the literals-only final entry, so trailing literals of the last stretch are parsed again
-
-Severity: Low
-
-Class: libzstd bug
-
-C reference: `lib/compress/zstd_opt.c:1385-1394` — `if (lastStretch.litlen > 0) { …storeStart = storeEnd-1; opt[storeStart] = lastStretch; } { opt[storeEnd] = lastStretch; storeStart = storeEnd; }`. This is a bare block where `else` was meant. It overwrites the literals-only entry, and the `mlen==0` store branch at `:1420-1424` becomes dead.
-
-Impact: when a series ends with trailing literals (`lastStretch.litlen > 0`), `ip` restarts at the end of the last match instead of after the literals. The next series re-runs match finding and pricing over those positions. The effect is CPU cost and a different parse at levels 16-22 (btopt/btultra/btultra2); frames stay valid.
-
-The bug was found by reading. That the port copied it is supported by the L19 byte-identical probe in R1-17.
+Found by reading. The port stores the hash, so its LDM split points, and its frames with LDM enabled, can differ from libzstd's.
 
 ### R1-19: [libzstd] `iend - 8` / `iend - HASH_READ_SIZE` form a pointer before `istart` for inputs under 8 bytes (undefined behaviour); port did not copy it
 
@@ -218,7 +206,7 @@ Class: libzstd bug
 
 C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
 
-Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. Fixing it on our side would break byte identity with libzstd, so the current behaviour is correct for parity. Evidence: reading, plus the existing Rust unit test.
+Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. The port counts every sampled position, so its pre-split points at block splitter levels 1-3 can differ from libzstd's. Evidence: reading; `split_block_matches_libzstd` compares only levels 0 and 4, where the counts agree.
 
 ### R2-2: [libzstd] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
 
@@ -296,7 +284,7 @@ Class: libzstd bug
 
 C reference: `common/huf.h:37` — `HUF_TABLELOG_MAX 12`. `common/entropy_common.c:280` and `:288` — `HUF_readStats_body` only rejects weights or a tableLog above 12. RFC 8878 §4.2.1: "This specification limits the maximum code length to 11 bits."
 
-Impact: proven by probe (`p6`). Direct weights 12..1 with an implied last weight of 1 (sum 4096, Max_Number_of_Bits 12) decode to `Ok(7)` in one-shot libzstd, streaming libzstd and all Rust paths, the same as the 11-bit control. This row is only for the upstream list; the port side is already covered by a user decision.
+Impact: proven by probe (`p6`). Direct weights 12..1 with an implied last weight of 1 (sum 4096, Max_Number_of_Bits 12) decode to `Ok(7)` in one-shot and streaming libzstd, the same as the 11-bit control. The port rejects every 12-bit table under the RFC decoder rule.
 
 ### R2-10: [libzstd] `ZSTD_resetCCtx_internal` subtracts two NULL pointers on a CCtx's first use
 
