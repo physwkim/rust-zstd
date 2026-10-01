@@ -13,4 +13,4 @@ pub use compress::{
     compress, compress_to_vec, compress_with, CompressError, CompressOptions, Compressor, Encoder,
     EndDirective, ParamSwitch,
 };
-pub use decode::decompress;
+pub use decode::{decompress, DecompressReader, Decompressor};
