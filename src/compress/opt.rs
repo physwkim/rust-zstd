@@ -10,17 +10,19 @@
 //!
 //! Literals are always entropy-coded for these strategies
 //! (`ZSTD_resolveLiteralsCompression` disables them only for negative
-//! levels), so `ZSTD_compressedLiterals` is constant true here. Without
-//! dictionaries `optPtr->symbolCosts` never holds a valid Huffman table
-//! when the statistics are initialized, so that branch of
-//! `ZSTD_rescaleFreqs` does not exist: the parser reads nothing produced
-//! by the entropy stage. Block N+1's parse may therefore overlap block N's
+//! levels), so `ZSTD_compressedLiterals` is constant true here.
+//! `optPtr->symbolCosts` holds a valid Huffman table when the statistics
+//! are initialized only as a dictionary loaded it, before the frame's first
+//! block: [`DictStats`] takes the statistics from those tables when the
+//! dictionary is loaded, and otherwise the parser reads nothing produced by
+//! the entropy stage. Block N+1's parse may therefore overlap block N's
 //! entropy stage in [`compress_blocks`](super::block::compress_blocks):
 //! its inputs are the repeat offsets, which the pipeline already takes
 //! from the committed state, and the statistics in [`MatchState::opt`],
 //! which the parser alone updates whatever type block N is written as
 //! (C keeps them in `ms->opt`, outside the block state too).
 
+use super::block::BlockState;
 use super::bt::{assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
 use super::common::{simd_level, Src};
 use super::ldm::RawSeqView;
@@ -29,6 +31,8 @@ use super::params::Strategy;
 use super::seqstore::{offset_to_offbase, update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
 use crate::constants::{ZSTD_BLOCKSIZE_MAX, ZSTD_MINMATCH};
+use crate::fse::FseCTable;
+use crate::huf::HufState;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -128,8 +132,69 @@ struct Stats {
 /// statistics ([`OptState::invalidate`]).
 pub struct OptState {
     stats: Stats,
+    /// The statistics the next first block starts from, when a dictionary
+    /// loaded before it holds a valid Huffman table
+    /// ([`OptState::seed_dict`]); forgotten with the statistics.
+    dict_stats: Option<DictStats>,
     matches: Box<[Match; ZSTD_OPT_SIZE]>,
     opt: Box<[Optimal; ZSTD_OPT_SIZE]>,
+}
+
+/// The first-block statistics `ZSTD_rescaleFreqs` takes from a
+/// dictionary's entropy tables (`optPtr->symbolCosts`, the block state the
+/// dictionary loaded) when its Huffman table is `HUF_repeat_valid`, so
+/// covers every literal: a symbol coded in `n` bits counts
+/// `1 << (scale - n)`, literals scaled to 2K and the sequence codes to 1K,
+/// and a symbol without a code counts 1.
+#[derive(Clone, Debug)]
+pub struct DictStats {
+    lit_freq: [u32; MAX_LIT + 1],
+    lit_length_freq: [u32; MAX_LL + 1],
+    match_length_freq: [u32; MAX_ML + 1],
+    off_code_freq: [u32; MAX_OFF + 1],
+}
+
+impl DictStats {
+    /// The statistics of a dictionary's block state `dict`, `None` unless
+    /// its Huffman table is `Valid` (the sequence tables of a dictionary
+    /// with one are always loaded).
+    ///
+    /// `FSE_getMaxNbBits` of a symbol above a table's `maxSymbolValue` reads
+    /// a `symbolTT` entry `FSE_buildCTable_wksp` never wrote: libzstd builds
+    /// the dictionary's literal and match length tables up to their largest
+    /// counted symbol only. Such a symbol has probability zero, so it is
+    /// priced here as `FSE_buildCTable_wksp` prices a zero-probability
+    /// symbol it does write, `tableLog + 1` bits.
+    pub fn of(dict: &BlockState) -> Option<Self> {
+        let HufState::Valid(huf) = &dict.huf else {
+            return None;
+        };
+        let (ll, of, ml) = (
+            dict.fse.ll.table()?,
+            dict.fse.of.table()?,
+            dict.fse.ml.table()?,
+        );
+        let freq = |scale_log: u32, bit_cost: u32| {
+            debug_assert!(bit_cost <= scale_log);
+            if bit_cost == 0 {
+                1 // minimum to calculate cost
+            } else {
+                1 << (scale_log - bit_cost)
+            }
+        };
+        // FSE_getMaxNbBits
+        let max_nb_bits = |table: &FseCTable, symbol: usize| match table.symbol_tt.get(symbol) {
+            Some(tt) if symbol <= table.max_symbol => (tt.delta_nb_bits + 0xFFFF) >> 16,
+            _ => table.table_log + 1,
+        };
+        // Literals scaled to 2K, the sequence codes to 1K.
+        Some(DictStats {
+            lit_freq: std::array::from_fn(|lit| freq(11, huf.nb_bits(lit))),
+            lit_length_freq: std::array::from_fn(|s| freq(10, max_nb_bits(ll, s))),
+            match_length_freq: std::array::from_fn(|s| freq(10, max_nb_bits(ml, s))),
+            off_code_freq: std::array::from_fn(|s| freq(10, max_nb_bits(of, s))),
+        })
+    }
 }
 
 /// `ZSTD_downscaleStats`: `table[s] = base + (table[s] >> shift)` with base
@@ -169,10 +234,12 @@ impl Stats {
     }
 
     /// `ZSTD_rescaleFreqs(optPtr, src = block, srcSize, optLevel)`: on the
-    /// first block (`litLengthSum == 0`) seed literal statistics from the
-    /// block itself and the sequence symbols from baseline tables, else
-    /// scale the accumulated statistics down as the next block's seed.
-    fn rescale_freqs<const OPT_LEVEL: u32>(&mut self, block: &[u8]) {
+    /// first block (`litLengthSum == 0`) take the statistics of a
+    /// dictionary with a valid Huffman table (`dict`), or else seed literal
+    /// statistics from the block itself and the sequence symbols from
+    /// baseline tables; on a later block scale the accumulated statistics
+    /// down as its seed.
+    fn rescale_freqs<const OPT_LEVEL: u32>(&mut self, block: &[u8], dict: Option<&DictStats>) {
         self.price_type = PriceType::Dynamic;
 
         if self.lit_length_sum == 0 {
@@ -181,6 +248,22 @@ impl Stats {
             // heuristic: use pre-defined stats for too small inputs
             if block.len() <= ZSTD_PREDEF_THRESHOLD {
                 self.price_type = PriceType::Predef;
+            }
+
+            if let Some(dict) = dict {
+                // huffman stats covering the full value set : table
+                // presumed generated by dictionary
+                self.price_type = PriceType::Dynamic;
+                self.lit_freq = dict.lit_freq;
+                self.lit_sum = dict.lit_freq.iter().sum();
+                self.lit_length_freq = dict.lit_length_freq;
+                self.lit_length_sum = dict.lit_length_freq.iter().sum();
+                self.match_length_freq = dict.match_length_freq;
+                self.match_length_sum = dict.match_length_freq.iter().sum();
+                self.off_code_freq = dict.off_code_freq;
+                self.off_code_sum = dict.off_code_freq.iter().sum();
+                self.set_base_prices::<OPT_LEVEL>();
+                return;
             }
 
             // first block, no dictionary: base initial cost of literals on
@@ -341,15 +424,25 @@ impl OptState {
                 off_code_sum_base_price: 0,
                 price_type: PriceType::Dynamic,
             },
+            dict_stats: None,
             matches: boxed(),
             opt: boxed(),
         }
     }
 
     /// `ZSTD_invalidateMatchState`'s `opt.litLengthSum = 0`: the next block
-    /// initializes fresh statistics.
+    /// initializes fresh statistics, and without a dictionary's until
+    /// [`OptState::seed_dict`] sets them again.
     pub fn invalidate(&mut self) {
         self.stats.lit_length_sum = 0;
+        self.dict_stats = None;
+    }
+
+    /// A dictionary with a valid Huffman table was loaded after the last
+    /// [`OptState::invalidate`]: the first block starts from its
+    /// statistics.
+    pub fn seed_dict(&mut self, stats: &DictStats) {
+        self.dict_stats = Some(stats.clone());
     }
 }
 
@@ -714,6 +807,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     } = finders;
     let OptState {
         stats,
+        dict_stats,
         matches,
         opt,
     } = state;
@@ -735,7 +829,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
     let mut opt_ldm = OptLdm::new(ldm, (iend - istart) as u32);
 
     // init
-    stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end));
+    stats.rescale_freqs::<OPT_LEVEL>(src.slice(block.start, block.end), dict_stats.as_ref());
     // C: `ip += (ip == prefixStart)`
     let prefix_lowest = ms.window_low();
     let mut ip = istart;
