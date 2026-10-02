@@ -652,6 +652,25 @@ pub struct BlockSizing {
     pub header_len: usize,
 }
 
+/// The least unsplit size of a block whose match finding [`compress_blocks`]'
+/// pipelined loop runs next to the previous block's entropy stage. The
+/// overlap hands that entropy stage, and the sequences it reads, to another
+/// core while the finder waits for it, so it pays only when the finder has
+/// this much to do: on one 8-core CCD, single-job rssrc and elf frames of
+/// 128 KiB and a 4-8 KiB second block lost 3-13% at L1 and L3 to the
+/// overlap, broke even at 16-28 KiB and gained 3-8% at 32 KiB.
+pub(crate) const MIN_OVERLAP: usize = 32 << 10;
+
+impl BlockSizing {
+    /// Whether [`compress_blocks`]' pipelined loop can overlap blocks of a
+    /// job of `len` bytes: whether its second block holds [`MIN_OVERLAP`]
+    /// bytes unsplit, as no later one holds more.
+    pub(crate) fn overlaps(&self, len: usize) -> bool {
+        let second = len.saturating_sub(self.block_size_max);
+        second.min(self.block_size_max) >= MIN_OVERLAP
+    }
+}
+
 /// How far the input [`compress_blocks`] is handed reaches, and what
 /// follows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -849,7 +868,8 @@ impl JobBlocks {
 /// splitter when `split`, with long distance matches from `ldm` and the
 /// attached dictionary `dms`. With
 /// `pipelined` (parallel feature only) block N's entropy stage and
-/// emission run on rayon next to block N+1's match finding whenever every
+/// emission run on rayon next to block N+1's match finding whenever N+1
+/// holds `MIN_OVERLAP` bytes unsplit and every
 /// block N is written as is proven (`proven_rep_after`) to be COMPRESSED,
 /// so that the repeat offsets N+1 starts from are the ones the decoder
 /// will hold, and N+1's size is fixed without N's compressed size;
@@ -902,7 +922,8 @@ pub fn compress_blocks(
 #[cfg(feature = "parallel")]
 pub static PIPELINE_OVERLAPPED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Blocks with a successor whose proof failed (entropy stage ran first).
+/// Blocks with a successor of `MIN_OVERLAP` bytes whose proof failed
+/// (entropy stage ran first).
 #[cfg(feature = "parallel")]
 pub static PIPELINE_SERIALIZED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -964,15 +985,16 @@ fn compress_blocks_pipelined(
             None => &[][..],
         });
         let following_start = block.end;
-        // A pre-split block is at least 8 KiB, so the unsplit size decides
-        // whether the next block attempts compression.
-        let following_builds = blocks.ready(following_start, input)
-            && attempts_compression(blocks.unsplit_size(following_start, input));
+        // Only a next block of MIN_OVERLAP bytes unsplit is worth the
+        // overlap; pre-split, it is at least 8 KiB, so it attempts
+        // compression.
+        let following_overlaps = blocks.ready(following_start, input)
+            && blocks.unsplit_size(following_start, input) >= MIN_OVERLAP;
         // Block N+1 may start before block N is written when N is proven
         // COMPRESSED (the offsets N+1 starts from) and N+1's size does not
         // depend on N's compressed size: it is not pre-split, or the least
         // savings a COMPRESSED N leaves already allow the split.
-        let overlap = following_builds
+        let overlap = following_overlaps
             .then(|| {
                 let rep = built?;
                 let rep_next = proven_rep_after(
@@ -1025,7 +1047,7 @@ fn compress_blocks_pipelined(
             built = built_following;
             block = following;
         } else {
-            if following_builds {
+            if following_overlaps {
                 PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
             }
             emit_block(
