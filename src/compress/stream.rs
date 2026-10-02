@@ -236,7 +236,10 @@ impl Frame {
     }
 
     /// Compress the blocks of the buffered input that `input` makes ready,
-    /// the frame header before the first.
+    /// the frame header before the first. As a one-shot frame's, they go to
+    /// rayon only when the pipelined loop overlaps some of them, and then
+    /// all at once: overlapping from outside the pool, every overlap was a
+    /// thread hop, and the match state went to whichever worker took it.
     fn compress(&mut self, input: InputEnd, out: &mut Vec<u8>) {
         if !self.blocks.has_ready(input) {
             return;
@@ -245,7 +248,18 @@ impl Frame {
             out.extend_from_slice(&header);
         }
         #[cfg(feature = "parallel")]
-        let _in_job = super::InJob::enter();
+        if self.blocks.overlaps(input) {
+            rayon::scope(|_| {
+                let _in_job = super::InJob::enter();
+                self.compress_blocks(input, out, true);
+            });
+            return;
+        }
+        self.compress_blocks(input, out, false);
+    }
+
+    /// [`block::compress_blocks`] over the buffered input up to `input`.
+    fn compress_blocks(&mut self, input: InputEnd, out: &mut Vec<u8>, pipelined: bool) {
         let (ms, scratch, mut ldm) = self.ctx.resume(self.ldm);
         block::compress_blocks(
             ms,
@@ -258,7 +272,7 @@ impl Frame {
             &mut ldm,
             self.attached.as_deref().map(CompressDict::dict_match_state),
             out,
-            cfg!(feature = "parallel"),
+            pipelined,
         );
     }
 

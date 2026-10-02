@@ -661,16 +661,6 @@ pub struct BlockSizing {
 /// overlap, broke even at 16-28 KiB and gained 3-8% at 32 KiB.
 pub(crate) const MIN_OVERLAP: usize = 32 << 10;
 
-impl BlockSizing {
-    /// Whether [`compress_blocks`]' pipelined loop can overlap blocks of a
-    /// job of `len` bytes: whether its second block holds [`MIN_OVERLAP`]
-    /// bytes unsplit, as no later one holds more.
-    pub(crate) fn overlaps(&self, len: usize) -> bool {
-        let second = len.saturating_sub(self.block_size_max);
-        second.min(self.block_size_max) >= MIN_OVERLAP
-    }
-}
-
 /// How far the input [`compress_blocks`] is handed reaches, and what
 /// follows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -759,6 +749,22 @@ impl JobBlocks {
             InputEnd::Open(end) => end > start && end - start > self.sizing.block_size_max,
             InputEnd::Chunk(end) | InputEnd::JobEnd(end) => start < end,
         }
+    }
+
+    /// Whether [`compress_blocks`]' pipelined loop overlaps the block at
+    /// `start`, the next one written, with the one before it: the block is
+    /// ready and holds [`MIN_OVERLAP`] bytes unsplit.
+    fn overlaps_at(&self, start: usize, input: InputEnd) -> bool {
+        self.ready(start, input) && self.unsplit_size(start, input) >= MIN_OVERLAP
+    }
+
+    /// Whether `input` gives [`compress_blocks`]' pipelined loop blocks to
+    /// overlap: whether it overlaps the second ready block, the first one
+    /// taken unsplit, as no later one holds more. A job's first block is
+    /// never pre-split, so on a job's whole input this is exact.
+    pub fn overlaps(&self, input: InputEnd) -> bool {
+        let start = self.next_start();
+        self.ready(start, input) && self.overlaps_at(start + self.unsplit_size(start, input), input)
     }
 
     /// Whether `block` is the frame's last.
@@ -985,11 +991,9 @@ fn compress_blocks_pipelined(
             None => &[][..],
         });
         let following_start = block.end;
-        // Only a next block of MIN_OVERLAP bytes unsplit is worth the
-        // overlap; pre-split, it is at least 8 KiB, so it attempts
-        // compression.
-        let following_overlaps = blocks.ready(following_start, input)
-            && blocks.unsplit_size(following_start, input) >= MIN_OVERLAP;
+        // Pre-split, a next block that overlaps is at least 8 KiB, so it
+        // attempts compression.
+        let following_overlaps = blocks.overlaps_at(following_start, input);
         // Block N+1 may start before block N is written when N is proven
         // COMPRESSED (the offsets N+1 starts from) and N+1's size does not
         // depend on N's compressed size: it is not pre-split, or the least
@@ -1490,6 +1494,27 @@ mod tests {
         st.rebase(100);
         assert_eq!(st.savings(899, 5), 5);
         assert_eq!(st.savings(900, 5), -5);
+    }
+
+    /// The pipelined loop has blocks to overlap once the second ready
+    /// block holds `MIN_OVERLAP` bytes unsplit: at a job or chunk end, from
+    /// `blockSizeMax + MIN_OVERLAP` bytes on; open, once the second block
+    /// is ready, past `2 * blockSizeMax`; never with `blockSizeMax` under
+    /// `MIN_OVERLAP`.
+    #[test]
+    fn overlaps_needs_a_ready_second_block_of_min_overlap() {
+        let bsm = ZSTD_BLOCKSIZE_MAX;
+        let at = 1000 + bsm + MIN_OVERLAP;
+        let mut st = job_blocks(Some(1), usize::MAX, 1000);
+        for end in [InputEnd::JobEnd, InputEnd::Chunk] {
+            assert!(!st.overlaps(end(1000 + bsm)));
+            assert!(!st.overlaps(end(at - 1)));
+            assert!(st.overlaps(end(at)));
+        }
+        assert!(!st.overlaps(InputEnd::Open(1000 + 2 * bsm)));
+        assert!(st.overlaps(InputEnd::Open(1000 + 2 * bsm + 1)));
+        st.sizing.block_size_max = MIN_OVERLAP - 1;
+        assert!(!st.overlaps(InputEnd::JobEnd(1 << 20)));
     }
 
     /// The pipelined loop fixes the next block before the current one is

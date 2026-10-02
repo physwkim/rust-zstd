@@ -661,7 +661,10 @@ impl Compressor {
         // calling thread in either build. Entering the pool from outside
         // it is a thread hop, which cut 4 KiB frames from 0.91x libzstd's
         // speed to 0.72x.
-        let parallel = cfg!(feature = "parallel") && (n_jobs > 1 || sizing.overlaps(src.len()));
+        let first = &jobs[0];
+        let first_blocks = JobBlocks::new(sizing, first.start, true, n_jobs == 1);
+        let parallel = cfg!(feature = "parallel")
+            && (n_jobs > 1 || first_blocks.overlaps(InputEnd::JobEnd(first.end)));
         // ZSTDMT_serialState: every job's long distance matches from the one
         // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
         // single-threaded frame generates each block's as it compresses the
@@ -2299,6 +2302,42 @@ mod tests {
             assert_eq!(cx.contexts.capacity, contexts, "{len} bytes, {job_size:?}");
             assert!(frame == compress_with(&data[..len], &opts), "{len} bytes");
         }
+    }
+
+    /// A stream call that buffers blocks for the pipelined loop to overlap
+    /// overlaps them, and the stream is still the one-shot frame.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn stream_call_overlaps_its_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let data = text(1 << 20);
+        let opts = CompressOptions {
+            level: 1,
+            ..Default::default()
+        };
+        let mut cx = Compressor::new(opts.clone());
+        cx.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+        let mut dst = vec![0u8; 2 * data.len()];
+        let (mut src_pos, mut dst_pos) = (0, 0);
+        let before = block::PIPELINE_OVERLAPPED.load(Relaxed);
+        cx.compress_stream(
+            &data,
+            &mut src_pos,
+            &mut dst,
+            &mut dst_pos,
+            EndDirective::Continue,
+        )
+        .unwrap();
+        assert_eq!(src_pos, data.len());
+        assert!(
+            block::PIPELINE_OVERLAPPED.load(Relaxed) > before,
+            "never overlapped"
+        );
+        let left = cx
+            .compress_stream(&[], &mut 0, &mut dst, &mut dst_pos, EndDirective::End)
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(dst[..dst_pos] == compress_with(&data, &opts));
     }
 
     /// A `Compressor` fed different inputs back to back, so that its tables
