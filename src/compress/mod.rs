@@ -468,9 +468,11 @@ impl Context {
 /// takes a context as it starts and gives it back when it finishes, so a
 /// frame creates no more contexts than it runs jobs at once, at most one
 /// per worker thread, and the pool keeps no more than that across frames.
+/// Contexts are boxed: their block buffers alone are 12.5 KB inline, which
+/// every take and give back copied.
 #[derive(Default)]
 struct ContextPool {
-    free: Mutex<Vec<Context>>,
+    free: Mutex<Vec<Box<Context>>>,
     /// `totalCCtx`: how many contexts the pool keeps.
     capacity: usize,
 }
@@ -494,12 +496,12 @@ impl ContextPool {
     }
 
     /// `ZSTDMT_getCCtx`: the last context given back, or a new one.
-    fn take(&self) -> Context {
+    fn take(&self) -> Box<Context> {
         self.free.lock().unwrap().pop().unwrap_or_default()
     }
 
     /// `ZSTDMT_releaseCCtx`: keep `ctx` unless the pool is full.
-    fn give_back(&self, ctx: Context) {
+    fn give_back(&self, ctx: Box<Context>) {
         let mut free = self.free.lock().unwrap();
         if free.len() < self.capacity {
             free.push(ctx);

@@ -107,7 +107,7 @@ fn frame_size(pledged: Option<u64>) -> usize {
 
 /// One streaming frame: its context and job state, and the input buffer.
 struct Frame {
-    ctx: Context,
+    ctx: Box<Context>,
     /// The dictionary the finders search in place, when attached
     /// ([`FrameDict::dict_match_state`]).
     attached: Option<Arc<CompressDict>>,
@@ -145,7 +145,7 @@ impl Frame {
         opts: &CompressOptions,
         pledged: Option<u64>,
         prefix: Option<&[u8]>,
-        mut ctx: Context,
+        mut ctx: Box<Context>,
     ) -> Self {
         let size = frame_size(pledged);
         let cdict = opts.dict.clone();
@@ -287,7 +287,7 @@ impl Frame {
     /// `ZSTD_compressEnd`: the buffered input as the frame's last blocks,
     /// or, with none left, `ZSTD_writeEpilogue`'s empty last block; then
     /// the checksum. Returns the context.
-    fn finish(mut self, out: &mut Vec<u8>) -> Context {
+    fn finish(mut self, out: &mut Vec<u8>) -> Box<Context> {
         let end = InputEnd::JobEnd(self.buf.len());
         if self.blocks.has_ready(end) {
             self.compress(end, out);

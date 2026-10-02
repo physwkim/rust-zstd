@@ -1258,9 +1258,9 @@ pub fn encode_sequences_section_with(
     let mut ll_counts = [0u32; 256];
     let mut of_counts = [0u32; 256];
     let mut ml_counts = [0u32; 256];
-    let (ll_most, ll_max) = huf::hist_count(&mut ll_counts, ll_codes);
-    let (of_most, of_max) = huf::hist_count(&mut of_counts, of_codes);
-    let (ml_most, ml_max) = huf::hist_count(&mut ml_counts, ml_codes);
+    let (ll_most, ll_max) = huf::hist_count(&mut ll_counts, ll_codes, MAX_LL);
+    let (of_most, of_max) = huf::hist_count(&mut of_counts, of_codes, MAX_OFF);
+    let (ml_most, ml_max) = huf::hist_count(&mut ml_counts, ml_codes, MAX_ML);
     let raw_bits = |counts: &[u32], bits: &dyn Fn(usize) -> usize| {
         counts
             .iter()
@@ -1386,6 +1386,8 @@ pub fn estimate_sequences_section(
         default_norm: &'a [i16],
         default_norm_log: u32,
         default_max: usize,
+        /// The largest code the stream can hold.
+        max_code: usize,
         /// Extra bits per code; `None` for offsets, whose code is the count.
         extra: Option<&'a [u8]>,
     }
@@ -1397,6 +1399,7 @@ pub fn estimate_sequences_section(
             default_norm: &LL_DEFAULT_NORM,
             default_norm_log: LL_DEFAULT_NORM_LOG,
             default_max: MAX_LL,
+            max_code: MAX_LL,
             extra: Some(&LL_BITS),
         },
         Stream {
@@ -1406,6 +1409,7 @@ pub fn estimate_sequences_section(
             default_norm: &OF_DEFAULT_NORM,
             default_norm_log: OF_DEFAULT_NORM_LOG,
             default_max: DEFAULT_MAX_OFF,
+            max_code: MAX_OFF,
             extra: None,
         },
         Stream {
@@ -1415,6 +1419,7 @@ pub fn estimate_sequences_section(
             default_norm: &ML_DEFAULT_NORM,
             default_norm_log: ML_DEFAULT_NORM_LOG,
             default_max: MAX_ML,
+            max_code: MAX_ML,
             extra: Some(&ML_BITS),
         },
     ];
@@ -1425,11 +1430,12 @@ pub fn estimate_sequences_section(
         default_norm,
         default_norm_log,
         default_max,
+        max_code,
         extra,
     } in streams
     {
         let mut counts = [0u32; 256];
-        let (most, max) = huf::hist_count(&mut counts, codes);
+        let (most, max) = huf::hist_count(&mut counts, codes, max_code);
         // `build_seq_table` lowers the last code's count for a new table.
         let mut table_counts = counts;
         let (table, _, ty, _) = build_seq_table(

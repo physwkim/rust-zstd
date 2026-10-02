@@ -97,12 +97,39 @@ fn highbit32(v: u32) -> u32 {
 // Histogram
 // =========================================================================
 
-/// `HIST_count_wksp` (`HIST_count_parallel_wksp`): count every byte of
-/// `src` into `counts` and return `(largest count, max symbol present)`.
-/// Four interleaved histograms over 16-byte stripes break the dependency
-/// chain between increments. `counts` is cleared first; `src` must not be
-/// empty.
-pub fn hist_count(counts: &mut [u32; 256], src: &[u8]) -> (u32, usize) {
+/// `HIST_countFast_wksp`'s heuristic threshold: shorter inputs take
+/// `HIST_count_simple`.
+const HIST_SIMPLE_MAX: usize = 1500;
+
+/// `HIST_countFast_wksp`: count every byte of `src` into `counts` and
+/// return `(largest count, max symbol present)`. No byte of `src` exceeds
+/// `max_symbol_value`, where the search for the max symbol starts: 255 for
+/// literals, `MAX_LL` / `MAX_OFF` / `MAX_ML` for sequence codes. `counts`
+/// is cleared first; `src` must not be empty.
+pub fn hist_count(counts: &mut [u32; 256], src: &[u8], max_symbol_value: usize) -> (u32, usize) {
+    debug_assert!(src.iter().all(|&b| b as usize <= max_symbol_value));
+    if src.len() < HIST_SIMPLE_MAX {
+        // HIST_count_simple: one histogram, nothing to clear or merge but
+        // `counts` itself.
+        counts.fill(0);
+        for &b in src {
+            counts[b as usize] += 1;
+        }
+    } else {
+        hist_count_parallel(counts, src);
+    }
+    let mut max_symbol = max_symbol_value;
+    while counts[max_symbol] == 0 {
+        max_symbol -= 1;
+    }
+    let largest = counts[..=max_symbol].iter().fold(0, |m, &c| m.max(c));
+    (largest, max_symbol)
+}
+
+/// `HIST_count_parallel_wksp`: four interleaved histograms over 16-byte
+/// stripes break the dependency chain between increments, then sum into
+/// `counts`.
+fn hist_count_parallel(counts: &mut [u32; 256], src: &[u8]) {
     let mut c1 = [0u32; 256];
     let mut c2 = [0u32; 256];
     let mut c3 = [0u32; 256];
@@ -120,17 +147,9 @@ pub fn hist_count(counts: &mut [u32; 256], src: &[u8]) -> (u32, usize) {
     for &b in rest {
         c1[b as usize] += 1;
     }
-    let mut max = 0;
     for s in 0..256 {
-        let total = c1[s] + c2[s] + c3[s] + c4[s];
-        counts[s] = total;
-        max = max.max(total);
+        counts[s] = c1[s] + c2[s] + c3[s] + c4[s];
     }
-    let mut max_symbol = 255;
-    while counts[max_symbol] == 0 {
-        max_symbol -= 1;
-    }
-    (max, max_symbol)
 }
 
 // =========================================================================
@@ -935,10 +954,15 @@ fn compress_internal(
     if flags.suspect_uncompressible
         && src_size >= SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO
     {
-        let (largest_begin, _) = hist_count(&mut count, &src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE]);
+        let (largest_begin, _) = hist_count(
+            &mut count,
+            &src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE],
+            HUF_SYMBOLVALUE_MAX,
+        );
         let (largest_end, _) = hist_count(
             &mut count,
             &src[src_size - SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE..],
+            HUF_SYMBOLVALUE_MAX,
         );
         let largest_total = largest_begin as usize + largest_end as usize;
         if largest_total <= ((2 * SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE) >> 7) + 4 {
@@ -946,7 +970,7 @@ fn compress_internal(
         }
     }
 
-    let (largest, max_symbol_value) = hist_count(&mut count, src);
+    let (largest, max_symbol_value) = hist_count(&mut count, src, HUF_SYMBOLVALUE_MAX);
     if largest as usize == src_size {
         return Some(1); // single symbol, rle
     }
@@ -1127,7 +1151,7 @@ pub fn estimate_literals_section(
         return Some(src_size); // set_basic: too small
     }
     let mut count = [0u32; 256];
-    let (largest, max_symbol) = hist_count(&mut count, literals);
+    let (largest, max_symbol) = hist_count(&mut count, literals, HUF_SYMBOLVALUE_MAX);
     if largest as usize == src_size {
         return Some(1); // set_rle
     }
