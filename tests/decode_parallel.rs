@@ -7,8 +7,11 @@
 
 mod common;
 
-use common::{datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS, MIB};
+use common::{
+    assert_lockstep, datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS, MIB, PARALLEL_ROOM,
+};
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
+use rust_zstd::Decompressor;
 use zstd::zstd_safe::zstd_sys as sys;
 
 /// Every frame through the multi-threaded path, however few its blocks.
@@ -46,6 +49,16 @@ fn pool(threads: usize) -> rayon::ThreadPool {
 /// literals forced on, so that small inputs give many blocks, most of them
 /// with treeless literals and repeat-mode FSE tables.
 fn zstd_small_blocks(data: &[u8], level: i32, max_block: i32) -> Vec<u8> {
+    zstd_small_blocks_with(data, level, max_block, &[])
+}
+
+/// `zstd_small_blocks` with the compression parameters `params` set too.
+fn zstd_small_blocks_with(
+    data: &[u8],
+    level: i32,
+    max_block: i32,
+    params: &[(sys::ZSTD_cParameter, i32)],
+) -> Vec<u8> {
     unsafe {
         let cctx = sys::ZSTD_createCCtx();
         let set = |p, v| {
@@ -56,6 +69,9 @@ fn zstd_small_blocks(data: &[u8], level: i32, max_block: i32) -> Vec<u8> {
         set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam18, max_block);
         // ZSTD_c_literalCompressionMode = ZSTD_ps_enable.
         set(sys::ZSTD_cParameter::ZSTD_c_experimentalParam5, 1);
+        for &(p, v) in params {
+            set(p, v);
+        }
         let mut out = vec![0u8; sys::ZSTD_compressBound(data.len())];
         let n = sys::ZSTD_compress2(
             cctx,
@@ -215,6 +231,98 @@ fn mt_corruption_matches_serial_outcome() {
                     let mut bad = c.clone();
                     bad[pos] ^= flip;
                     same_outcome(&format!("{} byte {} ^ {:#x}", name, pos, flip), &bad);
+                }
+            }
+        }
+    });
+}
+
+fn decompressor(min_parallel_blocks: usize) -> Decompressor {
+    Decompressor::with_options(&DecodeOptions {
+        min_parallel_blocks,
+        simd: true,
+        window_log_max: 0,
+    })
+}
+
+/// Streams of libzstd frames of full blocks, with output room for batches
+/// of them: every call decoding them in parallel reads, writes and returns
+/// what the serial one does, on pools of two and eight threads.
+#[test]
+fn mt_streams_match_serial_streams() {
+    let mut cases = Vec::new();
+    for ds in datasets() {
+        let data = &ds.data[..ds.data.len().min(2 * MIB)];
+        for level in [1, 19] {
+            for (kind, c) in [
+                ("bulk", zstd_bulk(data, level)),
+                ("stream", zstd_stream(data, level)),
+            ] {
+                cases.push((format!("{} L{level} {kind}", ds.name), c, data.len()));
+            }
+        }
+    }
+    for threads in [2, 8] {
+        pool(threads).install(|| {
+            for (name, c, len) in &cases {
+                for chunk in [100_000, 300_000, usize::MAX] {
+                    for room in [PARALLEL_ROOM, 3 * MIB / 2, len + 1] {
+                        // From one block on, and from the default count on.
+                        for mut parallel in [decompressor(1), Decompressor::new()] {
+                            let what = format!("{name} {threads} threads");
+                            let mut serial = decompressor(usize::MAX);
+                            assert_lockstep(&what, &mut serial, &mut parallel, c, chunk, room);
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Truncated and corrupted frames of small blocks, streamed: every call
+/// decoding them in parallel reads, writes and returns what the serial one
+/// does, failing ones included. The frames are ones the parallel decoder
+/// takes: one whose Frame_Content_Size, checked after its blocks, exceeds
+/// its 1 KiB window, and one without.
+#[test]
+fn mt_stream_verdicts_match_serial() {
+    use sys::ZSTD_cParameter::{ZSTD_c_checksumFlag, ZSTD_c_contentSizeFlag, ZSTD_c_windowLog};
+    // Room for every block of these frames.
+    const ROOM: usize = 1 << 16;
+    let mut data = b"The quick brown fox jumps over the lazy dog. ".repeat(60);
+    data.extend_from_slice(&lcg_bytes(1500, 11));
+    data.extend_from_slice(&b"abcabcabd".repeat(200));
+    let mut inputs = Vec::new();
+    for level in [1, 19] {
+        for (kind, params) in [
+            ("sized", [(ZSTD_c_windowLog, 10), (ZSTD_c_checksumFlag, 1)]),
+            (
+                "unsized",
+                [(ZSTD_c_contentSizeFlag, 0), (ZSTD_c_checksumFlag, 0)],
+            ),
+        ] {
+            let c = zstd_small_blocks_with(&data, level, 1024, &params);
+            assert_eq!(decode_mt(&c).unwrap(), data);
+            inputs.push((format!("L{level} {kind}"), c));
+        }
+    }
+    let lockstep = |what: &str, input: &[u8], chunk| {
+        let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+        assert_lockstep(what, &mut serial, &mut parallel, input, chunk, ROOM);
+    };
+    pool(4).install(|| {
+        for (name, c) in inputs {
+            for chunk in [700, usize::MAX] {
+                for cut in 0..c.len() {
+                    lockstep(&format!("{name} cut {cut}"), &c[..cut], chunk);
+                }
+                for pos in 0..c.len() {
+                    for flip in [0x01u8, 0x80, 0xFF] {
+                        let mut bad = c.clone();
+                        bad[pos] ^= flip;
+                        lockstep(&format!("{name} byte {pos} ^ {flip:#x}"), &bad, chunk);
+                    }
                 }
             }
         }
