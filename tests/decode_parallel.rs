@@ -8,7 +8,8 @@
 mod common;
 
 use common::{
-    assert_lockstep, datasets, lcg_bytes, zstd_bulk, zstd_stream, LEVELS, MIB, PARALLEL_ROOM,
+    assert_lockstep, datasets, frame_blocks, lcg_bytes, zstd_bulk, zstd_stream, LEVELS, MIB,
+    PARALLEL_ROOM,
 };
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use rust_zstd::Decompressor;
@@ -323,6 +324,75 @@ fn mt_stream_verdicts_match_serial() {
                         bad[pos] ^= flip;
                         lockstep(&format!("{name} byte {pos} ^ {flip:#x}"), &bad, chunk);
                     }
+                }
+            }
+        }
+    });
+}
+
+/// Frames of 1 KiB blocks, in a 1 KiB window so that the parallel decoder
+/// takes them, whose batches hold no compressed block, one fewer than
+/// `min_parallel_blocks` (both decoded on the calling thread) or that many
+/// (on the pool), among raw and RLE blocks: whole, truncated and
+/// corrupted, every call reads, writes and returns what the serial decoder
+/// does.
+#[test]
+fn mt_batches_either_side_of_the_compressed_count() {
+    use sys::ZSTD_cParameter::ZSTD_c_windowLog;
+    const MIN: usize = 3;
+    // Room for every block of these frames.
+    const ROOM: usize = 1 << 16;
+    let text = b"The quick brown fox jumps over the lazy dog. ".repeat(24);
+    let mut cases = Vec::new();
+    // Block types: `r` raw (0), `z` RLE (1), `c` compressed (2).
+    for kinds in ["rzrzr", "crzcz", "crczc"] {
+        let mut data = Vec::new();
+        for (i, kind) in kinds.bytes().enumerate() {
+            data.extend(match kind {
+                b'c' => text[i..][..1024].to_vec(),
+                b'r' => lcg_bytes(1024, i as u64),
+                _ => vec![i as u8; 1024],
+            });
+        }
+        let c = zstd_small_blocks_with(&data, 3, 1024, &[(ZSTD_c_windowLog, 10)]);
+        let types: String = frame_blocks(&c, data.len())
+            .0
+            .iter()
+            .map(|b| ['r', 'z', 'c'][b.ty as usize])
+            .collect();
+        assert_eq!(types, kinds, "block types");
+        cases.push((kinds, c, data));
+    }
+    let opts = DecodeOptions {
+        min_parallel_blocks: MIN,
+        simd: true,
+        window_log_max: 0,
+    };
+    let lockstep = |what: &str, input: &[u8]| {
+        let [mut serial, mut parallel] = [usize::MAX, MIN].map(decompressor);
+        assert_lockstep(what, &mut serial, &mut parallel, input, usize::MAX, ROOM);
+    };
+    for threads in [1, 4] {
+        pool(threads).install(|| {
+            for (kinds, c, data) in &cases {
+                assert!(
+                    decompress_with_options(c, &opts).unwrap() == *data,
+                    "{kinds}"
+                );
+                lockstep(kinds, c);
+            }
+        });
+    }
+    pool(4).install(|| {
+        for (kinds, c, _) in &cases {
+            for cut in 0..c.len() {
+                lockstep(&format!("{kinds} cut {cut}"), &c[..cut]);
+            }
+            for pos in 0..c.len() {
+                for flip in [0x01u8, 0x80, 0xFF] {
+                    let mut bad = c.clone();
+                    bad[pos] ^= flip;
+                    lockstep(&format!("{kinds} byte {pos} ^ {flip:#x}"), &bad);
                 }
             }
         }

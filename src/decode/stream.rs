@@ -203,9 +203,9 @@ impl Decompressor {
     /// With the `parallel` feature, when this call's input holds
     /// `min_parallel_blocks` or more whole blocks of a frame (from `new`,
     /// four on a pool of more than one thread) and `dst` has room for the
-    /// most they decode to, they decode on the current rayon pool; every
-    /// call reads, writes and returns what it would decoding them one after
-    /// another.
+    /// most they decode to, they decode on the current rayon pool if that
+    /// many of them are compressed; every call reads, writes and returns
+    /// what it would decoding them one after another.
     ///
     /// After an error the decompressor is stopped: every later call returns
     /// the same error, until `reset`.

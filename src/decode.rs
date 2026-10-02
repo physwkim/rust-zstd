@@ -163,8 +163,9 @@ pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, S
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeOptions {
-    /// Frames of at least this many blocks are decoded on the current rayon
-    /// pool, whatever its size; `usize::MAX` never does.
+    /// Frames of at least this many blocks are decoded in batches, on the
+    /// current rayon pool, whatever its size, when at least this many of a
+    /// batch's blocks are compressed; `usize::MAX` never does.
     pub min_parallel_blocks: usize,
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
@@ -5586,8 +5587,23 @@ mod parallel {
             if batch.plans.len() < min_blocks {
                 return Ok(None);
             }
-            let (done, hist, accounted) =
-                run_batch(&batch.plans, frame, start, out, self.simd, &mut next);
+            // Only compressed blocks have a stage 2 for the pool. Raw and
+            // RLE blocks alone took twice the serial time there (zeros_1M,
+            // random_1M), paying its handoff for nothing.
+            let compressed = batch
+                .plans
+                .iter()
+                .filter(|p| matches!(p, Plan::Compressed(_)));
+            let pooled = compressed.count() >= min_blocks;
+            let (done, hist, accounted) = run_batch(
+                &batch.plans,
+                frame,
+                start,
+                out,
+                self.simd,
+                pooled,
+                &mut next,
+            );
             let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
                 return Ok(None);
             };
@@ -5603,7 +5619,8 @@ mod parallel {
 
     /// Stages 2 and 3 of `plans`, blocks of `frame` from the tables and
     /// repeat offsets in `start`, into `out`, calling `next` before each
-    /// block but the first. Returns how many blocks it decoded, from the
+    /// block but the first; stage 2 on the rayon pool if `pooled`, else
+    /// all on this thread. Returns how many blocks it decoded, from the
     /// first, up to one whose stage 2 or 3 fails or before which `next`
     /// returns false, the repeat offsets after them, and the frame's size
     /// check on them, which ends them where it fails.
@@ -5613,6 +5630,7 @@ mod parallel {
         start: FrameStart<'_>,
         out: &mut O,
         simd: Level,
+        pooled: bool,
         next: &mut (impl FnMut(&mut O) -> bool + Send),
     ) -> (usize, [u32; 3], Result<(), String>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -5620,8 +5638,14 @@ mod parallel {
         // by the executing thread if no task has started it by the time
         // that thread needs block `i`, or waits for block `i - 1`. It
         // decodes no block further ahead, so a block it needs is never left
-        // waiting behind the decode of a later one.
-        let ring: Vec<RingSlot> = (0..(2 * rayon::current_num_threads()).min(plans.len()))
+        // waiting behind the decode of a later one. Unpooled, one position
+        // takes every block.
+        let positions = if pooled {
+            (2 * rayon::current_num_threads()).min(plans.len())
+        } else {
+            1
+        };
+        let ring: Vec<RingSlot> = (0..positions)
             .map(|_| RingSlot {
                 claimed: AtomicUsize::new(0),
                 done: AtomicUsize::new(0),
@@ -5632,24 +5656,8 @@ mod parallel {
         let block_size_max = frame.block_size_max;
         let mut hist = start.init.offset_hist;
         let mut done = 0;
-        let accounted = rayon::scope_fifo(|s| {
-            let spawn_decode = |i: usize| {
-                let Some(Plan::Compressed(cp)) = plans.get(i) else {
-                    return;
-                };
-                let cell = &ring[i % ring.len()];
-                s.spawn_fifo(move |_| {
-                    if !cell.claim(i) {
-                        return;
-                    }
-                    // Marks the block done even if decoding panics, so that
-                    // the executing thread finds the poisoned lock instead
-                    // of waiting forever.
-                    let _done = MarkDone(&cell.done, i + 1);
-                    let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans, start);
-                });
-            };
+        // `spawn_decode(i)` starts a task for block `i` if it is compressed.
+        let mut run = |spawn_decode: &dyn Fn(usize)| -> Result<(), String> {
             for i in 0..ring.len() {
                 spawn_decode(i);
             }
@@ -5700,7 +5708,30 @@ mod parallel {
                 frame.block_decoded(bytes)?;
             }
             Ok(())
-        });
+        };
+        let accounted = if pooled {
+            rayon::scope_fifo(|s| {
+                run(&|i| {
+                    let Some(Plan::Compressed(cp)) = plans.get(i) else {
+                        return;
+                    };
+                    let cell = &ring[i % ring.len()];
+                    s.spawn_fifo(move |_| {
+                        if !cell.claim(i) {
+                            return;
+                        }
+                        // Marks the block done even if decoding panics, so
+                        // that the executing thread finds the poisoned lock
+                        // instead of waiting forever.
+                        let _done = MarkDone(&cell.done, i + 1);
+                        let mut slot = cell.slot.lock().unwrap();
+                        slot.result = decode_block(&mut slot, i, cp, plans, start);
+                    });
+                })
+            })
+        } else {
+            run(&|_| {})
+        };
         (done, hist, accounted)
     }
 
