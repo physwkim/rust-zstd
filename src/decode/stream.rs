@@ -361,6 +361,30 @@ impl Decompressor {
                 ring: &mut self.ring,
                 dict: dict.map_or(&[], DecodeDict::content),
             };
+            // The content of a block whose header came first, as one that
+            // straddles two calls' input does, stays in the frame's chain,
+            // with the whole blocks after it.
+            #[cfg(feature = "parallel")]
+            {
+                let mut read = 0;
+                let decoded = self.dec.decode_held_block_parallel(
+                    unit,
+                    &src[*src_pos..],
+                    dict,
+                    &mut out,
+                    &mut read,
+                    |out| {
+                        *dst_pos += out.ring.flush(&mut dst[*dst_pos..]);
+                        out.ring.pending() == 0
+                    },
+                );
+                *src_pos += read;
+                if let Some(event) = decoded? {
+                    self.unit.clear();
+                    self.frame_ended = event == Event::FrameEnded;
+                    continue;
+                }
+            }
             let event = self.dec.process(unit, &mut out, dict)?;
             self.unit.clear();
             if event == Event::FrameStarted {

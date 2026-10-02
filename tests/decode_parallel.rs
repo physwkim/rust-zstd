@@ -421,20 +421,20 @@ fn mt_batches_either_side_of_the_gate() {
     });
 }
 
-/// `assert_lockstep` at the output room `room`, the first call reading
-/// `first` and the others `then`, from where the calls before stopped
-/// reading; returns the content written.
+/// `assert_lockstep` at the output room `room`, call `k` reading
+/// `inputs[k]`, and the calls after the last of them reading it, from
+/// where the calls before stopped reading; returns the content written.
 fn lockstep_switching(
     what: &str,
     serial: &mut Decompressor,
     parallel: &mut Decompressor,
-    [first, then]: [&[u8]; 2],
+    inputs: &[&[u8]],
     room: usize,
 ) -> Vec<u8> {
     let (mut a, mut b) = (vec![0u8; room], vec![0u8; room]);
     let (mut pos, mut content) = (0, Vec::new());
     for call in 0.. {
-        let src = &[first, then][usize::from(call != 0)][pos..];
+        let src = &inputs[call.min(inputs.len() - 1)][pos..];
         let (mut read, mut written, mut b_read, mut b_written) = (0, 0, 0, 0);
         let hint = serial.decompress_stream(src, &mut read, &mut a, &mut written);
         let b_hint = parallel.decompress_stream(src, &mut b_read, &mut b, &mut b_written);
@@ -509,7 +509,7 @@ fn mt_stream_takes_blocks_decoded_ahead_only_where_input_matches() {
             assert_ne!(a[..end], b[..end], "block {d}");
             let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
             let what = format!("changed in block {d}");
-            let got = lockstep_switching(&what, &mut serial, &mut parallel, [&a, &b], ROOM);
+            let got = lockstep_switching(&what, &mut serial, &mut parallel, &[&a, &b], ROOM);
             assert!(got == other, "{what}");
         }
     });
@@ -752,9 +752,53 @@ fn mt_stream_replans_from_the_tables_before_a_changed_block() {
             b.extend_from_slice(&a[starts[d + 1].0..]);
             let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
             let what = format!("block {d} raw");
-            lockstep_switching(&what, &mut serial, &mut parallel, [&a, &b], ROOM);
+            lockstep_switching(&what, &mut serial, &mut parallel, &[&a, &b], ROOM);
             changed += 1;
         }
     });
     assert!(changed >= 4, "{changed} compressed blocks made raw");
+}
+
+/// A stream whose second call's input ends inside the header or the
+/// content of a block that the first call's pipeline planned past its
+/// room, and whose third call completes that block from the same frame,
+/// or from one whose last byte of the block differs: the pipeline takes
+/// the block the serial decoder took the header of, as planned where its
+/// bytes match and planned again where not, then the blocks after it, and
+/// every call reads, writes and returns what the serial decoder does.
+#[test]
+fn mt_stream_takes_a_straddling_block_into_the_chain() {
+    const ROOM: usize = 4 << 10;
+    let (data, a) = changing_words(9);
+    let (blocks, _) = frame_blocks(&a, data.len());
+    // Where each block starts in `a`, after the frame header.
+    let mut starts = vec![a.len() - 4 - blocks.iter().map(|b| b.c_size).sum::<usize>()];
+    for b in &blocks {
+        starts.push(starts.last().unwrap() + b.c_size);
+    }
+    // The first unread block after the first call.
+    let mut serial = decompressor(usize::MAX);
+    let (mut read, mut written) = (0, 0);
+    serial
+        .decompress_stream(&a, &mut read, &mut vec![0u8; ROOM], &mut written)
+        .unwrap();
+    let first = starts.iter().position(|&c| c == read).unwrap();
+    pool(4).install(|| {
+        // The second call's room takes the blocks before.
+        for d in first + 1..first + 4 {
+            for cut in [starts[d] + 1, starts[d] + 4] {
+                for changed in [false, true] {
+                    let mut b = a.clone();
+                    if changed {
+                        b[starts[d + 1] - 1] ^= 0x01;
+                    }
+                    let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                    let what = format!("block {d} cut at {cut}, changed {changed}");
+                    let inputs: [&[u8]; 3] = [&a, &a[..cut], &b];
+                    let got = lockstep_switching(&what, &mut serial, &mut parallel, &inputs, ROOM);
+                    assert!(changed || got == data, "{what}");
+                }
+            }
+        }
+    });
 }

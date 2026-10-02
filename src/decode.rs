@@ -2202,7 +2202,7 @@ enum BlockType {
     Reserved,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct BlockHeader {
     last_block: bool,
     block_type: BlockType,
@@ -5272,8 +5272,7 @@ mod parallel {
 
     /// A block a chain planned and has not executed.
     struct Planned {
-        /// Its Block_Header, as bytes and parsed.
-        head: [u8; 3],
+        /// Its Block_Header.
         block: BlockHeader,
         /// A compressed block's stage 2 and the cell it decodes into.
         job: Option<(Arc<Job>, Arc<Cell>)>,
@@ -5289,15 +5288,43 @@ mod parallel {
             BLOCK_HEADER_LEN + self.block.content_size as usize
         }
 
-        /// Whether `bytes`, as long as the block, are the block's: its
-        /// header, and a compressed block's content. A raw or RLE block's
-        /// content is read from the input it is executed from.
-        fn holds(&self, bytes: &[u8]) -> bool {
-            bytes[..BLOCK_HEADER_LEN] == self.head
+        /// Whether `block`, with `content`, is the block: the same header,
+        /// which a block's header bytes are a function of, and a compressed
+        /// block's content. A raw or RLE block's content is read from the
+        /// input it is executed from.
+        fn holds(&self, block: &BlockHeader, content: &[u8]) -> bool {
+            *block == self.block
                 && self
                     .job
                     .as_ref()
-                    .is_none_or(|(job, _)| bytes[BLOCK_HEADER_LEN..] == job.content[..])
+                    .is_none_or(|(job, _)| content == &job.content[..])
+        }
+    }
+
+    /// A call's input to a chain: the block whose header the serial
+    /// decoder took, with its content, if the frame is at one, then whole
+    /// blocks from a header on. Its positions run through that block's
+    /// header and content, then `data`.
+    #[derive(Clone, Copy)]
+    struct Input<'a> {
+        held: Option<(BlockHeader, &'a [u8])>,
+        data: &'a [u8],
+    }
+
+    impl<'a> Input<'a> {
+        /// Where `data` starts.
+        fn data_start(&self) -> usize {
+            self.held
+                .map_or(0, |(_, content)| BLOCK_HEADER_LEN + content.len())
+        }
+
+        /// The block at `at`, a block's start: the held one, or one `data`
+        /// holds whole (`locate_block`).
+        fn block(&self, at: usize, block_size_max: usize) -> Option<(BlockHeader, &'a [u8])> {
+            match self.held {
+                Some(held) if at == 0 => Some(held),
+                _ => locate_block(self.data.get(at - self.data_start()..)?, block_size_max),
+            }
         }
     }
 
@@ -5510,13 +5537,13 @@ mod parallel {
             }
         }
 
-        /// Plan the blocks of `data` after the queue, the first at `pos`,
+        /// Plan the blocks of `input` after the queue, the first at `pos`,
         /// until `depth` are queued, handing each compressed one to a pool
-        /// task; it stops past the frame's last block, at a block `data`
+        /// task; it stops past the frame's last block, at a block `input`
         /// does not hold whole, at one with no idle cell for, and at one it
         /// cannot plan, setting `blocked`, which the serial decoder then
         /// decodes, giving its verdict on it.
-        fn fill(&mut self, data: &[u8], pos: usize, depth: usize, blocked: &mut bool) {
+        fn fill(&mut self, input: Input<'_>, pos: usize, depth: usize, blocked: &mut bool) {
             let call = self.calls;
             let Pipeline {
                 next_id,
@@ -5533,9 +5560,7 @@ mod parallel {
                 && chain.queue.len() < depth
                 && !chain.queue.back().is_some_and(|p| p.block.last_block)
             {
-                let at = pos + chain.queued_len;
-                let Some((block, content)) =
-                    data.get(at..).and_then(|d| locate_block(d, block_size_max))
+                let Some((block, content)) = input.block(pos + chain.queued_len, block_size_max)
                 else {
                     return;
                 };
@@ -5582,7 +5607,6 @@ mod parallel {
                     }
                 };
                 let planned = Planned {
-                    head: data[at..at + BLOCK_HEADER_LEN].try_into().unwrap(),
                     block,
                     job,
                     before,
@@ -5595,19 +5619,19 @@ mod parallel {
     }
 
     impl Pipeline {
-        /// Execute the chain's blocks that `data` starts with into `out`,
+        /// Execute the chain's blocks that `input` starts with into `out`,
         /// blocks of `frame`, calling `next` before each block but the
         /// first and stopping if it returns false, while planning the
-        /// blocks of `data` after them a ring's worth ahead, which keep
+        /// blocks of `input` after them a ring's worth ahead, which keep
         /// decoding after it returns. Returns whether the last block it
         /// executed was the frame's last, `None` if it executed none, and
-        /// sets `read` to where the blocks executed end, on failure too. It
-        /// stops before a block `data` does not hold whole, and before one
-        /// whose decode fails or that it cannot plan, which the serial
-        /// decoder then decodes, giving its verdict on it.
+        /// sets `read` to where the blocks executed end in `input.data`, on
+        /// failure too. It stops before a block `input` does not hold
+        /// whole, and before one whose decode fails or that it cannot plan,
+        /// which the serial decoder then decodes, giving its verdict on it.
         fn run<O: FrameOut>(
             &mut self,
-            data: &[u8],
+            input: Input<'_>,
             frame: &mut Frame,
             out: &mut O,
             simd: Level,
@@ -5619,19 +5643,19 @@ mod parallel {
             let block_size_max = frame.block_size_max;
             let (mut pos, mut last, mut blocked) = (0, None, false);
             loop {
-                self.fill(data, pos, depth, &mut blocked);
+                self.fill(input, pos, depth, &mut blocked);
                 let Some(chain) = &mut self.chain else {
                     break;
                 };
                 let Some(front) = chain.queue.front_mut() else {
                     break;
                 };
+                let Some((block, content)) = input.block(pos, block_size_max) else {
+                    break;
+                };
                 // Planned in an earlier call, on its input.
                 if front.seen != self.calls {
-                    let Some(bytes) = data.get(pos..pos + front.len()) else {
-                        break;
-                    };
-                    if !front.holds(bytes) {
+                    if !front.holds(&block, content) {
                         self.rewind();
                         continue;
                     }
@@ -5649,7 +5673,6 @@ mod parallel {
                     break;
                 };
                 let p = &chain.queue[0];
-                let content = &data[pos + BLOCK_HEADER_LEN..pos + p.len()];
                 let plan = match (p.block.block_type, &p.job) {
                     (BlockType::Raw, _) => Plan::Raw(content),
                     (BlockType::RLE, _) => {
@@ -5712,7 +5735,7 @@ mod parallel {
                     free.push(cell);
                 }
                 pos += len;
-                *read = pos;
+                *read = pos - input.data_start();
                 last = Some(ended);
                 frame.block_decoded(bytes)?;
                 if ended {
@@ -6226,7 +6249,35 @@ mod parallel {
                     return self.decode_scoped(data, dict, out, room, read, next);
                 }
             }
-            self.decode_detached(data, dict, out, read, next)
+            self.decode_detached(Input { held: None, data }, dict, out, read, next)
+        }
+
+        /// `decode_blocks_parallel` at the content of a block whose header
+        /// the serial decoder took, `content`: if the frame's chain runs,
+        /// it takes that block, then the blocks `data` starts with, as
+        /// `decode_blocks_parallel` takes blocks, and sets `read` to how
+        /// much of `data` those after it take. A block that straddles two
+        /// calls' input so stays in the chain, which goes on after it.
+        #[inline]
+        pub(super) fn decode_held_block_parallel<O: FrameOut>(
+            &mut self,
+            content: &[u8],
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            read: &mut usize,
+            next: impl FnMut(&mut O) -> bool,
+        ) -> Result<Option<Event>, DecodeError> {
+            match &self.stage {
+                Stage::Block {
+                    frame,
+                    header: Some(block),
+                } if frame.pipeline.active() => {
+                    let held = Some((*block, content));
+                    self.decode_detached(Input { held, data }, dict, out, read, next)
+                }
+                _ => Ok(None),
+            }
         }
 
         /// `decode_block_batch` on blocks `room` takes all of: stages 2 and
@@ -6278,18 +6329,20 @@ mod parallel {
             Ok(Some(Event::Continue))
         }
 
-        /// `decode_block_batch` on the frame's pipeline, which starts a
-        /// chain from the scratch if none runs.
+        /// `decode_block_batch`, or `decode_held_block_parallel`, on the
+        /// frame's pipeline, which starts a chain from the scratch if none
+        /// runs.
+        #[inline(never)]
         fn decode_detached<O: FrameOut>(
             &mut self,
-            data: &[u8],
+            input: Input<'_>,
             dict: Option<&DecodeDict>,
             out: &mut O,
             read: &mut usize,
             mut next: impl FnMut(&mut O) -> bool,
         ) -> Result<Option<Event>, DecodeError> {
             let simd = self.simd;
-            let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &self.scratch)
+            let (Stage::Block { frame, header }, Some(scratch)) = (&mut self.stage, &self.scratch)
             else {
                 return Ok(None);
             };
@@ -6298,8 +6351,12 @@ mod parallel {
             if !pipeline.active() {
                 pipeline.start(scratch, dict, frame.block_size_max);
             }
-            let ran = pipeline.run(data, frame, out, simd, read, &mut next);
+            let ran = pipeline.run(input, frame, out, simd, read, &mut next);
             frame.pipeline = pipeline;
+            // The held block, if any, is the first it executed.
+            if !matches!(ran, Ok(None)) {
+                *header = None;
+            }
             match ran? {
                 None => Ok(None),
                 Some(false) => Ok(Some(Event::Continue)),
@@ -6779,6 +6836,73 @@ mod parallel {
                     }
                 });
             }
+        }
+
+        /// A block that straddles two calls' input, whose header the
+        /// serial decoder took: the chain the call before ran takes it,
+        /// with no new start, and goes on with the blocks after it, and
+        /// the frame decodes as `decompress` decodes it.
+        #[test]
+        fn chain_takes_a_straddling_block() {
+            let (frame, header) = small_blocks(&words());
+            let mut dec = FrameDecoder::new(&DecodeOptions {
+                min_parallel_blocks: 1,
+                min_parallel_bytes: 0,
+                simd: true,
+                window_log_max: 0,
+            });
+            let mut output = Vec::new();
+            let mut out = VecOut {
+                output: &mut output,
+                prefix: Prefix {
+                    start: 0,
+                    window: 0,
+                },
+                dict: &[],
+            };
+            let started = dec.process(&frame[..header], &mut out, None);
+            assert!(matches!(started, Ok(Event::FrameStarted)));
+            // Where the 4th, 5th and 9th blocks start.
+            let mut ends = vec![header];
+            while ends.len() < 10 {
+                let at = *ends.last().unwrap();
+                let (_, content) = locate_block(&frame[at..], 1 << 10).unwrap();
+                ends.push(at + BLOCK_HEADER_LEN + content.len());
+            }
+            let (pos, after, stop) = (ends[3], ends[4], ends[8]);
+            // A room the chain takes three blocks for, and part of the 4th.
+            let mut read = 0;
+            let cut = &frame[header..pos + BLOCK_HEADER_LEN + 1];
+            let decoded =
+                dec.decode_blocks_parallel(cut, None, &mut out, 1024, &mut read, |_| true);
+            assert!(matches!(decoded, Ok(Some(Event::Continue))));
+            assert_eq!(header + read, pos);
+            let start = PlannedJobs::of(&dec).start;
+            let block = dec.process(&frame[pos..pos + BLOCK_HEADER_LEN], &mut out, None);
+            assert!(matches!(block, Ok(Event::Continue)));
+            let content = &frame[pos + BLOCK_HEADER_LEN..after];
+            let mut read = 0;
+            let decoded = dec.decode_held_block_parallel(
+                content,
+                &frame[after..stop + 1],
+                None,
+                &mut out,
+                &mut read,
+                |_| true,
+            );
+            assert!(matches!(decoded, Ok(Some(Event::Continue))));
+            assert_eq!(after + read, stop);
+            assert!(Weak::ptr_eq(&start, &PlannedJobs::of(&dec).start));
+            let Stage::Block { header: None, .. } = &dec.stage else {
+                panic!("at the 9th block's header");
+            };
+            let mut pos = stop;
+            while pos < frame.len() {
+                let len = dec.unit_len(&frame[pos..]);
+                dec.process(&frame[pos..pos + len], &mut out, None).unwrap();
+                pos += len;
+            }
+            assert!(output == words());
         }
 
         /// A frame dropped while a task decodes one of its blocks: the
