@@ -181,6 +181,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// Which frames decode follows RFC 8878, not libzstd: every block, raw,
 /// RLE or compressed, holds and decodes to at most Block_Maximum_Size
 /// bytes (lines 545-569).
+///
+/// Content of at most 1 KiB comes back in a `Vec` of exactly its length;
+/// larger content may come back with the room the decoder reserved past
+/// it.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
@@ -265,7 +269,33 @@ pub fn decompress_with_dict_options(
 ) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     decompress_frames(&mut FrameDecoder::new(opts), data, dict, &mut output)?;
-    Ok(output)
+    Ok(take_output(&mut output))
+}
+
+/// The most content a Vec-returning decode (`decompress` and the like, and
+/// `Decompressor::decompress` and the like) copies out of the buffer it
+/// decoded into, into a `Vec` of exactly its length. That buffer has
+/// `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes of room past the content
+/// (`Dst`), so handed over as it is, a few bytes of content would come
+/// back in a 131 KB allocation, which glibc serves from the top of the
+/// heap, merging it back on free. The copy costs less than that
+/// allocation up to about 1 KiB of content (about 280 fewer instructions a
+/// call on 120-960 B frames) and more from about 1.2 KiB on (about 350
+/// more), where glibc no longer serves it from its thread cache (chunks
+/// of up to 1032 bytes); larger content is handed over with the room.
+const COPY_OUT_MAX: usize = 1024;
+
+/// The `Vec` a Vec-returning decode returns for the content decoded into
+/// `buf`: a copy of exactly its length if that is at most `COPY_OUT_MAX`,
+/// leaving `buf` empty with its room for the next decode, or else `buf`
+/// itself.
+fn take_output(buf: &mut Vec<u8>) -> Vec<u8> {
+    if buf.len() > COPY_OUT_MAX {
+        return std::mem::take(buf);
+    }
+    let out = buf.as_slice().to_vec();
+    buf.clear();
+    out
 }
 
 /// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
@@ -6631,5 +6661,48 @@ mod tests {
         let compressed = crate::compress::compress_to_vec(&data);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// Every Vec-returning decode, with and without a dictionary, returns
+    /// content of at most `COPY_OUT_MAX` bytes in a `Vec` of exactly its
+    /// length and larger content with the room `reserve_frame` left past
+    /// it (`take_output`); a `Decompressor` does so call after call, below
+    /// the bound again after content above it.
+    #[test]
+    fn vec_output_capacity_bound() {
+        let raw_dict: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        let dict = DecodeDict::new(&raw_dict).unwrap();
+        let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, &raw_dict).unwrap();
+        let mut d = crate::Decompressor::new();
+        let room = MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH;
+        for n in [
+            COPY_OUT_MAX - 1,
+            COPY_OUT_MAX,
+            COPY_OUT_MAX + 1,
+            COPY_OUT_MAX - 1,
+        ] {
+            let content: Vec<u8> = (0..n)
+                .map(|i| b"zstd frame "[i % 11] ^ (i / 97) as u8)
+                .collect();
+            let plain = zstd::bulk::compress(&content, 3).unwrap();
+            let framed = with_dict.compress(&content).unwrap();
+            for (api, out) in [
+                ("decompress", decompress(&plain)),
+                ("decompress_with_dict", decompress_with_dict(&framed, &dict)),
+                ("Decompressor::decompress", d.decompress(&plain)),
+                (
+                    "Decompressor::decompress_with_dict",
+                    d.decompress_with_dict(&framed, &dict),
+                ),
+            ] {
+                let out = out.unwrap();
+                assert!(out == content, "{api} {n}: content differs");
+                if n <= COPY_OUT_MAX {
+                    assert_eq!(out.capacity(), n, "{api} {n}");
+                } else {
+                    assert!(out.capacity() >= n + room, "{api} {n}: {}", out.capacity());
+                }
+            }
+        }
     }
 }

@@ -32,6 +32,10 @@ pub struct Decompressor {
     window_max: u64,
     /// The dictionary frames start from, unless a call names another.
     dict: Option<DecodeDict>,
+    /// The buffer `decompress` and `decompress_with_dict` decode into: it
+    /// keeps its room from call to call while what they return is copied
+    /// out of it (`take_output`).
+    out: Vec<u8>,
     /// The start of a unit that came in pieces.
     unit: Vec<u8>,
     ring: Ring,
@@ -64,6 +68,7 @@ impl Decompressor {
             dec: FrameDecoder::new(opts),
             window_max: window_max(opts.window_log_max),
             dict: None,
+            out: Vec::new(),
             unit: Vec::new(),
             ring: Ring::default(),
             frame_ended: false,
@@ -122,9 +127,7 @@ impl Decompressor {
     /// `decompress_stream` holds, and its error, are dropped, and its next
     /// call starts on a new frame.
     pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, String> {
-        let mut dst = Vec::new();
-        self.decompress_whole(src, None, &mut dst)?;
-        Ok(dst)
+        self.decompress_vec(src, None)
     }
 
     /// `decompress` into `dst`: it clears `dst`, then fills it with what
@@ -147,9 +150,7 @@ impl Decompressor {
         src: &[u8],
         dict: &DecodeDict,
     ) -> Result<Vec<u8>, String> {
-        let mut dst = Vec::new();
-        self.decompress_whole(src, Some(dict), &mut dst)?;
-        Ok(dst)
+        self.decompress_vec(src, Some(dict))
     }
 
     /// `decompress_with_dict` into `dst`, which it clears and fills as
@@ -161,6 +162,16 @@ impl Decompressor {
         dst: &mut Vec<u8>,
     ) -> Result<(), String> {
         Ok(self.decompress_whole(src, Some(dict), dst)?)
+    }
+
+    /// `decompress_whole` into the decompressor's buffer, returning the
+    /// content as `take_output` gives it.
+    fn decompress_vec(&mut self, src: &[u8], dict: Option<&DecodeDict>) -> Result<Vec<u8>, String> {
+        let mut buf = std::mem::take(&mut self.out);
+        let result = self.decompress_whole(src, dict, &mut buf);
+        let content = result.map(|()| take_output(&mut buf));
+        self.out = buf;
+        Ok(content?)
     }
 
     /// Decode `src` into `dst`, each frame from `dict`, or without one from
