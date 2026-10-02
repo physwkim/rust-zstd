@@ -132,7 +132,7 @@ impl Decompressor {
     /// The room `dst` has is kept, so a `dst` reused from call to call
     /// takes no allocation once it has held the largest content.
     pub fn decompress_into(&mut self, src: &[u8], dst: &mut Vec<u8>) -> Result<(), String> {
-        self.decompress_whole(src, None, dst)
+        Ok(self.decompress_whole(src, None, dst)?)
     }
 
     /// `decompress` with dictionary `dict` in place of the decompressor's
@@ -160,7 +160,7 @@ impl Decompressor {
         dict: &DecodeDict,
         dst: &mut Vec<u8>,
     ) -> Result<(), String> {
-        self.decompress_whole(src, Some(dict), dst)
+        Ok(self.decompress_whole(src, Some(dict), dst)?)
     }
 
     /// Decode `src` into `dst`, each frame from `dict`, or without one from
@@ -171,7 +171,7 @@ impl Decompressor {
         src: &[u8],
         dict: Option<&DecodeDict>,
         dst: &mut Vec<u8>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DecodeError> {
         self.reset();
         dst.clear();
         let dict = dict.or(self.dict.as_ref());
@@ -222,8 +222,10 @@ impl Decompressor {
         if let Some(e) = &self.failed {
             return Err(e.clone());
         }
-        self.run(src, src_pos, dst, dst_pos).inspect_err(|e| {
+        self.run(src, src_pos, dst, dst_pos).map_err(|e| {
+            let e = String::from(e);
             self.failed = Some(e.clone());
+            e
         })
     }
 
@@ -241,7 +243,7 @@ impl Decompressor {
                 self.ring.pending()
             ));
         }
-        self.dec.end_of_input(&self.unit)
+        Ok(self.dec.end_of_input(&self.unit)?)
     }
 
     /// Drop the input and output in hand, and any error, for input that
@@ -260,7 +262,7 @@ impl Decompressor {
         src_pos: &mut usize,
         dst: &mut [u8],
         dst_pos: &mut usize,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DecodeError> {
         loop {
             // The ring is written out before the next unit: a block may
             // start a new segment over it.
@@ -360,7 +362,7 @@ impl Decompressor {
     /// in pieces, where libzstd's walk starts inside the header and fails.
     /// The verdict comes before the frame's first block, so before the ring
     /// takes memory for it.
-    fn admit(&mut self, input: &[u8], room: usize) -> Result<(), String> {
+    fn admit(&mut self, input: &[u8], room: usize) -> Result<(), DecodeError> {
         let (frame, _) = self.dec.frame_start();
         let window = frame.window as u64;
         if window <= self.window_max
@@ -371,7 +373,8 @@ impl Decompressor {
         Err(format!(
             "Window size {} too large, the streaming limit is {}",
             window, self.window_max
-        ))
+        )
+        .into())
     }
 
     /// The input bytes it takes to finish the current unit, at least 1.
@@ -573,7 +576,7 @@ impl Ring {
 
     /// Grow the buffer so that the next block fits, or as near as `full`
     /// allows, keeping the segment. Only for a frame with one segment.
-    fn grow(&mut self) -> Result<(), String> {
+    fn grow(&mut self) -> Result<(), DecodeError> {
         let len = self
             .buf
             .len()
@@ -608,7 +611,7 @@ impl FrameOut for RingOut<'_> {
         ring.flushed = 0;
     }
 
-    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), DecodeError> {
         let ring = &mut *self.ring;
         debug_assert_eq!(ring.pending(), 0, "the ring is written out");
         if ring.end + BLOCK_ROOM > ring.buf.len() && ring.buf.len() < ring.full {

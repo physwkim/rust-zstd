@@ -1,7 +1,9 @@
 //! Decoder dictionaries (RFC 8878 §5; libzstd zstd_ddict.c and
 //! ZSTD_loadDEntropy of zstd_decompress.c).
 
-use super::{DecoderScratch, FSEScratch, HuffmanScratch, HuffmanTable, ModeType, SeqTableSource};
+use super::{
+    DecodeError, DecoderScratch, FSEScratch, HuffmanScratch, HuffmanTable, ModeType, SeqTableSource,
+};
 use std::sync::Arc;
 
 /// Magic_Number of a formatted dictionary (RFC 8878 line 1809).
@@ -87,9 +89,9 @@ impl DecodeDict {
 /// ZSTD_loadDEntropy: the Huffman table, then the OF, ML, LL tables, then
 /// the three repeat offsets, of the formatted dictionary `dict`. Returns
 /// them with the length of everything before the content.
-fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), String> {
+fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), DecodeError> {
     if dict.len() <= 8 {
-        return Err("no entropy tables".to_string());
+        return Err("no entropy tables".into());
     }
     let mut pos = 8;
     let mut huf = HuffmanTable::new();
@@ -108,7 +110,7 @@ fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), String> {
 
     let reps = dict
         .get(pos..pos + 12)
-        .ok_or_else(|| "repeat offsets truncated".to_string())?;
+        .ok_or_else(|| DecodeError::from("repeat offsets truncated"))?;
     pos += 12;
     // RFC 8878 lines 1832-1833: each less than the dictionary size;
     // libzstd's bound, at most the content size, is the tighter one.
@@ -120,7 +122,8 @@ fn load_entropy(dict: &[u8]) -> Result<(DictEntropy, usize), String> {
             return Err(format!(
                 "repeat offset {} outside content of {} bytes",
                 *r, content_len
-            ));
+            )
+            .into());
         }
     }
     Ok((
