@@ -3157,7 +3157,9 @@ struct Dst {
 /// it: the `len` bytes that end at `end` (libzstd's `virtualStart` to
 /// `dictEnd`). They are initialized; writes to the segment may land in
 /// them (the streaming round buffer reuses them), so they are only read
-/// through raw pointers.
+/// through raw pointers. A match that starts in them, at `avail` bytes
+/// into the segment, starts in another allocation than the segment's, or
+/// more than `WILDCOPY_OVERLENGTH` bytes past `base + avail`.
 #[derive(Clone, Copy)]
 struct ExtHistory {
     end: *const u8,
@@ -3611,17 +3613,29 @@ fn exec_sequence<W: WildCopy, const EXT: bool>(
         if !EXT {
             return Err(SeqError::OffsetTooFar);
         }
+        let avail = o_lit_end - lim.prefix as usize;
+        // A match that starts `back` bytes before the end of `ext` and ends
+        // `WILDCOPY_OVERLENGTH` bytes or more before it (`offset` is then
+        // not 0) copies on here: out of line, its copy cost streamed
+        // rssrc_8M L3 MT decode 7%, with every wrap of the round buffer.
+        let back = offset.wrapping_sub(avail);
+        if back <= lim.ext.len && back >= ml + WILDCOPY_OVERLENGTH {
+            // SAFETY: as below for the literals. The match reads `ml + 31`
+            // bytes from `back` bytes before the end of `ext`, within it,
+            // and lies apart from the segment or ahead of `dst` by more
+            // than `W::WIDTH` bytes (the `ExtHistory` contract).
+            unsafe {
+                copy_literals(w, op, lit, ll);
+                w.wildcopy(op.add(ll), lim.ext.end.sub(back), ml);
+                cur.lit = lit.add(ll);
+                cur.op = op.add(ll + ml);
+            }
+            return Ok(());
+        }
         // SAFETY: as below, the checks above hold; the match starts before
         // the segment, which `exec_sequence_ext` takes from there.
         unsafe {
-            exec_sequence_ext(
-                w,
-                op,
-                lit,
-                (ll, ml, offset),
-                o_lit_end - lim.prefix as usize,
-                lim.ext,
-            )?;
+            exec_sequence_ext(w, op, lit, (ll, ml, offset), avail, lim.ext)?;
             cur.lit = lit.add(ll);
             cur.op = op.add(ll + ml);
         }
@@ -3751,7 +3765,7 @@ unsafe fn copy16(dst: *mut u8, src: *const u8) {
 ///
 /// # Safety
 /// `len + 31` bytes readable at `src` and writable at `dst`, and either the
-/// two ranges are disjoint or `dst - src >= 16`.
+/// two ranges are disjoint or `dst - src >= 16` or `src - dst >= 16`.
 #[inline(always)]
 unsafe fn wildcopy(mut dst: *mut u8, mut src: *const u8, len: usize) {
     copy16(dst, src);
@@ -3783,7 +3797,8 @@ trait WildCopy: Copy {
     ///
     /// # Safety
     /// `len + 31` bytes readable at `src` and writable at `dst`, and either
-    /// the two ranges are disjoint or `dst - src >= WIDTH`.
+    /// the two ranges are disjoint or `dst - src >= WIDTH` or `src - dst >=
+    /// WIDTH`: the chunks go forward, and each is read before it is written.
     unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize);
 
     /// Copy the `ml`-byte match that starts `offset` bytes before `dst`,
@@ -4078,7 +4093,8 @@ fn wide_chunks(dist: usize) -> bool {
 ///
 /// # Safety
 /// The CPU supports AVX2; `len + 31` bytes readable at `src` and writable
-/// at `dst`, and either the two ranges are disjoint or `dst - src >= 32`.
+/// at `dst`, and either the two ranges are disjoint or `dst - src >= 32` or
+/// `src - dst >= 32`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -7750,8 +7766,9 @@ mod tests {
     }
 
     /// A match reaches back through the segment into `ExtHistory` up to
-    /// its first byte and no further, wholly inside it or running on into
-    /// the segment, still bounded by Window_Size; without history it stops
+    /// its first byte and no further, wholly inside it (ending
+    /// `WILDCOPY_OVERLENGTH` bytes or more before its end, or nearer) or
+    /// running on into the segment, still bounded by Window_Size; without history it stops
     /// at the segment, as in one-shot decoding. Into a dictionary it may
     /// reach past Window_Size, while the segment before it holds at most
     /// Window_Size bytes. Each rejection names the bound it crossed.
@@ -7776,6 +7793,10 @@ mod tests {
             (11, 30, 64, 1 << 20, OK, OK),
             (20, 4, 64, 1 << 20, OK, OK),
             (20, 34, 64, 1 << 20, OK, OK),
+            (45, 4, 64, 1 << 20, OK, OK),
+            (46, 4, 64, 1 << 20, OK, OK),
+            (71, 30, 64, 1 << 20, OK, OK),
+            (72, 30, 64, 1 << 20, OK, OK),
             (74, 4, 64, 1 << 20, OK, OK),
             (74, 34, 64, 1 << 20, OK, OK),
             (75, 4, 64, 1 << 20, FRAME, DICT),
