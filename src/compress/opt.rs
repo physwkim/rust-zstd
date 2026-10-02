@@ -274,7 +274,7 @@ impl Stats {
 
             // first block, no dictionary: base initial cost of literals on
             // direct frequency within src (HIST_count_simple)
-            crate::huf::hist_count(&mut self.lit_freq, block);
+            crate::huf::hist_count(&mut self.lit_freq, block, MAX_LIT);
             self.lit_sum = downscale_stats(&mut self.lit_freq, 8, false);
 
             const BASE_LL_FREQS: [u32; MAX_LL + 1] = [
