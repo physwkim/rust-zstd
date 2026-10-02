@@ -174,8 +174,8 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// to nothing, and bytes after the last frame are an error. A frame that
 /// names a dictionary is an error; see `decompress_with_dict`.
 ///
-/// With the `parallel` feature, frames of four or more compressed blocks,
-/// of 8 KiB or more in all, are decoded on the current rayon pool when it
+/// With the `parallel` feature, frames of three or more compressed blocks,
+/// of 32 KiB or more in all, are decoded on the current rayon pool when it
 /// has more than one thread; the output is the same either way.
 ///
 /// Which frames decode follows RFC 8878, not libzstd: every block, raw,
@@ -4851,14 +4851,16 @@ mod parallel {
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    /// Batches with fewer compressed blocks decode on the calling thread.
-    pub(super) const MIN_BLOCKS: usize = 4;
+    /// Batches with fewer compressed blocks decode on the calling thread:
+    /// three blocks of 34-56 KiB took 7-41% less time on the pool.
+    pub(super) const MIN_BLOCKS: usize = 3;
 
     /// Batches whose compressed blocks hold fewer bytes decode on the
-    /// calling thread: on eight cores sharing an L3, the pool lost up to 5%
-    /// on 1 MiB frames below 7 KiB of compressed blocks and gained 6-14%
-    /// from 7.7 KiB up.
-    pub(super) const MIN_BYTES: usize = 8 * 1024;
+    /// calling thread. On eight cores sharing an L3 the pool took less time
+    /// from 10 KiB up, but on eight cores over two L3s it took up to 37%
+    /// more on frames of seven or eight 128 KiB blocks up to 29 KiB, and at
+    /// most 3% more from 30 KiB.
+    pub(super) const MIN_BYTES: usize = 32 * 1024;
 
     /// When a batch of blocks decodes on the rayon pool
     /// (`DecodeOptions::min_parallel_blocks` and `min_parallel_bytes`).
