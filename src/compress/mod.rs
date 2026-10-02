@@ -173,10 +173,11 @@ pub struct CompressOptions {
     pub overflow_correct_frequently: bool,
     /// `ZSTD_CCtx_refCDict`: compress every frame with this dictionary, as
     /// `ZSTD_compress2` and `ZSTD_compressStream2` do: its level supersedes
-    /// `level`, the frame header carries its ID, and the frame is one job
-    /// whatever `job_size` says (ZSTDMT with a dictionary is not supported
-    /// yet). A streaming frame sizes its use of the dictionary for the
-    /// pledged size, an unknown one as libzstd does (attached, with
+    /// `level` and the frame header carries its ID. With `job_size`, only
+    /// the first job starts from the dictionary, as ZSTDMT's first job
+    /// alone gets the CDict; later jobs see the input's overlap only. A
+    /// streaming frame sizes its use of the dictionary for the pledged
+    /// size, an unknown one as libzstd does (attached, with
     /// [`DictAttach::Auto`]). See [`CompressDict`] and [`dict`].
     pub dict: Option<Arc<CompressDict>>,
     /// `ZSTD_c_forceAttachDict`: whether a frame searches `dict`'s tables
@@ -425,7 +426,7 @@ impl Context {
             JobLdm::Off => BlockLdm::Off,
             JobLdm::External(seqs) => BlockLdm::External(seqs),
             JobLdm::Internal(params) => {
-                BlockLdm::Internal(reset_ldm_state(&mut self.ldm_state, params, frequently))
+                BlockLdm::Internal(reset_ldm_state(&mut self.ldm_state, params, 0, frequently))
             }
         };
         (ms, &mut self.scratch, ldm)
@@ -581,11 +582,13 @@ impl Compressor {
     }
 
     /// Append one frame holding `src`, with `dict` if given, to `out`. A
-    /// dictionary's content goes before `src` and the frame is one job (see
-    /// [`dict`]).
+    /// dictionary's content goes before `src` (see [`dict`]), and only the
+    /// first job starts from the dictionary, as ZSTDMT hands `job->cdict`
+    /// to job 0 alone.
     fn compress_frame(&mut self, src: &[u8], dict: Option<&FrameDict>, out: &mut Vec<u8>) {
+        let mt = multithreaded(&self.opts, src.len());
         let (frame_cparams, cparams, ldm_params) = match dict {
-            Some(dict) => dict.params(),
+            Some(dict) => dict.params(mt),
             None => {
                 let (cparams, ldm) = self.opts.frame_params(Some(src.len() as u64));
                 (cparams, cparams, ldm)
@@ -628,28 +631,31 @@ impl Compressor {
             return;
         }
 
+        // ZSTDMT sizes the jobs and their overlap from the frame's
+        // parameters (mtctx->params); the first job alone compresses with a
+        // dictionary's, and every later job with the frame's.
         let ldm_on = ldm_params.is_some();
-        let overlap = overlap_size(&cparams, self.opts.overlap_log, ldm_on);
-        // A frame with a dictionary is one job.
-        let requested = self.opts.job_size.filter(|_| dict.is_none());
-        let job_size = job_size_for(requested, &cparams, ldm_on, overlap);
+        let overlap = overlap_size(&frame_cparams, self.opts.overlap_log, ldm_on);
+        let job_size = job_size_for(self.opts.job_size, &frame_cparams, ldm_on, overlap);
         let split = split::block_splitter_enabled(self.opts.split_after_sequences, &frame_cparams);
         let jobs: Vec<_> = job_ranges(src.len(), job_size)
             .into_iter()
             .map(|job| src_start + job.start..src_start + job.end)
             .collect();
         let n_jobs = jobs.len();
-        let mt = dict.is_none() && multithreaded(&self.opts, src.len());
         let sizing = block_sizing(&self.opts, &cparams, mt, header_len);
+        let later_method = default_search_method(&frame_cparams);
+        let later_sizing = block_sizing(&self.opts, &frame_cparams, mt, header_len);
         let pipelined = cfg!(feature = "parallel");
         // ZSTDMT_serialState: every job's long distance matches from the one
-        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
-        // single-threaded frame generates each block's as it compresses the
-        // block (ZSTD_buildSeqStore), from its context's state.
+        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them, its
+        // window starting at the input (a CDict's content is job 0's alone).
+        // A single-threaded frame generates each block's as it compresses
+        // the block (ZSTD_buildSeqStore), from its context's state.
         let frequently = self.opts.overflow_correct_frequently;
         let mut serial_ldm = ldm_params
             .filter(|_| mt)
-            .map(|params| reset_ldm_state(&mut self.serial_ldm, params, frequently));
+            .map(|params| reset_ldm_state(&mut self.serial_ldm, params, src_start, frequently));
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
         run_jobs(
             &jobs,
@@ -670,9 +676,14 @@ impl Compressor {
                     Some(_) if mt => JobLdm::External(seqs),
                     Some(params) => JobLdm::Internal(params),
                 };
+                let (start, cparams, method, sizing) = if k == 0 {
+                    (JobStart::First(dict), cparams, method, sizing)
+                } else {
+                    (JobStart::Later, frame_cparams, later_method, later_sizing)
+                };
                 compress_job(
                     data,
-                    dict,
+                    start,
                     cparams,
                     method,
                     ldm,
@@ -680,7 +691,6 @@ impl Compressor {
                     sizing,
                     overlap,
                     job,
-                    k == 0,
                     k + 1 == n_jobs,
                     split,
                     pipelined,
@@ -702,19 +712,21 @@ impl Compressor {
 }
 
 /// The long distance matching state in `slot` reset for a frame with
-/// `params`, allocated on first use, with the overflow correction knob
-/// `frequently` (see [`CompressOptions`]).
+/// `params` whose window starts at position `first`, allocated on first
+/// use, with the overflow correction knob `frequently` (see
+/// [`CompressOptions`]).
 fn reset_ldm_state(
     slot: &mut Option<LdmState>,
     params: LdmParams,
+    first: usize,
     frequently: bool,
 ) -> &mut LdmState {
     let state = match slot.take() {
         Some(mut state) => {
-            state.reset(params, 0);
+            state.reset(params, first);
             slot.insert(state)
         }
-        None => slot.insert(LdmState::new(params, 0)),
+        None => slot.insert(LdmState::new(params, first)),
     };
     state.set_correct_frequently(frequently);
     state
@@ -755,24 +767,34 @@ fn job_bound(len: usize, block_size: usize) -> usize {
     len + ZSTD_BLOCKHEADERSIZE * len.div_ceil(block_size)
 }
 
+/// How a job starts (`ZSTDMT_compressionJob`'s init): the first job from
+/// the frame's dictionary if it has one, the only job given `job->cdict`,
+/// else from nothing; a later job from the raw-content overlap of the
+/// input before it.
+#[derive(Clone, Copy)]
+enum JobStart<'a> {
+    First(Option<&'a FrameDict<'a>>),
+    Later,
+}
+
 /// `ZSTDMT_compressionJob`: compress `data[job]` into a sequence of blocks
 /// appended to `out`, on `ctx` reset for this job ([`Context::reset`]) with
-/// tables for `method` and the long distance matches of `ldm`. Job 0
-/// starts from `repStartValue` with its first byte as the window start and
-/// pledges the rest of `data`; a later job pledges itself, its window
+/// tables for `method` and the long distance matches of `ldm`. The first
+/// job starts from `repStartValue` with its first byte as the window start
+/// and pledges the rest of `data`; a later job pledges itself, its window
 /// starts `overlap` bytes before it, and the job indexes that prefix
 /// (`ZSTD_loadDictionaryContent` on the raw-content prefix), starts with
 /// invalidated repeat offsets and no entropy tables, so its first block
 /// cannot reference state the decoder obtained from the previous job. The
-/// one job of a frame with `dict` has the dictionary's content before it,
-/// where its window starts, and starts from the dictionary instead
-/// ([`FrameDict::preload`]). `sizing` cuts the job into blocks; `split`
-/// runs every block through the post-sequence splitter; `frequently` is
-/// the overflow correction knob (see [`CompressOptions`]).
+/// first job of a frame with a dictionary has the dictionary's content
+/// before it, where its window starts, and starts from the dictionary
+/// instead ([`FrameDict::preload`]). `sizing` cuts the job into blocks;
+/// `split` runs every block through the post-sequence splitter;
+/// `frequently` is the overflow correction knob (see [`CompressOptions`]).
 #[allow(clippy::too_many_arguments)]
 fn compress_job(
     data: &[u8],
-    dict: Option<&FrameDict>,
+    start: JobStart,
     cparams: CParams,
     method: SearchMethod,
     ldm: JobLdm,
@@ -780,7 +802,6 @@ fn compress_job(
     sizing: BlockSizing,
     overlap: usize,
     job: Range<usize>,
-    first_job: bool,
     last_job: bool,
     split: bool,
     pipelined: bool,
@@ -788,19 +809,14 @@ fn compress_job(
     out: &mut Vec<u8>,
 ) {
     // ZSTDMT: a job's window starts at its prefix (ZSTD_dct_rawContent).
-    // A dictionary's content is the one job's prefix instead.
-    let prefix = match dict {
-        Some(_) => 0..job.start,
-        None => job_prefix(&job, first_job, overlap),
-    };
-    let pledged = if first_job {
-        data.len() - job.start
-    } else {
-        job.len()
+    // A dictionary's content is the first job's prefix instead.
+    let (prefix, pledged) = match start {
+        JobStart::First(Some(_)) => (0..job.start, data.len() - job.start),
+        JobStart::First(None) => (job_prefix(&job, true, overlap), data.len() - job.start),
+        JobStart::Later => (job_prefix(&job, false, overlap), job.len()),
     };
     let (ms, scratch, mut ldm) = ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
-    let (mut blocks, mut state) =
-        begin_job(ms, scratch, data, prefix, dict, sizing, first_job, last_job);
+    let (mut blocks, mut state) = begin_job(ms, scratch, data, prefix, start, sizing, last_job);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
         ms,
@@ -811,7 +827,10 @@ fn compress_job(
         &mut state,
         scratch,
         &mut ldm,
-        dict.and_then(FrameDict::dict_match_state),
+        match start {
+            JobStart::First(dict) => dict.and_then(FrameDict::dict_match_state),
+            JobStart::Later => None,
+        },
         out,
         pipelined,
     );
@@ -819,34 +838,33 @@ fn compress_job(
 
 /// The start of a job on a context just reset for it: a later ZSTDMT job
 /// indexes its raw-content `prefix` of `data` and starts with invalidated
-/// repeat offsets; job 0 (`prefix` empty, whatever `data`) starts from
-/// `repStartValue`; the one job of a frame with `dict` starts from the
+/// repeat offsets; the first job (`prefix` empty, whatever `data`) starts
+/// from `repStartValue`, or, in a frame with a dictionary, from the
 /// dictionary, whose content is `prefix` ([`FrameDict::preload`]). Returns
 /// the job's block cursor, its first block at the prefix end, and its
 /// committed block state. One-shot jobs and the streaming frame both start
 /// here.
-#[allow(clippy::too_many_arguments)]
 fn begin_job(
     ms: &mut MatchState,
     scratch: &mut BlockScratch,
     data: &[u8],
     prefix: Range<usize>,
-    dict: Option<&FrameDict>,
+    start: JobStart,
     sizing: BlockSizing,
-    first_job: bool,
     last_job: bool,
 ) -> (JobBlocks, CommittedBlockState) {
-    let initial = match dict {
-        Some(dict) => dict.preload(ms, data),
-        None if !first_job => {
+    let initial = match start {
+        JobStart::First(Some(dict)) => dict.preload(ms, data),
+        JobStart::First(None) => BlockState::initial(),
+        JobStart::Later => {
             block::load_prefix(ms, data, prefix.clone());
             let mut initial = BlockState::initial();
             initial.invalidate_rep_codes();
             initial
         }
-        None => BlockState::initial(),
     };
     scratch.reserve(sizing.block_size_max);
+    let first_job = matches!(start, JobStart::First(_));
     let blocks = JobBlocks::new(sizing, prefix.end, first_job, last_job);
     (blocks, CommittedBlockState::new(initial))
 }
@@ -1313,7 +1331,7 @@ mod tests {
                 let mut out = Vec::new();
                 compress_job(
                     &data,
-                    None,
+                    JobStart::Later,
                     cparams,
                     default_search_method(&cparams),
                     JobLdm::Off,
@@ -1321,7 +1339,6 @@ mod tests {
                     block_sizing(&opts, &cparams, true, 0),
                     overlap,
                     job.clone(),
-                    false,
                     true,
                     false,
                     false,
@@ -1626,7 +1643,11 @@ mod tests {
                       out: &mut Vec<u8>| {
                     compress_job(
                         src,
-                        None,
+                        if k == 0 {
+                            JobStart::First(None)
+                        } else {
+                            JobStart::Later
+                        },
                         cparams,
                         default_search_method(&cparams),
                         JobLdm::External(seqs),
@@ -1634,7 +1655,6 @@ mod tests {
                         sizing,
                         overlap,
                         job,
-                        k == 0,
                         k + 1 == n,
                         split,
                         pipelined,
@@ -1889,7 +1909,11 @@ mod tests {
                       out: &mut Vec<u8>| {
                     compress_job(
                         src,
-                        None,
+                        if k == 0 {
+                            JobStart::First(None)
+                        } else {
+                            JobStart::Later
+                        },
                         cparams,
                         default_search_method(&cparams),
                         JobLdm::Off,
@@ -1897,7 +1921,6 @@ mod tests {
                         sizing,
                         overlap,
                         job,
-                        k == 0,
                         k + 1 == n,
                         false,
                         pipelined,
@@ -1979,7 +2002,7 @@ mod tests {
         let job = 0..data.len();
         compress_job(
             data,
-            None,
+            JobStart::First(None),
             cparams,
             default_search_method(&cparams),
             JobLdm::Off,
@@ -1987,7 +2010,6 @@ mod tests {
             sizing,
             overlap,
             job,
-            true,
             true,
             split,
             pipelined,

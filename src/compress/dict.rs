@@ -20,11 +20,12 @@
 //!
 //! Copied (`ZSTD_resetCCtx_byCopyingCDict`) or loaded (the content hashed
 //! into the frame's own tables, for a large input): the frame compresses
-//! `content ++ input` as its one job, the dictionary's content (all of a
-//! raw-content dictionary, the rest of a structured one after its entropy
-//! tables and repeat offsets) at positions `0..content.len()`, the
-//! window's origin, and the input after it. In index space the content
-//! ends where the input begins, as in libzstd, where
+//! `content ++ input`, its first job's window starting at the
+//! dictionary's content (all of a raw-content dictionary, the rest of a
+//! structured one after its entropy tables and repeat offsets) at
+//! positions `0..content.len()`, the window's origin, and the input after
+//! it; later ZSTDMT jobs start from their overlap. In index space the
+//! content ends where the input begins, as in libzstd, where
 //! `ZSTD_loadDictionaryContent`'s `ZSTD_window_update` puts the content in
 //! the window and the input's then follows it. A copy takes the tables and
 //! window as they are ([`MatchState::copy_dict`]); a load enters the
@@ -285,6 +286,8 @@ pub(super) struct FrameDict<'a> {
     /// dictionary's with `frame`'s window log, sized for the input alone
     /// when attached.
     applied: CParams,
+    /// The requested long distance matching parameters, when enabled,
+    /// before `ZSTD_ldm_adjustParameters` ([`FrameDict::params`]).
     ldm: Option<LdmParams>,
     tables: Tables<'a>,
     /// The block state the frame starts from; `None` is `repStartValue`
@@ -352,7 +355,7 @@ impl<'a> FrameDict<'a> {
             id: dict.id,
             frame,
             applied,
-            ldm: ldm.map(|requested| requested.adjusted(&applied)),
+            ldm,
             tables,
             entropy: Some(&dict.entropy),
             opt_stats: dict.opt_stats.as_ref(),
@@ -375,7 +378,7 @@ impl<'a> FrameDict<'a> {
             id: 0,
             frame,
             applied: frame,
-            ldm: ldm.map(|requested| requested.adjusted(&frame)),
+            ldm,
             tables: Tables::Load,
             entropy: None,
             opt_stats: None,
@@ -406,10 +409,16 @@ impl<'a> FrameDict<'a> {
         self.id
     }
 
-    /// The frame's parameters, those it is compressed with, and its long
-    /// distance matching parameters (see [`FrameDict`]).
-    pub(super) fn params(&self) -> (CParams, CParams, Option<LdmParams>) {
-        (self.frame, self.applied, self.ldm)
+    /// The frame's parameters, those its first job is compressed with, and
+    /// its long distance matching parameters (see [`FrameDict`]), adjusted
+    /// for the parameters of the state that generates the matches: the
+    /// frame's for ZSTDMT's serial state (`mt`, `ZSTDMT_serialState_reset`
+    /// on `mtctx->params`), else the applied ones of the frame's one
+    /// context (`ZSTD_resetCCtx_internal`).
+    pub(super) fn params(&self, mt: bool) -> (CParams, CParams, Option<LdmParams>) {
+        let ldm_cparams = if mt { &self.frame } else { &self.applied };
+        let ldm = self.ldm.map(|requested| requested.adjusted(ldm_cparams));
+        (self.frame, self.applied, ldm)
     }
 
     /// The lazy finder the frame's tables are for: a used dictionary's
@@ -422,7 +431,7 @@ impl<'a> FrameDict<'a> {
         }
     }
 
-    /// Start `ms`, just reset for the frame's one job with the window at
+    /// Start `ms`, just reset for the frame's first job with the window at
     /// the start of `data` ([`FrameDict::content`], then the input), from
     /// the dictionary: attach it, copy its tables or load the content,
     /// seed the optimal parser's first statistics, and return the block

@@ -32,7 +32,7 @@ use super::dict::FrameDict;
 use super::{
     begin_job, block_sizing, default_search_method, multithreaded, split, write_epilogue,
     write_frame_header, write_raw_block, CommittedBlockState, CompressDict, CompressError,
-    CompressOptions, Compressor, Context, JobLdm,
+    CompressOptions, Compressor, Context, JobLdm, JobStart,
 };
 use crate::constants::ZSTD_BLOCKSIZE_MAX;
 use crate::xxhash::Xxh64;
@@ -155,9 +155,9 @@ impl Frame {
             (None, None) => None,
         };
         let dict = dict.as_ref();
-        debug_assert!(dict.is_some() || !multithreaded(opts, size));
+        debug_assert!(!multithreaded(opts, size));
         let (frame_cparams, cparams, ldm_params) = match dict {
-            Some(dict) => dict.params(),
+            Some(dict) => dict.params(false),
             None => {
                 let (cparams, ldm) = opts.frame_params(pledged);
                 (cparams, cparams, ldm)
@@ -172,7 +172,8 @@ impl Frame {
         let method = dict.map_or_else(|| default_search_method(&cparams), FrameDict::search_method);
         let buf = dict.map_or_else(Vec::new, |dict| dict.content().to_vec());
         let (ms, scratch, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
-        let (blocks, state) = begin_job(ms, scratch, &buf, 0..buf.len(), dict, sizing, true, true);
+        let start = JobStart::First(dict);
+        let (blocks, state) = begin_job(ms, scratch, &buf, 0..buf.len(), start, sizing, true);
         let attaches = dict.and_then(FrameDict::dict_match_state).is_some();
         let keep = 1usize << cparams.window_log;
         Self {
@@ -343,15 +344,14 @@ impl Compressor {
     /// input is cut into calls; without a pledged size, the header has no
     /// content size and the parameters, and how a dictionary is used, are
     /// those of an unknown size. A frame takes the prefix
-    /// [`Compressor::set_prefix`] left, else [`CompressOptions::dict`],
-    /// and is then one job.
+    /// [`Compressor::set_prefix`] left, else [`CompressOptions::dict`].
     ///
     /// Errors: [`CompressError::SrcSizeWrong`] when the input passes the
     /// pledged size (the call consumes none of it) or ends short of it;
-    /// [`CompressError::Unsupported`] for a `job_size` frame without a
-    /// dictionary that is not one first `End` call or pledged at most
-    /// `JOBSIZE_MIN` (multithreaded streaming is not implemented). After an
-    /// error every call returns [`CompressError::StageWrong`] until
+    /// [`CompressError::Unsupported`] for a `job_size` frame that is not
+    /// one first `End` call or pledged at most `JOBSIZE_MIN`
+    /// (multithreaded streaming is not implemented). After an error every
+    /// call returns [`CompressError::StageWrong`] until
     /// [`Compressor::reset_stream`].
     ///
     /// Panics if a position is past its buffer's end.
@@ -411,9 +411,7 @@ impl Compressor {
                     self.stream.stage = Stage::Ended;
                 }
                 Stage::Idle => {
-                    // A frame with a dictionary is one job.
-                    let dict = self.prefix.is_some() || self.opts.dict.is_some();
-                    if !dict && multithreaded(&self.opts, frame_size(self.stream.pledged)) {
+                    if multithreaded(&self.opts, frame_size(self.stream.pledged)) {
                         let what = "job_size streaming over JOBSIZE_MIN or of unknown size";
                         return Err(CompressError::Unsupported(what));
                     }

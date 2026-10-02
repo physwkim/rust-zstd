@@ -703,25 +703,108 @@ fn dictionary_with_ldm_and_checksum() {
     }
 }
 
-/// A frame with a dictionary is one job whatever the job size.
+/// `f`'s frame, which with the parallel feature must be the same on rayon
+/// pools of 1 and 4 threads.
+fn same_on_pools(what: &str, f: impl Fn() -> Vec<u8> + Sync) -> Vec<u8> {
+    let frame = f();
+    #[cfg(feature = "parallel")]
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        assert!(
+            pool.install(&f) == frame,
+            "{what}: another frame on a {threads}-thread pool"
+        );
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = what;
+    frame
+}
+
+/// Frames with a dictionary and a job size, over two jobs of 512 KiB, pass
+/// the gate against libzstd's ZSTDMT with the same CDict or prefix
+/// (`ZSTD_c_nbWorkers` 2, the same `ZSTD_c_jobSize`), with and without
+/// long distance matching. Only the first job starts from the dictionary,
+/// so a frame of several jobs is not the one-job frame.
 #[test]
-fn dictionary_frames_are_one_job() {
+fn multithreaded_dictionary_frames_pass_the_gate() {
     let corpus = corpora().swap_remove(1);
-    let (_, trained) = dictionaries(&corpus).swap_remove(0);
     let src: Vec<u8> = corpus.train.concat();
     assert!(src.len() > 2 * JOBSIZE_MIN);
-    let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
-    let frame = |job_size| {
-        Compressor::new(CompressOptions {
-            job_size,
-            dict: Some(dict.clone()),
-            ..Default::default()
-        })
-        .compress_to_vec(&src)
-    };
-    let one = frame(None);
-    assert!(frame(Some(JOBSIZE_MIN)) == one);
-    assert_decodes("job size", &one, &trained, &src);
+    let mut failures = Vec::new();
+    for (kind, dict) in dictionaries(&corpus) {
+        for level in [-5, 3, 19] {
+            let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+            let lib = LibCDict::new(&dict, level);
+            for (job_size, ldm) in [
+                (JOBSIZE_MIN, ParamSwitch::Auto),
+                (JOBSIZE_MIN, ParamSwitch::Enable),
+                (0, ParamSwitch::Auto),
+            ] {
+                let mut params = vec![
+                    (P::ZSTD_c_nbWorkers, 2),
+                    (P::ZSTD_c_jobSize, job_size as i32),
+                ];
+                if ldm == ParamSwitch::Enable {
+                    params.push((P::ZSTD_c_enableLongDistanceMatching, 1));
+                }
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let what = format!("{kind} L{level} job {job_size} ldm {ldm:?} {attach:?}");
+                    let opts = CompressOptions {
+                        job_size: Some(job_size),
+                        ldm,
+                        ..dict_opts(&ours, attach)
+                    };
+                    let frame = same_on_pools(&what, || {
+                        Compressor::new(opts.clone()).compress_to_vec(&src)
+                    });
+                    // At level 19 (btultra2) the overlap is the window,
+                    // which the job size grows to: one job.
+                    if job_size == JOBSIZE_MIN && ldm == ParamSwitch::Auto && level < 19 {
+                        let one_job = ours_frame(&src, &ours, attach);
+                        assert!(frame != one_job, "{what}: the one-job frame");
+                    }
+                    assert_decodes(&what, &frame, &dict, &src);
+                    let lib = lib.compress(&src, attach, &params);
+                    if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+                        failures.push(e);
+                    }
+                }
+                if kind != "raw" || ldm == ParamSwitch::Enable {
+                    continue;
+                }
+                let what = format!("prefix L{level} job {job_size} ldm {ldm:?}");
+                let opts = CompressOptions {
+                    level,
+                    job_size: Some(job_size),
+                    ldm,
+                    ..Default::default()
+                };
+                let frame = same_on_pools(&what, || compress_with_prefix(&src, &dict, &opts));
+                assert_decodes(&what, &frame, &dict, &src);
+                let lib = lib_frame(
+                    // SAFETY: a live context, `out` of its length.
+                    |cctx, out| unsafe {
+                        set(cctx, P::ZSTD_c_compressionLevel, level);
+                        for &(param, value) in &params {
+                            set(cctx, param, value);
+                        }
+                        let (p, n) = (dict.as_ptr().cast(), dict.len());
+                        assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refPrefix(cctx, p, n)), 0);
+                        let (dst, cap) = (out.as_mut_ptr().cast(), out.len());
+                        sys::ZSTD_compress2(cctx, dst, cap, src.as_ptr().cast(), src.len())
+                    },
+                    src.len(),
+                );
+                if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+                    failures.push(e);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The input chunk sizes of the streaming gate: 1, 7 and 64 KiB, and the
@@ -1267,9 +1350,10 @@ fn dictionary_streams_across_resets_and_encoder() {
     }
 }
 
-/// A dictionary stream is one job whatever the job size, as the one-shot
-/// frame is, and long distance matching and a checksum stream with a
-/// dictionary as they compress one-shot.
+/// A dictionary stream with a job size and over `JOBSIZE_MIN` is
+/// multithreaded streaming, which is not implemented, unless its first call
+/// ends it, which writes the one-shot frame; long distance matching and a
+/// checksum stream with a dictionary as they compress one-shot.
 #[test]
 fn dictionary_streams_with_job_size_and_ldm() {
     let corpus = corpora().swap_remove(2);
@@ -1282,25 +1366,54 @@ fn dictionary_streams_with_job_size_and_ldm() {
         src.extend_from_slice(s);
     }
     let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
-    for opts in [
-        CompressOptions {
-            job_size: Some(JOBSIZE_MIN),
-            ..dict_opts(&dict, Attach::Default)
-        },
-        CompressOptions {
-            ldm: ParamSwitch::Enable,
-            checksum: true,
-            ..dict_opts(&dict, Attach::Default)
-        },
-    ] {
-        let what = format!("job_size {:?} ldm {:?}", opts.job_size, opts.ldm);
-        let one_shot = Compressor::new(opts.clone()).compress_to_vec(&src);
-        let mut cctx = Compressor::new(opts);
-        for chunk in [7, 64 << 10] {
-            let frame = ours_stream(&mut cctx, &src, true, chunk, &[]);
-            assert!(frame == one_shot, "{what} chunk {chunk}: != one-shot frame");
-            let frame = ours_stream(&mut cctx, &src, false, chunk, &[]);
-            assert_decodes(&what, &frame, &trained, &src);
+    let opts = CompressOptions {
+        job_size: Some(JOBSIZE_MIN),
+        ..dict_opts(&dict, Attach::Default)
+    };
+    let one_shot = Compressor::new(opts.clone()).compress_to_vec(&src);
+    let mut cctx = Compressor::new(opts);
+    let mut dst = vec![0u8; src.len() + (1 << 16)];
+    for pledged in [true, false] {
+        if pledged {
+            cctx.set_pledged_src_size(Some(src.len() as u64)).unwrap();
         }
+        let (mut pos, mut dst_pos) = (0, 0);
+        let r = cctx.compress_stream(
+            &src,
+            &mut pos,
+            &mut dst,
+            &mut dst_pos,
+            EndDirective::Continue,
+        );
+        assert!(
+            matches!(r, Err(CompressError::Unsupported(_))),
+            "pledged {pledged}: {r:?}"
+        );
+        cctx.reset_stream();
+        if pledged {
+            cctx.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+        }
+        let (mut pos, mut dst_pos) = (0, 0);
+        let left = cctx
+            .compress_stream(&src, &mut pos, &mut dst, &mut dst_pos, EndDirective::End)
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(
+            dst[..dst_pos] == one_shot,
+            "pledged {pledged}: first-call End"
+        );
+    }
+    let opts = CompressOptions {
+        ldm: ParamSwitch::Enable,
+        checksum: true,
+        ..dict_opts(&dict, Attach::Default)
+    };
+    let one_shot = Compressor::new(opts.clone()).compress_to_vec(&src);
+    let mut cctx = Compressor::new(opts);
+    for chunk in [7, 64 << 10] {
+        let frame = ours_stream(&mut cctx, &src, true, chunk, &[]);
+        assert!(frame == one_shot, "ldm chunk {chunk}: != one-shot frame");
+        let frame = ours_stream(&mut cctx, &src, false, chunk, &[]);
+        assert_decodes("ldm", &frame, &trained, &src);
     }
 }
