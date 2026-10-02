@@ -391,7 +391,9 @@ fn outcome(r: &Result<Vec<u8>, String>) -> String {
 /// SIMD levels, the same content or the same error: streaming at each of
 /// `STREAM_CHUNKS`, with as much output room up to 64 KiB, but for the
 /// window limit's refusals that libzstd's streaming decoder shares
-/// (`check_streamed`), and through its `decompress`. So does
+/// (`check_streamed`), and through its `decompress`; with the `parallel`
+/// feature, decoding whole blocks in parallel changes no streaming call
+/// (`assert_parallel_streams`). So does
 /// `DecompressReader::with_dict`, in pieces of 7 bytes and whole, where it
 /// refuses by the window limit only input libzstd refuses so in pieces of
 /// a byte.
@@ -412,6 +414,8 @@ fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
                 let got = stream_with(d, input, chunk, stream_room(chunk));
                 let at = format!("{what} simd={simd} chunk {chunk}");
                 check_streamed(&at, input, chunk, simd, dict_and_bytes, &got, &want);
+                #[cfg(feature = "parallel")]
+                common::assert_parallel_streams(&at, input, chunk, simd, dict);
             }
             let got = d.decompress(input);
             assert!(

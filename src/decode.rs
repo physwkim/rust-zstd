@@ -235,8 +235,6 @@ fn decompress_frames(
     dict: Option<&DecodeDict>,
     output: &mut Vec<u8>,
 ) -> Result<(), String> {
-    #[cfg(feature = "parallel")]
-    let (min_parallel_blocks, simd) = (dec.min_parallel_blocks, dec.simd);
     let mut out = VecOut {
         output,
         prefix: Prefix {
@@ -264,19 +262,17 @@ fn decompress_frames(
         reserve_frame(out.output, frame, &data[pos..])?;
         #[cfg(feature = "parallel")]
         {
-            let (frame, init) = dec.frame_start();
-            let dict = dict.and_then(DecodeDict::entropy);
-            if parallel::decode_frame_blocks(
-                data,
-                &mut pos,
-                frame,
-                parallel::FrameStart { init, dict },
+            let mut read = 0;
+            let decoded = dec.decode_blocks_parallel(
+                &data[pos..],
+                dict,
                 &mut out,
-                min_parallel_blocks,
-                simd,
-            )? {
-                dec.blocks_ended()?;
-            }
+                usize::MAX,
+                &mut read,
+                |_| true,
+            );
+            pos += read;
+            decoded?;
         }
     }
 }
@@ -3056,6 +3052,12 @@ impl FSEScratch {
         }
     }
 
+    /// Whether Repeat_Mode may use the `SEQ_TABLES[t]` table: one is in
+    /// use, a dictionary's, the predefined one or one a block described.
+    fn repeatable(&self, t: usize) -> bool {
+        !matches!(self.source[t], SeqTableSource::Own) || !self.own(t).decode().is_empty()
+    }
+
     /// `own`, mutable.
     fn own_mut(&mut self, t: usize) -> &mut FSETable {
         match t {
@@ -3150,9 +3152,7 @@ fn build_sequence_table(
             Ok(0)
         }
         ModeType::Repeat => {
-            if matches!(scratch.source[t], SeqTableSource::Own)
-                && scratch.own(t).decode().is_empty()
-            {
+            if !scratch.repeatable(t) {
                 return Err(format!(
                     "Repeat mode without a previous {} table",
                     kind.name
@@ -4292,9 +4292,7 @@ struct FrameDecoder {
     stage: Stage,
     scratch: Option<DecoderScratch>,
     simd: Level,
-    /// `DecodeOptions::min_parallel_blocks`, for `decompress_frames`: the
-    /// units `Decompressor::decompress_stream` hands it decode on the
-    /// current thread.
+    /// `DecodeOptions::min_parallel_blocks`, for `decode_blocks_parallel`.
     #[cfg(feature = "parallel")]
     min_parallel_blocks: usize,
 }
@@ -4533,13 +4531,12 @@ fn frame_header_len(head: &[u8]) -> usize {
 }
 
 /// The block at the start of `src`, in a frame whose Block_Maximum_Size is
-/// `block_size_max`: its header and content.
-fn locate_block(src: &[u8], block_size_max: usize) -> Result<(BlockHeader, &[u8]), String> {
-    let block = parse_block_header(src, block_size_max)?;
-    let content = src
-        .get(BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + block.content_size as usize)
-        .ok_or_else(|| BLOCK_CONTENT_TRUNCATED.to_string())?;
-    Ok((block, content))
+/// `block_size_max`: its header and content, if `src` holds it whole and
+/// `parse_block_header` takes its header.
+fn locate_block(src: &[u8], block_size_max: usize) -> Option<(BlockHeader, &[u8])> {
+    let block = parse_block_header(src.get(..BLOCK_HEADER_LEN)?, block_size_max).ok()?;
+    let content = src.get(BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + block.content_size as usize)?;
+    Some((block, content))
 }
 
 /// Decode `block` with `content` into `out`, a block of `frame`, which
@@ -4645,17 +4642,23 @@ fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(
 fn blocks_decoded_bound(data: &[u8], block_size_max: usize) -> u64 {
     let mut rest = data;
     let mut bound = 0u64;
-    while let Ok((block, content)) = locate_block(rest, block_size_max) {
+    while let Some((block, content)) = locate_block(rest, block_size_max) {
         rest = &rest[BLOCK_HEADER_LEN + content.len()..];
-        bound = bound.saturating_add(match block.block_type {
-            BlockType::Compressed => block_size_max as u64,
-            _ => u64::from(block.decompressed_size),
-        });
+        bound = bound.saturating_add(block_bound(&block, block_size_max) as u64);
         if block.last_block {
             break;
         }
     }
     bound
+}
+
+/// The most `block` decodes to, in a frame whose Block_Maximum_Size is
+/// `block_size_max`: a raw or RLE block's size, or `block_size_max`.
+fn block_bound(block: &BlockHeader, block_size_max: usize) -> usize {
+    match block.block_type {
+        BlockType::Compressed => block_size_max,
+        _ => block.decompressed_size as usize,
+    }
 }
 
 // ============================================================
@@ -4827,17 +4830,18 @@ mod parallel {
     /// Frames with fewer blocks take the fused serial path.
     pub(super) const MIN_BLOCKS: usize = 4;
 
-    /// The "block" that defined a table the frame starts with: a
-    /// dictionary's (`FrameStart`).
+    /// The "block" that defined a table the batch starts with
+    /// (`FrameStart`): a dictionary's, or one a block before the batch
+    /// described.
     const START: usize = usize::MAX;
 
-    /// The tables and repeat offsets a frame starts from: `init`, the
-    /// decoder's scratch right after the frame header, which may select
-    /// those of `dict`, the dictionary the frame started from.
+    /// The tables and repeat offsets a batch of blocks starts from: `init`,
+    /// the serial decoder's scratch before its first block, which may
+    /// select those of `dict`, the dictionary the frame started from.
     #[derive(Clone, Copy)]
-    pub(super) struct FrameStart<'a> {
-        pub(super) init: &'a DecoderScratch,
-        pub(super) dict: Option<&'a DictEntropy>,
+    struct FrameStart<'a> {
+        init: &'a DecoderScratch,
+        dict: Option<&'a DictEntropy>,
     }
 
     /// One block of a frame, as located by the pre-pass.
@@ -4867,70 +4871,110 @@ mod parallel {
         }
     }
 
-    /// Stage 1: the block loop of ZSTD_decompressFrame, locating blocks
-    /// and resolving Treeless / Repeat references the way the serial
-    /// decoder's scratch tables carry them from block to block, from the
-    /// tables in `start`.
-    fn plan_frame<'a>(
+    /// The blocks at the start of `data` that it holds whole and whose
+    /// headers parse, each with where it ends in `data`, up to the frame's
+    /// last; past the first, only while the blocks before may decode to
+    /// `room` bytes at most (`block_bound`).
+    fn located(
+        data: &[u8],
+        block_size_max: usize,
+        room: usize,
+    ) -> impl Iterator<Item = (BlockHeader, &[u8], usize)> {
+        let (mut pos, mut bound, mut ended) = (0, 0usize, false);
+        std::iter::from_fn(move || {
+            if ended || bound > room {
+                return None;
+            }
+            let (block, content) = locate_block(&data[pos..], block_size_max)?;
+            pos += BLOCK_HEADER_LEN + content.len();
+            bound = bound.saturating_add(block_bound(&block, block_size_max));
+            ended = block.last_block;
+            Some((block, content, pos))
+        })
+    }
+
+    /// The blocks `plan_blocks` takes: their plans, where each ends in the
+    /// input, and whether the last is the frame's last.
+    struct Batch<'a> {
+        plans: Vec<Plan<'a>>,
+        ends: Vec<usize>,
+        last: bool,
+    }
+
+    /// Stage 1: the block loop of ZSTD_decompressFrame over the blocks
+    /// `located` gives, resolving Treeless / Repeat references the way the
+    /// serial decoder's scratch tables carry them from block to block, from
+    /// the tables in `start`. It stops before a block it cannot plan, which
+    /// the serial decoder then decodes, giving its verdict on it.
+    fn plan_blocks<'a>(
         data: &'a [u8],
-        pos: &mut usize,
         block_size_max: usize,
         start: FrameStart<'_>,
-    ) -> Result<Vec<Plan<'a>>, String> {
-        let mut plans = Vec::new();
+        room: usize,
+    ) -> Batch<'a> {
+        let mut batch = Batch {
+            plans: Vec::new(),
+            ends: Vec::new(),
+            last: false,
+        };
         let mut huf_def = (start.init.huf_table(start.dict).max_num_bits != 0).then_some(START);
-        let mut fse_def: [Option<usize>; 3] = std::array::from_fn(|t| {
-            matches!(start.init.fse.source[t], SeqTableSource::Dict).then_some(START)
-        });
-        loop {
-            let (block, content) = locate_block(&data[*pos..], block_size_max)?;
-            *pos += BLOCK_HEADER_LEN + content.len();
-            let i = plans.len();
-            plans.push(match block.block_type {
+        let mut fse_def: [Option<usize>; 3] =
+            std::array::from_fn(|t| start.init.fse.repeatable(t).then_some(START));
+        for (block, content, end) in located(data, block_size_max, room) {
+            let i = batch.plans.len();
+            let plan = match block.block_type {
                 BlockType::Raw => Plan::Raw(content),
                 BlockType::RLE => Plan::Rle(content[0], block.decompressed_size as usize),
                 BlockType::Compressed => {
-                    let parts = split_block(content, block_size_max)?;
-                    let huf = match parts.literals.ls_type {
-                        LiteralsSectionType::Compressed => {
-                            huf_def = Some(i);
-                            huf_def
-                        }
-                        LiteralsSectionType::Treeless => Some(huf_def.ok_or_else(|| {
-                            "Uninitialized Huffman table for treeless literals".to_string()
-                        })?),
-                        LiteralsSectionType::Raw | LiteralsSectionType::RLE => None,
+                    let Some(plan) =
+                        plan_compressed(content, block_size_max, i, &mut huf_def, &mut fse_def)
+                    else {
+                        break;
                     };
-                    let mut defs = [0; 3];
-                    if parts.sequences.num_sequences != 0 {
-                        let modes = parts
-                            .sequences
-                            .modes
-                            .ok_or_else(|| "Missing compression mode".to_string())?;
-                        for (t, mode) in modes.all().into_iter().enumerate() {
-                            if !matches!(mode, ModeType::Repeat) {
-                                fse_def[t] = Some(i);
-                            }
-                            defs[t] = fse_def[t].ok_or_else(|| {
-                                format!(
-                                    "Repeat mode without a previous {} table",
-                                    SEQ_TABLES[t].name
-                                )
-                            })?;
-                        }
-                    }
-                    Plan::Compressed(CompressedPlan {
-                        parts,
-                        huf_def: huf,
-                        fse_def: defs,
-                    })
+                    Plan::Compressed(plan)
                 }
-                BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
-            });
-            if block.last_block {
-                return Ok(plans);
+                BlockType::Reserved => break,
+            };
+            batch.plans.push(plan);
+            batch.ends.push(end);
+            batch.last = block.last_block;
+        }
+        batch
+    }
+
+    /// Plan compressed block `i`, of `content`, `huf_def` and `fse_def`
+    /// being the blocks that defined the tables in use before it, which it
+    /// updates; `None` if the block fails before decoding.
+    fn plan_compressed<'a>(
+        content: &'a [u8],
+        block_size_max: usize,
+        i: usize,
+        huf_def: &mut Option<usize>,
+        fse_def: &mut [Option<usize>; 3],
+    ) -> Option<CompressedPlan<'a>> {
+        let parts = split_block(content, block_size_max).ok()?;
+        let huf = match parts.literals.ls_type {
+            LiteralsSectionType::Compressed => {
+                *huf_def = Some(i);
+                *huf_def
+            }
+            LiteralsSectionType::Treeless => Some((*huf_def)?),
+            LiteralsSectionType::Raw | LiteralsSectionType::RLE => None,
+        };
+        let mut defs = [0; 3];
+        if parts.sequences.num_sequences != 0 {
+            for (t, mode) in parts.sequences.modes?.all().into_iter().enumerate() {
+                if !matches!(mode, ModeType::Repeat) {
+                    fse_def[t] = Some(i);
+                }
+                defs[t] = fse_def[t]?;
             }
         }
+        Some(CompressedPlan {
+            parts,
+            huf_def: huf,
+            fse_def: defs,
+        })
     }
 
     /// One sequence before repeat-offset resolution.
@@ -5017,15 +5061,7 @@ mod parallel {
                 }
             } else if slot.huf_from != Some(d) {
                 slot.huf_from = None;
-                // The same arguments as the defining block's own build in
-                // `decompress_literals`, so the same table kind (X1 / X2).
-                let def = compressed(&plans[d]);
-                let lit = &def.parts.literals;
-                slot.huf.table.build_decoder(
-                    def.parts.literals_src,
-                    lit.regenerated_size as usize,
-                    lit.num_streams == Some(4),
-                )?;
+                build_huf_from(compressed(&plans[d]), &mut slot.huf.table)?;
                 slot.huf_from = Some(d);
             }
         }
@@ -5056,19 +5092,45 @@ mod parallel {
                 slot.fse_from[t] = None;
                 used += build_sequence_table(mode, &src[used..], &mut slot.fse, t)?;
                 slot.fse_from[t] = Some(i);
-            } else if slot.fse_from[t] != Some(d) {
+            } else if d != START && slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                if d == START {
-                    // The dictionary's table, as `load_dict` selects it.
-                    slot.fse.source[t] = SeqTableSource::Dict;
-                } else {
-                    build_table_from(compressed(&plans[d]), t, &mut slot.fse)?;
-                }
+                build_table_from(compressed(&plans[d]), t, &mut slot.fse)?;
                 slot.fse_from[t] = Some(d);
             }
         }
-        let tables = slot.fse.tables(start.dict.map(|d| &d.fse));
+        let tables = seq_tables(plan, &slot.fse, start);
         decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
+    }
+
+    /// The LL, OF, ML tables compressed block `plan` decodes with: those
+    /// `start` has in use where no block of the batch described one, those
+    /// of `fse`, a slot's, built for it otherwise.
+    fn seq_tables<'s>(
+        plan: &CompressedPlan<'_>,
+        fse: &'s FSEScratch,
+        start: FrameStart<'s>,
+    ) -> [&'s FSETable; 3] {
+        std::array::from_fn(|t| {
+            if plan.fse_def[t] == START {
+                start.init.fse.table(t, start.dict.map(|d| &d.fse))
+            } else {
+                fse.table(t, None)
+            }
+        })
+    }
+
+    /// Build `table` from the tree description of compressed block `def`'s
+    /// literals, with the arguments of its own build in
+    /// `decompress_literals`, so the same table kind (X1 / X2).
+    fn build_huf_from(def: &CompressedPlan<'_>, table: &mut HuffmanTable) -> Result<(), String> {
+        let lit = &def.parts.literals;
+        table
+            .build_decoder(
+                def.parts.literals_src,
+                lit.regenerated_size as usize,
+                lit.num_streams == Some(4),
+            )
+            .map(|_| ())
     }
 
     /// Build table `t` from its description in the earlier block `def`,
@@ -5263,48 +5325,57 @@ mod parallel {
         temp
     }
 
-    /// Stage 3 for one block.
-    fn execute_block(
+    /// Stage 3 for one block, whose stage 2, if compressed, decoded into
+    /// `slot`: write it to `out` and return its bytes.
+    fn execute_block<'o>(
         plan: &Plan<'_>,
-        slot: &mut Slot,
-        dict: Option<&FSEScratch>,
+        slot: &Slot,
+        start: FrameStart<'_>,
         hist: &mut [u32; 3],
         block_size_max: usize,
-        out: &mut VecOut<'_>,
+        out: &'o mut impl FrameOut,
         simd: Level,
-    ) -> Result<(), String> {
-        let output = &mut *out.output;
-        match plan {
-            Plan::Raw(content) => output.extend_from_slice(content),
-            Plan::Rle(byte, len) => output.resize(output.len() + len, *byte),
-            Plan::Compressed(cp) => {
-                std::mem::replace(&mut slot.result, Ok(()))?;
-                let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
-                if cp.parts.sequences.num_sequences == 0 {
-                    output.extend_from_slice(&slot.literals[..literals_len]);
-                    return Ok(());
+    ) -> Result<&'o [u8], String> {
+        let (dst, ext) = out.block_dst()?;
+        // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A
+        // raw or RLE block decodes to at most `block_size_max <=
+        // MAX_BLOCK_SIZE` bytes (`parse_block_header`), and literals
+        // without sequences too (`split_block`), within the room `Dst` has,
+        // from input apart from it; on success each arm wrote the block up
+        // to `end`.
+        unsafe {
+            let at = dst.base.add(dst.op);
+            let end = match plan {
+                Plan::Raw(content) => {
+                    ptr::copy_nonoverlapping(content.as_ptr(), at, content.len());
+                    dst.op + content.len()
                 }
-                let seqs = DecodedSeqs {
-                    seqs: &slot.seqs,
-                    literals: &slot.literals,
-                };
-                let (dst, ext) = out.block_dst()?;
-                let offsets = slot.fse.table(1, dict);
-                // SAFETY: `block_dst` meets the `Dst` and `ExtHistory`
-                // contracts, and on success the block's bytes up to `end`
-                // are written.
-                unsafe {
-                    let end = if ext.len == 0 {
-                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                Plan::Rle(byte, len) => {
+                    ptr::write_bytes(at, *byte, *len);
+                    dst.op + len
+                }
+                Plan::Compressed(cp) => {
+                    let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
+                    if cp.parts.sequences.num_sequences == 0 {
+                        ptr::copy_nonoverlapping(slot.literals.as_ptr(), at, literals_len);
+                        dst.op + literals_len
                     } else {
-                        let seqs = ExtDecodedSeqs { seqs, ext };
-                        execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
-                    };
-                    out.commit(end);
+                        let seqs = DecodedSeqs {
+                            seqs: &slot.seqs,
+                            literals: &slot.literals,
+                        };
+                        let offsets = seq_tables(cp, &slot.fse, start)[1];
+                        if ext.len == 0 {
+                            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                        } else {
+                            let seqs = ExtDecodedSeqs { seqs, ext };
+                            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
+                        }
+                    }
                 }
-            }
+            };
+            Ok(out.commit(end))
         }
-        Ok(())
     }
 
     /// A block's sequences as stage 2 decoded them, with its literals
@@ -5391,38 +5462,111 @@ mod parallel {
         Ok(cur.op as usize + rest - out as usize)
     }
 
-    /// Decode the blocks of `frame`, at `data[*pos..]`, into `out` on the
-    /// current rayon pool, starting from the tables and repeat offsets in
-    /// `start`. Returns `Ok(false)` without consuming input when the frame
-    /// fits in one block, or the block headers do not show `min_blocks`
-    /// blocks: the frame has fewer, or a header before them fails, which
-    /// the serial decoder then reports.
-    pub(super) fn decode_frame_blocks(
-        data: &[u8],
-        pos: &mut usize,
-        frame: &mut Frame,
-        start: FrameStart<'_>,
-        out: &mut VecOut<'_>,
-        min_blocks: usize,
-        simd: Level,
-    ) -> Result<bool, String> {
-        if min_blocks == usize::MAX || frame.fits_one_block() {
-            return Ok(false);
-        }
-        let block_size_max = frame.block_size_max;
-        let mut rest = &data[*pos..];
-        for _ in 1..min_blocks {
-            match locate_block(rest, block_size_max) {
-                Ok((block, content)) if !block.last_block => {
-                    rest = &rest[BLOCK_HEADER_LEN + content.len()..];
+    impl FrameDecoder {
+        /// Decode on the current rayon pool the blocks of the frame being
+        /// decoded at the start of `data`, from a block header on, into
+        /// `out`; the frame started from `dict` if given. It takes the
+        /// blocks `plan_blocks` takes for `room` bytes of output, if
+        /// `min_parallel_blocks` or more and the frame does not fit in one
+        /// block. Before each block but the first it calls `next`, where
+        /// the serial driver writes out the blocks before, and stops if it
+        /// returns false. Returns the `Event` of the last block it decoded,
+        /// or `None` if it decoded none, and sets `read` to how much of
+        /// `data` those blocks take, on failure too.
+        ///
+        /// It stops before a block that fails, or that it cannot plan, and
+        /// leaves its scratch as the serial decoder would after the blocks
+        /// before, which then decodes that one and gives its verdict. The
+        /// frame's size checks, after each block and after the last, are
+        /// the serial ones, and fail here as there.
+        ///
+        /// Inline down to the stage and frame it never takes, which cost
+        /// the serial driver a branch on every unit.
+        #[inline]
+        pub(super) fn decode_blocks_parallel<O: FrameOut + Send>(
+            &mut self,
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            room: usize,
+            read: &mut usize,
+            next: impl FnMut(&mut O) -> bool + Send,
+        ) -> Result<Option<Event>, String> {
+            match &self.stage {
+                Stage::Block {
+                    frame,
+                    header: None,
+                } if self.min_parallel_blocks != usize::MAX && !frame.fits_one_block() => {
+                    self.decode_block_batch(data, dict, out, room, read, next)
                 }
-                _ => return Ok(false),
+                _ => Ok(None),
             }
         }
-        let mut end = *pos;
-        let plans = plan_frame(data, &mut end, block_size_max, start)?;
-        let plans = &plans[..];
 
+        /// `decode_blocks_parallel` at a block header of a frame it may
+        /// take.
+        #[inline(never)]
+        fn decode_block_batch<O: FrameOut + Send>(
+            &mut self,
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            room: usize,
+            read: &mut usize,
+            mut next: impl FnMut(&mut O) -> bool + Send,
+        ) -> Result<Option<Event>, String> {
+            let (
+                Stage::Block {
+                    frame,
+                    header: None,
+                },
+                Some(scratch),
+            ) = (&mut self.stage, &mut self.scratch)
+            else {
+                return Ok(None);
+            };
+            let min_blocks = self.min_parallel_blocks;
+            let block_size_max = frame.block_size_max;
+            if located(data, block_size_max, room).take(min_blocks).count() < min_blocks {
+                return Ok(None);
+            }
+            let start = FrameStart {
+                init: scratch,
+                dict: dict.and_then(DecodeDict::entropy),
+            };
+            let batch = plan_blocks(data, block_size_max, start, room);
+            if batch.plans.len() < min_blocks {
+                return Ok(None);
+            }
+            let (done, hist, accounted) =
+                run_batch(&batch.plans, frame, start, out, self.simd, &mut next);
+            let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
+                return Ok(None);
+            };
+            *read = end;
+            accounted?;
+            if done == batch.plans.len() && batch.last {
+                return self.blocks_ended().map(Some);
+            }
+            sync_scratch(scratch, &batch.plans[..done], hist)?;
+            Ok(Some(Event::Continue))
+        }
+    }
+
+    /// Stages 2 and 3 of `plans`, blocks of `frame` from the tables and
+    /// repeat offsets in `start`, into `out`, calling `next` before each
+    /// block but the first. Returns how many blocks it decoded, from the
+    /// first, up to one whose stage 2 or 3 fails or before which `next`
+    /// returns false, the repeat offsets after them, and the frame's size
+    /// check on them, which ends them where it fails.
+    fn run_batch<O: FrameOut + Send>(
+        plans: &[Plan<'_>],
+        frame: &mut Frame,
+        start: FrameStart<'_>,
+        out: &mut O,
+        simd: Level,
+        next: &mut (impl FnMut(&mut O) -> bool + Send),
+    ) -> (usize, [u32; 3], Result<(), String>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
         // spawned once block `i - ring.len()` has been executed from it, or
         // by the executing thread if no task has started it by the time
@@ -5437,9 +5581,10 @@ mod parallel {
             })
             .collect();
         let ring = &ring[..];
+        let block_size_max = frame.block_size_max;
         let mut hist = start.init.offset_hist;
-        let dict = start.dict.map(|d| &d.fse);
-        rayon::scope_fifo(|s| {
+        let mut done = 0;
+        let accounted = rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
                     return;
@@ -5461,8 +5606,11 @@ mod parallel {
                 spawn_decode(i);
             }
             for (i, plan) in plans.iter().enumerate() {
+                if i != 0 && !next(out) {
+                    break;
+                }
                 let cell = &ring[i % ring.len()];
-                let mut slot = match plan {
+                let slot = match plan {
                     Plan::Compressed(cp) if cell.claim(i) => {
                         let mut slot = cell.slot.lock().unwrap();
                         slot.result = decode_block(&mut slot, i, cp, plans, start);
@@ -5490,16 +5638,53 @@ mod parallel {
                     }
                     _ => cell.slot.lock().unwrap(),
                 };
-                let start = out.output.len();
-                execute_block(plan, &mut slot, dict, &mut hist, block_size_max, out, simd)?;
+                if matches!(plan, Plan::Compressed(_)) && slot.result.is_err() {
+                    break;
+                }
+                let Ok(bytes) =
+                    execute_block(plan, &slot, start, &mut hist, block_size_max, out, simd)
+                else {
+                    break;
+                };
                 drop(slot);
                 spawn_decode(i + ring.len());
-                frame.block_decoded(&out.output[start..])?;
+                done = i + 1;
+                frame.block_decoded(bytes)?;
             }
-            Ok::<(), String>(())
-        })?;
-        *pos = end;
-        Ok(true)
+            Ok(())
+        });
+        (done, hist, accounted)
+    }
+
+    /// Leave `scratch` as the serial decoder leaves it after `plans`, the
+    /// blocks up to here, all decoded: with repeat offsets `hist`, and the
+    /// Huffman and sequence tables the last descriptions among them built,
+    /// for the blocks after to repeat.
+    fn sync_scratch(
+        scratch: &mut DecoderScratch,
+        plans: &[Plan<'_>],
+        hist: [u32; 3],
+    ) -> Result<(), String> {
+        scratch.offset_hist = hist;
+        let (mut huf, mut fse) = (None, None);
+        for plan in plans {
+            if let Plan::Compressed(cp) = plan {
+                huf = cp.huf_def.or(huf);
+                if cp.parts.sequences.num_sequences != 0 {
+                    fse = Some(cp.fse_def);
+                }
+            }
+        }
+        if let Some(d) = huf.filter(|&d| d != START) {
+            build_huf_from(compressed(&plans[d]), &mut scratch.huf.table)?;
+            scratch.huf_from_dict = false;
+        }
+        for (t, d) in fse.into_iter().flatten().enumerate() {
+            if d != START {
+                build_table_from(compressed(&plans[d]), t, &mut scratch.fse)?;
+            }
+        }
+        Ok(())
     }
 }
 
