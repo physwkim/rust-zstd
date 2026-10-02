@@ -172,6 +172,13 @@ pub unsafe fn write_tagged(table: &mut [u32], hash_and_tag: usize, idx: usize) {
     );
 }
 
+/// `ZSTD_comparePackedTags`: do two tagged values (a table entry, a hash
+/// [`SHORT_CACHE_TAG_BITS`] wider than the table's) carry the same tag?
+#[inline(always)]
+pub fn tags_match(packed1: usize, packed2: usize) -> bool {
+    (packed1 ^ packed2) & SHORT_CACHE_TAG_MASK == 0
+}
+
 /// Is the table entry `idx` a usable candidate for position `cur`, i.e.
 /// `low <= idx < cur`? `low` is the lowest valid index (`low <= cur`).
 ///
@@ -306,6 +313,119 @@ pub unsafe fn count(src: Src, a: usize, b: usize, limit: usize) -> usize {
         a += 1;
     }
     a - start
+}
+
+/// [`count`] across two buffers: the length of the common prefix of the
+/// bytes at indices `a..limit` of `a_src` and `b..` of `b_src`.
+///
+/// # Safety
+/// `a_src.lo() <= a <= limit <= a_src.end()`, `b_src.lo() <= b` and
+/// `b + (limit - a) <= b_src.end()`.
+#[inline]
+pub unsafe fn count_across(a_src: Src, a: usize, b_src: Src, b: usize, limit: usize) -> usize {
+    debug_assert!(a_src.lo <= a && a <= limit && limit <= a_src.end);
+    debug_assert!(b_src.lo <= b && b + (limit - a) <= b_src.end);
+    let start = a;
+    let (mut a, mut b) = (a, b);
+    while a + 8 <= limit {
+        let diff = read64(b_src, b) ^ read64(a_src, a);
+        if diff != 0 {
+            return a + (diff.trailing_zeros() >> 3) as usize - start;
+        }
+        a += 8;
+        b += 8;
+    }
+    if a + 4 <= limit && read32(b_src, b) == read32(a_src, a) {
+        a += 4;
+        b += 4;
+    }
+    if a + 2 <= limit && read16(b_src, b) == read16(a_src, a) {
+        a += 2;
+        b += 2;
+    }
+    if a < limit && byte(b_src, b) == byte(a_src, a) {
+        a += 1;
+    }
+    a - start
+}
+
+/// `ZSTD_count_2segments(ip, match, iEnd, mEnd = dictEnd, iStart =
+/// prefixStart)` of the `ZSTD_dictMatchState` finders, for a match at
+/// index `m` of `dict`, an attached dictionary's content by the indices of
+/// the frame's window ([`DictMatchState::src_below`]): the common length
+/// of `src[ip..i_end]` and the content from `m` on, continued from the
+/// input's start, `dict.end()`, when it reaches the content's end. As in
+/// C, an `m` past the content's end counts `0`: a tree descent's common
+/// length can carry a candidate there.
+///
+/// # Safety
+/// `src.lo() <= dict.end() <= ip <= i_end <= src.end()` and
+/// `dict.lo() <= m`.
+///
+/// [`DictMatchState::src_below`]: super::matchstate::DictMatchState::src_below
+#[inline]
+pub unsafe fn count_2segments<M: MatchCount>(
+    mc: M,
+    src: Src,
+    ip: usize,
+    i_end: usize,
+    dict: Src,
+    m: usize,
+) -> usize {
+    debug_assert!(src.lo <= dict.end && dict.end <= ip && ip <= i_end && dict.lo <= m);
+    if m > dict.end {
+        return 0;
+    }
+    let v_end = (ip + (dict.end - m)).min(i_end);
+    let len = count_across(src, ip, dict, m, v_end);
+    if m + len != dict.end {
+        return len;
+    }
+    len + mc.count(src, ip + len, dict.end, i_end)
+}
+
+/// The match length at `ip` of the `ZSTD_dictMatchState` finders'
+/// candidate at index `m`, in `dict` below its end (the input's start, see
+/// [`count_2segments`]) and in `src` from there on: `ZSTD_count_2segments`
+/// with `mEnd` the content's end or `iEnd`, which counts as `ZSTD_count`.
+///
+/// # Safety
+/// `src.lo() <= dict.end() <= ip <= i_end <= src.end()` and `dict.lo() <=
+/// m < ip`.
+#[inline]
+pub unsafe fn count_dms<M: MatchCount>(
+    mc: M,
+    src: Src,
+    ip: usize,
+    i_end: usize,
+    dict: Src,
+    m: usize,
+) -> usize {
+    if m < dict.end {
+        count_2segments(mc, src, ip, i_end, dict, m)
+    } else {
+        mc.count(src, ip, m, i_end)
+    }
+}
+
+/// The source of the `ZSTD_dictMatchState` finders' repcode candidate at
+/// index `rep_index` for position `ip`: `dict`, an attached dictionary's
+/// content by the frame's indices, below its end (the input's start),
+/// else `src`. `None` where the candidate's 4 bytes would cross the
+/// input's start ([`index_overlap_check`]), and where `rep_index` is not in
+/// `dict.lo()..ip`, which libzstd asserts instead (`offset_1 <=
+/// dictAndPrefixLength`) and the repeat offsets of a frame with the
+/// dictionary keep, unless the dictionary's content was cut to a suffix.
+#[inline(always)]
+pub fn dms_rep_source<'a>(
+    src: Src<'a>,
+    dict: Src<'a>,
+    rep_index: usize,
+    ip: usize,
+) -> Option<Src<'a>> {
+    let candidate =
+        dict.lo <= rep_index && rep_index < ip && index_overlap_check(dict.end, rep_index as u32);
+    candidate.then_some(if rep_index < dict.end { dict } else { src })
 }
 
 /// The SIMD level of this machine, detected once (`Level::new`).
