@@ -69,16 +69,19 @@ pub const CURRENT_MAX: usize = if MEM_32BITS { 2000 << 20 } else { 3500 << 20 };
 /// [`LdmState`](super::ldm::LdmState), each of which owns one and alone
 /// moves it.
 ///
-/// A dictionary is content in front of the input, in the same contiguous
-/// window (the caller lays the two out back to back), with its end at
-/// `loaded_dict_end` (`ZSTD_MatchState_t::loadedDictEnd`, kept here with
-/// the indices it is compared with). libzstd keeps the content in the
-/// `dictBase` segment instead, `[lowLimit, dictLimit)`, and the input from
-/// `dictLimit` on: the distances are the same, but while the segment is
-/// in the window (`ZSTD_window_hasExtDict`) every finder runs its
-/// `ZSTD_extDict` variant, whose rules differ at the segment's edge. The
-/// window keeps `dictLimit` ([`Window::dict_limit`]) so that the finders
-/// can follow those rules.
+/// A loaded or copied dictionary is content in front of the input, in the
+/// same contiguous window (the caller lays the two out back to back), with
+/// its end at `loaded_dict_end` (`ZSTD_MatchState_t::loadedDictEnd`, kept
+/// here with the indices it is compared with). libzstd keeps the content
+/// in the `dictBase` segment instead, `[lowLimit, dictLimit)`, and the
+/// input from `dictLimit` on: the distances are the same, but while the
+/// segment is in the window (`ZSTD_window_hasExtDict`) every finder runs
+/// its `ZSTD_extDict` variant, whose rules differ at the segment's edge.
+/// The window keeps `dictLimit` ([`Window::dict_limit`]) so that the
+/// finders can follow those rules. An attached dictionary
+/// ([`DictMatchState`]) is outside the window: the input starts the
+/// window, at `loaded_dict_end`, and the dictionary's content lies below
+/// it in index space (`Window::attach_dict`).
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
     /// `window.base` as a position of the input slice: the position of
@@ -96,7 +99,8 @@ pub struct Window {
     /// `loadedDictEnd`: the index where loaded dictionary content ends
     /// while the whole dictionary is still valid, else `0`. Set by
     /// [`Window::load_dict`], cleared once the input passes the window
-    /// size ([`Window::check_dict_validity`]).
+    /// size ([`Window::check_dict_validity`]); the input's start for an
+    /// attached dictionary (`Window::attach_dict`).
     loaded_dict_end: usize,
     /// `nbOverflowCorrections`.
     nb_overflow_corrections: u32,
@@ -151,6 +155,28 @@ impl Window {
         }
     }
 
+    /// `ZSTD_resetCCtx_byAttachingCDict`'s window, before any input: the
+    /// input starts no lower than `dict_end`, the index where an attached
+    /// dictionary's content ends in its own window (`ZSTD_window_clear`
+    /// at `cdictEnd`), so that a dictionary index plus `dict_limit -
+    /// dict_end` is an index of this window below the input; and the
+    /// dictionary is valid as loaded content is (`loadedDictEnd =
+    /// dictLimit`) until [`Window::check_dict_validity`],
+    /// [`Window::enforce_max_dist`] or an overflow correction drops it,
+    /// which detaches it (`dictMatchState = NULL`).
+    fn attach_dict(&mut self, dict_end: usize) {
+        assert!(
+            self.index(self.next_src) == self.dict_limit && self.low == self.dict_limit,
+            "input entered before the dictionary is attached"
+        );
+        if self.dict_limit < dict_end {
+            self.base = self.next_src.wrapping_sub(dict_end);
+            self.low = dict_end;
+            self.dict_limit = dict_end;
+        }
+        self.loaded_dict_end = self.dict_limit;
+    }
+
     /// `loadedDictEnd`: where the valid dictionary ends, `None` once it is
     /// invalidated or without one.
     pub fn loaded_dict_end(&self) -> Option<usize> {
@@ -178,8 +204,9 @@ impl Window {
     /// valid no more than Window_Size bytes have been decoded after it
     /// (RFC 8878 §5, rfc8878.txt:1836-1844). libzstd also invalidates it
     /// when `loadedDictEnd != dictLimit`, which in its two-segment window
-    /// marks a dictionary contiguous with the input; here the dictionary
-    /// is always contiguous, and that test does not apply.
+    /// marks a dictionary contiguous with the input; here a loaded
+    /// dictionary is always contiguous, an attached one ends at
+    /// `dictLimit`, and that test does not apply.
     #[inline]
     fn check_dict_validity(&mut self, block_end: usize, max_dist: usize) {
         if self.index(block_end) > self.loaded_dict_end + max_dist {
@@ -891,6 +918,56 @@ impl EnteredBlock {
 #[derive(Debug)]
 pub struct EnteredPrefix(Range<usize>);
 
+/// `ms->dictMatchState`: a dictionary attached to a frame
+/// (`ZSTD_resetCCtx_byAttachingCDict`), whose tables the finders search in
+/// place by the `ZSTD_dictMatchState` rules: the dictionary's match
+/// state, which loaded `content` from a fresh window
+/// ([`MatchState::enter_dict`]), and that content. The frame's window
+/// starts after it ([`MatchState::attach_dict`]); its finders get it only
+/// while it is valid ([`MatchState::dict_match_state`]).
+#[derive(Clone, Copy)]
+pub struct DictMatchState<'a> {
+    /// `dms->cParams` and the tables (`dms->hashTable`, ...).
+    pub ms: &'a MatchState,
+    content: &'a [u8],
+}
+
+impl<'a> DictMatchState<'a> {
+    /// `ms`, a dictionary's state that loaded `content`, or its suffix,
+    /// from a fresh window starting at the loaded part.
+    pub fn new(ms: &'a MatchState, content: &'a [u8]) -> Self {
+        let w = &ms.window;
+        assert!(
+            w.nb_overflow_corrections == 0
+                && w.pos(WINDOW_START_INDEX) <= content.len()
+                && w.index(content.len()) == w.dict_limit,
+            "a dictionary state that did not load this content"
+        );
+        Self { ms, content }
+    }
+
+    /// The loaded content by the dictionary's indices: from
+    /// [`WINDOW_START_INDEX`] (`dms->window.dictLimit`, C's `dictStart`)
+    /// to its end (`dms->window.nextSrc`, C's `dictEnd`).
+    #[inline]
+    pub fn src(&self) -> Src<'a> {
+        Src::new(
+            self.content,
+            self.ms.window.pos(WINDOW_START_INDEX),
+            WINDOW_START_INDEX,
+        )
+    }
+
+    /// The loaded content by the indices of the frame's window, whose
+    /// input starts at index `prefix_start`, where the content ends: a
+    /// dictionary index plus `dictIndexDelta`.
+    #[inline]
+    pub fn src_below(&self, prefix_start: usize) -> Src<'a> {
+        let src = self.src();
+        src.rebased(prefix_start - src.end())
+    }
+}
+
 /// The indices of one block about to be searched. Only
 /// [`MatchState::start_block`] makes one, after the block-start
 /// `nextToUpdate` clamp, so no finder can run without it.
@@ -1185,6 +1262,26 @@ impl MatchState {
         self.window.set_correct_frequently(frequently);
         self.next_to_update = dict.next_to_update;
         self.hash_salt = dict.hash_salt;
+    }
+
+    /// `ZSTD_resetCCtx_byAttachingCDict` after the reset, for a dictionary
+    /// with content: its content ends where this window may start
+    /// (`Window::attach_dict`), and table insertion starts at the input.
+    pub fn attach_dict(&mut self, dict: &DictMatchState) {
+        self.window.attach_dict(dict.src().end());
+        self.next_to_update = self.window.low;
+    }
+
+    /// `ms->dictMatchState` for the block that entered the window last:
+    /// `dict`, attached by [`MatchState::attach_dict`], while it is valid
+    /// ([`Window::loaded_dict_end`]), else `None`
+    /// (`ZSTD_matchState_dictMode` is then `ZSTD_noDict`).
+    #[inline]
+    pub fn dict_match_state<'a>(
+        &self,
+        dict: Option<DictMatchState<'a>>,
+    ) -> Option<DictMatchState<'a>> {
+        dict.filter(|_| self.window.loaded_dict_end != 0)
     }
 
     /// The indices of an entered prefix's suffix to index.
