@@ -169,6 +169,11 @@ pub struct DecodeOptions {
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
+    /// `ZSTD_d_windowLogMax`: the window limit of
+    /// `Decompressor::decompress_stream`, as
+    /// `Decompressor::set_window_log_max` sets it; `0`, the default, is
+    /// that of a new ZSTD_DCtx.
+    pub window_log_max: u32,
 }
 
 impl DecodeOptions {
@@ -196,6 +201,7 @@ impl Default for DecodeOptions {
         DecodeOptions {
             min_parallel_blocks,
             simd: true,
+            window_log_max: 0,
         }
     }
 }

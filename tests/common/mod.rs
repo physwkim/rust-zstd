@@ -408,6 +408,7 @@ thread_local! {
         let d = Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd,
+            window_log_max: 0,
         });
         (d, Vec::new())
     }));
@@ -429,22 +430,181 @@ pub fn into_result(got: Result<(), String>, dst: &[u8]) -> Result<Vec<u8>, Strin
     }
 }
 
+/// A decode outcome, for messages.
+pub fn outcome(r: &Result<Vec<u8>, String>) -> String {
+    match r {
+        Ok(content) => format!("{} bytes", content.len()),
+        Err(e) => format!("error {e:?}"),
+    }
+}
+
+/// `ZSTD_WINDOWLOG_MAX`, the largest `DecodeOptions::window_log_max`.
+pub const WINDOW_LOG_MAX: u32 = if usize::BITS == 32 { 30 } else { 31 };
+
+/// Whether `r` is our streaming decoder's refusal of a frame whose
+/// Window_Size is above its limit (`DecodeOptions::window_log_max`).
+pub fn is_window_limit<T>(r: &Result<T, String>) -> bool {
+    matches!(r, Err(e) if e.contains("the streaming limit is"))
+}
+
+/// libzstd's streaming decoder, ZSTD_decompressStream from a new DCtx with
+/// `ZSTD_d_windowLogMax` `window_log_max` unless 0 and the dictionary of
+/// bytes `dict` referenced if given (ZSTD_DCtx_refDDict), fed as
+/// `stream_with` feeds ours: at most `chunk` bytes of input and `room`
+/// bytes of output a call, until a call moves nothing. The content or the
+/// error code; input that ends inside a frame is
+/// `ZSTD_error_srcSize_wrong`.
+pub fn c_streaming(
+    input: &[u8],
+    chunk: usize,
+    room: usize,
+    window_log_max: i32,
+    dict: Option<&[u8]>,
+) -> Result<Vec<u8>, sys::ZSTD_ErrorCode> {
+    // SAFETY: the context and the DDict are used only here, the DDict
+    // outliving the context, with buffers whose sizes they are given.
+    unsafe {
+        let dctx = sys::ZSTD_createDCtx();
+        assert!(!dctx.is_null(), "create DCtx");
+        if window_log_max != 0 {
+            let r = sys::ZSTD_DCtx_setParameter(
+                dctx,
+                sys::ZSTD_dParameter::ZSTD_d_windowLogMax,
+                window_log_max,
+            );
+            assert_eq!(sys::ZSTD_isError(r), 0, "windowLogMax {window_log_max}");
+        }
+        let ddict = match dict {
+            Some(dict) => {
+                let ddict = sys::ZSTD_createDDict(dict.as_ptr().cast(), dict.len());
+                assert!(!ddict.is_null(), "create DDict");
+                assert_eq!(sys::ZSTD_isError(sys::ZSTD_DCtx_refDDict(dctx, ddict)), 0);
+                ddict
+            }
+            None => std::ptr::null_mut(),
+        };
+        let mut content = Vec::new();
+        let mut out = vec![0u8; room];
+        let mut pos = 0usize;
+        // No input is no frame, which ends between frames.
+        let mut between = true;
+        let result = loop {
+            let end = input.len().min(pos.saturating_add(chunk));
+            let mut src = sys::ZSTD_inBuffer {
+                src: input[pos..end].as_ptr().cast(),
+                size: end - pos,
+                pos: 0,
+            };
+            let mut dst = sys::ZSTD_outBuffer {
+                dst: out.as_mut_ptr().cast(),
+                size: out.len(),
+                pos: 0,
+            };
+            let hint = sys::ZSTD_decompressStream(dctx, &mut dst, &mut src);
+            if sys::ZSTD_isError(hint) != 0 {
+                break Err(sys::ZSTD_getErrorCode(hint));
+            }
+            content.extend_from_slice(&out[..dst.pos]);
+            pos += src.pos;
+            if src.pos == 0 && dst.pos == 0 {
+                break if between {
+                    Ok(content)
+                } else {
+                    Err(sys::ZSTD_ErrorCode::ZSTD_error_srcSize_wrong)
+                };
+            }
+            // 0: a frame has been decoded and written out.
+            between = hint == 0;
+        };
+        sys::ZSTD_freeDCtx(dctx);
+        if !ddict.is_null() {
+            sys::ZSTD_freeDDict(ddict);
+        }
+        result
+    }
+}
+
+/// Whether `r` refuses a frame's window: above the streaming limit, or
+/// above `ZSTD_WINDOWLOG_MAX` in its header, as one-shot decoding does too.
+/// libzstd gives both `ZSTD_error_frameParameter_windowTooLarge`.
+pub fn refuses_window(r: &Result<Vec<u8>, String>) -> bool {
+    is_window_limit(r) || matches!(r, Err(e) if e.starts_with("Window log "))
+}
+
+/// Check `got`, what our serial streaming decoder at SIMD level `simd`
+/// with the default window limit, holding the dictionary `dict` (parsed,
+/// and its bytes) if given, gave on `input` fed `chunk` bytes and
+/// `stream_room(chunk)` bytes of output a call, against `want`, the
+/// one-shot outcome. libzstd's streaming decoder fed alike
+/// (`c_streaming`) refuses a window exactly where ours does
+/// (`refuses_window`). `got` equals `want` unless it refuses a frame above
+/// the window limit; then so does ours with the limit at its largest,
+/// `ZSTD_WINDOWLOG_MAX`, exactly where libzstd's does with that limit, and
+/// otherwise it gives `want`.
+pub fn check_streamed(
+    what: &str,
+    input: &[u8],
+    chunk: usize,
+    simd: bool,
+    dict: Option<(&DecodeDict, &[u8])>,
+    got: &Result<Vec<u8>, String>,
+    want: &Result<Vec<u8>, String>,
+) {
+    let room = stream_room(chunk);
+    let raw = dict.map(|(_, raw)| raw);
+    let window_too_large = Err(sys::ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge);
+    let lib = c_streaming(input, chunk, room, 0, raw);
+    assert!(
+        refuses_window(got) == (lib == window_too_large),
+        "{what}: streaming gives {} where libzstd's streaming decoder gives {:?}",
+        outcome(got),
+        lib.map(|c| c.len())
+    );
+    if !is_window_limit(got) {
+        assert!(
+            got == want,
+            "{what}: streaming gives {} where one-shot gives {}",
+            outcome(got),
+            outcome(want)
+        );
+        return;
+    }
+    let mut d = Decompressor::with_options(&DecodeOptions {
+        min_parallel_blocks: usize::MAX,
+        simd,
+        window_log_max: WINDOW_LOG_MAX,
+    });
+    d.set_dict(dict.map(|(d, _)| d));
+    let lifted = stream_with(&mut d, input, chunk, room);
+    let lib = c_streaming(input, chunk, room, WINDOW_LOG_MAX as i32, raw);
+    assert!(
+        refuses_window(&lifted) == (lib == window_too_large),
+        "{what}: streaming with window_log_max {WINDOW_LOG_MAX} gives {} where libzstd's \
+         streaming decoder gives {:?}",
+        outcome(&lifted),
+        lib.map(|c| c.len())
+    );
+    assert!(
+        is_window_limit(&lifted) || lifted == *want,
+        "{what}: streaming with window_log_max {WINDOW_LOG_MAX} gives {} where one-shot gives {}",
+        outcome(&lifted),
+        outcome(want)
+    );
+}
+
 /// `decompress_streaming` of `input` at each of `chunks`, with as much
 /// output room up to 64 KiB, has the outcome of `decompress_with_options`,
-/// serial, at both SIMD levels: the same content or the same error. So
-/// does `Decompressor::decompress` on a decompressor every call reuses,
-/// and its `decompress_into` into a buffer every call reuses.
+/// serial, at both SIMD levels: the same content or the same error, or
+/// the window limit's refusal where libzstd's streaming decoder refuses
+/// too (`check_streamed`). So does `Decompressor::decompress` on a
+/// decompressor every call reuses, and its `decompress_into` into a buffer
+/// every call reuses, without the exception.
 pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
-    fn outcome(r: &Result<Vec<u8>, String>) -> String {
-        match r {
-            Ok(content) => format!("{} bytes", content.len()),
-            Err(e) => format!("error {e:?}"),
-        }
-    }
     for simd in [false, true] {
         let opts = DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd,
+            window_log_max: 0,
         };
         let want = decompress_with_options(input, &opts);
         let (reused, into) = REUSED.with_borrow_mut(|r| {
@@ -467,12 +627,8 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
         );
         for &chunk in chunks {
             let got = decompress_streaming(input, chunk, stream_room(chunk), &opts);
-            assert!(
-                got == want,
-                "{name} simd={simd} chunk {chunk}: streaming gives {} where one-shot gives {}",
-                outcome(&got),
-                outcome(&want)
-            );
+            let what = format!("{name} simd={simd} chunk {chunk}");
+            check_streamed(&what, input, chunk, simd, None, &got, &want);
         }
     }
 }

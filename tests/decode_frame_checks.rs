@@ -35,6 +35,7 @@ fn check(name: &str, f: &[u8], accept: bool) {
             let options = DecodeOptions {
                 min_parallel_blocks,
                 simd,
+                window_log_max: 0,
             };
             let ours = decompress_with_options(f, &options);
             match (&theirs, &ours) {
@@ -574,6 +575,7 @@ fn skippable_frame_of_any_32_bit_size_is_skipped() {
                 let options = DecodeOptions {
                     min_parallel_blocks,
                     simd,
+                    window_log_max: 0,
                 };
                 let ours = decompress_with_options(&f, &options);
                 assert_eq!(

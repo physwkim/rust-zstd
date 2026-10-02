@@ -18,6 +18,7 @@ fn decode_mt(data: &[u8]) -> Result<Vec<u8>, String> {
         &DecodeOptions {
             min_parallel_blocks: 1,
             simd: true,
+            window_log_max: 0,
         },
     )
 }
@@ -29,6 +30,7 @@ fn decode_serial(data: &[u8]) -> Result<Vec<u8>, String> {
         &DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd: true,
+            window_log_max: 0,
         },
     )
 }
