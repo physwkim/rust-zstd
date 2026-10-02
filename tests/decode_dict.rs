@@ -323,6 +323,7 @@ fn c_loads_dict(dict: &[u8]) -> bool {
 fn paths() -> [(DecodeOptions, &'static str); 4] {
     let o = |min_parallel_blocks, simd| DecodeOptions {
         min_parallel_blocks,
+        min_parallel_bytes: 0,
         simd,
         window_log_max: 0,
     };
@@ -373,6 +374,7 @@ thread_local! {
     static HOLDING: RefCell<[Decompressor; 2]> = RefCell::new([false, true].map(|simd| {
         Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd,
             window_log_max: 0,
         })
@@ -403,6 +405,7 @@ fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
     for simd in [false, true] {
         let opts = DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd,
             window_log_max: 0,
         };

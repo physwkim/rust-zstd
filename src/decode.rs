@@ -131,9 +131,9 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// to nothing, and bytes after the last frame are an error. A frame that
 /// names a dictionary is an error; see `decompress_with_dict`.
 ///
-/// With the `parallel` feature, frames of four or more blocks are decoded on
-/// the current rayon pool when it has more than one thread; the output is
-/// the same either way.
+/// With the `parallel` feature, frames of four or more compressed blocks,
+/// of 8 KiB or more in all, are decoded on the current rayon pool when it
+/// has more than one thread; the output is the same either way.
 ///
 /// Which frames decode follows RFC 8878, not libzstd: every block, raw,
 /// RLE or compressed, holds and decodes to at most Block_Maximum_Size
@@ -163,10 +163,13 @@ pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, S
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeOptions {
-    /// Frames of at least this many blocks are decoded in batches, on the
-    /// current rayon pool, whatever its size, when at least this many of a
-    /// batch's blocks are compressed; `usize::MAX` never does.
+    /// The whole blocks of a frame in the input decode on the current rayon
+    /// pool, whatever its size, when at least this many of them are
+    /// compressed, of `min_parallel_bytes` or more in all; `usize::MAX`
+    /// never do.
     pub min_parallel_blocks: usize,
+    /// See `min_parallel_blocks`.
+    pub min_parallel_bytes: usize,
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
@@ -192,15 +195,19 @@ impl Default for DecodeOptions {
     /// What `decompress` uses.
     fn default() -> Self {
         #[cfg(feature = "parallel")]
-        let min_parallel_blocks = if rayon::current_num_threads() > 1 {
-            parallel::MIN_BLOCKS
-        } else {
-            usize::MAX
-        };
+        let (min_parallel_blocks, min_parallel_bytes) = (
+            if rayon::current_num_threads() > 1 {
+                parallel::MIN_BLOCKS
+            } else {
+                usize::MAX
+            },
+            parallel::MIN_BYTES,
+        );
         #[cfg(not(feature = "parallel"))]
-        let min_parallel_blocks = usize::MAX;
+        let (min_parallel_blocks, min_parallel_bytes) = (usize::MAX, usize::MAX);
         DecodeOptions {
             min_parallel_blocks,
+            min_parallel_bytes,
             simd: true,
             window_log_max: 0,
         }
@@ -4341,9 +4348,10 @@ struct FrameDecoder {
     stage: Stage,
     scratch: Option<DecoderScratch>,
     simd: Level,
-    /// `DecodeOptions::min_parallel_blocks`, for `decode_blocks_parallel`.
+    /// When `decode_blocks_parallel` takes blocks to the rayon pool;
+    /// `None` if never.
     #[cfg(feature = "parallel")]
-    min_parallel_blocks: usize,
+    parallel: Option<parallel::Gate>,
 }
 
 impl FrameDecoder {
@@ -4353,7 +4361,7 @@ impl FrameDecoder {
             scratch: None,
             simd: opts.simd_level(),
             #[cfg(feature = "parallel")]
-            min_parallel_blocks: opts.min_parallel_blocks,
+            parallel: parallel::Gate::new(opts),
         }
     }
 
@@ -4876,8 +4884,48 @@ mod parallel {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    /// Frames with fewer blocks take the fused serial path.
+    /// Batches with fewer compressed blocks decode on the calling thread.
     pub(super) const MIN_BLOCKS: usize = 4;
+
+    /// Batches whose compressed blocks hold fewer bytes decode on the
+    /// calling thread: on eight cores sharing an L3, the pool lost up to 5%
+    /// on 1 MiB frames below 7 KiB of compressed blocks and gained 6-14%
+    /// from 7.7 KiB up.
+    pub(super) const MIN_BYTES: usize = 8 * 1024;
+
+    /// When a batch of blocks decodes on the rayon pool
+    /// (`DecodeOptions::min_parallel_blocks` and `min_parallel_bytes`).
+    #[derive(Clone, Copy)]
+    pub(super) struct Gate {
+        min_blocks: usize,
+        min_bytes: usize,
+    }
+
+    impl Gate {
+        /// The gate of `opts`; `None` if it takes no batch.
+        pub(super) fn new(opts: &DecodeOptions) -> Option<Gate> {
+            (opts.min_parallel_blocks != usize::MAX).then_some(Gate {
+                min_blocks: opts.min_parallel_blocks,
+                min_bytes: opts.min_parallel_bytes,
+            })
+        }
+
+        /// Whether the blocks `located` gives carry enough compressed work
+        /// for the pool: `min_blocks` compressed blocks of `min_bytes` or
+        /// more in all. Only compressed blocks have a stage 2 to hand it,
+        /// and that work grows with their bytes, against the fixed cost of
+        /// starting tasks and waiting for them.
+        fn pools<'a>(self, blocks: impl Iterator<Item = (BlockHeader, &'a [u8], usize)>) -> bool {
+            let (mut compressed, mut bytes) = (0, 0);
+            for (block, content, _) in blocks {
+                if matches!(block.block_type, BlockType::Compressed) {
+                    compressed += 1;
+                    bytes += content.len();
+                }
+            }
+            compressed >= self.min_blocks && bytes >= self.min_bytes
+        }
+    }
 
     /// The "block" that defined a table the batch starts with
     /// (`FrameStart`): a dictionary's, or one a block before the batch
@@ -5512,22 +5560,24 @@ mod parallel {
     }
 
     impl FrameDecoder {
-        /// Decode on the current rayon pool the blocks of the frame being
-        /// decoded at the start of `data`, from a block header on, into
-        /// `out`; the frame started from `dict` if given. It takes the
-        /// blocks `plan_blocks` takes for `room` bytes of output, if
-        /// `min_parallel_blocks` or more and the frame does not fit in one
-        /// block. Before each block but the first it calls `next`, where
-        /// the serial driver writes out the blocks before, and stops if it
-        /// returns false. Returns the `Event` of the last block it decoded,
-        /// or `None` if it decoded none, and sets `read` to how much of
-        /// `data` those blocks take, on failure too.
+        /// Decode the blocks of the frame being decoded at the start of
+        /// `data`, from a block header on, that `located` gives for `room`
+        /// bytes of output, into `out`, the frame having started from
+        /// `dict` if given, unless the frame fits in one block: on the
+        /// current rayon pool if `Gate::pools` takes them, else one after
+        /// another as `process` would. Before each block but the first it
+        /// calls `next`, where the serial driver writes out the blocks
+        /// before, and stops if it returns false. Returns the `Event` of
+        /// the last block it decoded, or `None` if it decoded none, and
+        /// sets `read` to how much of `data` those blocks take, on failure
+        /// too.
         ///
-        /// It stops before a block that fails, or that it cannot plan, and
-        /// leaves its scratch as the serial decoder would after the blocks
-        /// before, which then decodes that one and gives its verdict. The
-        /// frame's size checks, after each block and after the last, are
-        /// the serial ones, and fail here as there.
+        /// On the pool it takes the blocks `plan_blocks` takes, and stops
+        /// before a block that fails, or that it cannot plan, and leaves
+        /// its scratch as the serial decoder would after the blocks before,
+        /// which then decodes that one and gives its verdict. The frame's
+        /// size checks, after each block and after the last, are the
+        /// serial ones, and fail here as there.
         ///
         /// Inline down to the stage and frame it never takes, which cost
         /// the serial driver a branch on every unit.
@@ -5545,7 +5595,7 @@ mod parallel {
                 Stage::Block {
                     frame,
                     header: None,
-                } if self.min_parallel_blocks != usize::MAX && !frame.fits_one_block() => {
+                } if self.parallel.is_some() && !frame.fits_one_block() => {
                     self.decode_block_batch(data, dict, out, room, read, next)
                 }
                 _ => Ok(None),
@@ -5564,46 +5614,24 @@ mod parallel {
             read: &mut usize,
             mut next: impl FnMut(&mut O) -> bool + Send,
         ) -> Result<Option<Event>, String> {
-            let (
-                Stage::Block {
-                    frame,
-                    header: None,
-                },
-                Some(scratch),
-            ) = (&mut self.stage, &mut self.scratch)
+            let (Stage::Block { frame, .. }, Some(gate)) = (&self.stage, self.parallel) else {
+                return Ok(None);
+            };
+            let block_size_max = frame.block_size_max;
+            if !gate.pools(located(data, block_size_max, room)) {
+                return self.decode_serially(data, dict, out, room, read, next);
+            }
+            let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &mut self.scratch)
             else {
                 return Ok(None);
             };
-            let min_blocks = self.min_parallel_blocks;
-            let block_size_max = frame.block_size_max;
-            if located(data, block_size_max, room).take(min_blocks).count() < min_blocks {
-                return Ok(None);
-            }
             let start = FrameStart {
                 init: scratch,
                 dict: dict.and_then(DecodeDict::entropy),
             };
             let batch = plan_blocks(data, block_size_max, start, room);
-            if batch.plans.len() < min_blocks {
-                return Ok(None);
-            }
-            // Only compressed blocks have a stage 2 for the pool. Raw and
-            // RLE blocks alone took twice the serial time there (zeros_1M,
-            // random_1M), paying its handoff for nothing.
-            let compressed = batch
-                .plans
-                .iter()
-                .filter(|p| matches!(p, Plan::Compressed(_)));
-            let pooled = compressed.count() >= min_blocks;
-            let (done, hist, accounted) = run_batch(
-                &batch.plans,
-                frame,
-                start,
-                out,
-                self.simd,
-                pooled,
-                &mut next,
-            );
+            let (done, hist, accounted) =
+                run_batch(&batch.plans, frame, start, out, self.simd, &mut next);
             let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
                 return Ok(None);
             };
@@ -5615,12 +5643,46 @@ mod parallel {
             sync_scratch(scratch, &batch.plans[..done], hist)?;
             Ok(Some(Event::Continue))
         }
+
+        /// `decode_block_batch` on blocks the pool does not take: the
+        /// blocks `located` gives, decoded one after another as `process`
+        /// decodes them, here rather than by the serial driver so that
+        /// none is located twice.
+        fn decode_serially<O: FrameOut>(
+            &mut self,
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            room: usize,
+            read: &mut usize,
+            mut next: impl FnMut(&mut O) -> bool,
+        ) -> Result<Option<Event>, String> {
+            let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &mut self.scratch)
+            else {
+                return Ok(None);
+            };
+            let dict = dict.and_then(DecodeDict::entropy);
+            let mut last = None;
+            for (i, (block, content, end)) in located(data, frame.block_size_max, room).enumerate()
+            {
+                if i > 0 && !next(out) {
+                    break;
+                }
+                *read = end;
+                super::decode_block(&block, content, frame, scratch, dict, out, self.simd)?;
+                last = Some(block.last_block);
+            }
+            match last {
+                None => Ok(None),
+                Some(false) => Ok(Some(Event::Continue)),
+                Some(true) => self.blocks_ended().map(Some),
+            }
+        }
     }
 
     /// Stages 2 and 3 of `plans`, blocks of `frame` from the tables and
     /// repeat offsets in `start`, into `out`, calling `next` before each
-    /// block but the first; stage 2 on the rayon pool if `pooled`, else
-    /// all on this thread. Returns how many blocks it decoded, from the
+    /// block but the first. Returns how many blocks it decoded, from the
     /// first, up to one whose stage 2 or 3 fails or before which `next`
     /// returns false, the repeat offsets after them, and the frame's size
     /// check on them, which ends them where it fails.
@@ -5630,7 +5692,6 @@ mod parallel {
         start: FrameStart<'_>,
         out: &mut O,
         simd: Level,
-        pooled: bool,
         next: &mut (impl FnMut(&mut O) -> bool + Send),
     ) -> (usize, [u32; 3], Result<(), String>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -5638,14 +5699,8 @@ mod parallel {
         // by the executing thread if no task has started it by the time
         // that thread needs block `i`, or waits for block `i - 1`. It
         // decodes no block further ahead, so a block it needs is never left
-        // waiting behind the decode of a later one. Unpooled, one position
-        // takes every block.
-        let positions = if pooled {
-            (2 * rayon::current_num_threads()).min(plans.len())
-        } else {
-            1
-        };
-        let ring: Vec<RingSlot> = (0..positions)
+        // waiting behind the decode of a later one.
+        let ring: Vec<RingSlot> = (0..(2 * rayon::current_num_threads()).min(plans.len()))
             .map(|_| RingSlot {
                 claimed: AtomicUsize::new(0),
                 done: AtomicUsize::new(0),
@@ -5656,8 +5711,24 @@ mod parallel {
         let block_size_max = frame.block_size_max;
         let mut hist = start.init.offset_hist;
         let mut done = 0;
-        // `spawn_decode(i)` starts a task for block `i` if it is compressed.
-        let mut run = |spawn_decode: &dyn Fn(usize)| -> Result<(), String> {
+        let accounted = rayon::scope_fifo(|s| {
+            let spawn_decode = |i: usize| {
+                let Some(Plan::Compressed(cp)) = plans.get(i) else {
+                    return;
+                };
+                let cell = &ring[i % ring.len()];
+                s.spawn_fifo(move |_| {
+                    if !cell.claim(i) {
+                        return;
+                    }
+                    // Marks the block done even if decoding panics, so that
+                    // the executing thread finds the poisoned lock instead
+                    // of waiting forever.
+                    let _done = MarkDone(&cell.done, i + 1);
+                    let mut slot = cell.slot.lock().unwrap();
+                    slot.result = decode_block(&mut slot, i, cp, plans, start);
+                });
+            };
             for i in 0..ring.len() {
                 spawn_decode(i);
             }
@@ -5708,30 +5779,7 @@ mod parallel {
                 frame.block_decoded(bytes)?;
             }
             Ok(())
-        };
-        let accounted = if pooled {
-            rayon::scope_fifo(|s| {
-                run(&|i| {
-                    let Some(Plan::Compressed(cp)) = plans.get(i) else {
-                        return;
-                    };
-                    let cell = &ring[i % ring.len()];
-                    s.spawn_fifo(move |_| {
-                        if !cell.claim(i) {
-                            return;
-                        }
-                        // Marks the block done even if decoding panics, so
-                        // that the executing thread finds the poisoned lock
-                        // instead of waiting forever.
-                        let _done = MarkDone(&cell.done, i + 1);
-                        let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans, start);
-                    });
-                })
-            })
-        } else {
-            run(&|_| {})
-        };
+        });
         (done, hist, accounted)
     }
 
@@ -5764,6 +5812,57 @@ mod parallel {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const BLOCK_SIZE_MAX: usize = 1 << 17;
+
+        /// Blocks of `kinds`, `r` raw, `z` RLE and `c` compressed, each of
+        /// Block_Size `n` but RLE's 1, the last one last.
+        fn blocks(kinds: &str, n: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            for (i, kind) in kinds.bytes().enumerate() {
+                let (ty, size) = match kind {
+                    b'r' => (0, n),
+                    b'z' => (1, 1),
+                    _ => (2, n),
+                };
+                let last = (i + 1 == kinds.len()) as u32;
+                let header = last | ty << 1 | (n as u32) << 3;
+                out.extend_from_slice(&header.to_le_bytes()[..3]);
+                out.resize(out.len() + size, 7);
+            }
+            out
+        }
+
+        fn pools(kinds: &str, n: usize, min_blocks: usize, min_bytes: usize) -> bool {
+            let data = blocks(kinds, n);
+            let span = located(&data, BLOCK_SIZE_MAX, usize::MAX);
+            assert_eq!(span.count(), kinds.len(), "{kinds}");
+            let span = located(&data, BLOCK_SIZE_MAX, usize::MAX);
+            Gate {
+                min_blocks,
+                min_bytes,
+            }
+            .pools(span)
+        }
+
+        /// `Gate::pools` on either side of its two thresholds: blocks of no
+        /// compressed one, one fewer than `min_blocks`, and that many of
+        /// one byte fewer than `min_bytes` or exactly that many.
+        #[test]
+        fn gate_pools_at_its_thresholds() {
+            assert!(!pools("rzrzr", 100, 1, 0));
+            assert!(pools("rzczr", 100, 1, 0));
+            assert!(!pools("crrzc", 4000, 3, 0));
+            // Three compressed blocks of 100 bytes.
+            for (min_bytes, want) in [(0, true), (299, true), (300, true), (301, false)] {
+                assert_eq!(pools("crczc", 100, 3, min_bytes), want, "{min_bytes}");
+            }
+        }
     }
 }
 

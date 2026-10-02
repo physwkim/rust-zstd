@@ -34,6 +34,7 @@ fn check(name: &str, f: &[u8], accept: bool) {
         for min_parallel_blocks in [usize::MAX, 1] {
             let options = DecodeOptions {
                 min_parallel_blocks,
+                min_parallel_bytes: 0,
                 simd,
                 window_log_max: 0,
             };
@@ -574,6 +575,7 @@ fn skippable_frame_of_any_32_bit_size_is_skipped() {
             for min_parallel_blocks in [usize::MAX, 1] {
                 let options = DecodeOptions {
                     min_parallel_blocks,
+                    min_parallel_bytes: 0,
                     simd,
                     window_log_max: 0,
                 };

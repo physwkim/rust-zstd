@@ -91,6 +91,7 @@ fn streams(
     for simd in [false, true] {
         let mut d = Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd,
             window_log_max,
         });
@@ -153,6 +154,7 @@ fn assert_one_shot_takes(what: &str, input: &[u8], content: &[u8]) {
     assert_eq!(lib, content, "{what}: libzstd one-shot");
     let opts = DecodeOptions {
         min_parallel_blocks: usize::MAX,
+        min_parallel_bytes: 0,
         simd: true,
         window_log_max: 10,
     };
@@ -420,6 +422,7 @@ fn window_log_max_bounds_match_libzstd() {
         let options = std::panic::catch_unwind(|| {
             Decompressor::with_options(&DecodeOptions {
                 min_parallel_blocks: usize::MAX,
+                min_parallel_bytes: 0,
                 simd: true,
                 window_log_max,
             })

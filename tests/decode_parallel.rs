@@ -21,6 +21,7 @@ fn decode_mt(data: &[u8]) -> Result<Vec<u8>, String> {
         data,
         &DecodeOptions {
             min_parallel_blocks: 1,
+            min_parallel_bytes: 0,
             simd: true,
             window_log_max: 0,
         },
@@ -33,6 +34,7 @@ fn decode_serial(data: &[u8]) -> Result<Vec<u8>, String> {
         data,
         &DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd: true,
             window_log_max: 0,
         },
@@ -241,6 +243,7 @@ fn mt_corruption_matches_serial_outcome() {
 fn decompressor(min_parallel_blocks: usize) -> Decompressor {
     Decompressor::with_options(&DecodeOptions {
         min_parallel_blocks,
+        min_parallel_bytes: 0,
         simd: true,
         window_log_max: 0,
     })
@@ -332,12 +335,13 @@ fn mt_stream_verdicts_match_serial() {
 
 /// Frames of 1 KiB blocks, in a 1 KiB window so that the parallel decoder
 /// takes them, whose batches hold no compressed block, one fewer than
-/// `min_parallel_blocks` (both decoded on the calling thread) or that many
-/// (on the pool), among raw and RLE blocks: whole, truncated and
-/// corrupted, every call reads, writes and returns what the serial decoder
-/// does.
+/// `min_parallel_blocks`, or that many of one byte fewer than
+/// `min_parallel_bytes` (all decoded one after another), or exactly that
+/// many bytes (on the pool), among raw and RLE blocks: whole,
+/// truncated and corrupted, every call reads, writes and returns what the
+/// serial decoder does.
 #[test]
-fn mt_batches_either_side_of_the_compressed_count() {
+fn mt_batches_either_side_of_the_gate() {
     use sys::ZSTD_cParameter::ZSTD_c_windowLog;
     const MIN: usize = 3;
     // Room for every block of these frames.
@@ -355,44 +359,58 @@ fn mt_batches_either_side_of_the_compressed_count() {
             });
         }
         let c = zstd_small_blocks_with(&data, 3, 1024, &[(ZSTD_c_windowLog, 10)]);
-        let types: String = frame_blocks(&c, data.len())
-            .0
+        let blocks = frame_blocks(&c, data.len()).0;
+        let types: String = blocks
             .iter()
             .map(|b| ['r', 'z', 'c'][b.ty as usize])
             .collect();
         assert_eq!(types, kinds, "block types");
-        cases.push((kinds, c, data));
+        // The Block_Size of the compressed blocks.
+        let bytes: usize = blocks
+            .iter()
+            .filter(|b| b.ty == 2)
+            .map(|b| b.c_size - 3)
+            .sum();
+        if kinds == "crczc" {
+            for min_bytes in [bytes, bytes + 1] {
+                let name = format!("{kinds} min_parallel_bytes {min_bytes} of {bytes}");
+                cases.push((name, c.clone(), data.clone(), min_bytes));
+            }
+        } else {
+            cases.push((kinds.to_string(), c, data, 0));
+        }
     }
-    let opts = DecodeOptions {
+    let opts = |min_parallel_bytes| DecodeOptions {
         min_parallel_blocks: MIN,
+        min_parallel_bytes,
         simd: true,
         window_log_max: 0,
     };
-    let lockstep = |what: &str, input: &[u8]| {
-        let [mut serial, mut parallel] = [usize::MAX, MIN].map(decompressor);
+    let lockstep = |what: &str, input: &[u8], min_bytes| {
+        let mut serial = decompressor(usize::MAX);
+        let mut parallel = Decompressor::with_options(&opts(min_bytes));
         assert_lockstep(what, &mut serial, &mut parallel, input, usize::MAX, ROOM);
     };
     for threads in [1, 4] {
         pool(threads).install(|| {
-            for (kinds, c, data) in &cases {
-                assert!(
-                    decompress_with_options(c, &opts).unwrap() == *data,
-                    "{kinds}"
-                );
-                lockstep(kinds, c);
+            for (name, c, data, min_bytes) in &cases {
+                let got = decompress_with_options(c, &opts(*min_bytes)).unwrap();
+                assert!(got == *data, "{name}");
+                lockstep(name, c, *min_bytes);
             }
         });
     }
     pool(4).install(|| {
-        for (kinds, c, _) in &cases {
+        for (name, c, _, min_bytes) in &cases {
             for cut in 0..c.len() {
-                lockstep(&format!("{kinds} cut {cut}"), &c[..cut]);
+                lockstep(&format!("{name} cut {cut}"), &c[..cut], *min_bytes);
             }
             for pos in 0..c.len() {
                 for flip in [0x01u8, 0x80, 0xFF] {
                     let mut bad = c.clone();
                     bad[pos] ^= flip;
-                    lockstep(&format!("{kinds} byte {pos} ^ {flip:#x}"), &bad);
+                    let what = format!("{name} byte {pos} ^ {flip:#x}");
+                    lockstep(&what, &bad, *min_bytes);
                 }
             }
         }
