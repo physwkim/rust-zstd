@@ -12,7 +12,7 @@
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, EnteredBlock, EnteredPrefix, MatchState};
+use super::matchstate::{Block, DictMatchState, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -168,8 +168,10 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 pub enum TableLoad {
     /// `ZSTD_dtlm_fast`: every third position, as a context loads content.
     Fast,
-    /// `ZSTD_dtlm_full`: also the positions between them where their slot
-    /// is empty, as a CDict loads its content once for many frames.
+    /// `ZSTD_dtlm_full` with `ZSTD_tfp_forCDict`: also the positions
+    /// between them where their slot is empty, as a CDict loads its
+    /// content once for many frames, and every fast and dfast entry tagged
+    /// (`ZSTD_CDictIndicesAreTagged`, see [`MatchState::copy_dict`]).
     Full,
 }
 
@@ -213,16 +215,22 @@ fn fill_tables(ms: &mut MatchState, data: &[u8], content: EnteredPrefix, load: T
     }
 }
 
-/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, ZSTD_noDict)`
+/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, dictMode)`
 /// run on `block`: store its sequences into `out` and return the anchor of
-/// the trailing literals.
+/// the trailing literals. `dms` is the attached dictionary while it is
+/// valid ([`MatchState::dict_match_state`]), which selects the
+/// `ZSTD_dictMatchState` variants.
 pub fn run_block_compressor(
     ms: &mut MatchState,
     src: Src,
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    dms: Option<DictMatchState>,
 ) -> usize {
+    if let Some(dms) = dms {
+        return run_dms_block_compressor(ms, src, block, rep, out, RawSeqView::default(), dms);
+    }
     match ms.cparams.strategy {
         Strategy::Fast => fast::compress_block(ms, src, block, rep, out),
         Strategy::DFast => dfast::compress_block(ms, src, block, rep, out),
@@ -231,6 +239,32 @@ pub fn run_block_compressor(
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             opt::compress_block(ms, src, block, rep, out, RawSeqView::default())
+        }
+    }
+}
+
+/// The `ZSTD_dictMatchState` block compressors of
+/// [`run_block_compressor`], the optimal parser's with the long distance
+/// matches `ldm`. Out of line, so that the no-dictionary dispatch stays as
+/// it is.
+#[inline(never)]
+pub fn run_dms_block_compressor(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+    dms: DictMatchState,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::Fast => fast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::DFast => dfast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            lazy::compress_block_dms(ms, src, block, rep, out, dms)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block_dms(ms, src, block, rep, out, ldm, dms)
         }
     }
 }
@@ -262,7 +296,8 @@ pub enum BlockLdm<'a> {
 /// the strategy's block compressor on it (through `ZSTD_ldm_blockCompress`
 /// when `ldm` provides long matches) and store the trailing literals
 /// (`ZSTD_storeLastLiterals`). `rep` is the committed repeat offsets; the
-/// block's candidates are returned.
+/// block's candidates are returned. `dms` is the frame's attached
+/// dictionary, searched while it is valid.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
@@ -274,6 +309,7 @@ pub fn build_seq_store(
     mut rep: [u32; 3],
     store: &mut SeqStore,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
 ) -> Option<[u32; 3]> {
     let positions = block.positions();
     if !attempts_compression(positions.len()) {
@@ -282,16 +318,17 @@ pub fn build_seq_store(
     store.clear();
     let (block_len, block_end) = (positions.len(), positions.end);
     let (src, block) = ms.start_block(data, block);
+    let dms = ms.dict_match_state(dms);
     let anchor = match ldm {
         BlockLdm::External(seqs) if !seqs.is_exhausted() => {
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Internal(state) => {
             let seqs = state.generate_block_sequences(data, positions);
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Off | BlockLdm::External(_) => {
-            run_block_compressor(ms, src, block, &mut rep, store)
+            run_block_compressor(ms, src, block, &mut rep, store, dms)
         }
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
@@ -556,6 +593,7 @@ pub fn compress_block(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     let cparams = ms.cparams;
@@ -566,7 +604,7 @@ pub fn compress_block(
         ..
     } = scratch;
     let entered = ms.enter_block(block.clone());
-    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm);
+    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm, dms);
     let parts = split.then(|| match built {
         Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
         None => &[][..],
@@ -798,7 +836,8 @@ impl JobBlocks {
 /// `ZSTD_compress_frameChunk` over the input of a job up to `input`: the
 /// ready blocks of `src` from `blocks`' next one, sized by its
 /// [`BlockSizing`], appended to `out`, each through the post-sequence
-/// splitter when `split`, with long distance matches from `ldm`. With
+/// splitter when `split`, with long distance matches from `ldm` and the
+/// attached dictionary `dms`. With
 /// `pipelined` (parallel feature only) block N's entropy stage and
 /// emission run on rayon next to block N+1's match finding whenever every
 /// block N is written as is proven (`proven_rep_after`) to be COMPRESSED,
@@ -817,12 +856,13 @@ pub fn compress_blocks(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
     #[cfg(feature = "parallel")]
     if pipelined {
-        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, out);
+        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, dms, out);
         blocks.input_ended(input);
         return;
     }
@@ -840,6 +880,7 @@ pub fn compress_blocks(
             state,
             scratch,
             ldm,
+            dms,
             out,
         );
         blocks.wrote(&block, out.len() - written);
@@ -882,6 +923,7 @@ fn compress_blocks_pipelined(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -901,7 +943,7 @@ fn compress_blocks_pipelined(
     let mut block = blocks.next(src, input, presplit);
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
     let entered = ms.enter_block(block.clone());
-    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm);
+    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm, dms);
     loop {
         let is_first_block = blocks.is_first(&block);
         let is_last = blocks.is_last(&block, input);
@@ -948,7 +990,7 @@ fn compress_blocks_pipelined(
             // The match state stays on this thread, whose caches hold its
             // tables; block N's entropy stage is the part a thief takes.
             let (built_following, compressed) = rayon::join(
-                || build_seq_store(ms, src, entered, rep_next, nxt, ldm),
+                || build_seq_store(ms, src, entered, rep_next, nxt, ldm, dms),
                 || {
                     emit_block(
                         src,
@@ -994,7 +1036,7 @@ fn compress_blocks_pipelined(
             }
             block = blocks.next(src, input, presplit);
             let entered = ms.enter_block(block.clone());
-            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm);
+            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm, dms);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }
@@ -1072,20 +1114,41 @@ mod tests {
     /// `ZSTD_dtlm_full` keeps every slot `ZSTD_dtlm_fast` writes, as each
     /// third position overwrites its slot either way, and gives empty slots
     /// the positions between them: fast's table and dfast's large one gain
-    /// entries, dfast's small table is unchanged.
+    /// entries, dfast's small table is unchanged. Its entries are tagged
+    /// with the low byte of a hash 8 bits wider than the slot's.
     #[test]
     fn full_table_load_fills_only_empty_slots() {
+        use crate::compress::common::{hash_ptr, SHORT_CACHE_TAG_BITS};
         let data = crate::compress::common::testutil::synthetic_text(100_000, 5);
         for level in [1, 3] {
             let cp = CParams::for_level(level, 1 << 20);
             let load = |how| {
                 let mut ms = MatchState::new(cp, 0);
                 load_dict(&mut ms, &data, 0..data.len(), how);
+                let src = ms.view(&data);
                 let (hash, chain, _) = ms.tables();
-                (hash.to_vec(), chain.to_vec(), ms.index(0))
+                (hash.to_vec(), chain.to_vec(), ms.index(0), src)
             };
-            let (fast_hash, fast_chain, base) = load(TableLoad::Fast);
-            let (full_hash, full_chain, _) = load(TableLoad::Full);
+            let (fast_hash, fast_chain, base, _) = load(TableLoad::Fast);
+            let (tagged_hash, tagged_chain, _, src) = load(TableLoad::Full);
+            let tbits = cp.hash_log + SHORT_CACHE_TAG_BITS;
+            for &e in tagged_hash.iter().filter(|&&e| e != 0) {
+                let idx = (e >> SHORT_CACHE_TAG_BITS) as usize;
+                // SAFETY: a filled position has 8 bytes after it in `data`.
+                let hash_and_tag = unsafe {
+                    match (cp.strategy, cp.min_match) {
+                        (Strategy::DFast, _) => hash_ptr::<8>(src, idx, tbits),
+                        (_, 5) => hash_ptr::<5>(src, idx, tbits),
+                        (_, 6) => hash_ptr::<6>(src, idx, tbits),
+                        (_, 7) => hash_ptr::<7>(src, idx, tbits),
+                        _ => hash_ptr::<4>(src, idx, tbits),
+                    }
+                };
+                assert_eq!(e & 0xff, hash_and_tag as u32 & 0xff, "L{level}: tag");
+            }
+            let untag = |t: Vec<u32>| t.into_iter().map(|e| e >> SHORT_CACHE_TAG_BITS).collect();
+            let (full_hash, full_chain): (Vec<u32>, Vec<u32>) =
+                (untag(tagged_hash), untag(tagged_chain));
             for (&f, &g) in fast_hash.iter().zip(&full_hash) {
                 assert!(f == 0 || f == g, "L{level}: slot {f} became {g}");
                 assert!(

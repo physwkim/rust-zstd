@@ -19,7 +19,7 @@
 
 use super::block;
 use super::common::{count, prefetch_l1, Src, HASH_READ_SIZE};
-use super::matchstate::{Block, MatchState, Window};
+use super::matchstate::{Block, DictMatchState, MatchState, Window};
 use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
@@ -632,6 +632,7 @@ fn fill_fast_tables(ms: &mut MatchState, src: Src, end: usize) {
 /// run the strategy's block compressor on the literals between them, each
 /// run set up by [`MatchState::ldm_sub_block`]. Either way `seqs` moves
 /// past the block. Returns the anchor of the block's trailing literals.
+/// The block compressors are the `ZSTD_dictMatchState` ones with `dms`.
 pub fn block_compress(
     seqs: &mut RawSeqStore,
     ms: &mut MatchState,
@@ -639,12 +640,18 @@ pub fn block_compress(
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    dms: Option<DictMatchState>,
 ) -> usize {
     // If using opt parser, use LDMs only as candidates rather than always
     // accepting them
     if ms.cparams.strategy >= Strategy::BtOpt {
         let block_len = block.range().len();
-        let anchor = opt::compress_block(ms, src, block, rep, out, seqs.view());
+        let anchor = match dms {
+            None => opt::compress_block(ms, src, block, rep, out, seqs.view()),
+            Some(dms) => {
+                block::run_dms_block_compressor(ms, src, block, rep, out, seqs.view(), dms)
+            }
+        };
         seqs.skip_raw_seq_store_bytes(block_len);
         return anchor;
     }
@@ -667,7 +674,7 @@ pub fn block_compress(
         let lits = ms.ldm_sub_block(block, ip..lit_end);
         fill_fast_tables(ms, src, ip);
         // Run the block compressor
-        let anchor = block::run_block_compressor(ms, src, lits, rep, out);
+        let anchor = block::run_block_compressor(ms, src, lits, rep, out, dms);
         ip = lit_end;
         // Update the repcodes
         rep[2] = rep[1];
@@ -688,7 +695,7 @@ pub fn block_compress(
     let lits = ms.ldm_sub_block(block, ip..iend);
     fill_fast_tables(ms, src, ip);
     // Compress the last literals
-    block::run_block_compressor(ms, src, lits, rep, out)
+    block::run_block_compressor(ms, src, lits, rep, out, dms)
 }
 
 /// `ldmRollingHashState_t`: the gear hash.
@@ -1238,7 +1245,7 @@ mod tests {
                 let mut out = SeqStore::new();
                 let entered = ms.enter_block(block.clone());
                 let (view, b) = ms.start_block(&src, entered);
-                let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out);
+                let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out, None);
                 let anchor = ms.pos(anchor);
                 let found: Vec<_> = out
                     .seqs

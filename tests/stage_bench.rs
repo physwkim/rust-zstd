@@ -89,6 +89,7 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
                 prev.rep,
                 &mut scratch.store,
                 &mut block::BlockLdm::Off,
+                None,
             );
             st.block += t.elapsed();
             // None below 7 bytes (RAW)

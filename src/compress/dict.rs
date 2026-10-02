@@ -2,45 +2,56 @@
 //! `ZSTD_compress_insertDictionary`, and how a frame starts from a
 //! dictionary (`FrameDict`).
 //!
-//! Layout. A frame with a dictionary compresses `content ++ input` as its
-//! one job: the dictionary's content (all of a raw-content dictionary, the
-//! rest of a structured one after its entropy tables and repeat offsets)
-//! at positions `0..content.len()`, the window's origin, and the input
-//! after it. In index space the content ends where the input begins, as in
-//! libzstd, where `ZSTD_loadDictionaryContent`'s `ZSTD_window_update` puts
-//! the content in the window and the input's then follows it, so every
-//! distance `current - matchIndex`, into the dictionary too, is libzstd's.
-//! The content enters the window through [`MatchState::enter_dict`], which
-//! records where it ends (`loadedDictEnd`): matches may then reference all
-//! of it, offsets above the window size included, until the input passes
-//! the window size (RFC 8878 §5, [`Window::lowest_match_index`]).
-//!
 //! A [`CompressDict`] hashes its content once, into tables of its own
-//! parameters, at those same positions from a fresh window: the content
-//! at [`WINDOW_START_INDEX`], as a CDict's `ZSTD_reset_matchState` and
-//! load lay it out. A frame that uses its tables copies them and the
-//! window as they are ([`MatchState::copy_dict`],
-//! `ZSTD_resetCCtx_byCopyingCDict`), and never hashes the content again.
-//! libzstd attaches the tables of a dictionary large for its input instead
-//! (`ZSTD_resetCCtx_byAttachingCDict`), to search them in place; here they
-//! are copied for every input.
+//! parameters, at the positions of a fresh window: the content at
+//! [`WINDOW_START_INDEX`], as a CDict's `ZSTD_reset_matchState` and load
+//! lay it out. A frame starts from it in one of three ways
+//! ([`DictAttach`], `ZSTD_shouldAttachDict`), and never hashes the content
+//! again in the first two.
 //!
-//! Cost: the joined buffer copies the content and the input once per
-//! frame, `content.len() + input.len()` bytes of allocation and memcpy. In
-//! exchange every finder searches one contiguous buffer; libzstd instead
-//! searches the dictionary where it lies (`ZSTD_extDict` and
-//! `ZSTD_dictMatchState` variants of every finder). Its copied tables
-//! keep the content in the `dictBase` segment, so the finders here follow
-//! the `ZSTD_extDict` rules where the content ends ([`Window::dict_limit`]).
+//! Attached (`ZSTD_resetCCtx_byAttachingCDict`), libzstd's default for an
+//! input up to a size by strategy: the frame compresses the input alone,
+//! in a window whose indices start where the content ends in the
+//! dictionary's own ([`MatchState::attach_dict`]), and its finders search
+//! the dictionary's tables and content where they lie, by the
+//! `ZSTD_dictMatchState` rules ([`DictMatchState`]), so every distance
+//! into the dictionary is libzstd's. The dictionary stays searchable until
+//! the input passes the window size ([`Window::loaded_dict_end`]).
+//!
+//! Copied (`ZSTD_resetCCtx_byCopyingCDict`) or loaded (the content hashed
+//! into the frame's own tables, for a large input): the frame compresses
+//! `content ++ input` as its one job, the dictionary's content (all of a
+//! raw-content dictionary, the rest of a structured one after its entropy
+//! tables and repeat offsets) at positions `0..content.len()`, the
+//! window's origin, and the input after it. In index space the content
+//! ends where the input begins, as in libzstd, where
+//! `ZSTD_loadDictionaryContent`'s `ZSTD_window_update` puts the content in
+//! the window and the input's then follows it. A copy takes the tables and
+//! window as they are ([`MatchState::copy_dict`]); a load enters the
+//! content through [`MatchState::enter_dict`]. Either way the window
+//! records where the content ends (`loadedDictEnd`): matches may then
+//! reference all of it, offsets above the window size included, until the
+//! input passes the window size (RFC 8878 §5,
+//! [`Window::lowest_match_index`]).
+//!
+//! Cost of a copy or load: the joined buffer copies the content and the
+//! input once per frame, `content.len() + input.len()` bytes of allocation
+//! and memcpy. In exchange every finder searches one contiguous buffer;
+//! libzstd instead searches the dictionary where it lies (`ZSTD_extDict`
+//! variants of every finder). Its copied tables keep the content in the
+//! `dictBase` segment, so the finders here follow the `ZSTD_extDict` rules
+//! where the content ends ([`Window::dict_limit`]).
 //!
 //! [`Window::lowest_match_index`]: super::matchstate::Window::lowest_match_index
 //! [`Window::dict_limit`]: super::matchstate::Window::dict_limit
+//! [`Window::loaded_dict_end`]: super::matchstate::Window::loaded_dict_end
 //! [`WINDOW_START_INDEX`]: super::matchstate::WINDOW_START_INDEX
 
 use super::block::{self, BlockState, TableLoad};
+use super::common::SHORT_CACHE_TAG_BITS;
 use super::lazy::{default_search_method, SearchMethod};
 use super::ldm::LdmParams;
-use super::matchstate::MatchState;
+use super::matchstate::{DictMatchState, MatchState, WINDOW_START_INDEX};
 use super::opt::DictStats;
 use super::params::{CParamMode, CParams, ZSTD_CLEVEL_DEFAULT};
 use super::{CompressError, CompressOptions};
@@ -59,6 +70,50 @@ const USE_CDICT_PARAMS_SRCSIZE_CUTOFF: u64 = 128 << 10;
 /// `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`: so does an input below this
 /// many times the dictionary's size.
 const USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER: u64 = 6;
+
+/// `attachDictSizeCutoffs`, by strategy (`ZSTD_strategy` number): the
+/// input sizes up to which [`DictAttach::Auto`] attaches a dictionary's
+/// tables rather than copying them, "past which copying the dictionary
+/// tables into the working context is faster than using them in-place".
+const ATTACH_DICT_SIZE_CUTOFFS: [u64; 10] = [
+    8 << 10,  // unused
+    8 << 10,  // fast
+    16 << 10, // dfast
+    32 << 10, // greedy
+    32 << 10, // lazy
+    32 << 10, // lazy2
+    32 << 10, // btlazy2
+    32 << 10, // btopt
+    8 << 10,  // btultra
+    8 << 10,  // btultra2
+];
+
+/// `ZSTD_dictAttachPref_e` (`ZSTD_c_forceAttachDict`): how a frame starts
+/// from a [`CompressDict`]'s tables. They are used for an input below 128
+/// KiB or six times the dictionary's size; a larger one hashes the
+/// content into tables of its own (`ZSTD_dictForceLoad`) whatever this
+/// says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DictAttach {
+    /// `ZSTD_dictDefaultAttach`: attach the tables for an input up to a
+    /// size by the dictionary's strategy (8 KiB for `Fast`, 16 KiB for
+    /// `DFast`, 32 KiB for `Greedy` to `BtOpt`, 8 KiB for `BtUltra` and
+    /// `BtUltra2`), copy them for a larger one.
+    #[default]
+    Auto,
+    /// `ZSTD_dictForceAttach`: search the dictionary's tables in place,
+    /// next to the frame's own, sized for the input alone
+    /// (`ZSTD_resetCCtx_byAttachingCDict`).
+    Attach,
+    /// `ZSTD_dictForceCopy`: copy them into the frame's tables
+    /// (`ZSTD_resetCCtx_byCopyingCDict`), which then hold the dictionary's
+    /// parameters.
+    Copy,
+    /// `ZSTD_dictForceLoad`: never use them; hash the content into the
+    /// frame's own tables. As in libzstd, the frame's parameters are still
+    /// sized as for an attached dictionary where `Auto` would attach.
+    Load,
+}
 
 /// `ZSTD_dictContentType_e`: how a dictionary's bytes are read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -134,9 +189,18 @@ impl CompressDict {
         let cparams = CParams::for_level_with(level, None, dict.len(), CParamMode::CreateCDict);
         let (id, entropy, content) = insert_dictionary(dict, content_type)?;
         let content = content.to_vec();
-        let mut ms = MatchState::new_for(cparams, 0, default_search_method(&cparams));
-        if !content.is_empty() {
-            block::load_dict(&mut ms, &content, 0..content.len(), TableLoad::Full);
+        // ZSTD_loadDictionaryContent with ZSTD_tfp_forCDict: tagged indices
+        // must leave the tag bits free, so only the suffix whose indices
+        // do is loaded, and the window starts there.
+        let origin = if cparams.cdict_indices_are_tagged() {
+            let max = (1usize << (32 - SHORT_CACHE_TAG_BITS)) - WINDOW_START_INDEX;
+            content.len().saturating_sub(max)
+        } else {
+            0
+        };
+        let mut ms = MatchState::new_for(cparams, origin, default_search_method(&cparams));
+        if origin < content.len() {
+            block::load_dict(&mut ms, &content, origin..content.len(), TableLoad::Full);
         }
         Ok(Self {
             content,
@@ -163,6 +227,21 @@ impl CompressDict {
     pub fn cparams(&self) -> CParams {
         self.ms.cparams
     }
+
+    /// The dictionary's match state and loaded content, to attach.
+    fn dict_match_state(&self) -> DictMatchState<'_> {
+        DictMatchState::new(&self.ms, &self.content)
+    }
+}
+
+/// `ZSTD_shouldAttachDict` for an input of `pledged` bytes: attach where
+/// the input is no larger than the cutoff of the dictionary's strategy
+/// ([`ATTACH_DICT_SIZE_CUTOFFS`]) or `pref` forces it, unless `pref`
+/// forces a copy. There is no `dedicatedDictSearch` nor `forceWindow`
+/// here, which would force or forbid it.
+fn should_attach(dict: &CompressDict, pledged: u64, pref: DictAttach) -> bool {
+    let cutoff = ATTACH_DICT_SIZE_CUTOFFS[dict.ms.cparams.strategy as usize];
+    (pledged <= cutoff || pref == DictAttach::Attach) && pref != DictAttach::Copy
 }
 
 impl fmt::Debug for CompressDict {
@@ -179,6 +258,9 @@ impl fmt::Debug for CompressDict {
 
 /// Where a frame's tables get the dictionary's content from.
 enum Tables<'a> {
+    /// `ZSTD_resetCCtx_byAttachingCDict`: none; the finders search a
+    /// [`CompressDict`]'s in place, unless its content is empty (`None`).
+    Attach(Option<DictMatchState<'a>>),
     /// `ZSTD_resetCCtx_byCopyingCDict`: a [`CompressDict`]'s.
     Copy(&'a MatchState),
     /// `ZSTD_loadDictionaryContent` with `ZSTD_dtlm_fast`, hashing the
@@ -188,17 +270,19 @@ enum Tables<'a> {
 
 /// One frame's dictionary, resolved for its input: the parameters, where
 /// its tables come from and the block state it starts from. The frame
-/// driver takes it as an `Option<&FrameDict>`: the content goes before the
-/// input (see the module docs), [`FrameDict::preload`] starts the job's
-/// match state, and [`FrameDict::id`] goes in the frame header.
+/// driver takes it as an `Option<&FrameDict>`: [`FrameDict::content`] goes
+/// before the input (see the module docs), [`FrameDict::preload`] starts
+/// the job's match state, [`FrameDict::dict_match_state`] goes to the
+/// finders, and [`FrameDict::id`] goes in the frame header.
 pub(super) struct FrameDict<'a> {
     content: &'a [u8],
     id: u32,
     /// The frame's parameters (`ZSTD_getCParamsFromCCtxParams`), which
     /// resolve the post-block splitter and long distance matching.
     frame: CParams,
-    /// The parameters the frame is compressed with: `frame`, or a copied
-    /// dictionary's with `frame`'s window log.
+    /// The parameters the frame is compressed with: `frame`, or a used
+    /// dictionary's with `frame`'s window log, sized for the input alone
+    /// when attached.
     applied: CParams,
     ldm: Option<LdmParams>,
     tables: Tables<'a>,
@@ -209,27 +293,46 @@ pub(super) struct FrameDict<'a> {
 }
 
 impl<'a> FrameDict<'a> {
-    /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` and
-    /// `ZSTD_dictForceCopy` for an input of `src_size` bytes: `opts` at the
-    /// dictionary's level, sized for the input and the dictionary (the
-    /// tables are never attached, so `ZSTD_getCParamMode` is
-    /// `ZSTD_cpm_noAttachDict`), then the dictionary's tables with the
-    /// frame's window log for an input below 128 KiB or six times the
-    /// dictionary's size, else the frame's own tables loaded with the
-    /// content (`ZSTD_compressBegin_internal`). The dictionary's entropy
-    /// tables and repeat offsets either way.
+    /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` for an input of
+    /// `src_size` bytes, `opts.dict_attach` the attach preference: `opts`
+    /// at the dictionary's level, sized for the input and the dictionary
+    /// (`ZSTD_getCParamMode`: `ZSTD_cpm_attachDict` where
+    /// `ZSTD_shouldAttachDict`, which leaves the dictionary out, else
+    /// `ZSTD_cpm_noAttachDict`). Then (`ZSTD_compressBegin_internal`) for
+    /// an input below 128 KiB or six times the dictionary's size, unless
+    /// [`DictAttach::Load`], the dictionary's tables: attached, with its
+    /// parameters sized for the input alone, or copied, with its
+    /// parameters as they are, either way with the frame's window log;
+    /// else the frame's own tables loaded with the content. The
+    /// dictionary's entropy tables and repeat offsets either way.
     pub(super) fn of(dict: &'a CompressDict, src_size: usize, opts: &CompressOptions) -> Self {
         let pledged = src_size as u64;
-        let (frame, ldm) = opts.frame_cparams(
-            dict.level,
-            src_size,
-            dict.dict_size,
-            CParamMode::NoAttachDict,
-        );
+        let attach = should_attach(dict, pledged, opts.dict_attach);
+        let mode = if attach {
+            CParamMode::AttachDict
+        } else {
+            CParamMode::NoAttachDict
+        };
+        let (frame, ldm) = opts.frame_cparams(dict.level, src_size, dict.dict_size, mode);
         let use_tables = dict.dict_size > 0
             && (pledged < USE_CDICT_PARAMS_SRCSIZE_CUTOFF
-                || pledged < dict.dict_size as u64 * USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER);
-        let (applied, tables) = if use_tables {
+                || pledged < dict.dict_size as u64 * USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER)
+            && opts.dict_attach != DictAttach::Load;
+        let (applied, tables) = if use_tables && attach {
+            // Resize working context table params for input only, since
+            // the dict has its own tables.
+            let sized =
+                dict.ms
+                    .cparams
+                    .adjust_with(Some(pledged), dict.dict_size, CParamMode::AttachDict);
+            let applied = CParams {
+                window_log: frame.window_log,
+                ..sized
+            };
+            // Don't even attach dictionaries with no contents.
+            let dms = (!dict.content.is_empty()).then(|| dict.dict_match_state());
+            (applied, Tables::Attach(dms))
+        } else if use_tables {
             let applied = CParams {
                 window_log: frame.window_log,
                 ..dict.ms.cparams
@@ -272,9 +375,23 @@ impl<'a> FrameDict<'a> {
         }
     }
 
-    /// The content that goes before the input.
+    /// The content that goes before the input: none for an attached
+    /// dictionary, whose content the finders read where it lies.
     pub(super) fn content(&self) -> &'a [u8] {
-        self.content
+        match self.tables {
+            Tables::Attach(_) => &[],
+            Tables::Copy(_) | Tables::Load => self.content,
+        }
+    }
+
+    /// `ms->dictMatchState` once [`FrameDict::preload`] attached it: the
+    /// attached dictionary, for [`MatchState::dict_match_state`] to hand
+    /// to the finders of each block while it is valid.
+    pub(super) fn dict_match_state(&self) -> Option<DictMatchState<'a>> {
+        match self.tables {
+            Tables::Attach(dms) => dms,
+            Tables::Copy(_) | Tables::Load => None,
+        }
     }
 
     /// The frame header's `Dictionary_ID`.
@@ -288,26 +405,30 @@ impl<'a> FrameDict<'a> {
         (self.frame, self.applied, self.ldm)
     }
 
-    /// The lazy finder the frame's tables are for: a copied dictionary's
+    /// The lazy finder the frame's tables are for: a used dictionary's
     /// (`useRowMatchFinder` from the CDict), else the frame's default.
     pub(super) fn search_method(&self) -> SearchMethod {
         match self.tables {
+            Tables::Attach(Some(dms)) => dms.ms.search_method,
             Tables::Copy(dict) => dict.search_method,
-            Tables::Load => default_search_method(&self.applied),
+            Tables::Attach(None) | Tables::Load => default_search_method(&self.applied),
         }
     }
 
     /// Start `ms`, just reset for the frame's one job with the window at
-    /// the content's start in `data` (the content then the input), from
-    /// the dictionary: copy its tables or load the content, seed the
-    /// optimal parser's first statistics, and return the block state the
-    /// first block starts from.
+    /// the start of `data` ([`FrameDict::content`], then the input), from
+    /// the dictionary: attach it, copy its tables or load the content,
+    /// seed the optimal parser's first statistics, and return the block
+    /// state the first block starts from.
     pub(super) fn preload(&self, ms: &mut MatchState, data: &[u8]) -> BlockState {
-        debug_assert_eq!(&data[..self.content.len()], self.content);
+        let content = self.content();
+        debug_assert_eq!(&data[..content.len()], content);
         match self.tables {
+            Tables::Attach(Some(dms)) => ms.attach_dict(&dms),
+            Tables::Attach(None) => {}
             Tables::Copy(dict) => ms.copy_dict(dict),
-            Tables::Load if self.content.is_empty() => {}
-            Tables::Load => block::load_dict(ms, data, 0..self.content.len(), TableLoad::Fast),
+            Tables::Load if content.is_empty() => {}
+            Tables::Load => block::load_dict(ms, data, 0..content.len(), TableLoad::Fast),
         }
         if let (Some(stats), Some(opt)) = (self.opt_stats, ms.opt.as_mut()) {
             opt.seed_dict(stats);
@@ -802,15 +923,23 @@ mod tests {
     /// `attachDictSizeCutoffs`: libzstd's force-copy frame still counts the
     /// content (`ZSTD_cpm_noAttachDict`), a window of `highbit(4 KiB + 100
     /// KiB - 1) + 1 = 17`, which sets the 3-byte hash log and enables the
-    /// post-block splitter; the input alone would give 12.
+    /// post-block splitter; its default frame attaches the dictionary and
+    /// leaves it out (`ZSTD_cpm_attachDict`), 12 for the input alone.
     #[test]
-    fn frame_window_counts_the_content() {
+    fn frame_window_counts_the_content_unless_attached() {
         let content: Vec<u8> = (0..100 << 10).map(|i| (i * 7 % 251) as u8).collect();
         for level in [1, 3, 9, 13, 19] {
             let dict = CompressDict::new(&content, level).unwrap();
-            let frame = FrameDict::of(&dict, 4 << 10, &CompressOptions::default());
-            assert_eq!(frame.frame.window_log, 17, "level {level}");
-            assert_eq!(frame.applied.window_log, 17, "level {level}");
+            for (dict_attach, window_log) in [(DictAttach::Copy, 17), (DictAttach::Auto, 12)] {
+                let opts = CompressOptions {
+                    dict_attach,
+                    ..Default::default()
+                };
+                let frame = FrameDict::of(&dict, 4 << 10, &opts);
+                let what = format!("level {level} {dict_attach:?}");
+                assert_eq!(frame.frame.window_log, window_log, "{what}");
+                assert_eq!(frame.applied.window_log, window_log, "{what}");
+            }
         }
     }
 }

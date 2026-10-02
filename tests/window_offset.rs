@@ -351,9 +351,15 @@ fn finders_stop_short_of_the_window() {
             for start in (0..data.len()).step_by(w) {
                 let end = (start + w).min(data.len());
                 let block = ms.enter_block(start..end);
-                let Some(next) =
-                    build_seq_store(&mut ms, &data, block, rep, &mut store, &mut BlockLdm::Off)
-                else {
+                let Some(next) = build_seq_store(
+                    &mut ms,
+                    &data,
+                    block,
+                    rep,
+                    &mut store,
+                    &mut BlockLdm::Off,
+                    None,
+                ) else {
                     continue;
                 };
                 rep = next;

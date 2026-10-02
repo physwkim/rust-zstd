@@ -27,6 +27,9 @@ use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 use std::sync::OnceLock;
 
+mod dms;
+pub use dms::compress_block_dms;
+
 /// `ZSTD_ROW_HASH_TAG_BITS`: low hash bits kept in the tag table.
 const ROW_HASH_TAG_BITS: u32 = 8;
 const ROW_HASH_TAG_MASK: u32 = (1 << ROW_HASH_TAG_BITS) - 1;

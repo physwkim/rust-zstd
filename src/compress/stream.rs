@@ -212,6 +212,7 @@ impl Frame {
             &mut self.state,
             scratch,
             &mut ldm,
+            None,
             out,
             cfg!(feature = "parallel"),
         );

@@ -11,10 +11,11 @@
 //! one of the invariants stated in `compress_block_generic`.
 
 use super::common::{
-    byte, candidate_valid, hash_ptr, index_overlap_check, prefetch, read32, simd_level, tget, tset,
-    MatchCount, Src, HASH_READ_SIZE, K_SEARCH_STRENGTH,
+    byte, candidate_valid, count_2segments, count_dms, dms_rep_source, hash_ptr,
+    index_overlap_check, prefetch, read32, simd_level, tags_match, tget, tset, write_tagged,
+    MatchCount, Src, HASH_READ_SIZE, K_SEARCH_STRENGTH, SHORT_CACHE_TAG_BITS,
 };
-use super::matchstate::{Block, EnteredPrefix, MatchState};
+use super::matchstate::{Block, DictMatchState, EnteredPrefix, MatchState, WINDOW_START_INDEX};
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
@@ -516,11 +517,252 @@ fn compress_block_level<const EXT: bool, C: MatchCount>(
     }
 }
 
-/// `ZSTD_fillHashTableForCCtx(ms, end, dtlm)`: `ZSTD_dtlm_fast` without
-/// `FULL`, `ZSTD_dtlm_full` with it. The CDict's
-/// `ZSTD_fillHashTableForCDict` writes the same slots: its short cache tag
-/// is the low byte of a hash 8 bits wider, whose high bits are this hash.
-fn fill_hash_table<const MLS: u32, const FULL: bool>(
+/// `ZSTD_compressBlock_fast_dictMatchState`: [`compress_block`] with the
+/// dictionary `dms` attached, searched by the `ZSTD_dictMatchState` rules.
+pub fn compress_block_dms(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    dms: DictMatchState,
+) -> usize {
+    let block = block.range();
+    match ms.cparams.min_match {
+        5 => compress_block_dms_generic::<5>(ms, src, block, rep, out, dms),
+        6 => compress_block_dms_generic::<6>(ms, src, block, rep, out, dms),
+        7 => compress_block_dms_generic::<7>(ms, src, block, rep, out, dms),
+        _ => compress_block_dms_generic::<4>(ms, src, block, rep, out, dms),
+    }
+}
+
+/// `ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src,
+/// srcSize, mls, 0)`, monomorphized over `MLS`. Each position checks the
+/// repcode at the next one, then the dictionary's candidate (its tables
+/// are tagged, [`tags_match`]) where the frame's own is no valid match,
+/// then the frame's own; the step grows every `1 << kSearchStrength`
+/// bytes. The input starts the window (`prefix_start`), the dictionary's
+/// content lies below it ([`DictMatchState::src_below`]), and no repcode
+/// is disabled.
+///
+/// Bounds: inside the search loop `ip0 < ip1 <= ilimit = iend - 8`, and
+/// after a match `curr + 2 < ip0 <= ilimit` for the table fill; a frame
+/// candidate is read only when `prefix_start <= match_idx < ip0`
+/// ([`match4_found`]), a dictionary one only above the content's start,
+/// the dictionary's table holding no index but `0` and loaded positions
+/// at least 8 bytes before its end; a repcode only where
+/// [`dms_rep_source`] admits it.
+#[inline(never)]
+fn compress_block_dms_generic<const MLS: u32>(
+    ms: &mut MatchState,
+    src: Src,
+    block: Range<usize>,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    dms: DictMatchState,
+) -> usize {
+    const K_STEP_INCR_DMS: usize = 1 << K_SEARCH_STRENGTH;
+    let mc = Fallback::new();
+    let hlog = ms.cparams.hash_log;
+    let target_length = ms.cparams.target_length as usize;
+    // support stepSize of 0
+    let step_size = target_length + (target_length == 0) as usize;
+    let istart = block.start;
+    let iend = block.end;
+    let prefix_start = ms.window().dict_limit();
+    assert!(src.lo() <= prefix_start && prefix_start <= istart && istart <= iend);
+    assert!(iend <= src.end());
+    assert!((1..=32).contains(&hlog));
+    let dict = dms.src_below(prefix_start);
+    let dict_start = dict.lo();
+    let dict_and_prefix_length = istart - dict_start;
+    let dict_hbits = dms.ms.cparams.hash_log + SHORT_CACHE_TAG_BITS;
+    assert!(dict_hbits <= 32);
+    let (dict_hash_table, _, _) = dms.ms.tables();
+    assert_eq!(dict_hash_table.len(), 1usize << dms.ms.cparams.hash_log);
+    // A dictionary table entry as an index of this window: `0` stays below
+    // the content.
+    let dict_index =
+        |packed: usize| (packed >> SHORT_CACHE_TAG_BITS) + (dict_start - WINDOW_START_INDEX);
+    let ilimit = iend.saturating_sub(HASH_READ_SIZE);
+
+    let mut ip0 = istart;
+    let mut ip1 = ip0 + step_size;
+    let mut anchor = istart;
+    let mut offset_1 = rep[0] as usize;
+    let mut offset_2 = rep[1] as usize;
+    ip0 += (dict_and_prefix_length == 0) as usize;
+
+    let (hash_table, _, _) = ms.ws.tables_mut();
+    assert_eq!(hash_table.len(), 1usize << hlog);
+
+    // SAFETY: the bounds above, for every read and table access.
+    unsafe {
+        // Outer search loop: the repcode check at ip0 + 1 is safe because
+        // ip0 < ip1.
+        'outer: while ip1 <= ilimit {
+            let mut hash0 = hash_ptr::<MLS>(src, ip0, hlog);
+            let dict_hash_and_tag0 = hash_ptr::<MLS>(src, ip0, dict_hbits);
+            let mut dict_match_index_and_tag =
+                tget(dict_hash_table, dict_hash_and_tag0 >> SHORT_CACHE_TAG_BITS);
+            let mut dict_tags_match = tags_match(dict_match_index_and_tag, dict_hash_and_tag0);
+            let mut match_index = tget(hash_table, hash0);
+            let mut curr = ip0;
+            let mut step = step_size;
+            let mut next_step = ip0 + K_STEP_INCR_DMS;
+
+            // Inner search loop
+            let m_length = loop {
+                let rep_index = (curr + 1).wrapping_sub(offset_1);
+                let hash1 = hash_ptr::<MLS>(src, ip1, hlog);
+                let dict_hash_and_tag1 = hash_ptr::<MLS>(src, ip1, dict_hbits);
+                tset(hash_table, hash0, curr); // update hash table
+
+                if let Some(rep_src) = dms_rep_source(src, dict, rep_index, curr + 1) {
+                    if read32(rep_src, rep_index) == read32(src, ip0 + 1) {
+                        let m_length =
+                            count_dms(mc, src, ip0 + 1 + 4, iend, dict, rep_index + 4) + 4;
+                        ip0 += 1;
+                        out.store_seq(
+                            src,
+                            anchor,
+                            ip0 - anchor,
+                            iend,
+                            REPCODE1_TO_OFFBASE,
+                            m_length,
+                        );
+                        break m_length;
+                    }
+                }
+
+                if dict_tags_match {
+                    // Found a possible dict match
+                    let mut dict_match = dict_index(dict_match_index_and_tag);
+                    // To replicate extDict parse behavior, we only use dict
+                    // matches when the normal matchIndex is invalid.
+                    if dict_match > dict_start
+                        && read32(dict, dict_match) == read32(src, ip0)
+                        && match_index <= prefix_start
+                    {
+                        let offset = curr - dict_match;
+                        let mut m_length =
+                            count_2segments(mc, src, ip0 + 4, iend, dict, dict_match + 4) + 4;
+                        // catch up
+                        while ip0 > anchor
+                            && dict_match > dict_start
+                            && byte(src, ip0 - 1) == byte(dict, dict_match - 1)
+                        {
+                            ip0 -= 1;
+                            dict_match -= 1;
+                            m_length += 1;
+                        }
+                        offset_2 = offset_1;
+                        offset_1 = offset;
+                        out.store_seq(
+                            src,
+                            anchor,
+                            ip0 - anchor,
+                            iend,
+                            offset_to_offbase(offset as u32),
+                            m_length,
+                        );
+                        break m_length;
+                    }
+                }
+
+                if match4_found::<false>(src, ip0, match_index, prefix_start) {
+                    // found a regular match of size >= 4
+                    let mut match0 = match_index;
+                    let offset = ip0 - match0;
+                    let mut m_length = mc.count(src, ip0 + 4, match0 + 4, iend) + 4;
+                    // catch up
+                    while ip0 > anchor
+                        && match0 > prefix_start
+                        && byte(src, ip0 - 1) == byte(src, match0 - 1)
+                    {
+                        ip0 -= 1;
+                        match0 -= 1;
+                        m_length += 1;
+                    }
+                    offset_2 = offset_1;
+                    offset_1 = offset;
+                    out.store_seq(
+                        src,
+                        anchor,
+                        ip0 - anchor,
+                        iend,
+                        offset_to_offbase(offset as u32),
+                        m_length,
+                    );
+                    break m_length;
+                }
+
+                // Prepare for next iteration
+                dict_match_index_and_tag =
+                    tget(dict_hash_table, dict_hash_and_tag1 >> SHORT_CACHE_TAG_BITS);
+                dict_tags_match = tags_match(dict_match_index_and_tag, dict_hash_and_tag1);
+                match_index = tget(hash_table, hash1);
+
+                if ip1 >= next_step {
+                    step += 1;
+                    next_step += K_STEP_INCR_DMS;
+                }
+                ip0 = ip1;
+                ip1 += step;
+                if ip1 > ilimit {
+                    break 'outer; // _cleanup
+                }
+
+                curr = ip0;
+                hash0 = hash1;
+            };
+
+            // match found
+            ip0 += m_length;
+            anchor = ip0;
+
+            if ip0 <= ilimit {
+                // Fill Table: here because curr + 2 could be > iend - 8
+                tset(hash_table, hash_ptr::<MLS>(src, curr + 2, hlog), curr + 2);
+                tset(hash_table, hash_ptr::<MLS>(src, ip0 - 2, hlog), ip0 - 2);
+
+                // check immediate repcode
+                while ip0 <= ilimit {
+                    let current2 = ip0;
+                    let rep_index2 = current2.wrapping_sub(offset_2);
+                    let Some(rep_src) = dms_rep_source(src, dict, rep_index2, current2) else {
+                        break;
+                    };
+                    if read32(rep_src, rep_index2) != read32(src, ip0) {
+                        break;
+                    }
+                    let rep_length2 = count_dms(mc, src, ip0 + 4, iend, dict, rep_index2 + 4) + 4;
+                    std::mem::swap(&mut offset_1, &mut offset_2);
+                    out.store_seq(src, anchor, 0, iend, REPCODE1_TO_OFFBASE, rep_length2);
+                    tset(hash_table, hash_ptr::<MLS>(src, ip0, hlog), current2);
+                    ip0 += rep_length2;
+                    anchor = ip0;
+                }
+            }
+
+            // Prepare for next iteration
+            ip1 = ip0 + step_size;
+        }
+    }
+
+    // _cleanup: save reps for next block
+    rep[0] = offset_1 as u32;
+    rep[1] = offset_2 as u32;
+    anchor
+}
+
+/// `ZSTD_fillHashTableForCCtx(ms, end, ZSTD_dtlm_fast)` without
+/// `FOR_CDICT`; with it `ZSTD_fillHashTableForCDict(ms, end,
+/// ZSTD_dtlm_full)`, which also inserts the two positions after each third
+/// one where their slot is empty, and tags every entry ([`write_tagged`]):
+/// the slot is the high bits of a hash [`SHORT_CACHE_TAG_BITS`] wider,
+/// the same slot as the untagged hash's.
+fn fill_hash_table<const MLS: u32, const FOR_CDICT: bool>(
     ms: &mut MatchState,
     src: Src,
     start: usize,
@@ -529,6 +771,7 @@ fn fill_hash_table<const MLS: u32, const FULL: bool>(
     const FAST_HASH_FILL_STEP: usize = 3;
     let hbits = ms.cparams.hash_log;
     assert!((1..=32).contains(&hbits));
+    assert!(!FOR_CDICT || hbits + SHORT_CACHE_TAG_BITS <= 32);
     assert!(end <= src.end());
     let (hash_table, _, _) = ms.ws.tables_mut();
     assert_eq!(hash_table.len(), 1usize << hbits);
@@ -537,32 +780,42 @@ fn fill_hash_table<const MLS: u32, const FULL: bool>(
     // with iend = end - HASH_READ_SIZE. Always insert every
     // fastHashFillStep position into the hash table.
     while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
-        // SAFETY: ip + 10 <= end <= src.end(); hash < 1 << hbits == len.
-        unsafe { tset(hash_table, hash_ptr::<MLS>(src, ip, hbits), ip) };
-        if FULL {
-            // Only load extra positions for ZSTD_dtlm_full, where their
-            // entry is still empty.
-            for p in 1..FAST_HASH_FILL_STEP {
-                // SAFETY: as above, ip + p + 8 <= ip + 10 <= end.
-                unsafe {
-                    let h = hash_ptr::<MLS>(src, ip + p, hbits);
-                    if tget(hash_table, h) == 0 {
-                        tset(hash_table, h, ip + p);
+        if FOR_CDICT {
+            let tbits = hbits + SHORT_CACHE_TAG_BITS;
+            // SAFETY: ip + 10 <= end <= src.end(); a hash of `tbits` bits
+            // shifted down by the tag is < 1 << hbits == len.
+            unsafe {
+                write_tagged(hash_table, hash_ptr::<MLS>(src, ip, tbits), ip);
+                // Only load extra positions for ZSTD_dtlm_full, where their
+                // entry is still empty.
+                for p in 1..FAST_HASH_FILL_STEP {
+                    // ip + p + 8 <= ip + 10 <= end.
+                    let hash_and_tag = hash_ptr::<MLS>(src, ip + p, tbits);
+                    if tget(hash_table, hash_and_tag >> SHORT_CACHE_TAG_BITS) == 0 {
+                        write_tagged(hash_table, hash_and_tag, ip + p);
                     }
                 }
             }
+        } else {
+            // SAFETY: ip + 10 <= end <= src.end(); hash < 1 << hbits == len.
+            unsafe { tset(hash_table, hash_ptr::<MLS>(src, ip, hbits), ip) };
         }
         ip += FAST_HASH_FILL_STEP;
     }
 }
 
 /// [`fill_hash_table`] for `ms.cparams.min_match`.
-fn fill_hash_table_from<const FULL: bool>(ms: &mut MatchState, src: Src, start: usize, end: usize) {
+fn fill_hash_table_from<const FOR_CDICT: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    start: usize,
+    end: usize,
+) {
     match ms.cparams.min_match {
-        5 => fill_hash_table::<5, FULL>(ms, src, start, end),
-        6 => fill_hash_table::<6, FULL>(ms, src, start, end),
-        7 => fill_hash_table::<7, FULL>(ms, src, start, end),
-        _ => fill_hash_table::<4, FULL>(ms, src, start, end),
+        5 => fill_hash_table::<5, FOR_CDICT>(ms, src, start, end),
+        6 => fill_hash_table::<6, FOR_CDICT>(ms, src, start, end),
+        7 => fill_hash_table::<7, FOR_CDICT>(ms, src, start, end),
+        _ => fill_hash_table::<4, FOR_CDICT>(ms, src, start, end),
     }
 }
 
@@ -576,10 +829,10 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
     ms.next_to_update = end;
 }
 
-/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)` for
-/// entered dictionary content, into untagged tables: [`load_prefix`] that
-/// also inserts the two positions after each third one where their entry
-/// is empty.
+/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)` for a
+/// dictionary's entered content: [`load_prefix`] that also inserts the two
+/// positions after each third one where their entry is empty, every entry
+/// tagged (see `fill_hash_table`).
 pub fn load_dict_full(ms: &mut MatchState, src: Src, content: EnteredPrefix) {
     let end = ms.prefix_indices(content).end;
     assert!(end <= src.end());

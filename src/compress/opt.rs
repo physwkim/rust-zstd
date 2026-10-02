@@ -23,10 +23,13 @@
 //! (C keeps them in `ms->opt`, outside the block state too).
 
 use super::block::BlockState;
-use super::bt::{assert_opt_bounds, bt_get_all_matches, Match, ZSTD_OPT_NUM, ZSTD_OPT_SIZE};
+use super::bt::{
+    assert_opt_bounds, bt_get_all_matches, bt_get_all_matches_dms, BtDms, Match, ZSTD_OPT_NUM,
+    ZSTD_OPT_SIZE,
+};
 use super::common::{simd_level, Src};
 use super::ldm::RawSeqView;
-use super::matchstate::{Block, MatchState};
+use super::matchstate::{Block, DictMatchState, MatchState};
 use super::params::Strategy;
 use super::seqstore::{offset_to_offbase, update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
@@ -238,7 +241,10 @@ impl Stats {
     /// dictionary with a valid Huffman table (`dict`), or else seed literal
     /// statistics from the block itself and the sequence symbols from
     /// baseline tables; on a later block scale the accumulated statistics
-    /// down as its seed.
+    /// down as its seed. Inlined into each `opt_generic` instance: called
+    /// out of line once there is one with a dictionary, it reallocates the
+    /// registers of the one without.
+    #[inline(always)]
     fn rescale_freqs<const OPT_LEVEL: u32>(&mut self, block: &[u8], dict: Option<&DictStats>) {
         self.price_type = PriceType::Dynamic;
 
@@ -528,12 +534,177 @@ unsafe fn get_all_matches_avx2<const MLS: u32, const EXT: bool>(
     )
 }
 
+/// `ZSTD_btGetAllMatches_dictMatchState_<mls>`: [`GetAllMatches`] with
+/// the attached dictionary's tree.
+type GetAllMatchesDms = unsafe fn(
+    &mut [Match; ZSTD_OPT_SIZE],
+    &mut MatchState,
+    &mut usize,
+    &Src,
+    usize,
+    usize,
+    &[u32; 3],
+    u32,
+    u32,
+    &BtDms,
+) -> u32;
+
+/// `ZSTD_btGetAllMatches_dictMatchState_<mls>` with the 8-byte count.
+///
+/// # Safety
+/// As [`bt_get_all_matches_dms`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_all_matches_dms_scalar<const MLS: u32>(
+    matches: &mut [Match; ZSTD_OPT_SIZE],
+    ms: &mut MatchState,
+    next_to_update3: &mut usize,
+    src: &Src,
+    ip: usize,
+    i_high_limit: usize,
+    rep: &[u32; 3],
+    ll0: u32,
+    length_to_beat: u32,
+    d: &BtDms,
+) -> u32 {
+    bt_get_all_matches_dms::<Fallback, MLS>(
+        Fallback::new(),
+        matches,
+        ms,
+        next_to_update3,
+        *src,
+        ip,
+        i_high_limit,
+        rep,
+        ll0,
+        length_to_beat,
+        d,
+    )
+}
+
+/// `ZSTD_btGetAllMatches_dictMatchState_<mls>` compiled with AVX2.
+///
+/// # Safety
+/// As [`bt_get_all_matches_dms`]; the CPU must support AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+unsafe fn get_all_matches_dms_avx2<const MLS: u32>(
+    matches: &mut [Match; ZSTD_OPT_SIZE],
+    ms: &mut MatchState,
+    next_to_update3: &mut usize,
+    src: &Src,
+    ip: usize,
+    i_high_limit: usize,
+    rep: &[u32; 3],
+    ll0: u32,
+    length_to_beat: u32,
+    d: &BtDms,
+) -> u32 {
+    bt_get_all_matches_dms::<Avx2, MLS>(
+        Avx2::new_unchecked(),
+        matches,
+        ms,
+        next_to_update3,
+        *src,
+        ip,
+        i_high_limit,
+        rep,
+        ll0,
+        length_to_beat,
+        d,
+    )
+}
+
+/// `ZSTD_getAllMatchesFn` as `opt_generic` calls it: a [`GetAllMatches`],
+/// or a [`DmsFinder`].
+trait GetMatches: Copy {
+    /// # Safety
+    /// As [`bt_get_all_matches`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn get(
+        self,
+        matches: &mut [Match; ZSTD_OPT_SIZE],
+        ms: &mut MatchState,
+        next_to_update3: &mut usize,
+        src: &Src,
+        ip: usize,
+        i_high_limit: usize,
+        rep: &[u32; 3],
+        ll0: u32,
+        length_to_beat: u32,
+    ) -> u32;
+}
+
+impl GetMatches for GetAllMatches {
+    #[inline(always)]
+    unsafe fn get(
+        self,
+        matches: &mut [Match; ZSTD_OPT_SIZE],
+        ms: &mut MatchState,
+        next_to_update3: &mut usize,
+        src: &Src,
+        ip: usize,
+        i_high_limit: usize,
+        rep: &[u32; 3],
+        ll0: u32,
+        length_to_beat: u32,
+    ) -> u32 {
+        self(
+            matches,
+            ms,
+            next_to_update3,
+            src,
+            ip,
+            i_high_limit,
+            rep,
+            ll0,
+            length_to_beat,
+        )
+    }
+}
+
+/// The `ZSTD_dictMatchState` finder and the dictionary's tree it searches.
+#[derive(Clone, Copy)]
+struct DmsFinder<'a> {
+    get_all_matches: GetAllMatchesDms,
+    dms: BtDms<'a>,
+}
+
+impl GetMatches for DmsFinder<'_> {
+    #[inline(always)]
+    unsafe fn get(
+        self,
+        matches: &mut [Match; ZSTD_OPT_SIZE],
+        ms: &mut MatchState,
+        next_to_update3: &mut usize,
+        src: &Src,
+        ip: usize,
+        i_high_limit: usize,
+        rep: &[u32; 3],
+        ll0: u32,
+        length_to_beat: u32,
+    ) -> u32 {
+        (self.get_all_matches)(
+            matches,
+            ms,
+            next_to_update3,
+            src,
+            ip,
+            i_high_limit,
+            rep,
+            ll0,
+            length_to_beat,
+            &self.dms,
+        )
+    }
+}
+
 /// Where `ZSTD_compressBlock_opt_generic` takes its match candidates from:
 /// the binary tree (`ZSTD_selectBtGetAllMatches`) and the block's long
 /// distance matches (`ms->ldmSeqStore`, empty without LDM).
 #[derive(Clone, Copy)]
-struct Finders<'a> {
-    get_all_matches: GetAllMatches,
+struct Finders<'a, G = GetAllMatches> {
+    get_all_matches: G,
     ldm: RawSeqView<'a>,
 }
 
@@ -608,8 +779,8 @@ fn compress_block_mode<const EXT: bool>(
         .take()
         .expect("MatchState::reset allocates OptState for the opt strategies");
     let anchor = match ms.cparams.strategy {
-        Strategy::BtOpt => opt_generic::<0>(ms, &mut state, src, block, rep, out, finders),
-        Strategy::BtUltra => opt_generic::<2>(ms, &mut state, src, block, rep, out, finders),
+        Strategy::BtOpt => opt_generic::<0, _>(ms, &mut state, src, block, rep, out, finders),
+        Strategy::BtUltra => opt_generic::<2, _>(ms, &mut state, src, block, rep, out, finders),
         Strategy::BtUltra2 => {
             // 2-passes strategy: this strategy makes a first pass over
             // first block to collect statistics in order to seed next
@@ -625,9 +796,68 @@ fn compress_block_mode<const EXT: bool>(
             } else {
                 (src, block)
             };
-            opt_generic::<2>(ms, &mut state, src, block, rep, out, finders)
+            opt_generic::<2, _>(ms, &mut state, src, block, rep, out, finders)
         }
         s => unreachable!("opt::compress_block called for {s:?}"),
+    };
+    ms.opt = Some(state);
+    anchor
+}
+
+/// `ZSTD_selectBtGetAllMatches(ms, ZSTD_dictMatchState)`, see
+/// [`select_get_all_matches`].
+fn select_get_all_matches_dms(min_match: u32, level: Level) -> GetAllMatchesDms {
+    let mls = min_match.clamp(3, 6);
+    match level {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Level::Avx2(_) => match mls {
+            3 => get_all_matches_dms_avx2::<3>,
+            4 => get_all_matches_dms_avx2::<4>,
+            5 => get_all_matches_dms_avx2::<5>,
+            _ => get_all_matches_dms_avx2::<6>,
+        },
+        _ => match mls {
+            3 => get_all_matches_dms_scalar::<3>,
+            4 => get_all_matches_dms_scalar::<4>,
+            5 => get_all_matches_dms_scalar::<5>,
+            _ => get_all_matches_dms_scalar::<6>,
+        },
+    }
+}
+
+/// `ZSTD_compressBlock_btopt_dictMatchState` /
+/// `_btultra_dictMatchState` (also btultra2's: libzstd has no btultra2
+/// variant with a dictionary, and so no statistics pass): [`compress_block`]
+/// with the dictionary `dms` attached, whose tables are a binary tree.
+#[inline(never)]
+pub fn compress_block_dms(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+    dms: DictMatchState,
+) -> usize {
+    let block = block.range();
+    assert_opt_bounds(ms, src, block.end);
+    let finders = Finders {
+        get_all_matches: DmsFinder {
+            get_all_matches: select_get_all_matches_dms(ms.cparams.min_match, simd_level()),
+            dms: BtDms::new(dms, ms.window().dict_limit()),
+        },
+        ldm,
+    };
+    let mut state = ms
+        .opt
+        .take()
+        .expect("MatchState::reset allocates OptState for the opt strategies");
+    let anchor = match ms.cparams.strategy {
+        Strategy::BtOpt => opt_generic::<0, _>(ms, &mut state, src, block, rep, out, finders),
+        Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt_generic::<2, _>(ms, &mut state, src, block, rep, out, finders)
+        }
+        s => unreachable!("opt::compress_block_dms called for {s:?}"),
     };
     ms.opt = Some(state);
     anchor
@@ -653,7 +883,7 @@ fn init_stats_ultra<'a>(
     debug_assert_eq!(ms.next_to_update, ms.window_low()); // no prefix
 
     // generate stats into ms.opt
-    opt_generic::<2>(ms, state, src, block.clone(), &mut tmp_rep, out, finders);
+    opt_generic::<2, _>(ms, state, src, block.clone(), &mut tmp_rep, out, finders);
 
     // invalidate first scan from history, only keep entropy stats
     out.clear();
@@ -814,14 +1044,14 @@ impl<'a> OptLdm<'a> {
 
 /// `ZSTD_compressBlock_opt_generic(ms, seqStore, rep, src, srcSize,
 /// optLevel, ZSTD_noDict)`.
-fn opt_generic<const OPT_LEVEL: u32>(
+fn opt_generic<const OPT_LEVEL: u32, G: GetMatches>(
     ms: &mut MatchState,
     state: &mut OptState,
     src: Src,
     block: Range<usize>,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
-    finders: Finders,
+    finders: Finders<G>,
 ) -> usize {
     let Finders {
         get_all_matches,
@@ -868,7 +1098,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
             // SAFETY: `ip + 8 < iend <= src.end()`, `ip >= window_low`, the
             // tables passed `assert_opt_bounds` in `compress_block`.
             let mut nb_matches = unsafe {
-                get_all_matches(
+                get_all_matches.get(
                     matches,
                     ms,
                     &mut next_to_update3,
@@ -1043,7 +1273,7 @@ fn opt_generic<const OPT_LEVEL: u32>(
                     // SAFETY: `inr <= ilimit` so `inr + 8 <= iend`,
                     // `inr > ip >= window_low`.
                     let mut nb_matches = unsafe {
-                        get_all_matches(
+                        get_all_matches.get(
                             matches,
                             ms,
                             &mut next_to_update3,
