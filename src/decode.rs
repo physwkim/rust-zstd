@@ -3867,26 +3867,7 @@ trait WildCopy: Copy {
     /// `1 <= offset <= avail` and `ml >= 1`; the `avail` bytes before `dst`
     /// are initialized, and `ml + 31` bytes from `dst` are writable, all in
     /// one allocation.
-    #[inline(always)]
-    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize) {
-        let _ = avail;
-        let src = dst.sub(offset) as *const u8;
-        // Sequential chunks stay correct for overlapping periodic matches
-        // while `dst - src` is at least the chunk size.
-        if offset >= Self::WIDTH {
-            self.wildcopy(dst, src, ml);
-        } else if offset >= WILDCOPY_VECLEN {
-            // Only for `WIDTH > 16`.
-            wildcopy(dst, src, ml);
-        } else {
-            // Copy 8 bytes and spread the offset to at least 8, then
-            // continue with 8-byte chunks.
-            let (dst, src) = overlap_copy8(dst, src, offset);
-            if ml > 8 {
-                wildcopy_overlap8(dst, src, ml - 8);
-            }
-        }
-    }
+    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize);
 }
 
 impl WildCopy for Fallback {
@@ -3969,6 +3950,30 @@ impl WildCopy for Avx2 {
         // SAFETY: `self` proves AVX2; the ranges are the caller's.
         unsafe { wildcopy32(dst, src, len) }
     }
+
+    #[inline(always)]
+    unsafe fn copy_match(self, dst: *mut u8, offset: usize, ml: usize, avail: usize) {
+        let _ = avail;
+        let src = dst.sub(offset) as *const u8;
+        if offset >= 32 {
+            // The first 32 bytes end at or before `dst`.
+            ptr::copy_nonoverlapping(src, dst, 32);
+            if ml > 32 {
+                // SAFETY: `self` proves AVX2; `offset >= 32` and the rest
+                // is the caller's.
+                unsafe { wildcopy_periodic_outlined(dst.add(32), offset, ml - 32) }
+            }
+        } else if offset >= WILDCOPY_VECLEN {
+            wildcopy(dst, src, ml);
+        } else {
+            // Copy 8 bytes and spread the offset to at least 8, then
+            // continue with 8-byte chunks.
+            let (dst, src) = overlap_copy8(dst, src, offset);
+            if ml > 8 {
+                wildcopy_overlap8(dst, src, ml - 8);
+            }
+        }
+    }
 }
 
 /// AVX2 copies for blocks with many short offsets
@@ -4047,8 +4052,8 @@ const PERIOD_SPREAD: [u8; 16] = {
 /// `WildCopy::copy_match` with no branch on the offset for the first 32
 /// bytes: the 32 bytes from `max(offset, 32)` back are shuffled into the
 /// match, which is a plain copy for `offset >= 32` and repeats the period
-/// below it (ZSTD_overlapCopy8). A match past 32 bytes continues in chunks
-/// of 32, or 16 when the distance is shorter.
+/// below it (ZSTD_overlapCopy8). A match past 32 bytes continues in
+/// `wildcopy_periodic`.
 ///
 /// # Safety
 /// The CPU supports AVX2, `avail >= 32`, and `WildCopy::copy_match`'s
@@ -4086,13 +4091,56 @@ unsafe fn copy_match_short(dst: *mut u8, offset: usize, ml: usize) {
         } else {
             usize::from(PERIOD_SPREAD[offset])
         };
-        let src = dst.add(32).sub(dist) as *const u8;
-        if dist >= 32 {
-            wildcopy32(dst.add(32), src, ml - 32);
-        } else {
-            wildcopy(dst.add(32), src, ml - 32);
-        }
+        wildcopy_periodic(dst.add(32), dist, ml - 32);
     }
+}
+
+/// Continue a periodic match at `dst` from `dist` bytes back: in 32-byte
+/// chunks where they are the faster ones (`wide_chunks`), else in 16-byte
+/// chunks as ZSTD_wildcopy does.
+///
+/// # Safety
+/// The CPU supports AVX2, `dist >= 16`, the `dist` bytes before `dst` are
+/// initialized, and `len + 31` bytes from `dst` are writable, all in one
+/// allocation.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn wildcopy_periodic(dst: *mut u8, dist: usize, len: usize) {
+    let src = dst.sub(dist) as *const u8;
+    if wide_chunks(dist) {
+        wildcopy32(dst, src, len);
+    } else {
+        wildcopy(dst, src, len);
+    }
+}
+
+/// `wildcopy_periodic` out of line, for `Avx2::copy_match`: inlined into
+/// the sequence loop, its two loops changed the loop's register
+/// allocation to one more store per sequence, 6% slower on f64_1M, whose
+/// matches never get here.
+///
+/// # Safety
+/// `wildcopy_periodic`'s.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn wildcopy_periodic_outlined(dst: *mut u8, dist: usize, len: usize) {
+    wildcopy_periodic(dst, dist, len);
+}
+
+/// Whether 32-byte chunks copy a match at distance `dist` faster than
+/// 16-byte ones. A chunk's load that partly overlaps the store of an
+/// earlier chunk waits for that store to commit (no store-to-load
+/// forwarding), so a copy has `dist` rounded down to a multiple of its
+/// chunk size in flight per wait: at 58 bytes (text_1M) 32 in 32-byte
+/// chunks against 48, 0.66x. 16-byte chunks keep at least as many bytes
+/// in flight up to 128, and at the odd multiples of 16 they forward
+/// whole from one store each, where 32-byte chunks ran 0.65x (144) to
+/// 0.96x (368) on Zen 5. Past these, 32-byte chunks were up to 1.2x.
+#[inline(always)]
+fn wide_chunks(dist: usize) -> bool {
+    dist > 128 && dist % 32 != 16
 }
 
 /// `wildcopy` in 32-byte chunks (one AVX2 load and store each).
@@ -5692,14 +5740,15 @@ mod parallel {
 mod tests {
     use super::*;
 
-    /// `copy_match` against a byte-at-a-time copy at every offset and
-    /// every length up to 100, with the bytes before the match both fewer
-    /// and more than the 32 that `copy_match_short` loads.
+    /// `copy_match` against a byte-at-a-time copy at every offset up to
+    /// 200 (past 128 `wide_chunks` turns on the offset mod 32) and every
+    /// length up to 150, with the bytes before the match both fewer and
+    /// more than the 32 that `copy_match_short` loads.
     fn check_copy_match<W: WildCopy>(w: W, name: &str) {
-        let init: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
-        for avail in [1, 2, 7, 8, 15, 16, 31, 32, 33, 47, 64, 100] {
+        let init: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
+        for avail in [1, 2, 7, 8, 15, 16, 31, 32, 33, 47, 64, 100, 200] {
             for offset in 1..=avail {
-                for ml in 1..=100 {
+                for ml in 1..=150 {
                     let mut buf = vec![0xEEu8; avail + ml + 31];
                     buf[..avail].copy_from_slice(&init[..avail]);
                     let mut want = buf.clone();
