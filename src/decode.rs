@@ -2198,6 +2198,7 @@ struct LiteralsSection {
 impl LiteralsSection {
     /// Parse the Literals_Section_Header that starts `raw`: the section and
     /// the header's length.
+    #[inline(always)]
     fn parse(raw: &[u8]) -> Result<(LiteralsSection, usize), DecodeError> {
         let short = |need: usize| {
             format!(
@@ -2323,6 +2324,7 @@ struct SequencesHeader {
 impl SequencesHeader {
     /// Parse the Sequences_Section_Header that starts `source`: the header
     /// and its length.
+    #[inline(always)]
     fn parse(source: &[u8]) -> Result<(SequencesHeader, usize), DecodeError> {
         let short = |need: usize| {
             format!(
@@ -2575,6 +2577,7 @@ const SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
 /// fewest bytes ZSTD_decompressMultiFrame takes for another frame.
 const FRAME_HEADER_PREFIX_LEN: usize = 5;
 
+#[inline(always)]
 fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderError> {
     let magic_num = src
         .get(..4)
@@ -2662,6 +2665,7 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
 
 /// Parse the block header at the start of `src`, in a frame whose
 /// Block_Maximum_Size is `block_size_max`.
+#[inline(always)]
 fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, DecodeError> {
     let buf: [u8; 3] = src
         .get(..3)
@@ -4571,6 +4575,7 @@ struct BlockParts<'a> {
 /// `parse_block_header` has held to `block_size_max`, in a frame whose
 /// Block_Maximum_Size that is. The literals decode into the block, so they
 /// are held to it too, before anything is sized from their header.
+#[inline(always)]
 fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, DecodeError> {
     let (section, bytes_in_literals_header) = LiteralsSection::parse(raw)?;
     if section.regenerated_size as usize > block_size_max {
