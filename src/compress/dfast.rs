@@ -721,7 +721,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
 /// `ZSTD_fillDoubleHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)`
 /// for a dictionary's entered content: [`load_prefix`] that also inserts
 /// the two positions after each third one into the large table where their
-/// entry is empty, every entry tagged (see [`fill_double_hash_table`]).
+/// entry is empty, every entry tagged (see `fill_double_hash_table`).
 pub fn load_dict_full(ms: &mut MatchState, src: Src, content: EnteredPrefix) {
     let end = ms.prefix_indices(content).end;
     assert!(end <= src.end());

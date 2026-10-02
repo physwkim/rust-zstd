@@ -592,7 +592,7 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
 /// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)` for a
 /// dictionary's entered content: [`load_prefix`] that also inserts the two
 /// positions after each third one where their entry is empty, every entry
-/// tagged (see [`fill_hash_table`]).
+/// tagged (see `fill_hash_table`).
 pub fn load_dict_full(ms: &mut MatchState, src: Src, content: EnteredPrefix) {
     let end = ms.prefix_indices(content).end;
     assert!(end <= src.end());
