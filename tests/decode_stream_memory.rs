@@ -139,14 +139,14 @@ fn long_window_frames_stream_in_window_memory() {
                 "{at}: frame {} bytes, held {held}, peak {peak}",
                 frame.len()
             );
-            // The window and a block's room, the decoder's tables and
-            // buffers, the output room.
+            // The window and its margin of eight blocks, the decoder's
+            // tables and buffers, the output room.
             assert!(
-                held < window + MIB,
+                held < window + 2 * MIB,
                 "{at}: holds {held} bytes for a {window} byte window"
             );
             assert!(
-                peak < 2 * window + MIB,
+                peak < 2 * window + 2 * MIB,
                 "{at}: peak {peak} bytes for a {window} byte window"
             );
         }

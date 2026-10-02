@@ -90,14 +90,15 @@ fn check_vs(name: &str, f: &[u8], accept: bool, libzstd: bool) {
 }
 
 /// Windows of 1 KiB, 1 KiB + 1/8 and 2 KiB, each after more decoded bytes
-/// than the window: offsets up to Window_Size are accepted, larger ones
-/// rejected though the frame holds them.
+/// than the window and the round buffer's margin of seven blocks, so that
+/// the match starts a segment: offsets up to Window_Size are accepted,
+/// larger ones rejected though the frame holds them.
 #[test]
 fn offset_is_at_most_window_size() {
     for (wd, window, raws) in [
-        (0, 1024, &[1000, 1000][..]),
-        (1, 1152, &[1000, 1000][..]),
-        (1 << 3, 2048, &[1000, 1000, 1000][..]),
+        (0, 1024, &[1000; 9][..]),
+        (1, 1152, &[1000; 10][..]),
+        (1 << 3, 2048, &[1000; 17][..]),
     ] {
         let decoded: u32 = raws.iter().sum::<usize>() as u32;
         for offset in [window - 1, window, window + 1, decoded, decoded + 1] {
