@@ -461,6 +461,7 @@ pub fn assert_parallel_streams(
         let [mut serial, mut parallel] = [usize::MAX, 1].map(|min_parallel_blocks| {
             let mut d = Decompressor::with_options(&DecodeOptions {
                 min_parallel_blocks,
+                min_parallel_bytes: 0,
                 simd,
                 window_log_max: 0,
             });
@@ -479,6 +480,7 @@ thread_local! {
     static REUSED: RefCell<[(Decompressor, Vec<u8>); 2]> = RefCell::new([false, true].map(|simd| {
         let d = Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd,
             window_log_max: 0,
         });
@@ -643,6 +645,7 @@ pub fn check_streamed(
     }
     let mut d = Decompressor::with_options(&DecodeOptions {
         min_parallel_blocks: usize::MAX,
+        min_parallel_bytes: 0,
         simd,
         window_log_max: WINDOW_LOG_MAX,
     });
@@ -677,6 +680,7 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
     for simd in [false, true] {
         let opts = DecodeOptions {
             min_parallel_blocks: usize::MAX,
+            min_parallel_bytes: 0,
             simd,
             window_log_max: 0,
         };
