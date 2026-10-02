@@ -15,9 +15,10 @@ use std::io::{self, Read};
 /// is above the limit `set_window_log_max` sets, by default `(1 << 27) + 1`,
 /// is refused unless one call gets it whole. With the `parallel` feature it
 /// also keeps, once a call has decoded blocks of a frame on the rayon pool
-/// and until the frame ends, the buffers they decoded into: one per block
-/// of up to twice the pool's threads, holding blocks decoded ahead for the
-/// next call, with their input.
+/// and until the frame ends, the buffers they decoded into, up to four per
+/// thread of the pool, and copies of the blocks it planned past the call's
+/// room, up to two per thread, which pool tasks decode ahead for the next
+/// call, with a copy of the tables they started from.
 ///
 /// One made `with_dict`, or given a dictionary by `set_dict`, starts every
 /// frame from it (ZSTD_DCtx_refDDict), as `decompress_with_dict` does: the
@@ -360,6 +361,30 @@ impl Decompressor {
                 ring: &mut self.ring,
                 dict: dict.map_or(&[], DecodeDict::content),
             };
+            // The content of a block whose header came first, as one that
+            // straddles two calls' input does, stays in the frame's chain,
+            // with the whole blocks after it.
+            #[cfg(feature = "parallel")]
+            {
+                let mut read = 0;
+                let decoded = self.dec.decode_held_block_parallel(
+                    unit,
+                    &src[*src_pos..],
+                    dict,
+                    &mut out,
+                    &mut read,
+                    |out| {
+                        *dst_pos += out.ring.flush(&mut dst[*dst_pos..]);
+                        out.ring.pending() == 0
+                    },
+                );
+                *src_pos += read;
+                if let Some(event) = decoded? {
+                    self.unit.clear();
+                    self.frame_ended = event == Event::FrameEnded;
+                    continue;
+                }
+            }
             let event = self.dec.process(unit, &mut out, dict)?;
             self.unit.clear();
             if event == Event::FrameStarted {

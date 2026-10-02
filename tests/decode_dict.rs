@@ -539,7 +539,7 @@ fn dict_frames_decode_with(raw: &[u8], name: &str) {
 
 /// Blocks of at most 1 KiB with Huffman literals forced, so that later
 /// blocks repeat the dictionary's tables after earlier blocks, and the MT
-/// path plans `START` definitions across many blocks.
+/// path plans tables its start defined across many blocks.
 #[test]
 fn dict_small_blocks_decode() {
     for (raw, name) in dicts() {

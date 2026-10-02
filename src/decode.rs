@@ -2202,7 +2202,7 @@ enum BlockType {
     Reserved,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct BlockHeader {
     last_block: bool,
     block_type: BlockType,
@@ -4195,10 +4195,10 @@ struct Frame {
     content_size: Option<u64>,
     decoded: u64,
     checksum: Option<Xxh64>,
-    /// Blocks a batch decoded past the room its caller had, for the next
-    /// batch of the frame to take if no block is decoded before it.
+    /// The frame's blocks decoding on detached pool tasks, kept from call
+    /// to call.
     #[cfg(feature = "parallel")]
-    ahead: parallel::Ahead,
+    pipeline: parallel::Pipeline,
 }
 
 impl Frame {
@@ -4211,7 +4211,7 @@ impl Frame {
             decoded: 0,
             checksum: header.descriptor.content_checksum_flag().then(Xxh64::new),
             #[cfg(feature = "parallel")]
-            ahead: parallel::Ahead::default(),
+            pipeline: parallel::Pipeline::default(),
         })
     }
 
@@ -4219,8 +4219,6 @@ impl Frame {
     /// frame that decodes past its Frame_Content_Size fails here, which
     /// keeps a decoder's buffer within that size.
     fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
-        #[cfg(feature = "parallel")]
-        self.ahead.outdate();
         self.decoded += bytes.len() as u64;
         if let Some(h) = &mut self.checksum {
             h.update(bytes);
@@ -4541,6 +4539,9 @@ fn decode_block(
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), DecodeError> {
+    // The serial decoder's tables are those the frame's chain left in use.
+    #[cfg(feature = "parallel")]
+    frame.pipeline.hand_back(scratch)?;
     let (dst, ext) = out.block_dst()?;
     // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
     // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
@@ -4801,13 +4802,21 @@ unsafe fn decompress_block(
 // OFFBASE form. Stage 3 (one thread, in block order, as soon as each block
 // is decoded) resolves the repeat offsets and executes the sequences into
 // the output.
+//
+// Blocks a call has room for all of decode in one rayon scope, from the
+// call's input. Others go to the frame's `Pipeline`: detached tasks that
+// own copies of what they read, so that those planned past the room keep
+// decoding after the call returns, for the next call to take.
 // ============================================================
 
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
+    use std::any::Any;
+    use std::collections::VecDeque;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Batches with fewer compressed blocks decode on the calling thread.
     pub(super) const MIN_BLOCKS: usize = 4;
@@ -4852,19 +4861,35 @@ mod parallel {
         }
     }
 
-    /// The "block" that defined a table the batch starts with
-    /// (`FrameStart`): a dictionary's, or one a block before the batch
-    /// described.
-    const START: usize = usize::MAX;
-
-    /// The tables and repeat offsets a batch of blocks starts from: `init`,
+    /// The tables and repeat offsets a run of blocks starts from: `init`,
     /// the serial decoder's scratch before its first block, which may
-    /// select those of `dict`, the dictionary the frame started from.
+    /// select those of `dict`, the dictionary the frame started from. `id`
+    /// stands for them where a plan names the block that defined a table
+    /// (`Defs`): a dictionary's, or one a block before the run described.
     #[derive(Clone, Copy)]
     struct FrameStart<'a> {
+        id: u64,
         init: &'a DecoderScratch,
         dict: Option<&'a DictEntropy>,
     }
+
+    impl FrameStart<'_> {
+        /// The tables in use before the run's first block: `id` for each
+        /// table `init` has one of.
+        fn defs(self) -> Defs {
+            let mut defs = [None; 4];
+            defs[0] = (self.init.huf_table(self.dict).max_num_bits != 0).then_some(self.id);
+            for t in 0..3 {
+                defs[1 + t] = self.init.fse.repeatable(t).then_some(self.id);
+            }
+            defs
+        }
+    }
+
+    /// For the Huffman table, then the LL, OF and ML tables (`SEQ_TABLES`
+    /// order), the id of the block that defined the one in use, or of the
+    /// `FrameStart`; `None` while none is.
+    type Defs = [Option<u64>; 4];
 
     /// One block of a frame, as located by the pre-pass.
     enum Plan<'a> {
@@ -4877,20 +4902,12 @@ mod parallel {
         parts: BlockParts<'a>,
         /// For Huffman-coded literals, the block whose tree description
         /// they use: this block for Compressed literals, the last earlier
-        /// block with Compressed literals for Treeless ones, or `START`.
-        huf_def: Option<usize>,
+        /// block with Compressed literals for Treeless ones, or the start.
+        huf_def: Option<u64>,
         /// For LL, OF and ML (`SEQ_TABLES` order), the block whose mode
-        /// defined the table this block uses, or `START`. Unused without
+        /// defined the table this block uses, or the start. Unused without
         /// sequences.
-        fse_def: [usize; 3],
-    }
-
-    fn compressed<'p, 'a>(plan: &'p Plan<'a>) -> &'p CompressedPlan<'a> {
-        match plan {
-            Plan::Compressed(c) => c,
-            // `plan_frame` only records compressed blocks as definitions.
-            _ => unreachable!("table definition in a non-compressed block"),
-        }
+        fse_def: [u64; 3],
     }
 
     /// The blocks at the start of `data` that it holds whole and whose
@@ -4916,47 +4933,62 @@ mod parallel {
     }
 
     /// The blocks `plan_blocks` takes: their plans, where each ends in the
-    /// input, and whether the last is the frame's last.
+    /// input, whether the last is the frame's last, and the id of the
+    /// first, the others' following.
     struct Batch<'a> {
         plans: Vec<Plan<'a>>,
         ends: Vec<usize>,
         last: bool,
+        base: u64,
+    }
+
+    impl<'a> Batch<'a> {
+        /// The sections of compressed block `d` of the batch.
+        fn def(&self, d: u64) -> Option<&BlockParts<'a>> {
+            match self
+                .plans
+                .get(usize::try_from(d.checked_sub(self.base)?).ok()?)?
+            {
+                Plan::Compressed(c) => Some(&c.parts),
+                _ => None,
+            }
+        }
     }
 
     /// Stage 1: the block loop of ZSTD_decompressFrame over the blocks
     /// `located` gives, resolving Treeless / Repeat references the way the
     /// serial decoder's scratch tables carry them from block to block, from
-    /// the tables in `start`. It stops before a block it cannot plan, which
-    /// the serial decoder then decodes, giving its verdict on it.
+    /// the tables in `start`, naming each block by the next of `ids`. It
+    /// stops before a block it cannot plan, which the serial decoder then
+    /// decodes, giving its verdict on it.
     fn plan_blocks<'a>(
         data: &'a [u8],
         block_size_max: usize,
         start: FrameStart<'_>,
         room: usize,
+        ids: &mut u64,
     ) -> Batch<'a> {
         let mut batch = Batch {
             plans: Vec::new(),
             ends: Vec::new(),
             last: false,
+            base: *ids,
         };
-        let mut huf_def = (start.init.huf_table(start.dict).max_num_bits != 0).then_some(START);
-        let mut fse_def: [Option<usize>; 3] =
-            std::array::from_fn(|t| start.init.fse.repeatable(t).then_some(START));
+        let mut defs = start.defs();
         for (block, content, end) in located(data, block_size_max, room) {
-            let i = batch.plans.len();
+            let i = *ids;
             let plan = match block.block_type {
                 BlockType::Raw => Plan::Raw(content),
                 BlockType::RLE => Plan::Rle(content[0], block.decompressed_size as usize),
                 BlockType::Compressed => {
-                    let Some(plan) =
-                        plan_compressed(content, block_size_max, i, &mut huf_def, &mut fse_def)
-                    else {
+                    let Some(plan) = plan_compressed(content, block_size_max, i, &mut defs) else {
                         break;
                     };
                     Plan::Compressed(plan)
                 }
                 BlockType::Reserved => break,
             };
+            *ids += 1;
             batch.plans.push(plan);
             batch.ends.push(end);
             batch.last = block.last_block;
@@ -4964,38 +4996,39 @@ mod parallel {
         batch
     }
 
-    /// Plan compressed block `i`, of `content`, `huf_def` and `fse_def`
-    /// being the blocks that defined the tables in use before it, which it
-    /// updates; `None` if the block fails before decoding.
+    /// Plan compressed block `id`, of `content`, `defs` being the tables
+    /// in use before it, which it updates; `None`, leaving them, if the
+    /// block fails before decoding.
     fn plan_compressed<'a>(
         content: &'a [u8],
         block_size_max: usize,
-        i: usize,
-        huf_def: &mut Option<usize>,
-        fse_def: &mut [Option<usize>; 3],
+        id: u64,
+        defs: &mut Defs,
     ) -> Option<CompressedPlan<'a>> {
         let parts = split_block(content, block_size_max).ok()?;
+        let mut after = *defs;
         let huf = match parts.literals.ls_type {
             LiteralsSectionType::Compressed => {
-                *huf_def = Some(i);
-                *huf_def
+                after[0] = Some(id);
+                after[0]
             }
-            LiteralsSectionType::Treeless => Some((*huf_def)?),
+            LiteralsSectionType::Treeless => Some(after[0]?),
             LiteralsSectionType::Raw | LiteralsSectionType::RLE => None,
         };
-        let mut defs = [0; 3];
+        let mut fse = [0; 3];
         if parts.sequences.num_sequences != 0 {
             for (t, mode) in parts.sequences.modes.all().into_iter().enumerate() {
                 if !matches!(mode, ModeType::Repeat) {
-                    fse_def[t] = Some(i);
+                    after[1 + t] = Some(id);
                 }
-                defs[t] = fse_def[t]?;
+                fse[t] = after[1 + t]?;
             }
         }
+        *defs = after;
         Some(CompressedPlan {
             parts,
             huf_def: huf,
-            fse_def: defs,
+            fse_def: fse,
         })
     }
 
@@ -5009,112 +5042,84 @@ mod parallel {
         off_base: u32,
     }
 
-    /// A ring position: its slot, and the index plus one of the last block
-    /// claimed for decoding into it and of the last block decoded into it.
-    struct RingSlot {
-        claimed: AtomicUsize,
+    /// Where the stage 2 of one compressed block after another decodes to,
+    /// each block named by a ticket: the ticket of a block it is handed is
+    /// planned (`hand`), then taken by whoever decodes it first, a pool task
+    /// or the executing thread (`take`), then done once its decode is in
+    /// `slot` (`decoded`). A task whose block someone else took, or whose
+    /// cell has since been handed another block, finds a ticket it cannot
+    /// take and returns.
+    struct Cell {
+        /// `2 * ticket` while the block of `ticket` is planned, one more
+        /// once it is taken.
+        claim: AtomicUsize,
+        /// `2 * ticket + 1` once the block of `ticket` is decoded.
         done: AtomicUsize,
         slot: Mutex<Slot>,
     }
 
-    impl RingSlot {
-        fn new() -> RingSlot {
-            RingSlot {
-                claimed: AtomicUsize::new(0),
+    impl Cell {
+        fn new() -> Cell {
+            Cell {
+                // Taken, of no block: nothing is to decode yet.
+                claim: AtomicUsize::new(1),
                 done: AtomicUsize::new(0),
                 slot: Mutex::new(Slot::new()),
             }
         }
 
-        /// Take block `i`'s decode; false if someone already has. A task
-        /// that runs after block `i` has been decoded and its position
-        /// reused finds a later block's claim and fails too.
-        fn claim(&self, i: usize) -> bool {
-            self.claimed.fetch_max(i + 1, Ordering::AcqRel) < i + 1
-        }
-    }
-
-    /// What a batch stopped by its caller's room leaves for the next batch
-    /// of the frame: the ring its tasks decoded into, `ring[..held]`
-    /// holding the stage 2 of the blocks after the last one it executed,
-    /// with their input. The next batch takes those its input starts with,
-    /// byte for byte, unless a block has been decoded since. The ring, kept
-    /// for the frame's batches, is dropped with the frame.
-    #[derive(Default)]
-    pub(super) struct Ahead {
-        ring: Vec<RingSlot>,
-        held: usize,
-    }
-
-    impl Ahead {
-        /// A block has been decoded after the held ones' batch: they were
-        /// decoded from a state the frame has left.
-        pub(super) fn outdate(&mut self) {
-            self.held = 0;
+        /// Plan the block of `ticket`, once the cell's block before it has
+        /// been executed or given up.
+        fn hand(&self, ticket: usize) {
+            self.claim.store(ticket.wrapping_mul(2), Ordering::Release);
         }
 
-        /// Take the held blocks `data` starts with; returns how many. The
-        /// others are dropped.
-        fn take(&mut self, data: &[u8]) -> usize {
-            let (mut taken, mut from) = (0, 0);
-            for cell in &mut self.ring[..self.held] {
-                let input = &cell.slot.get_mut().unwrap_or_else(|e| e.into_inner()).input;
-                if data.get(from..from + input.len()) != Some(input) {
-                    break;
+        /// Take the decode of the block of `ticket`; false if someone has,
+        /// or the cell holds another block.
+        fn take(&self, ticket: usize) -> bool {
+            let planned = ticket.wrapping_mul(2);
+            self.claim
+                .compare_exchange(planned, planned | 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        }
+
+        fn decoded(&self, ticket: usize) -> bool {
+            self.done.load(Ordering::Acquire) == ticket.wrapping_mul(2) | 1
+        }
+
+        /// Decode the block of `ticket`, taken, into the slot with `decode`,
+        /// then mark it done, on a panic too, which the slot keeps for the
+        /// executing thread to resume.
+        fn decode(&self, ticket: usize, decode: impl FnOnce(&mut Slot) -> Result<(), DecodeError>) {
+            let _done = MarkDone(&self.done, ticket.wrapping_mul(2) | 1);
+            let mut slot = lock(&self.slot);
+            let slot = &mut *slot;
+            let decoded = panic::catch_unwind(AssertUnwindSafe(|| decode(&mut *slot)));
+            slot.result = match decoded {
+                Ok(result) => result,
+                Err(payload) => {
+                    slot.panic = Some(payload);
+                    Err("Block decode panicked".into())
                 }
-                from += input.len();
-                taken += 1;
-            }
-            self.held = taken;
-            taken
-        }
-
-        /// The ring of a batch of `len` positions, the first holding the
-        /// blocks `take` took, which are its first.
-        fn ring(&mut self, len: usize) -> BatchRing<'_> {
-            if self.ring.len() < len {
-                self.ring.resize_with(len, RingSlot::new);
-            }
-            self.held = self.held.min(len);
-            let held = self.held;
-            let slots = &mut self.ring[..len];
-            for (k, cell) in slots.iter_mut().enumerate() {
-                let n = if k < held { k + 1 } else { 0 };
-                *cell.claimed.get_mut() = n;
-                *cell.done.get_mut() = n;
-                // Its tables are tagged with blocks of an earlier batch.
-                let slot = cell.slot.get_mut().unwrap_or_else(|e| e.into_inner());
-                slot.huf_from = None;
-                slot.fse_from = [None; 3];
-            }
-            BatchRing { slots, held }
-        }
-
-        /// After a batch on `ring[..len]` that executed `done` blocks,
-        /// which end in `data` at `ends`: hold the `ready` blocks after
-        /// them.
-        fn hold(&mut self, len: usize, data: &[u8], ends: &[usize], done: usize, ready: usize) {
-            if ready == 0 {
-                self.held = 0;
-                return;
-            }
-            // Those `take` took have their input already.
-            for j in done.max(self.held)..done + ready {
-                let cell = &mut self.ring[j % len];
-                let slot = cell.slot.get_mut().unwrap_or_else(|e| e.into_inner());
-                slot.input.clear();
-                slot.input.extend_from_slice(&data[ends[j - 1]..ends[j]]);
-            }
-            self.ring[..len].rotate_left(done % len);
-            self.held = ready;
+            };
         }
     }
 
-    /// The positions a batch's tasks decode into, the first `held` holding
-    /// the stage 2 of its first blocks.
-    struct BatchRing<'r> {
-        slots: &'r [RingSlot],
-        held: usize,
+    /// A cell's slot. A decode that panics leaves its payload in the slot
+    /// rather than poisoning the lock.
+    fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
+        slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The slot of a block that the executing thread is to execute, its
+    /// decode done: its stage 2, or the panic of its decode resumed.
+    fn decoded_slot(cell: &Cell) -> MutexGuard<'_, Slot> {
+        let mut slot = lock(&cell.slot);
+        if let Some(payload) = slot.panic.take() {
+            drop(slot);
+            panic::resume_unwind(payload);
+        }
+        slot
     }
 
     /// Publishes a finished decode on drop.
@@ -5126,19 +5131,23 @@ mod parallel {
         }
     }
 
-    /// Per-ring-position worker state: tables tagged with the block that
-    /// defined them (so a run of blocks reusing one table builds it once),
-    /// and the decoded literals and sequences of the current block.
+    /// Per-cell worker state: tables tagged with the id of the block that
+    /// defined them (so a run of blocks reusing one table builds it once;
+    /// ids are never reused within the frame), and the decoded literals and
+    /// sequences of the current block.
     struct Slot {
         huf: HuffmanScratch,
-        huf_from: Option<usize>,
+        huf_from: Option<u64>,
         fse: FSEScratch,
-        fse_from: [Option<usize>; 3],
+        fse_from: [Option<u64>; 3],
         literals: Vec<u8>,
         seqs: Vec<RawSeq>,
         result: Result<(), DecodeError>,
-        /// The block, header included, while `Ahead` holds its stage 2.
-        input: Vec<u8>,
+        /// The detached decode of the block handed to the cell, until it
+        /// is taken.
+        job: Option<Arc<Job>>,
+        /// What the last decode panicked with.
+        panic: Option<Box<dyn Any + Send>>,
     }
 
     impl Slot {
@@ -5152,38 +5161,619 @@ mod parallel {
                 literals: Vec::new(),
                 seqs: Vec::new(),
                 result: Ok(()),
-                input: Vec::new(),
+                job: None,
+                panic: None,
             }
         }
     }
 
-    /// Stage 2 for compressed block `i`, of a frame starting with the
-    /// tables in `start`.
-    fn decode_block(
-        slot: &mut Slot,
-        i: usize,
+    /// The tables and repeat offsets a chain starts from: a copy of those
+    /// of the serial decoder's scratch when it started, with the dictionary
+    /// the frame started from.
+    struct StartTables {
+        id: u64,
+        init: DecoderScratch,
+        dict: Option<DecodeDict>,
+        block_size_max: usize,
+    }
+
+    impl StartTables {
+        fn view(&self) -> FrameStart<'_> {
+            FrameStart {
+                id: self.id,
+                init: &self.init,
+                dict: self.dict.as_ref().and_then(DecodeDict::entropy),
+            }
+        }
+    }
+
+    impl DecoderScratch {
+        /// A copy of the tables and repeat offsets.
+        fn copy_tables(&self) -> DecoderScratch {
+            let mut huf = HuffmanTable::new();
+            huf.copy_from(&self.huf.table);
+            DecoderScratch {
+                huf: HuffmanScratch { table: huf },
+                fse: FSEScratch {
+                    offsets: self.fse.offsets.clone(),
+                    literal_lengths: self.fse.literal_lengths.clone(),
+                    match_lengths: self.fse.match_lengths.clone(),
+                    source: self.fse.source,
+                },
+                offset_hist: self.offset_hist,
+                literals_buffer: Vec::new(),
+                huf_from_dict: self.huf_from_dict,
+            }
+        }
+    }
+
+    /// The stage 2 of a compressed block of a chain, for a pool task: it
+    /// owns all it reads.
+    struct Job {
+        id: u64,
+        content: Arc<[u8]>,
+        huf_def: Option<u64>,
+        fse_def: [u64; 3],
+        /// For the Huffman, then LL, OF, ML tables, the earlier block of
+        /// the chain that described the one the block uses, and its
+        /// content; `None` for one the block describes or the chain
+        /// started from, or does not use.
+        defs: [Option<(u64, Arc<[u8]>)>; 4],
+        start: Arc<StartTables>,
+    }
+
+    impl Job {
+        /// Stage 2 into `slot`.
+        fn decode(&self, slot: &mut Slot) -> Result<(), DecodeError> {
+            let block_size_max = self.start.block_size_max;
+            let plan = CompressedPlan {
+                parts: split_block(&self.content, block_size_max)?,
+                huf_def: self.huf_def,
+                fse_def: self.fse_def,
+            };
+            let defs = self.defs.each_ref().map(|d| {
+                let (id, content) = d.as_ref()?;
+                Some((*id, split_block(content, block_size_max).ok()?))
+            });
+            let def = |d| {
+                defs.iter()
+                    .flatten()
+                    .find(|(id, _)| *id == d)
+                    .map(|(_, p)| p)
+            };
+            decode_block(slot, self.id, &plan, def, self.start.view())
+        }
+    }
+
+    /// A pool task: the decode of the block of `ticket`, handed to `cell`,
+    /// unless someone has taken it.
+    fn run_job(cell: &Cell, ticket: usize) {
+        if cell.take(ticket) {
+            run_taken(cell, ticket);
+        }
+    }
+
+    /// The decode of the block of `ticket`, taken, from the job its cell
+    /// holds.
+    fn run_taken(cell: &Cell, ticket: usize) {
+        cell.decode(ticket, |slot| match slot.job.take() {
+            Some(job) => job.decode(slot),
+            None => Err("Block decode without a job".into()),
+        });
+    }
+
+    /// The tables in use after a block of a chain: their `Defs`, and the
+    /// content of each block of the chain among them.
+    #[derive(Clone)]
+    struct ChainDefs {
+        ids: Defs,
+        blocks: [Option<Arc<[u8]>>; 4],
+    }
+
+    /// A block a chain planned and has not executed.
+    struct Planned {
+        /// Its Block_Header.
+        block: BlockHeader,
+        /// A compressed block's stage 2 and the cell it decodes into.
+        job: Option<(Arc<Job>, Arc<Cell>)>,
+        /// The tables in use before it.
+        before: ChainDefs,
+        /// The last call of the pipeline whose input held it.
+        seen: u64,
+    }
+
+    impl Planned {
+        /// Its bytes in the input, header included.
+        fn len(&self) -> usize {
+            BLOCK_HEADER_LEN + self.block.content_size as usize
+        }
+
+        /// Whether `block`, with `content`, is the block: the same header,
+        /// which a block's header bytes are a function of, and a compressed
+        /// block's content. A raw or RLE block's content is read from the
+        /// input it is executed from.
+        fn holds(&self, block: &BlockHeader, content: &[u8]) -> bool {
+            *block == self.block
+                && self
+                    .job
+                    .as_ref()
+                    .is_none_or(|(job, _)| content == &job.content[..])
+        }
+    }
+
+    /// A call's input to a chain: the block whose header the serial
+    /// decoder took, with its content, if the frame is at one, then whole
+    /// blocks from a header on. Its positions run through that block's
+    /// header and content, then `data`.
+    #[derive(Clone, Copy)]
+    struct Input<'a> {
+        held: Option<(BlockHeader, &'a [u8])>,
+        data: &'a [u8],
+    }
+
+    impl<'a> Input<'a> {
+        /// Where `data` starts.
+        fn data_start(&self) -> usize {
+            self.held
+                .map_or(0, |(_, content)| BLOCK_HEADER_LEN + content.len())
+        }
+
+        /// The block at `at`, a block's start: the held one, or one `data`
+        /// holds whole (`locate_block`).
+        fn block(&self, at: usize, block_size_max: usize) -> Option<(BlockHeader, &'a [u8])> {
+            match self.held {
+                Some(held) if at == 0 => Some(held),
+                _ => locate_block(self.data.get(at - self.data_start()..)?, block_size_max),
+            }
+        }
+    }
+
+    /// The frame's blocks planned from one start, the serial decoder's
+    /// scratch then: those executed, through their repeat offsets and the
+    /// tables they leave in use, and those planned after them.
+    struct Chain {
+        start: Arc<StartTables>,
+        /// The repeat offsets after the blocks executed.
+        hist: [u32; 3],
+        /// The tables in use after the blocks planned.
+        defs: ChainDefs,
+        /// The blocks planned and not executed, the frame's next block
+        /// first.
+        queue: VecDeque<Planned>,
+        /// Their bytes in the input.
+        queued_len: usize,
+    }
+
+    /// The frame's stage 2 on detached pool tasks: a chain of blocks, kept
+    /// from call to call, and the cells their tasks decode into.
+    ///
+    /// Invariant: a task reads only what its `Job` owns, copies of its
+    /// block, of the earlier blocks whose table descriptions it uses and of
+    /// the tables and repeat offsets the chain started from; nothing of
+    /// the frame, the decoder, its dictionary or a caller's input. It
+    /// writes only its cell's slot, so it may outlive the call that
+    /// planned it, and the frame. Only `run`, on the thread that executes
+    /// the frame's blocks, applies a task's result: in plan order, to a
+    /// block whose bytes the call's input holds where it executes it, and
+    /// only while the frame has decoded no block outside the chain since it
+    /// started; the serial decoder's `hand_back` ends the chain before it
+    /// decodes one. A block leaves the chain only by being executed or
+    /// through `retire`, on every other way out: input that differs
+    /// (`rewind`), a block decoded outside the chain (`hand_back`), the
+    /// frame's end or reset or drop (`Drop`). `retire` cancels a decode no
+    /// task has started; one running finishes into its cell, which is read
+    /// next only for a block planned after.
+    #[derive(Default)]
+    pub(super) struct Pipeline {
+        /// The next block or start id: none is used twice in the frame.
+        next_id: u64,
+        /// The calls of `run` so far.
+        calls: u64,
+        /// Boxed, to keep `Stage` small.
+        chain: Option<Box<Chain>>,
+        /// Cells no block of the chain has, the pool's tasks perhaps still
+        /// holding some.
+        free: Vec<Arc<Cell>>,
+        /// The cells allocated.
+        cells: usize,
+    }
+
+    impl Drop for Pipeline {
+        fn drop(&mut self) {
+            self.outdate();
+        }
+    }
+
+    /// Give up a planned block: take its decode if no task has, so that
+    /// the task returns at once, and free its cell.
+    fn retire(p: Planned, free: &mut Vec<Arc<Cell>>) {
+        if let Some((job, cell)) = p.job {
+            if cell.take(job.id as usize) {
+                lock(&cell.slot).job = None;
+            }
+            free.push(cell);
+        }
+    }
+
+    /// A free cell that no task holds, most recently freed first, or a new
+    /// one while fewer than `cap` are allocated. `Arc::get_mut` sees every
+    /// write of the tasks that held it.
+    fn idle_cell(free: &mut Vec<Arc<Cell>>, cells: &mut usize, cap: usize) -> Option<Arc<Cell>> {
+        if let Some(k) = free.iter_mut().rposition(|c| Arc::get_mut(c).is_some()) {
+            return Some(free.swap_remove(k));
+        }
+        (*cells < cap).then(|| {
+            *cells += 1;
+            Arc::new(Cell::new())
+        })
+    }
+
+    /// For the Huffman, then LL, OF, ML tables compressed block `plan`
+    /// (`id`) uses, the earlier block of the chain that described it, from
+    /// the tables in use before it, `before`.
+    fn job_defs(
         plan: &CompressedPlan<'_>,
-        plans: &[Plan<'_>],
+        id: u64,
+        start: u64,
+        before: &ChainDefs,
+    ) -> [Option<(u64, Arc<[u8]>)>; 4] {
+        let mut used = [plan.huf_def, None, None, None];
+        if plan.parts.sequences.num_sequences != 0 {
+            used[1..].copy_from_slice(&plan.fse_def.map(Some));
+        }
+        std::array::from_fn(|k| {
+            let d = used[k].filter(|&d| d != id && d != start)?;
+            Some((d, before.blocks[k].clone()?))
+        })
+    }
+
+    impl Pipeline {
+        fn new_id(&mut self) -> u64 {
+            self.next_id += 1;
+            self.next_id - 1
+        }
+
+        /// Whether a chain is running: until it ends, every block of the
+        /// frame decoded in parallel is one of its.
+        pub(super) fn active(&self) -> bool {
+            self.chain.is_some()
+        }
+
+        /// `len` cells for a batch on the pool, idle ones first; given back
+        /// to `free` after it.
+        fn ring(&mut self, len: usize) -> Vec<Arc<Cell>> {
+            (0..len)
+                .map(|_| {
+                    idle_cell(&mut self.free, &mut self.cells, usize::MAX)
+                        .expect("cells are allocated without bound")
+                })
+                .collect()
+        }
+
+        /// Start a chain from `scratch`, the serial decoder's, in a frame
+        /// that started from `dict` if given.
+        fn start(
+            &mut self,
+            scratch: &DecoderScratch,
+            dict: Option<&DecodeDict>,
+            block_size_max: usize,
+        ) {
+            let start = Arc::new(StartTables {
+                id: self.new_id(),
+                init: scratch.copy_tables(),
+                dict: dict.cloned(),
+                block_size_max,
+            });
+            self.chain = Some(Box::new(Chain {
+                hist: scratch.offset_hist,
+                defs: ChainDefs {
+                    ids: start.view().defs(),
+                    blocks: Default::default(),
+                },
+                queue: VecDeque::new(),
+                queued_len: 0,
+                start,
+            }));
+        }
+
+        /// End the chain: give up every block planned.
+        fn outdate(&mut self) {
+            if let Some(chain) = self.chain.take() {
+                for p in chain.queue {
+                    retire(p, &mut self.free);
+                }
+            }
+        }
+
+        /// Before the serial decoder decodes a block of the frame: end the
+        /// chain, leaving `scratch` as the serial decoder would have left
+        /// it after the blocks the chain executed.
+        #[inline]
+        pub(super) fn hand_back(
+            &mut self,
+            scratch: &mut DecoderScratch,
+        ) -> Result<(), DecodeError> {
+            match self.chain {
+                Some(_) => self.hand_back_chain(scratch),
+                None => Ok(()),
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn hand_back_chain(&mut self, scratch: &mut DecoderScratch) -> Result<(), DecodeError> {
+            let Some(chain) = &self.chain else {
+                return Ok(());
+            };
+            let defs = chain.queue.front().map_or(&chain.defs, |p| &p.before);
+            let block_size_max = chain.start.block_size_max;
+            let parts = defs
+                .blocks
+                .each_ref()
+                .map(|b| split_block(b.as_deref()?, block_size_max).ok());
+            let def = |d| {
+                let k = defs.ids.iter().position(|&id| id == Some(d))?;
+                parts[k].as_ref()
+            };
+            // The chain started from `scratch`'s tables, which no block has
+            // changed since.
+            let synced = sync_scratch(scratch, chain.hist, defs.ids, chain.start.id, def);
+            self.outdate();
+            synced
+        }
+
+        /// The input differs from the next block's: give up the queue, to
+        /// plan again from the tables in use before that block.
+        fn rewind(&mut self) {
+            let Some(chain) = &mut self.chain else {
+                return;
+            };
+            if let Some(front) = chain.queue.front() {
+                chain.defs = front.before.clone();
+            }
+            chain.queued_len = 0;
+            for p in chain.queue.drain(..) {
+                retire(p, &mut self.free);
+            }
+        }
+
+        /// Plan the blocks of `input` after the queue, the first at `pos`,
+        /// until `depth` are queued, handing each compressed one to a pool
+        /// task; it stops past the frame's last block, at a block `input`
+        /// does not hold whole, at one with no idle cell for, and at one it
+        /// cannot plan, setting `blocked`, which the serial decoder then
+        /// decodes, giving its verdict on it.
+        fn fill(&mut self, input: Input<'_>, pos: usize, depth: usize, blocked: &mut bool) {
+            let call = self.calls;
+            let Pipeline {
+                next_id,
+                chain: Some(chain),
+                free,
+                cells,
+                ..
+            } = self
+            else {
+                return;
+            };
+            let block_size_max = chain.start.block_size_max;
+            while !*blocked
+                && chain.queue.len() < depth
+                && !chain.queue.back().is_some_and(|p| p.block.last_block)
+            {
+                let Some((block, content)) = input.block(pos + chain.queued_len, block_size_max)
+                else {
+                    return;
+                };
+                let before = chain.defs.clone();
+                let job = match block.block_type {
+                    BlockType::Raw | BlockType::RLE => None,
+                    BlockType::Compressed => {
+                        let mut ids = before.ids;
+                        let Some(plan) =
+                            plan_compressed(content, block_size_max, *next_id, &mut ids)
+                        else {
+                            *blocked = true;
+                            return;
+                        };
+                        let Some(cell) = idle_cell(free, cells, 2 * depth) else {
+                            return;
+                        };
+                        let id = *next_id;
+                        *next_id += 1;
+                        let content: Arc<[u8]> = content.into();
+                        let job = Arc::new(Job {
+                            id,
+                            huf_def: plan.huf_def,
+                            fse_def: plan.fse_def,
+                            defs: job_defs(&plan, id, chain.start.id, &before),
+                            content: content.clone(),
+                            start: chain.start.clone(),
+                        });
+                        for (k, d) in ids.iter().enumerate() {
+                            if *d == Some(id) {
+                                chain.defs.blocks[k] = Some(content.clone());
+                            }
+                        }
+                        chain.defs.ids = ids;
+                        lock(&cell.slot).job = Some(job.clone());
+                        cell.hand(id as usize);
+                        let task = cell.clone();
+                        rayon::spawn_fifo(move || run_job(&task, id as usize));
+                        Some((job, cell))
+                    }
+                    BlockType::Reserved => {
+                        *blocked = true;
+                        return;
+                    }
+                };
+                let planned = Planned {
+                    block,
+                    job,
+                    before,
+                    seen: call,
+                };
+                chain.queued_len += planned.len();
+                chain.queue.push_back(planned);
+            }
+        }
+    }
+
+    impl Pipeline {
+        /// Execute the chain's blocks that `input` starts with into `out`,
+        /// blocks of `frame`, calling `next` before each block but the
+        /// first and stopping if it returns false, while planning the
+        /// blocks of `input` after them a ring's worth ahead, which keep
+        /// decoding after it returns. Returns whether the last block it
+        /// executed was the frame's last, `None` if it executed none, and
+        /// sets `read` to where the blocks executed end in `input.data`, on
+        /// failure too. It stops before a block `input` does not hold
+        /// whole, and before one whose decode fails or that it cannot plan,
+        /// which the serial decoder then decodes, giving its verdict on it.
+        fn run<O: FrameOut>(
+            &mut self,
+            input: Input<'_>,
+            frame: &mut Frame,
+            out: &mut O,
+            simd: Level,
+            read: &mut usize,
+            next: &mut impl FnMut(&mut O) -> bool,
+        ) -> Result<Option<bool>, DecodeError> {
+            self.calls += 1;
+            let depth = 2 * rayon::current_num_threads();
+            let block_size_max = frame.block_size_max;
+            let (mut pos, mut last, mut blocked) = (0, None, false);
+            loop {
+                self.fill(input, pos, depth, &mut blocked);
+                let Some(chain) = &mut self.chain else {
+                    break;
+                };
+                let Some(front) = chain.queue.front_mut() else {
+                    break;
+                };
+                let Some((block, content)) = input.block(pos, block_size_max) else {
+                    break;
+                };
+                // Planned in an earlier call, on its input.
+                if front.seen != self.calls {
+                    if !front.holds(&block, content) {
+                        self.rewind();
+                        continue;
+                    }
+                    front.seen = self.calls;
+                }
+                if last.is_some() && !next(out) {
+                    break;
+                }
+                let Pipeline {
+                    chain: Some(chain),
+                    free,
+                    ..
+                } = self
+                else {
+                    break;
+                };
+                let p = &chain.queue[0];
+                let plan = match (p.block.block_type, &p.job) {
+                    (BlockType::Raw, _) => Plan::Raw(content),
+                    (BlockType::RLE, _) => {
+                        Plan::Rle(content[0], p.block.decompressed_size as usize)
+                    }
+                    (_, Some((job, _))) => {
+                        let Ok(parts) = split_block(content, block_size_max) else {
+                            break;
+                        };
+                        Plan::Compressed(CompressedPlan {
+                            parts,
+                            huf_def: job.huf_def,
+                            fse_def: job.fse_def,
+                        })
+                    }
+                    (_, None) => break,
+                };
+                let slot = match &p.job {
+                    Some((job, cell)) => {
+                        let ticket = job.id as usize;
+                        if cell.take(ticket) {
+                            run_taken(cell, ticket);
+                        }
+                        while !cell.decoded(ticket) {
+                            // If no task has started the block after either,
+                            // the pool is behind: decode it here meanwhile.
+                            match chain.queue.get(1).and_then(|n| n.job.as_ref()) {
+                                Some((job, after)) if after.take(job.id as usize) => {
+                                    run_taken(after, job.id as usize)
+                                }
+                                _ => std::thread::yield_now(),
+                            }
+                        }
+                        let slot = decoded_slot(cell);
+                        if slot.result.is_err() {
+                            break;
+                        }
+                        Some(slot)
+                    }
+                    None => None,
+                };
+                let start = chain.start.view();
+                let hist = &mut chain.hist;
+                let Ok(bytes) = execute_block(
+                    &plan,
+                    slot.as_deref(),
+                    start,
+                    hist,
+                    block_size_max,
+                    out,
+                    simd,
+                ) else {
+                    break;
+                };
+                drop(slot);
+                let p = chain.queue.pop_front().unwrap();
+                let (len, ended) = (p.len(), p.block.last_block);
+                chain.queued_len -= len;
+                if let Some((_, cell)) = p.job {
+                    free.push(cell);
+                }
+                pos += len;
+                *read = pos - input.data_start();
+                last = Some(ended);
+                frame.block_decoded(bytes)?;
+                if ended {
+                    break;
+                }
+            }
+            Ok(last)
+        }
+    }
+
+    /// Stage 2 for compressed block `id`, of a run starting with the
+    /// tables in `start`; `def` gives the sections of the earlier blocks of
+    /// the run whose table descriptions it uses.
+    fn decode_block<'p, 'a: 'p>(
+        slot: &mut Slot,
+        id: u64,
+        plan: &CompressedPlan<'_>,
+        def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
         start: FrameStart<'_>,
     ) -> Result<(), DecodeError> {
         if let Some(d) = plan.huf_def {
-            if d == i {
+            if d == id {
                 // `decode_block_literals` builds it from this block.
                 slot.huf_from = None;
-            } else if d == START {
+            } else if d == start.id {
                 if slot.huf_from != Some(d) {
                     slot.huf.table.copy_from(start.init.huf_table(start.dict));
                     slot.huf_from = Some(d);
                 }
             } else if slot.huf_from != Some(d) {
                 slot.huf_from = None;
-                build_huf_from(compressed(&plans[d]), &mut slot.huf.table)?;
+                build_huf_from(described(&def, d)?, &mut slot.huf.table)?;
                 slot.huf_from = Some(d);
             }
         }
         decode_block_literals(&plan.parts, &mut slot.huf, None, &mut slot.literals)?;
-        if plan.huf_def == Some(i) {
-            slot.huf_from = Some(i);
+        if plan.huf_def == Some(id) {
+            slot.huf_from = Some(id);
         }
 
         slot.seqs.clear();
@@ -5200,18 +5790,27 @@ mod parallel {
         let mut used = 0;
         for (t, mode) in seq.modes.all().into_iter().enumerate() {
             let d = plan.fse_def[t];
-            if d == i {
+            if d == id {
                 slot.fse_from[t] = None;
                 used += build_sequence_table(mode, &src[used..], &mut slot.fse, t)?;
-                slot.fse_from[t] = Some(i);
-            } else if d != START && slot.fse_from[t] != Some(d) {
+                slot.fse_from[t] = Some(id);
+            } else if d != start.id && slot.fse_from[t] != Some(d) {
                 slot.fse_from[t] = None;
-                build_table_from(compressed(&plans[d]), t, &mut slot.fse)?;
+                build_table_from(described(&def, d)?, t, &mut slot.fse)?;
                 slot.fse_from[t] = Some(d);
             }
         }
         let tables = seq_tables(plan, &slot.fse, start);
         decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
+    }
+
+    /// The sections of block `d`, which described a table a later block
+    /// uses, as `def` gives them.
+    fn described<'p, 'a>(
+        def: &impl Fn(u64) -> Option<&'p BlockParts<'a>>,
+        d: u64,
+    ) -> Result<&'p BlockParts<'a>, DecodeError> {
+        def(d).ok_or_else(|| format!("No description of block {d}'s tables").into())
     }
 
     /// The LL, OF, ML tables compressed block `plan` decodes with: those
@@ -5223,7 +5822,7 @@ mod parallel {
         start: FrameStart<'s>,
     ) -> [&'s FSETable; 3] {
         std::array::from_fn(|t| {
-            if plan.fse_def[t] == START {
+            if plan.fse_def[t] == start.id {
                 start.init.fse.table(t, start.dict.map(|d| &d.fse))
             } else {
                 fse.table(t, None)
@@ -5231,32 +5830,29 @@ mod parallel {
         })
     }
 
-    /// Build `table` from the tree description of compressed block `def`'s
-    /// literals, with the arguments of its own build in
-    /// `decompress_literals`, so the same table kind (X1 / X2).
-    fn build_huf_from(
-        def: &CompressedPlan<'_>,
-        table: &mut HuffmanTable,
-    ) -> Result<(), DecodeError> {
-        let lit = &def.parts.literals;
+    /// Build `table` from the tree description of the literals of the
+    /// compressed block of sections `def`, with the arguments of its own
+    /// build in `decompress_literals`, so the same table kind (X1 / X2).
+    fn build_huf_from(def: &BlockParts<'_>, table: &mut HuffmanTable) -> Result<(), DecodeError> {
+        let lit = &def.literals;
         table
             .build_decoder(
-                def.parts.literals_src,
+                def.literals_src,
                 lit.regenerated_size as usize,
                 lit.four_streams,
             )
             .map(|_| ())
     }
 
-    /// Build table `t` from its description in the earlier block `def`,
-    /// skipping the descriptions that precede it there.
+    /// Build table `t` from its description in the earlier block of
+    /// sections `def`, skipping the descriptions that precede it there.
     fn build_table_from(
-        def: &CompressedPlan<'_>,
+        def: &BlockParts<'_>,
         t: usize,
         fse: &mut FSEScratch,
     ) -> Result<(), DecodeError> {
-        let modes = def.parts.sequences.modes.all();
-        let src = def.parts.sequences_src;
+        let modes = def.sequences.modes.all();
+        let src = def.sequences_src;
         let mut used = 0;
         for (u, kind) in SEQ_TABLES.iter().enumerate().take(t) {
             used += match modes[u] {
@@ -5441,7 +6037,7 @@ mod parallel {
     /// `slot`: write it to `out` and return its bytes.
     fn execute_block<'o>(
         plan: &Plan<'_>,
-        slot: &Slot,
+        slot: Option<&Slot>,
         start: FrameStart<'_>,
         hist: &mut [u32; 3],
         block_size_max: usize,
@@ -5467,6 +6063,7 @@ mod parallel {
                     dst.op + len
                 }
                 Plan::Compressed(cp) => {
+                    let slot = slot.expect("a compressed block is executed from its stage 2");
                     let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
                     if cp.parts.sequences.num_sequences == 0 {
                         ptr::copy_nonoverlapping(slot.literals.as_ptr(), at, literals_len);
@@ -5578,24 +6175,26 @@ mod parallel {
         /// Decode the blocks of the frame being decoded at the start of
         /// `data`, from a block header on, into `out`, the frame having
         /// started from `dict` if given, unless the frame fits in one
-        /// block: on the current rayon pool if `data` starts with blocks
-        /// the last call decoded ahead (`Ahead`) or `Gate::pools` takes the
-        /// blocks `located` gives for `room` bytes of output, else those
-        /// one after another as `process` would. Before each block but the
-        /// first it calls `next`, where the serial driver writes out the
-        /// blocks before, and stops if it returns false. Returns the
-        /// `Event` of the last block it decoded, or `None` if it decoded
-        /// none, and sets `read` to how much of `data` those blocks take,
-        /// on failure too.
+        /// block: on the current rayon pool while the frame's `Pipeline`
+        /// runs a chain or if `Gate::pools` takes the blocks `located`
+        /// gives for `room` bytes of output, else those one after another
+        /// as `process` would. Before each block but the first it calls
+        /// `next`, where the serial driver writes out the blocks before,
+        /// and stops if it returns false. Returns the `Event` of the last
+        /// block it decoded, or `None` if it decoded none, and sets `read`
+        /// to how much of `data` those blocks take, on failure too.
         ///
-        /// On the pool it takes the blocks `plan_blocks` takes for a ring's
-        /// worth of blocks past `room`: when `next` stops it, those decoded
-        /// after the last one executed are kept for the next call. It
-        /// stops before a block that fails, or that it cannot plan, and
-        /// leaves its scratch as the serial decoder would after the blocks
-        /// before, which then decodes that one and gives its verdict. The
-        /// frame's size checks, after each block and after the last, are
-        /// the serial ones, and fail here as there.
+        /// If `room` takes all the whole blocks of `data`, or the rest of
+        /// the frame's content, none is left to decode ahead, and the pool
+        /// decodes them in one scope, from `data` as borrowed. Otherwise
+        /// the pipeline's chain takes them, and those it planned past the
+        /// last one executed keep decoding after the call, for the next.
+        /// It stops before a block that fails, or that it cannot plan, and
+        /// leaves the serial decoder's state as the serial decoder would
+        /// after the blocks before (on `Pipeline::hand_back`, for a chain),
+        /// which then decodes that one and gives its verdict. The frame's
+        /// size checks, after each block and after the last, are the serial
+        /// ones, and fail here as there.
         ///
         /// Inline down to the stage and frame it never takes, which cost
         /// the serial driver a branch on every unit.
@@ -5630,38 +6229,84 @@ mod parallel {
             out: &mut O,
             room: usize,
             read: &mut usize,
-            mut next: impl FnMut(&mut O) -> bool + Send,
+            next: impl FnMut(&mut O) -> bool + Send,
         ) -> Result<Option<Event>, DecodeError> {
-            let (Stage::Block { frame, .. }, Some(gate)) = (&mut self.stage, self.parallel) else {
+            let (Stage::Block { frame, .. }, Some(gate)) = (&self.stage, self.parallel) else {
                 return Ok(None);
             };
             let block_size_max = frame.block_size_max;
-            // Blocks decoded ahead have had their stage 2.
-            let held = frame.ahead.take(data);
-            if held == 0 && !gate.pools(located(data, block_size_max, room)) {
-                return self.decode_serially(data, dict, out, room, read, next);
+            // Room for the rest of the frame's content is room for all its
+            // blocks, however much more they could decode to.
+            let room = match frame.content_size {
+                Some(fcs) if fcs - frame.decoded <= room as u64 => usize::MAX,
+                _ => room,
+            };
+            if !frame.pipeline.active() {
+                if !gate.pools(located(data, block_size_max, room)) {
+                    return self.decode_serially(data, dict, out, room, read, next);
+                }
+                if room_takes_all(data, block_size_max, room) {
+                    return self.decode_scoped(data, dict, out, room, read, next);
+                }
             }
+            self.decode_detached(Input { held: None, data }, dict, out, read, next)
+        }
+
+        /// `decode_blocks_parallel` at the content of a block whose header
+        /// the serial decoder took, `content`: if the frame's chain runs,
+        /// it takes that block, then the blocks `data` starts with, as
+        /// `decode_blocks_parallel` takes blocks, and sets `read` to how
+        /// much of `data` those after it take. A block that straddles two
+        /// calls' input so stays in the chain, which goes on after it.
+        #[inline]
+        pub(super) fn decode_held_block_parallel<O: FrameOut>(
+            &mut self,
+            content: &[u8],
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            read: &mut usize,
+            next: impl FnMut(&mut O) -> bool,
+        ) -> Result<Option<Event>, DecodeError> {
+            match &self.stage {
+                Stage::Block {
+                    frame,
+                    header: Some(block),
+                } if frame.pipeline.active() => {
+                    let held = Some((*block, content));
+                    self.decode_detached(Input { held, data }, dict, out, read, next)
+                }
+                _ => Ok(None),
+            }
+        }
+
+        /// `decode_block_batch` on blocks `room` takes all of: stages 2 and
+        /// 3 in one rayon scope.
+        fn decode_scoped<O: FrameOut + Send>(
+            &mut self,
+            data: &[u8],
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            room: usize,
+            read: &mut usize,
+            mut next: impl FnMut(&mut O) -> bool + Send,
+        ) -> Result<Option<Event>, DecodeError> {
             let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &mut self.scratch)
             else {
                 return Ok(None);
             };
+            let block_size_max = frame.block_size_max;
+            let pipeline = &mut frame.pipeline;
             let start = FrameStart {
+                id: pipeline.new_id(),
                 init: scratch,
                 dict: dict.and_then(DecodeDict::entropy),
             };
-            // Past the blocks `room` takes, a ring's worth more decode ahead
-            // for the next call, if the room runs out first.
-            let positions = 2 * rayon::current_num_threads();
-            let reach = room.saturating_add(positions.saturating_mul(block_size_max));
-            let batch = plan_blocks(data, block_size_max, start, reach);
-            let len = positions.min(batch.plans.len());
-            // Out of the frame its blocks are accounted to while they run.
-            let mut ahead = std::mem::take(&mut frame.ahead);
-            let ring = ahead.ring(len);
-            let (done, ready, hist, accounted) =
-                run_batch(&batch.plans, frame, start, out, self.simd, &mut next, ring);
-            ahead.hold(len, data, &batch.ends, done, ready);
-            frame.ahead = ahead;
+            let batch = plan_blocks(data, block_size_max, start, room, &mut pipeline.next_id);
+            let ring = pipeline.ring((2 * rayon::current_num_threads()).min(batch.plans.len()));
+            let (done, hist, accounted) =
+                run_batch(&batch, frame, start, out, self.simd, &mut next, &ring);
+            frame.pipeline.free.extend(ring);
             let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
                 return Ok(None);
             };
@@ -5670,8 +6315,53 @@ mod parallel {
             if done == batch.plans.len() && batch.last {
                 return self.blocks_ended().map(Some);
             }
-            sync_scratch(scratch, &batch.plans[..done], hist)?;
+            let mut defs = [None; 4];
+            for plan in &batch.plans[..done] {
+                if let Plan::Compressed(cp) = plan {
+                    defs[0] = cp.huf_def.or(defs[0]);
+                    if cp.parts.sequences.num_sequences != 0 {
+                        defs[1..].copy_from_slice(&cp.fse_def.map(Some));
+                    }
+                }
+            }
+            let start = start.id;
+            sync_scratch(scratch, hist, defs, start, |d| batch.def(d))?;
             Ok(Some(Event::Continue))
+        }
+
+        /// `decode_block_batch`, or `decode_held_block_parallel`, on the
+        /// frame's pipeline, which starts a chain from the scratch if none
+        /// runs.
+        #[inline(never)]
+        fn decode_detached<O: FrameOut>(
+            &mut self,
+            input: Input<'_>,
+            dict: Option<&DecodeDict>,
+            out: &mut O,
+            read: &mut usize,
+            mut next: impl FnMut(&mut O) -> bool,
+        ) -> Result<Option<Event>, DecodeError> {
+            let simd = self.simd;
+            let (Stage::Block { frame, header }, Some(scratch)) = (&mut self.stage, &self.scratch)
+            else {
+                return Ok(None);
+            };
+            // Out of the frame its blocks are accounted to while they run.
+            let mut pipeline = std::mem::take(&mut frame.pipeline);
+            if !pipeline.active() {
+                pipeline.start(scratch, dict, frame.block_size_max);
+            }
+            let ran = pipeline.run(input, frame, out, simd, read, &mut next);
+            frame.pipeline = pipeline;
+            // The held block, if any, is the first it executed.
+            if !matches!(ran, Ok(None)) {
+                *header = None;
+            }
+            match ran? {
+                None => Ok(None),
+                Some(false) => Ok(Some(Event::Continue)),
+                Some(true) => self.blocks_ended().map(Some),
+            }
         }
 
         /// `decode_block_batch` on blocks the pool does not take: the
@@ -5710,23 +6400,29 @@ mod parallel {
         }
     }
 
-    /// Stages 2 and 3 of `plans`, blocks of `frame` from the tables and
+    /// Whether `room` bytes of output take all the whole blocks of `data`
+    /// (`located`).
+    fn room_takes_all(data: &[u8], block_size_max: usize, room: usize) -> bool {
+        located(data, block_size_max, room).count()
+            == located(data, block_size_max, usize::MAX).count()
+    }
+
+    /// Stages 2 and 3 of `batch`, blocks of `frame`, from the tables and
     /// repeat offsets in `start`, into `out`, calling `next` before each
-    /// block but the first, with tasks decoding into `ring`. Returns how many
-    /// blocks it decoded, from the first, up to one whose stage 2 or 3
-    /// fails or before which `next` returns false; in that last case how
-    /// many blocks after them had been decoded; the repeat offsets after
-    /// the blocks decoded, and the frame's size check on them, which ends
-    /// them where it fails.
+    /// block but the first, with tasks decoding into `ring`. Returns how
+    /// many blocks it decoded, from the first, up to one whose stage 2 or 3
+    /// fails or before which `next` returns false; the repeat offsets after
+    /// them, and the frame's size check on them, which ends them where it
+    /// fails.
     fn run_batch<O: FrameOut + Send>(
-        plans: &[Plan<'_>],
+        batch: &Batch<'_>,
         frame: &mut Frame,
         start: FrameStart<'_>,
         out: &mut O,
         simd: Level,
         next: &mut (impl FnMut(&mut O) -> bool + Send),
-        BatchRing { slots: ring, held }: BatchRing<'_>,
-    ) -> (usize, usize, [u32; 3], Result<(), DecodeError>) {
+        ring: &[Arc<Cell>],
+    ) -> (usize, [u32; 3], Result<(), DecodeError>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
         // spawned once block `i - ring.len()` has been executed from it, or
         // by the executing thread if no task has started it by the time
@@ -5734,27 +6430,31 @@ mod parallel {
         // decodes no block further ahead, so a block it needs is never left
         // waiting behind the decode of a later one.
         let block_size_max = frame.block_size_max;
+        let (plans, base) = (&batch.plans[..], batch.base);
+        let def = |d| batch.def(d);
+        let ticket = |i: usize| (base + i as u64) as usize;
+        let decode = |i: usize, cell: &Cell| {
+            if let Plan::Compressed(cp) = &plans[i] {
+                let id = base + i as u64;
+                cell.decode(ticket(i), |slot| decode_block(slot, id, cp, def, start));
+            }
+        };
         let mut hist = start.init.offset_hist;
         let (mut done, mut stopped) = (0, false);
         let accounted = rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
-                let Some(Plan::Compressed(cp)) = plans.get(i) else {
+                let Some(Plan::Compressed(_)) = plans.get(i) else {
                     return;
                 };
-                let cell = &ring[i % ring.len()];
+                let cell = &*ring[i % ring.len()];
+                cell.hand(ticket(i));
                 s.spawn_fifo(move |_| {
-                    if !cell.claim(i) {
-                        return;
+                    if cell.take(ticket(i)) {
+                        decode(i, cell);
                     }
-                    // Marks the block done even if decoding panics, so that
-                    // the executing thread finds the poisoned lock instead
-                    // of waiting forever.
-                    let _done = MarkDone(&cell.done, i + 1);
-                    let mut slot = cell.slot.lock().unwrap();
-                    slot.result = decode_block(&mut slot, i, cp, plans, start);
                 });
             };
-            for i in held..ring.len() {
+            for i in 0..ring.len() {
                 spawn_decode(i);
             }
             for (i, plan) in plans.iter().enumerate() {
@@ -5763,44 +6463,47 @@ mod parallel {
                         stopped = true;
                         break;
                     }
-                    // Block `i - 1` has been executed from its position.
+                    // Block `i - 1` has been executed from its cell.
                     spawn_decode(i - 1 + ring.len());
                 }
-                let cell = &ring[i % ring.len()];
                 let slot = match plan {
-                    Plan::Compressed(cp) if cell.claim(i) => {
-                        let mut slot = cell.slot.lock().unwrap();
-                        slot.result = decode_block(&mut slot, i, cp, plans, start);
-                        slot
-                    }
                     Plan::Compressed(_) => {
-                        while cell.done.load(Ordering::Acquire) != i + 1 {
+                        let cell = &*ring[i % ring.len()];
+                        if cell.take(ticket(i)) {
+                            decode(i, cell);
+                        }
+                        while !cell.decoded(ticket(i)) {
                             // If no task has started block `i + 1` either,
                             // the decoders are behind: decode it here while
-                            // block `i` finishes. Its position is free, as
-                            // block `i + 1 - ring.len()` has been executed.
-                            let next = &ring[(i + 1) % ring.len()];
+                            // block `i` finishes. Its cell is free, as block
+                            // `i + 1 - ring.len()` has been executed.
+                            let after = &*ring[(i + 1) % ring.len()];
                             match plans.get(i + 1) {
-                                Some(Plan::Compressed(np)) if next.claim(i + 1) => {
-                                    let _done = MarkDone(&next.done, i + 2);
-                                    let mut slot = next.slot.lock().unwrap();
-                                    slot.result = decode_block(&mut slot, i + 1, np, plans, start);
+                                Some(Plan::Compressed(_)) if after.take(ticket(i + 1)) => {
+                                    decode(i + 1, after)
                                 }
                                 // Hand the CPU to a worker the kernel may
                                 // have queued on it.
                                 _ => std::thread::yield_now(),
                             }
                         }
-                        cell.slot.lock().unwrap()
+                        let slot = decoded_slot(cell);
+                        if slot.result.is_err() {
+                            break;
+                        }
+                        Some(slot)
                     }
-                    _ => cell.slot.lock().unwrap(),
+                    _ => None,
                 };
-                if matches!(plan, Plan::Compressed(_)) && slot.result.is_err() {
-                    break;
-                }
-                let Ok(bytes) =
-                    execute_block(plan, &slot, start, &mut hist, block_size_max, out, simd)
-                else {
+                let Ok(bytes) = execute_block(
+                    plan,
+                    slot.as_deref(),
+                    start,
+                    &mut hist,
+                    block_size_max,
+                    out,
+                    simd,
+                ) else {
                     break;
                 };
                 drop(slot);
@@ -5808,55 +6511,37 @@ mod parallel {
                 frame.block_decoded(bytes)?;
             }
             if stopped {
-                // Claim the decodes no task has started, which the next
-                // batch may not take, so that their tasks return; the scope
-                // waits for the others.
+                // Take the decodes no task has started, so that their tasks
+                // return; the scope waits for the others.
                 for j in done..plans.len().min(done + ring.len()) {
-                    ring[j % ring.len()].claim(j);
+                    ring[j % ring.len()].take(ticket(j));
                 }
             }
             Ok(())
         });
-        let ready = match accounted {
-            Ok(()) if stopped => (done..plans.len().min(done + ring.len()))
-                .take_while(|&j| {
-                    let cell = &ring[j % ring.len()];
-                    !matches!(plans[j], Plan::Compressed(_))
-                        || cell.done.load(Ordering::Acquire) == j + 1
-                            && cell.slot.lock().unwrap().result.is_ok()
-                })
-                .count(),
-            _ => 0,
-        };
-        (done, ready, hist, accounted)
+        (done, hist, accounted)
     }
 
-    /// Leave `scratch` as the serial decoder leaves it after `plans`, the
-    /// blocks up to here, all decoded: with repeat offsets `hist`, and the
-    /// Huffman and sequence tables the last descriptions among them built,
-    /// for the blocks after to repeat.
-    fn sync_scratch(
+    /// Leave `scratch` as the serial decoder leaves it after a run of
+    /// blocks from the tables `scratch` had, named `start`, all decoded:
+    /// with repeat offsets `hist`, and the Huffman and sequence tables
+    /// `defs` names rebuilt from the descriptions `def` gives, those of
+    /// blocks of the run, for the blocks after to repeat.
+    fn sync_scratch<'p, 'a: 'p>(
         scratch: &mut DecoderScratch,
-        plans: &[Plan<'_>],
         hist: [u32; 3],
+        defs: Defs,
+        start: u64,
+        def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
     ) -> Result<(), DecodeError> {
         scratch.offset_hist = hist;
-        let (mut huf, mut fse) = (None, None);
-        for plan in plans {
-            if let Plan::Compressed(cp) = plan {
-                huf = cp.huf_def.or(huf);
-                if cp.parts.sequences.num_sequences != 0 {
-                    fse = Some(cp.fse_def);
-                }
-            }
-        }
-        if let Some(d) = huf.filter(|&d| d != START) {
-            build_huf_from(compressed(&plans[d]), &mut scratch.huf.table)?;
+        if let Some(d) = defs[0].filter(|&d| d != start) {
+            build_huf_from(described(&def, d)?, &mut scratch.huf.table)?;
             scratch.huf_from_dict = false;
         }
-        for (t, d) in fse.into_iter().flatten().enumerate() {
-            if d != START {
-                build_table_from(compressed(&plans[d]), t, &mut scratch.fse)?;
+        for (t, d) in defs[1..].iter().enumerate() {
+            if let Some(d) = d.filter(|&d| d != start) {
+                build_table_from(described(&def, d)?, t, &mut scratch.fse)?;
             }
         }
         Ok(())
@@ -5865,6 +6550,7 @@ mod parallel {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::{mpsc, Weak};
 
         const BLOCK_SIZE_MAX: usize = 1 << 17;
 
@@ -5912,60 +6598,336 @@ mod parallel {
             }
         }
 
-        /// `Ahead::take` after a batch that executed the first of five
-        /// blocks and holds the next three: it takes those the next input
-        /// starts with, byte for byte, none once a block has been decoded
-        /// since, and drops the others; `Ahead::ring` then has them
-        /// decoded, and no table tagged with a block numbered for the batch
-        /// before.
+        /// A cell's tickets: one handed is taken once, by whoever comes
+        /// first, and is done once decoded; an earlier ticket, a task's
+        /// whose block someone else took or whose cell was handed another,
+        /// is neither takeable nor done. A decode that panics is done, and
+        /// its panic resumes on the thread that executes the block.
         #[test]
-        fn ahead_takes_the_held_blocks_input_starts_with() {
-            let data = blocks("czcrc", 100);
-            let ends: Vec<usize> = located(&data, BLOCK_SIZE_MAX, usize::MAX)
-                .map(|(_, _, end)| end)
-                .collect();
-            let held = || {
-                let mut ahead = Ahead::default();
-                ahead.ring(4);
-                ahead.hold(4, &data, &ends, 1, 3);
-                ahead
+        fn cell_tickets_are_taken_once() {
+            let cell = Cell::new();
+            assert!(!cell.take(0) && !cell.decoded(0), "new");
+            cell.hand(7);
+            assert!(!cell.decoded(7));
+            assert!(cell.take(7), "planned");
+            assert!(!cell.take(7), "taken");
+            cell.decode(7, |_| Ok(()));
+            assert!(cell.decoded(7));
+            cell.hand(8);
+            assert!(!cell.take(7) && !cell.decoded(8), "handed the next");
+            assert!(cell.take(8));
+            cell.decode(8, |_| panic!("stage 2"));
+            assert!(cell.decoded(8));
+            let resumed = panic::catch_unwind(AssertUnwindSafe(|| drop(decoded_slot(&cell))));
+            let payload = resumed.expect_err("the decode's panic");
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"stage 2"));
+            // Resumed once; the slot is not poisoned.
+            assert!(decoded_slot(&cell).result.is_err());
+        }
+
+        /// The libzstd frame of `data` in blocks of 1 KiB, with a 1 KiB
+        /// window and Huffman literals forced on; returns it with where its
+        /// blocks start.
+        fn small_blocks(data: &[u8]) -> (Vec<u8>, usize) {
+            use zstd::zstd_safe::zstd_sys as sys;
+            unsafe {
+                let cctx = sys::ZSTD_createCCtx();
+                for (p, v) in [
+                    (sys::ZSTD_cParameter::ZSTD_c_compressionLevel, 3),
+                    (sys::ZSTD_cParameter::ZSTD_c_windowLog, 10),
+                    (sys::ZSTD_cParameter::ZSTD_c_experimentalParam18, 1024),
+                    (sys::ZSTD_cParameter::ZSTD_c_experimentalParam5, 1),
+                ] {
+                    assert_eq!(
+                        sys::ZSTD_isError(sys::ZSTD_CCtx_setParameter(cctx, p, v)),
+                        0
+                    );
+                }
+                let mut out = vec![0u8; sys::ZSTD_compressBound(data.len())];
+                let n = sys::ZSTD_compress2(
+                    cctx,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                    data.as_ptr().cast(),
+                    data.len(),
+                );
+                assert_eq!(sys::ZSTD_isError(n), 0);
+                sys::ZSTD_freeCCtx(cctx);
+                out.truncate(n);
+                let header = frame_header_len(&out);
+                (out, header)
+            }
+        }
+
+        /// 40 KiB of words, compressed blocks of 1 KiB each.
+        fn words() -> Vec<u8> {
+            let words: [&[u8]; 6] = [b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy "];
+            let (mut data, mut x) = (Vec::new(), 1u64);
+            while data.len() < 40 << 10 {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                data.extend_from_slice(words[(x >> 33) as usize % words.len()]);
+            }
+            data.truncate(40 << 10);
+            data
+        }
+
+        /// What `retire` leaves of the blocks a chain planned: each block's
+        /// job, the cell it decodes into, and its id.
+        struct PlannedJobs {
+            jobs: Vec<(Weak<Job>, Arc<Cell>, u64)>,
+            start: Weak<StartTables>,
+        }
+
+        impl PlannedJobs {
+            fn of(dec: &FrameDecoder) -> PlannedJobs {
+                let Stage::Block { frame, .. } = &dec.stage else {
+                    panic!("inside the frame");
+                };
+                let chain = frame.pipeline.chain.as_ref().expect("a chain");
+                let jobs = chain
+                    .queue
+                    .iter()
+                    .filter_map(|p| p.job.as_ref())
+                    .map(|(job, cell)| (Arc::downgrade(job), cell.clone(), job.id))
+                    .collect();
+                PlannedJobs {
+                    jobs,
+                    start: Arc::downgrade(&chain.start),
+                }
+            }
+
+            /// Every job is gone and its ticket taken from its cell, which
+            /// decoded none of them, and so is what the chain started from.
+            fn assert_retired(&self, what: &str) {
+                for (job, cell, id) in &self.jobs {
+                    let ticket = *id as usize;
+                    assert!(job.upgrade().is_none(), "{what}: job {id} dropped");
+                    assert!(!cell.take(ticket), "{what}: job {id} taken");
+                    assert!(!cell.decoded(ticket), "{what}: job {id} not decoded");
+                }
+                assert!(self.start.upgrade().is_none(), "{what}: start dropped");
+            }
+
+            /// Wait until no task holds a cell: every task the chain spawned
+            /// has returned.
+            fn wait_for_tasks(&self, what: &str) {
+                let t0 = std::time::Instant::now();
+                for (_, cell, id) in &self.jobs {
+                    while Arc::strong_count(cell) != 1 {
+                        assert!(t0.elapsed().as_secs() < 10, "{what}: task {id} returned");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+
+        /// A pool of two threads, one of them held until the returned
+        /// sender sends or drops, so that tasks spawned from the other,
+        /// which runs `f`, stay queued while it runs.
+        fn on_held_pool<R: Send>(f: impl FnOnce(mpsc::Sender<()>) -> R + Send) -> R {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (held, release) = (mpsc::channel(), mpsc::channel::<()>());
+                rayon::spawn(move || {
+                    held.0.send(()).unwrap();
+                    let _ = release.1.recv();
+                });
+                held.1.recv().unwrap();
+                f(release.0)
+            })
+        }
+
+        /// One call on the frame of `words` through the pipeline that
+        /// executes its first block only, the pool's second thread held:
+        /// the decoder, its output, and where the call stopped reading.
+        fn one_block_decoded() -> (FrameDecoder, Vec<u8>, usize) {
+            let (frame, header) = small_blocks(&words());
+            let mut dec = FrameDecoder::new(&DecodeOptions {
+                min_parallel_blocks: 1,
+                min_parallel_bytes: 0,
+                simd: true,
+                window_log_max: 0,
+            });
+            let mut output = Vec::new();
+            let mut out = VecOut {
+                output: &mut output,
+                prefix: Prefix {
+                    start: 0,
+                    window: 0,
+                },
+                dict: &[],
             };
-            let next = &data[ends[0]..];
-            let mut changed = next.to_vec();
-            changed[ends[2] - ends[0] + 5] ^= 1;
-            for (what, input, want) in [
-                ("whole", next, 3),
-                ("third changed", &changed[..], 2),
-                ("cut in the second", &next[..ends[2] - ends[0] - 1], 1),
-                ("from the first block", &data[..], 0),
-            ] {
-                let mut ahead = held();
-                assert_eq!(ahead.take(input), want, "{what}");
-                assert_eq!(ahead.take(next), want, "{what}, again");
+            let started = dec.process(&frame[..header], &mut out, None);
+            assert!(matches!(started, Ok(Event::FrameStarted)));
+            let mut read = 0;
+            let decoded = dec.decode_blocks_parallel(
+                &frame[header..],
+                None,
+                &mut out,
+                2048,
+                &mut read,
+                |_| false,
+            );
+            assert!(matches!(decoded, Ok(Some(Event::Continue))));
+            (dec, output, header + read)
+        }
+
+        /// A frame's reset or drop, or a block the serial decoder decodes,
+        /// with the blocks the chain planned queued on a held pool: each
+        /// one's ticket is taken from its cell and its job dropped there
+        /// and then, with what the chain started from, and once the pool
+        /// runs their tasks, none decodes. After the serial block the frame
+        /// decodes as `decompress` decodes it.
+        #[test]
+        fn pipeline_retires_planned_blocks_at_once() {
+            for what in ["reset", "drop", "serial block"] {
+                on_held_pool(|release| {
+                    let (mut dec, mut output, read) = one_block_decoded();
+                    let planned = PlannedJobs::of(&dec);
+                    assert_eq!(
+                        planned.jobs.len(),
+                        2 * rayon::current_num_threads(),
+                        "{what}"
+                    );
+                    for (_, cell, id) in &planned.jobs {
+                        assert!(!cell.decoded(*id as usize), "{what}: {id} queued");
+                    }
+                    match what {
+                        "reset" => dec.stage = Stage::FrameHeader,
+                        "drop" => drop(dec),
+                        _ => {
+                            let (frame, _) = small_blocks(&words());
+                            let mut out = VecOut {
+                                output: &mut output,
+                                // The frame's, as `process` started it.
+                                prefix: Prefix {
+                                    start: 0,
+                                    window: 1 << 10,
+                                },
+                                dict: &[],
+                            };
+                            let mut pos = read;
+                            loop {
+                                let len = dec.unit_len(&frame[pos..]);
+                                let event = dec.process(&frame[pos..pos + len], &mut out, None);
+                                pos += len;
+                                if event.unwrap() == Event::FrameEnded {
+                                    break;
+                                }
+                                if pos == read + 3 {
+                                    // The block's header only.
+                                    continue;
+                                }
+                                planned.assert_retired(what);
+                            }
+                            assert!(output == words(), "{what}: content");
+                        }
+                    }
+                    planned.assert_retired(what);
+                    release.send(()).unwrap();
+                    planned.wait_for_tasks(what);
+                    for (_, cell, id) in &planned.jobs {
+                        assert!(!cell.decoded(*id as usize), "{what}: {id} never decoded");
+                    }
+                });
             }
-            let mut ahead = held();
-            ahead.outdate();
-            assert_eq!(ahead.take(next), 0, "outdated");
-            // The taken blocks are the batch's first, decoded, and no table
-            // is tagged with a block of the batch before.
-            let mut ahead = held();
-            for cell in &mut ahead.ring {
-                let slot = cell.slot.get_mut().unwrap();
-                slot.huf_from = Some(START);
-                slot.fse_from = [Some(0), Some(1), Some(2)];
+        }
+
+        /// A block that straddles two calls' input, whose header the
+        /// serial decoder took: the chain the call before ran takes it,
+        /// with no new start, and goes on with the blocks after it, and
+        /// the frame decodes as `decompress` decodes it.
+        #[test]
+        fn chain_takes_a_straddling_block() {
+            let (frame, header) = small_blocks(&words());
+            let mut dec = FrameDecoder::new(&DecodeOptions {
+                min_parallel_blocks: 1,
+                min_parallel_bytes: 0,
+                simd: true,
+                window_log_max: 0,
+            });
+            let mut output = Vec::new();
+            let mut out = VecOut {
+                output: &mut output,
+                prefix: Prefix {
+                    start: 0,
+                    window: 0,
+                },
+                dict: &[],
+            };
+            let started = dec.process(&frame[..header], &mut out, None);
+            assert!(matches!(started, Ok(Event::FrameStarted)));
+            // Where the 4th, 5th and 9th blocks start.
+            let mut ends = vec![header];
+            while ends.len() < 10 {
+                let at = *ends.last().unwrap();
+                let (_, content) = locate_block(&frame[at..], 1 << 10).unwrap();
+                ends.push(at + BLOCK_HEADER_LEN + content.len());
             }
-            ahead.take(next);
-            let ring = ahead.ring(4);
-            let done: Vec<usize> = ring
-                .slots
-                .iter()
-                .map(|c| c.done.load(Ordering::Relaxed))
-                .collect();
-            assert_eq!((done, ring.held), (vec![1, 2, 3, 0], 3));
-            for cell in ring.slots {
-                let slot = cell.slot.lock().unwrap();
-                assert_eq!((slot.huf_from, slot.fse_from), (None, [None; 3]));
+            let (pos, after, stop) = (ends[3], ends[4], ends[8]);
+            // A room the chain takes three blocks for, and part of the 4th.
+            let mut read = 0;
+            let cut = &frame[header..pos + BLOCK_HEADER_LEN + 1];
+            let decoded =
+                dec.decode_blocks_parallel(cut, None, &mut out, 1024, &mut read, |_| true);
+            assert!(matches!(decoded, Ok(Some(Event::Continue))));
+            assert_eq!(header + read, pos);
+            let start = PlannedJobs::of(&dec).start;
+            let block = dec.process(&frame[pos..pos + BLOCK_HEADER_LEN], &mut out, None);
+            assert!(matches!(block, Ok(Event::Continue)));
+            let content = &frame[pos + BLOCK_HEADER_LEN..after];
+            let mut read = 0;
+            let decoded = dec.decode_held_block_parallel(
+                content,
+                &frame[after..stop + 1],
+                None,
+                &mut out,
+                &mut read,
+                |_| true,
+            );
+            assert!(matches!(decoded, Ok(Some(Event::Continue))));
+            assert_eq!(after + read, stop);
+            assert!(Weak::ptr_eq(&start, &PlannedJobs::of(&dec).start));
+            let Stage::Block { header: None, .. } = &dec.stage else {
+                panic!("at the 9th block's header");
+            };
+            let mut pos = stop;
+            while pos < frame.len() {
+                let len = dec.unit_len(&frame[pos..]);
+                dec.process(&frame[pos..pos + len], &mut out, None).unwrap();
+                pos += len;
             }
+            assert!(output == words());
+        }
+
+        /// A frame dropped while a task decodes one of its blocks: the
+        /// task keeps what it reads, its job and the tables the chain
+        /// started from, decodes from them after the frame is gone, and
+        /// then drops them.
+        #[test]
+        fn running_task_outlives_the_frame_on_its_own_copies() {
+            on_held_pool(|_release| {
+                let (dec, _, _) = one_block_decoded();
+                let planned = PlannedJobs::of(&dec);
+                let (job, cell, id) = &planned.jobs[0];
+                // The task's take.
+                assert!(cell.take(*id as usize));
+                drop(dec);
+                assert!(job.upgrade().is_some(), "the running task's job");
+                assert!(planned.start.upgrade().is_some(), "its start tables");
+                for (other, _, _) in &planned.jobs[1..] {
+                    assert!(other.upgrade().is_none(), "jobs no task started");
+                }
+                run_taken(cell, *id as usize);
+                assert!(cell.decoded(*id as usize));
+                assert!(decoded_slot(cell).result.is_ok());
+                assert!(job.upgrade().is_none() && planned.start.upgrade().is_none());
+            });
         }
     }
 }

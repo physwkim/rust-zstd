@@ -13,6 +13,8 @@ use common::{
 };
 use rust_zstd::decode::{decompress_with_options, DecodeOptions};
 use rust_zstd::Decompressor;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 use zstd::zstd_safe::zstd_sys as sys;
 
 /// Every frame through the multi-threaded path, however few its blocks.
@@ -288,7 +290,9 @@ fn mt_streams_match_serial_streams() {
 /// decoding them in parallel reads, writes and returns what the serial one
 /// does, failing ones included. The frames are ones the parallel decoder
 /// takes: one whose Frame_Content_Size, checked after its blocks, exceeds
-/// its 1 KiB window, and one without.
+/// its 1 KiB window, and one without. With room for every block, a call
+/// decodes them in one scope; with room for two, the pipeline decodes the
+/// blocks past it ahead, a failing one among them.
 #[test]
 fn mt_stream_verdicts_match_serial() {
     use sys::ZSTD_cParameter::{ZSTD_c_checksumFlag, ZSTD_c_contentSizeFlag, ZSTD_c_windowLog};
@@ -311,21 +315,21 @@ fn mt_stream_verdicts_match_serial() {
             inputs.push((format!("L{level} {kind}"), c));
         }
     }
-    let lockstep = |what: &str, input: &[u8], chunk| {
+    let lockstep = |what: &str, input: &[u8], (chunk, room)| {
         let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
-        assert_lockstep(what, &mut serial, &mut parallel, input, chunk, ROOM);
+        assert_lockstep(what, &mut serial, &mut parallel, input, chunk, room);
     };
     pool(4).install(|| {
         for (name, c) in inputs {
-            for chunk in [700, usize::MAX] {
+            for at in [(700, ROOM), (usize::MAX, ROOM), (usize::MAX, 2 << 10)] {
                 for cut in 0..c.len() {
-                    lockstep(&format!("{name} cut {cut}"), &c[..cut], chunk);
+                    lockstep(&format!("{name} cut {cut}"), &c[..cut], at);
                 }
                 for pos in 0..c.len() {
                     for flip in [0x01u8, 0x80, 0xFF] {
                         let mut bad = c.clone();
                         bad[pos] ^= flip;
-                        lockstep(&format!("{name} byte {pos} ^ {flip:#x}"), &bad, chunk);
+                        lockstep(&format!("{name} byte {pos} ^ {flip:#x}"), &bad, at);
                     }
                 }
             }
@@ -417,20 +421,20 @@ fn mt_batches_either_side_of_the_gate() {
     });
 }
 
-/// `assert_lockstep` at the output room `room`, the first call reading
-/// `first` and the others `then`, from where the calls before stopped
-/// reading; returns the content written.
+/// `assert_lockstep` at the output room `room`, call `k` reading
+/// `inputs[k]`, and the calls after the last of them reading it, from
+/// where the calls before stopped reading; returns the content written.
 fn lockstep_switching(
     what: &str,
     serial: &mut Decompressor,
     parallel: &mut Decompressor,
-    [first, then]: [&[u8]; 2],
+    inputs: &[&[u8]],
     room: usize,
 ) -> Vec<u8> {
     let (mut a, mut b) = (vec![0u8; room], vec![0u8; room]);
     let (mut pos, mut content) = (0, Vec::new());
     for call in 0.. {
-        let src = &[first, then][usize::from(call != 0)][pos..];
+        let src = &inputs[call.min(inputs.len() - 1)][pos..];
         let (mut read, mut written, mut b_read, mut b_written) = (0, 0, 0, 0);
         let hint = serial.decompress_stream(src, &mut read, &mut a, &mut written);
         let b_hint = parallel.decompress_stream(src, &mut b_read, &mut b, &mut b_written);
@@ -505,7 +509,7 @@ fn mt_stream_takes_blocks_decoded_ahead_only_where_input_matches() {
             assert_ne!(a[..end], b[..end], "block {d}");
             let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
             let what = format!("changed in block {d}");
-            let got = lockstep_switching(&what, &mut serial, &mut parallel, [&a, &b], ROOM);
+            let got = lockstep_switching(&what, &mut serial, &mut parallel, &[&a, &b], ROOM);
             assert!(got == other, "{what}");
         }
     });
@@ -520,18 +524,7 @@ fn mt_stream_takes_blocks_decoded_ahead_only_where_input_matches() {
 fn mt_streams_change_tables_between_batches() {
     use sys::ZSTD_cParameter::ZSTD_c_windowLog;
     const BLOCK: usize = 1 << 10;
-    let alphabets: [&[&[u8]]; 3] = [
-        &[b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy "],
-        &[b"0123 ", b"4567, ", b"89. ", b"1000 ", b"-42 "],
-        &[b"ALPHA ", b"BETA; ", b"GAMMA ", b"DELTA! ", b"ZETA "],
-    ];
-    let mut data = Vec::new();
-    for (i, r) in lcg_bytes(40 * BLOCK / 5, 9).into_iter().enumerate() {
-        // Segments of two to three blocks.
-        let words = alphabets[(i / 500 + i / 1300) % 3];
-        data.extend_from_slice(words[usize::from(r) % words.len()]);
-    }
-    data.truncate(40 * BLOCK);
+    let data = changing_words_data(9);
     let mut cases = Vec::new();
     for level in [1, 19] {
         let c = zstd_small_blocks_with(&data, level, BLOCK as i32, &[(ZSTD_c_windowLog, 10)]);
@@ -551,4 +544,261 @@ fn mt_streams_change_tables_between_batches() {
             }
         });
     }
+}
+
+/// 40 KiB of words, each followed by one of its letters, whose alphabet
+/// changes every two to three blocks of 1 KiB: in blocks of 1 KiB, their
+/// Huffman and FSE tables change every few blocks.
+fn changing_words_data(seed: u64) -> Vec<u8> {
+    const BLOCK: usize = 1 << 10;
+    let alphabets: [&[&[u8]]; 3] = [
+        &[b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy "],
+        &[b"0123 ", b"4567, ", b"89. ", b"1000 ", b"-42 "],
+        &[b"ALPHA ", b"BETA; ", b"GAMMA ", b"DELTA! ", b"ZETA "],
+    ];
+    let mut data = Vec::new();
+    let noise = lcg_bytes(40 * BLOCK / 5, seed + 1);
+    for (i, r) in lcg_bytes(40 * BLOCK / 5, seed).into_iter().enumerate() {
+        let words = alphabets[(i / 500 + i / 1300) % 3];
+        let word = words[usize::from(r) % words.len()];
+        data.extend_from_slice(word);
+        // Literals of the alphabet's letters, for Huffman tables.
+        data.push(word[usize::from(noise[i]) % word.len()]);
+    }
+    data.truncate(40 * BLOCK);
+    data
+}
+
+/// `changing_words_data` as a frame of 1 KiB blocks in a 1 KiB window, so
+/// that a stream call with a few KiB of room leaves blocks for the
+/// pipeline to decode ahead, with tables the frame replaces later.
+fn changing_words(seed: u64) -> (Vec<u8>, Vec<u8>) {
+    use sys::ZSTD_cParameter::{ZSTD_c_checksumFlag, ZSTD_c_windowLog};
+    let data = changing_words_data(seed);
+    let params = [(ZSTD_c_windowLog, 10), (ZSTD_c_checksumFlag, 1)];
+    let c = zstd_small_blocks_with(&data, 3, 1 << 10, &params);
+    (data, c)
+}
+
+/// Run `f` on a pool of `threads` threads, all but the one running it held
+/// until the sender it gets sends or drops: tasks spawned meanwhile stay
+/// queued, unless the thread running `f` takes them.
+fn on_held_pool<R: Send>(threads: usize, f: impl FnOnce(mpsc::Sender<()>) -> R + Send) -> R {
+    pool(threads).install(|| {
+        let (held, release) = (mpsc::channel(), mpsc::channel::<()>());
+        let release_rx = Arc::new(Mutex::new(release.1));
+        for _ in 1..threads {
+            let (held, release_rx) = (held.0.clone(), release_rx.clone());
+            rayon::spawn(move || {
+                held.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv();
+            });
+        }
+        for _ in 1..threads {
+            held.1.recv().unwrap();
+        }
+        f(release.0)
+    })
+}
+
+/// `assert_lockstep` at chunk `usize::MAX`, calling `between` with the
+/// number of the call before each call but the first.
+fn lockstep_between(
+    what: &str,
+    serial: &mut Decompressor,
+    parallel: &mut Decompressor,
+    input: &[u8],
+    room: usize,
+    mut between: impl FnMut(usize),
+) -> Vec<u8> {
+    let (mut a, mut b) = (vec![0u8; room], vec![0u8; room]);
+    let (mut pos, mut content) = (0, Vec::new());
+    for call in 0.. {
+        if call != 0 {
+            between(call);
+        }
+        let src = &input[pos..];
+        let (mut read, mut written, mut b_read, mut b_written) = (0, 0, 0, 0);
+        let hint = serial.decompress_stream(src, &mut read, &mut a, &mut written);
+        let b_hint = parallel.decompress_stream(src, &mut b_read, &mut b, &mut b_written);
+        assert!(
+            (&hint, read, &a[..written]) == (&b_hint, b_read, &b[..b_written]),
+            "{what}, room {room}, call {call}: serial gives {hint:?}, reading {read} and \
+             writing {written}; parallel {b_hint:?}, reading {b_read} and writing {b_written}"
+        );
+        content.extend_from_slice(&a[..written]);
+        pos += read;
+        if hint.is_err() || read == 0 && written == 0 && hint != Ok(0) {
+            break;
+        }
+    }
+    assert_eq!(serial.finish(), parallel.finish(), "{what}: finish");
+    content
+}
+
+/// Blocks the pipeline decoded ahead whose tasks finish before the next
+/// call (a pause between calls), during it (no pause), or only once it
+/// has started (the pool held through the first call, then released):
+/// every call reads, writes and returns what the serial decoder does.
+#[test]
+fn mt_stream_takes_tasks_finished_before_or_during_the_next_call() {
+    let (data, c) = changing_words(9);
+    for room in [2 << 10, 5 << 10] {
+        for threads in [2, 4] {
+            for when in ["before", "during"] {
+                pool(threads).install(|| {
+                    let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                    let what = format!("finished {when}, {threads} threads");
+                    let got = lockstep_between(&what, &mut serial, &mut parallel, &c, room, |_| {
+                        if when == "before" {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    });
+                    assert!(got == data, "{what}");
+                });
+            }
+            on_held_pool(threads, |release| {
+                let mut release = Some(release);
+                let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                let what = format!("started after the first call, {threads} threads");
+                let got = lockstep_between(&what, &mut serial, &mut parallel, &c, room, |_| {
+                    release.take();
+                });
+                assert!(got == data, "{what}");
+            });
+        }
+    }
+}
+
+/// A stream reset, or a decompressor dropped, while the blocks the
+/// pipeline planned past the first call's room are queued on a held pool:
+/// the next frame, decoded while the pool is still held or once it has
+/// run them, gives what the serial decoder gives, call by call.
+#[test]
+fn mt_stream_resets_with_blocks_in_flight() {
+    const ROOM: usize = 2 << 10;
+    let (a_data, a) = changing_words(9);
+    let (b_data, b) = changing_words(10);
+    for end in ["reset", "drop"] {
+        for released in [false, true] {
+            on_held_pool(4, |release| {
+                let what = format!("{end}, pool released {released}");
+                let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                let (mut out, mut read, mut written) = (vec![0u8; ROOM], 0, 0);
+                parallel
+                    .decompress_stream(&a, &mut read, &mut out, &mut written)
+                    .unwrap();
+                assert!(written != 0 && read < a.len(), "{what}: a first call");
+                assert!(out[..written] == a_data[..written], "{what}: a first call");
+                match end {
+                    "reset" => parallel.reset(),
+                    _ => parallel = decompressor(1),
+                }
+                if released {
+                    drop(release);
+                    std::thread::sleep(Duration::from_millis(20));
+                    let got = lockstep_between(&what, &mut serial, &mut parallel, &b, ROOM, |_| {});
+                    assert!(got == b_data, "{what}");
+                } else {
+                    let got = lockstep_between(&what, &mut serial, &mut parallel, &b, ROOM, |_| {});
+                    assert!(got == b_data, "{what}");
+                    drop(release);
+                }
+            });
+        }
+    }
+}
+
+/// A stream whose input after the first call is the same frame with one
+/// compressed block that the first call's pipeline planned ahead, past its
+/// room, made raw: the blocks after it are the frame's own, whose Treeless
+/// and Repeat references now resolve to the tables in use before it. The
+/// pipeline plans them again from those tables, and every call reads,
+/// writes and returns what the serial decoder does.
+#[test]
+fn mt_stream_replans_from_the_tables_before_a_changed_block() {
+    const ROOM: usize = 2 << 10;
+    let (data, a) = changing_words(9);
+    let (blocks, _) = frame_blocks(&a, data.len());
+    // Where each block starts in `a`, after the frame header, and in the
+    // content.
+    let mut starts = vec![(
+        a.len() - 4 - blocks.iter().map(|b| b.c_size).sum::<usize>(),
+        0,
+    )];
+    for b in &blocks {
+        let &(c, d) = starts.last().unwrap();
+        starts.push((c + b.c_size, d + b.size));
+    }
+    // The first unread block after the first call.
+    let mut serial = decompressor(usize::MAX);
+    let (mut read, mut written) = (0, 0);
+    serial
+        .decompress_stream(&a, &mut read, &mut vec![0u8; ROOM], &mut written)
+        .unwrap();
+    let first = starts.iter().position(|&(c, _)| c == read).unwrap();
+    let mut changed = 0;
+    pool(4).install(|| {
+        // Pools of four threads decode up to eight blocks ahead.
+        for d in first..first + 9 {
+            if blocks[d].ty != 2 {
+                continue;
+            }
+            let ((c, o), last) = (starts[d], d + 1 == blocks.len());
+            let raw = u32::from(last) | (blocks[d].size as u32) << 3;
+            let mut b = a[..c].to_vec();
+            b.extend_from_slice(&raw.to_le_bytes()[..3]);
+            b.extend_from_slice(&data[o..o + blocks[d].size]);
+            b.extend_from_slice(&a[starts[d + 1].0..]);
+            let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+            let what = format!("block {d} raw");
+            lockstep_switching(&what, &mut serial, &mut parallel, &[&a, &b], ROOM);
+            changed += 1;
+        }
+    });
+    assert!(changed >= 4, "{changed} compressed blocks made raw");
+}
+
+/// A stream whose second call's input ends inside the header or the
+/// content of a block that the first call's pipeline planned past its
+/// room, and whose third call completes that block from the same frame,
+/// or from one whose last byte of the block differs: the pipeline takes
+/// the block the serial decoder took the header of, as planned where its
+/// bytes match and planned again where not, then the blocks after it, and
+/// every call reads, writes and returns what the serial decoder does.
+#[test]
+fn mt_stream_takes_a_straddling_block_into_the_chain() {
+    const ROOM: usize = 4 << 10;
+    let (data, a) = changing_words(9);
+    let (blocks, _) = frame_blocks(&a, data.len());
+    // Where each block starts in `a`, after the frame header.
+    let mut starts = vec![a.len() - 4 - blocks.iter().map(|b| b.c_size).sum::<usize>()];
+    for b in &blocks {
+        starts.push(starts.last().unwrap() + b.c_size);
+    }
+    // The first unread block after the first call.
+    let mut serial = decompressor(usize::MAX);
+    let (mut read, mut written) = (0, 0);
+    serial
+        .decompress_stream(&a, &mut read, &mut vec![0u8; ROOM], &mut written)
+        .unwrap();
+    let first = starts.iter().position(|&c| c == read).unwrap();
+    pool(4).install(|| {
+        // The second call's room takes the blocks before.
+        for d in first + 1..first + 4 {
+            for cut in [starts[d] + 1, starts[d] + 4] {
+                for changed in [false, true] {
+                    let mut b = a.clone();
+                    if changed {
+                        b[starts[d + 1] - 1] ^= 0x01;
+                    }
+                    let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                    let what = format!("block {d} cut at {cut}, changed {changed}");
+                    let inputs: [&[u8]; 3] = [&a, &a[..cut], &b];
+                    let got = lockstep_switching(&what, &mut serial, &mut parallel, &inputs, ROOM);
+                    assert!(changed || got == data, "{what}");
+                }
+            }
+        }
+    });
 }
