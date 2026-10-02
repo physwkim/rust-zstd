@@ -352,7 +352,15 @@ fn window_low_follows_libzstd_low_limit() {
                 assert_eq!(got, want, "L{level} frame {frame}: block {row}");
                 if start == 0 {
                     let rep = BlockState::initial().rep;
-                    build_seq_store(&mut ms, &data, entered, rep, &mut store, &mut BlockLdm::Off);
+                    build_seq_store(
+                        &mut ms,
+                        &data,
+                        entered,
+                        rep,
+                        &mut store,
+                        &mut BlockLdm::Off,
+                        None,
+                    );
                 }
                 end = start + size;
             }

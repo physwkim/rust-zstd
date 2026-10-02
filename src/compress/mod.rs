@@ -37,7 +37,7 @@ use block::{
     InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
 };
 use dict::FrameDict;
-pub use dict::{CompressDict, DictContentType};
+pub use dict::{CompressDict, DictAttach, DictContentType};
 pub use error::CompressError;
 use lazy::{default_search_method, SearchMethod};
 use ldm::{LdmParams, LdmState, RawSeqStore, LDM_DEFAULT_WINDOW_LOG};
@@ -179,6 +179,10 @@ pub struct CompressOptions {
     /// [`Compressor::compress_stream`] and [`Encoder`] fail with
     /// [`CompressError::Unsupported`]. See [`CompressDict`] and [`dict`].
     pub dict: Option<Arc<CompressDict>>,
+    /// `ZSTD_c_forceAttachDict`: whether a frame searches `dict`'s tables
+    /// in place or copies them, see [`DictAttach`]. Default
+    /// [`DictAttach::Auto`], libzstd's rule.
+    pub dict_attach: DictAttach,
 }
 
 impl Default for CompressOptions {
@@ -197,6 +201,7 @@ impl Default for CompressOptions {
             block_splitter_level: 0,
             overflow_correct_frequently: false,
             dict: None,
+            dict_attach: DictAttach::Auto,
         }
     }
 }
@@ -786,6 +791,7 @@ fn compress_job(
         &mut state,
         scratch,
         &mut ldm,
+        dict.and_then(FrameDict::dict_match_state),
         out,
         pipelined,
     );

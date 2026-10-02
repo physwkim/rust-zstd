@@ -5,23 +5,22 @@
 //! sizes across the sizes where libzstd changes how it uses a dictionary.
 //!
 //! The gate on every frame: libzstd and our decoder decode it with the
-//! dictionary, and it is at most [`common::size_limit`] of libzstd's frame with the same
-//! parameters: `ZSTD_compress2` with `ZSTD_CCtx_refCDict`, whose semantics
-//! [`CompressOptions::dict`] follows, and `ZSTD_c_forceAttachDict` =
-//! `ZSTD_dictForceCopy`, the table mode we always use (see
-//! `rust_zstd::compress::dict`). libzstd's default attaches a dictionary's
-//! tables for small inputs instead and searches them with its
-//! `ZSTD_dictMatchState` finders, whose parse differs; those frames are
-//! reported beside ours, as are `ZSTD_compress_usingDict` and
-//! `ZSTD_compress_usingCDict`. Raw prefixes are gated against
-//! `ZSTD_CCtx_refPrefix`. Streaming with a dictionary is not implemented
-//! and must say so.
+//! dictionary, and it is at most [`common::size_limit`] of libzstd's frame
+//! with the same parameters: `ZSTD_compress2` with `ZSTD_CCtx_refCDict`,
+//! whose semantics [`CompressOptions::dict`] follows, and the same
+//! `ZSTD_c_forceAttachDict`: its default, which attaches a dictionary's
+//! tables for small inputs and searches them in place, for our
+//! [`DictAttach::Auto`], and `ZSTD_dictForceCopy` for our
+//! [`DictAttach::Copy`]. `ZSTD_compress_usingDict` and
+//! `ZSTD_compress_usingCDict` frames are reported beside ours. Raw
+//! prefixes are gated against `ZSTD_CCtx_refPrefix`. Streaming with a
+//! dictionary is not implemented and must say so.
 
 mod common;
 
 use rust_zstd::compress::{
     compress_with_dict, compress_with_prefix, CompressDict, CompressError, CompressOptions,
-    Compressor, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
+    Compressor, DictAttach, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
 };
 use rust_zstd::decode::{decompress_with_dict, DecodeDict};
 use std::io::Write;
@@ -206,12 +205,32 @@ fn dictionaries(corpus: &Corpus) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// `ZSTD_dictAttachPref_e`, for `ZSTD_c_forceAttachDict`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Attach {
     /// `ZSTD_dictDefaultAttach`.
     Default = 0,
     /// `ZSTD_dictForceCopy`.
     ForceCopy = 2,
+}
+
+impl Attach {
+    /// Our preference of the same meaning.
+    fn ours(self) -> DictAttach {
+        match self {
+            Attach::Default => DictAttach::Auto,
+            Attach::ForceCopy => DictAttach::Copy,
+        }
+    }
+}
+
+/// Our frame of `src` with `dict` and the preference `attach` means.
+fn ours_frame(src: &[u8], dict: &Arc<CompressDict>, attach: Attach) -> Vec<u8> {
+    Compressor::new(CompressOptions {
+        dict: Some(dict.clone()),
+        dict_attach: attach.ours(),
+        ..Default::default()
+    })
+    .compress_to_vec(src)
 }
 
 /// A frame libzstd's `f` writes into a buffer of `ZSTD_compressBound(len)`
@@ -343,48 +362,51 @@ fn assert_ours_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
     assert!(out == src, "{what}: our decoder decodes another input");
 }
 
-/// One dictionary frame through the gate: our frame of `src` with `ours`
-/// round trips through libzstd and our decoder with `dict`, carries libzstd's dictionary
-/// ID, and is at most [`common::size_limit`] of libzstd's force-copy frame
-/// with `lib` (else the error is pushed to `failures`). Returns our size,
-/// libzstd's force-copy size and libzstd's default size.
+/// One dictionary frame through the gate with libzstd's default and its
+/// force-copy preference: our frame of `src` with `ours` and the same
+/// preference round trips through libzstd and our decoder with `dict`,
+/// carries libzstd's dictionary ID, and is at most [`common::size_limit`]
+/// of libzstd's frame with `lib` (else the error is pushed to `failures`).
+/// Returns our size and libzstd's with the default, then with force-copy.
 fn gate(
     what: &str,
     src: &[u8],
     dict: &[u8],
-    ours: &CompressDict,
+    ours: &Arc<CompressDict>,
     lib: &LibCDict,
     failures: &mut Vec<String>,
-) -> [usize; 3] {
-    let frame = compress_with_dict(src, ours);
-    assert_decodes(what, &frame, dict, src);
-    let copy = lib.compress(src, Attach::ForceCopy, &[]);
-    let attach = lib.compress(src, Attach::Default, &[]);
-    assert_eq!(
-        zstd_safe::get_dict_id_from_frame(&frame),
-        zstd_safe::get_dict_id_from_frame(&copy),
-        "{what}: dictionary ID"
-    );
-    if let Err(e) = common::check_size(what, frame.len(), copy.len()) {
-        failures.push(e);
-    }
-    [frame.len(), copy.len(), attach.len()]
+) -> [[usize; 2]; 2] {
+    [Attach::Default, Attach::ForceCopy].map(|attach| {
+        let what = format!("{what} {attach:?}");
+        let frame = ours_frame(src, ours, attach);
+        assert_decodes(&what, &frame, dict, src);
+        let lib = lib.compress(src, attach, &[]);
+        assert_eq!(
+            zstd_safe::get_dict_id_from_frame(&frame),
+            zstd_safe::get_dict_id_from_frame(&lib),
+            "{what}: dictionary ID"
+        );
+        if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+            failures.push(e);
+        }
+        [frame.len(), lib.len()]
+    })
 }
 
 #[test]
 fn dictionary_frames_pass_the_gate() {
     let mut failures = Vec::new();
     println!(
-        "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>9} {:>10}  worst vs copy, vs attach",
-        "corpus", "dict", "lvl", "ours", "copy", "attach", "usingDict", "usingCDict"
+        "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>8} {:>9} {:>10}  worst vs default, vs copy",
+        "corpus", "dict", "lvl", "ours", "default", "ourscopy", "copy", "usingDict", "usingCDict"
     );
     for corpus in corpora() {
         for (kind, dict) in dictionaries(&corpus) {
             for level in LEVELS {
-                let ours = CompressDict::new(&dict, level).unwrap();
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
                 let lib = LibCDict::new(&dict, level);
-                let mut sums = [0usize; 5];
-                // (largest ours - lib, its input size), vs copy and attach.
+                let mut sums = [0usize; 6];
+                // (largest ours - lib, its input size), default and copy.
                 let mut worst = [(isize::MIN, 0); 2];
                 for (i, src) in corpus.test.iter().enumerate() {
                     let what = format!(
@@ -392,21 +414,23 @@ fn dictionary_frames_pass_the_gate() {
                         corpus.name,
                         src.len()
                     );
-                    let [n, copy, attach] = gate(&what, src, &dict, &ours, &lib, &mut failures);
+                    let sizes = gate(&what, src, &dict, &ours, &lib, &mut failures);
                     let using_dict = lib_using_dict(src, &dict, level).len();
                     let using_cdict = lib.compress_using(src).len();
-                    for (sum, n) in sums
-                        .iter_mut()
-                        .zip([n, copy, attach, using_dict, using_cdict])
-                    {
+                    for (sum, n) in sums.iter_mut().zip(
+                        sizes
+                            .as_flattened()
+                            .iter()
+                            .chain(&[using_dict, using_cdict]),
+                    ) {
                         *sum += n;
                     }
-                    for (w, lib) in worst.iter_mut().zip([copy, attach]) {
+                    for (w, [n, lib]) in worst.iter_mut().zip(sizes) {
                         *w = (*w).max((n as isize - lib as isize, src.len()));
                     }
                 }
                 println!(
-                    "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>9} {:>10}  {:+} ({}), {:+} ({})",
+                    "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>8} {:>9} {:>10}  {:+} ({}), {:+} ({})",
                     corpus.name,
                     kind,
                     level,
@@ -415,6 +439,7 @@ fn dictionary_frames_pass_the_gate() {
                     sums[2],
                     sums[3],
                     sums[4],
+                    sums[5],
                     worst[0].0,
                     worst[0].1,
                     worst[1].0,
@@ -426,27 +451,24 @@ fn dictionary_frames_pass_the_gate() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The held-out samples of the generated corpora at a level of every
-/// strategy are libzstd's force-copy frames byte for byte, a stricter
-/// check than the gate's size bound: the finders follow libzstd's
-/// `ZSTD_extDict` rules at the end of the dictionary content. The crate
-/// source corpus is left out: it changes with every edit, and fast,
-/// double-fast and btlazy2 may match the first byte of the content where
-/// libzstd's do not (`dictStartIndex < matchIndex`;
-/// `Window::lowest_match_index` is one inclusive bound), which some
-/// versions of it reach.
-#[test]
-fn dictionary_frames_equal_force_copy() {
+/// The held-out samples of the generated corpora at `levels` are
+/// libzstd's frames with the preference `attach` byte for byte, a stricter
+/// check than the gate's size bound. The crate source corpus is left out:
+/// it changes with every edit, and fast, double-fast and btlazy2 may match
+/// the first byte of the content where libzstd's do not
+/// (`dictStartIndex < matchIndex`; `Window::lowest_match_index` is one
+/// inclusive bound), which some versions of it reach.
+fn frames_equal(attach: Attach, levels: &[i32]) {
     let mut failures = Vec::new();
     for corpus in corpora().into_iter().filter(|c| c.name != "source") {
         for (kind, dict) in dictionaries(&corpus) {
-            for level in [-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19] {
-                let ours = CompressDict::new(&dict, level).unwrap();
+            for &level in levels {
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
                 let lib = LibCDict::new(&dict, level);
                 let differ: Vec<usize> = (0..corpus.test.len())
                     .filter(|&i| {
                         let src = &corpus.test[i];
-                        compress_with_dict(src, &ours) != lib.compress(src, Attach::ForceCopy, &[])
+                        ours_frame(src, &ours, attach) != lib.compress(src, attach, &[])
                     })
                     .collect();
                 if !differ.is_empty() {
@@ -461,11 +483,30 @@ fn dictionary_frames_equal_force_copy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// With the dictionary's tables copied, at a level of every strategy: the
+/// finders follow libzstd's `ZSTD_extDict` rules at the end of the
+/// dictionary content.
+#[test]
+fn dictionary_frames_equal_force_copy() {
+    frames_equal(
+        Attach::ForceCopy,
+        &[-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19],
+    );
+}
+
+/// With libzstd's default, which attaches the dictionary's tables for every
+/// held-out sample but the last, at a level of every strategy: the finders
+/// follow libzstd's `ZSTD_dictMatchState` rules.
+#[test]
+fn dictionary_frames_equal_default() {
+    frames_equal(Attach::Default, &[-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19]);
+}
+
 /// Levels across every strategy, and input sizes either side of each
 /// strategy's attach cutoff (8, 16 and 32 KiB), of 128 KiB and of six times
 /// a 32 KiB dictionary (the dictionary's tables or the frame's own),
 /// through the gate; also prints, per dictionary, our size minus libzstd's
-/// force-copy size and minus its default (attach) size for every cell.
+/// with its default and with force-copy for every cell.
 fn grid(levels: &[i32]) {
     let corpus = corpora().swap_remove(1);
     let text: Vec<u8> = corpus.train.concat();
@@ -491,24 +532,25 @@ fn grid(levels: &[i32]) {
     ];
     let mut failures = Vec::new();
     for (kind, dict) in [("trained 16K", &trained), ("raw 32K", &raw)] {
-        println!("{kind}: ours - copy / ours - attach (bytes) per input size");
+        println!("{kind}: ours - libzstd, default / force-copy (bytes) per input size");
         print!("{:>5}", "level");
         for size in sizes {
             print!(" {size:>11}");
         }
         println!();
         for &level in levels {
-            let ours = CompressDict::new(dict, level).unwrap();
+            let ours = Arc::new(CompressDict::new(dict, level).unwrap());
             let lib = LibCDict::new(dict, level);
             print!("{level:>5}");
             for size in sizes {
                 let src = &text[text.len() - size..];
                 let what = format!("{kind} L{level} {size} bytes");
-                let [n, copy, attach] = gate(&what, src, dict, &ours, &lib, &mut failures);
+                let [[n, default], [n_copy, copy]] =
+                    gate(&what, src, dict, &ours, &lib, &mut failures);
                 let cell = format!(
                     "{:+}/{:+}",
-                    n as isize - copy as isize,
-                    n as isize - attach as isize
+                    n as isize - default as isize,
+                    n_copy as isize - copy as isize
                 );
                 print!(" {cell:>11}");
             }
@@ -647,7 +689,7 @@ fn dictionary_with_ldm_and_checksum() {
                 (P::ZSTD_c_enableLongDistanceMatching, 1),
                 (P::ZSTD_c_checksumFlag, 1),
             ];
-            let lib = LibCDict::new(&dict, level).compress(&src, Attach::ForceCopy, &params);
+            let lib = LibCDict::new(&dict, level).compress(&src, Attach::Default, &params);
             println!("{what}: ours {} libzstd {}", ours.len(), lib.len());
             common::check_size(&what, ours.len(), lib.len()).unwrap();
         }

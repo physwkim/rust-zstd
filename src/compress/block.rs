@@ -12,7 +12,7 @@
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, EnteredBlock, EnteredPrefix, MatchState};
+use super::matchstate::{Block, DictMatchState, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -215,16 +215,22 @@ fn fill_tables(ms: &mut MatchState, data: &[u8], content: EnteredPrefix, load: T
     }
 }
 
-/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, ZSTD_noDict)`
+/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, dictMode)`
 /// run on `block`: store its sequences into `out` and return the anchor of
-/// the trailing literals.
+/// the trailing literals. `dms` is the attached dictionary while it is
+/// valid ([`MatchState::dict_match_state`]), which selects the
+/// `ZSTD_dictMatchState` variants.
 pub fn run_block_compressor(
     ms: &mut MatchState,
     src: Src,
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    dms: Option<DictMatchState>,
 ) -> usize {
+    if let Some(dms) = dms {
+        return run_dms_block_compressor(ms, src, block, rep, out, RawSeqView::default(), dms);
+    }
     match ms.cparams.strategy {
         Strategy::Fast => fast::compress_block(ms, src, block, rep, out),
         Strategy::DFast => dfast::compress_block(ms, src, block, rep, out),
@@ -233,6 +239,32 @@ pub fn run_block_compressor(
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             opt::compress_block(ms, src, block, rep, out, RawSeqView::default())
+        }
+    }
+}
+
+/// The `ZSTD_dictMatchState` block compressors of
+/// [`run_block_compressor`], the optimal parser's with the long distance
+/// matches `ldm`. Out of line, so that the no-dictionary dispatch stays as
+/// it is.
+#[inline(never)]
+pub fn run_dms_block_compressor(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+    dms: DictMatchState,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::Fast => fast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::DFast => dfast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            lazy::compress_block_dms(ms, src, block, rep, out, dms)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block_dms(ms, src, block, rep, out, ldm, dms)
         }
     }
 }
@@ -264,7 +296,8 @@ pub enum BlockLdm<'a> {
 /// the strategy's block compressor on it (through `ZSTD_ldm_blockCompress`
 /// when `ldm` provides long matches) and store the trailing literals
 /// (`ZSTD_storeLastLiterals`). `rep` is the committed repeat offsets; the
-/// block's candidates are returned.
+/// block's candidates are returned. `dms` is the frame's attached
+/// dictionary, searched while it is valid.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
@@ -276,6 +309,7 @@ pub fn build_seq_store(
     mut rep: [u32; 3],
     store: &mut SeqStore,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
 ) -> Option<[u32; 3]> {
     let positions = block.positions();
     if !attempts_compression(positions.len()) {
@@ -284,16 +318,17 @@ pub fn build_seq_store(
     store.clear();
     let (block_len, block_end) = (positions.len(), positions.end);
     let (src, block) = ms.start_block(data, block);
+    let dms = ms.dict_match_state(dms);
     let anchor = match ldm {
         BlockLdm::External(seqs) if !seqs.is_exhausted() => {
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Internal(state) => {
             let seqs = state.generate_block_sequences(data, positions);
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Off | BlockLdm::External(_) => {
-            run_block_compressor(ms, src, block, &mut rep, store)
+            run_block_compressor(ms, src, block, &mut rep, store, dms)
         }
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
@@ -558,6 +593,7 @@ pub fn compress_block(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     let cparams = ms.cparams;
@@ -568,7 +604,7 @@ pub fn compress_block(
         ..
     } = scratch;
     let entered = ms.enter_block(block.clone());
-    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm);
+    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm, dms);
     let parts = split.then(|| match built {
         Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
         None => &[][..],
@@ -800,7 +836,8 @@ impl JobBlocks {
 /// `ZSTD_compress_frameChunk` over the input of a job up to `input`: the
 /// ready blocks of `src` from `blocks`' next one, sized by its
 /// [`BlockSizing`], appended to `out`, each through the post-sequence
-/// splitter when `split`, with long distance matches from `ldm`. With
+/// splitter when `split`, with long distance matches from `ldm` and the
+/// attached dictionary `dms`. With
 /// `pipelined` (parallel feature only) block N's entropy stage and
 /// emission run on rayon next to block N+1's match finding whenever every
 /// block N is written as is proven (`proven_rep_after`) to be COMPRESSED,
@@ -819,12 +856,13 @@ pub fn compress_blocks(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
     #[cfg(feature = "parallel")]
     if pipelined {
-        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, out);
+        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, dms, out);
         blocks.input_ended(input);
         return;
     }
@@ -842,6 +880,7 @@ pub fn compress_blocks(
             state,
             scratch,
             ldm,
+            dms,
             out,
         );
         blocks.wrote(&block, out.len() - written);
@@ -884,6 +923,7 @@ fn compress_blocks_pipelined(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -903,7 +943,7 @@ fn compress_blocks_pipelined(
     let mut block = blocks.next(src, input, presplit);
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
     let entered = ms.enter_block(block.clone());
-    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm);
+    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm, dms);
     loop {
         let is_first_block = blocks.is_first(&block);
         let is_last = blocks.is_last(&block, input);
@@ -950,7 +990,7 @@ fn compress_blocks_pipelined(
             // The match state stays on this thread, whose caches hold its
             // tables; block N's entropy stage is the part a thief takes.
             let (built_following, compressed) = rayon::join(
-                || build_seq_store(ms, src, entered, rep_next, nxt, ldm),
+                || build_seq_store(ms, src, entered, rep_next, nxt, ldm, dms),
                 || {
                     emit_block(
                         src,
@@ -996,7 +1036,7 @@ fn compress_blocks_pipelined(
             }
             block = blocks.next(src, input, presplit);
             let entered = ms.enter_block(block.clone());
-            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm);
+            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm, dms);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }
