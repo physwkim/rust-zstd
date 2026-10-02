@@ -12,8 +12,8 @@ use std::io::{self, Read};
 /// output: a frame decodes in memory bounded by its Window_Size, by its
 /// Frame_Content_Size when that is smaller, and by what it has decoded
 /// to so far. The one exception is libzstd's: a frame whose Window_Size
-/// is above the limit `DecodeOptions::window_log_max` sets, by default
-/// `(1 << 27) + 1`, is refused unless one call gets it whole.
+/// is above the limit `set_window_log_max` sets, by default `(1 << 27) + 1`,
+/// is refused unless one call gets it whole.
 ///
 /// One made `with_dict`, or given a dictionary by `set_dict`, starts every
 /// frame from it (ZSTD_DCtx_refDDict), as `decompress_with_dict` does: the
@@ -54,25 +54,16 @@ impl Decompressor {
     }
 
     /// A decompressor on the paths `opts` picks, with the window limit it
-    /// sets. `decompress_stream` decodes on the current thread whatever
-    /// `opts.min_parallel_blocks` says.
+    /// sets (`set_window_log_max`). `decompress_stream` decodes on the
+    /// current thread whatever `opts.min_parallel_blocks` says.
     ///
     /// # Panics
-    /// If `opts.window_log_max` is neither 0 nor in
-    /// `ZSTD_WINDOWLOG_ABSOLUTEMIN..=ZSTD_WINDOWLOG_MAX`.
+    /// Where `set_window_log_max` panics on `opts.window_log_max`.
     #[doc(hidden)]
     pub fn with_options(opts: &DecodeOptions) -> Self {
-        let window_max = match opts.window_log_max {
-            0 => ZSTD_MAXWINDOWSIZE_DEFAULT,
-            log @ ZSTD_WINDOWLOG_ABSOLUTEMIN..=ZSTD_WINDOWLOG_MAX => 1 << log,
-            log => panic!(
-                "window_log_max {log} out of range: 0 or \
-                 {ZSTD_WINDOWLOG_ABSOLUTEMIN}..={ZSTD_WINDOWLOG_MAX}"
-            ),
-        };
         Decompressor {
             dec: FrameDecoder::new(opts),
-            window_max,
+            window_max: window_max(opts.window_log_max),
             dict: None,
             unit: Vec::new(),
             ring: Ring::default(),
@@ -99,6 +90,25 @@ impl Decompressor {
     pub fn set_dict(&mut self, dict: Option<&DecodeDict>) {
         self.reset();
         self.dict = dict.cloned();
+    }
+
+    /// `ZSTD_DCtx_setParameter(ZSTD_d_windowLogMax)`: `decompress_stream`
+    /// refuses a frame whose Window_Size is above `1 << log`, which bounds
+    /// the memory a frame takes, unless one call has all of the frame and
+    /// room for its Frame_Content_Size. `0` restores the default, the limit
+    /// of a new ZSTD_DCtx: `(1 << 27) + 1`, one byte past `log` 27. One-shot
+    /// decoding (`decompress` and the like) takes no window buffer and no
+    /// limit, as ZSTD_decompressDCtx.
+    ///
+    /// The limit holds from the next frame header `decompress_stream`
+    /// completes: a frame already started keeps the one it started under,
+    /// where libzstd refuses the call (`stage_wrong`) until the frame ends.
+    ///
+    /// # Panics
+    /// If `log` is neither 0 nor in `10..=31` (`10..=30` where `usize` is 32
+    /// bits), where libzstd returns `parameter_outOfBound`.
+    pub fn set_window_log_max(&mut self, log: u32) {
+        self.window_max = window_max(log);
     }
 
     /// Decompress `src`, whole, as the function `decompress` does, or as
@@ -189,7 +199,7 @@ impl Decompressor {
     ///
     /// A frame whose Window_Size is above the decompressor's limit fails at
     /// its header, unless this call has all of it and room for its
-    /// Frame_Content_Size (`DecodeOptions::window_log_max`).
+    /// Frame_Content_Size (`set_window_log_max`).
     ///
     /// After an error the decompressor is stopped: every later call returns
     /// the same error, until `reset`.
@@ -339,8 +349,21 @@ const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 /// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
 const ZSTD_WINDOWLOG_LIMIT_DEFAULT: u32 = 27;
 /// `ZSTD_MAXWINDOWSIZE_DEFAULT`, the window limit of a new ZSTD_DCtx and of
-/// `DecodeOptions::window_log_max` 0.
+/// `window_log_max` 0.
 const ZSTD_MAXWINDOWSIZE_DEFAULT: u64 = (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1;
+
+/// The Window_Size limit of `ZSTD_d_windowLogMax` `log`
+/// (`Decompressor::set_window_log_max`).
+fn window_max(log: u32) -> u64 {
+    match log {
+        0 => ZSTD_MAXWINDOWSIZE_DEFAULT,
+        ZSTD_WINDOWLOG_ABSOLUTEMIN..=ZSTD_WINDOWLOG_MAX => 1 << log,
+        _ => panic!(
+            "window_log_max {log} out of range: 0 or \
+             {ZSTD_WINDOWLOG_ABSOLUTEMIN}..={ZSTD_WINDOWLOG_MAX}"
+        ),
+    }
+}
 
 /// Whether `input` holds the whole frame whose header it starts with, as
 /// ZSTD_findFrameCompressedSize walks it: the header, the blocks up to the
@@ -407,6 +430,17 @@ impl<R: Read> DecompressReader<R> {
         let mut r = Self::new(inner);
         r.dec.set_dict(Some(dict));
         r
+    }
+
+    /// The window limit of the frames it reads from now on, as
+    /// `Decompressor::set_window_log_max` sets it: a frame above it fails
+    /// with `InvalidData`, unless the reader got all of it in one read of
+    /// `inner` and the `read` has room for its Frame_Content_Size.
+    ///
+    /// # Panics
+    /// Where `Decompressor::set_window_log_max` panics.
+    pub fn set_window_log_max(&mut self, log: u32) {
+        self.dec.set_window_log_max(log);
     }
 
     /// The reader of the frames. Input it has read and not decoded yet is

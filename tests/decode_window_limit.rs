@@ -11,7 +11,7 @@ use common::{
     c_compress2, c_streaming, is_window_limit, outcome, refuses_window, stream_room, stream_with,
     STREAM_CHUNKS, WINDOW_LOG_MAX,
 };
-use rust_zstd::decode::{decompress, decompress_with_options, DecodeOptions};
+use rust_zstd::decode::{decompress, decompress_with_options, DecodeDict, DecodeOptions};
 use rust_zstd::{DecompressReader, Decompressor};
 use std::io::Read;
 use zstd::zstd_safe::zstd_sys as sys;
@@ -417,7 +417,7 @@ fn window_log_max_bounds_match_libzstd() {
             sys::ZSTD_freeDCtx(dctx);
             sys::ZSTD_isError(r) == 0
         };
-        let ours = std::panic::catch_unwind(|| {
+        let options = std::panic::catch_unwind(|| {
             Decompressor::with_options(&DecodeOptions {
                 min_parallel_blocks: usize::MAX,
                 simd: true,
@@ -425,6 +425,121 @@ fn window_log_max_bounds_match_libzstd() {
             })
         })
         .is_ok();
-        assert_eq!(ours, lib, "window_log_max {window_log_max}");
+        let set =
+            std::panic::catch_unwind(|| Decompressor::new().set_window_log_max(window_log_max))
+                .is_ok();
+        let reader = std::panic::catch_unwind(|| {
+            DecompressReader::new(&[][..]).set_window_log_max(window_log_max)
+        })
+        .is_ok();
+        assert_eq!(
+            [options, set, reader],
+            [lib; 3],
+            "window_log_max {window_log_max}"
+        );
+    }
+}
+
+/// `Decompressor::set_window_log_max` sets the limit `window_log_max`
+/// does, checked against libzstd's ZSTD_d_windowLogMax by `stream_both`,
+/// at every input piece size; 0 after another value restores the default.
+#[test]
+fn set_window_log_max_is_the_option() {
+    for (log, mantissa) in [(27, 0), (27, 1), (28, 0), (28, 1), (31, 0)] {
+        let f = frame(&windowed(wd(log, mantissa), None, false), HI, None);
+        for window_log_max in [0, 10, 27, 28, 31] {
+            let what = format!("window log {log} mantissa {mantissa}");
+            for chunk in STREAM_CHUNKS {
+                let room = stream_room(chunk);
+                let want = stream_both(&what, &f, chunk, room, window_log_max);
+                let mut d = Decompressor::new();
+                d.set_window_log_max(window_log_max);
+                let got = stream_with(&mut d, &f, chunk, room);
+                assert!(
+                    got == want,
+                    "{what}, set_window_log_max {window_log_max}, chunk {chunk}: {} where \
+                     the option gives {}",
+                    outcome(&got),
+                    outcome(&want)
+                );
+            }
+        }
+        let mut d = Decompressor::new();
+        d.set_window_log_max(31);
+        d.set_window_log_max(0);
+        let got = stream_with(&mut d, &f, 1, 1);
+        assert!(
+            got == stream_both("default", &f, 1, 1, 0),
+            "window log {log} mantissa {mantissa}: 0 after 31 gives {}",
+            outcome(&got)
+        );
+    }
+}
+
+/// The limit a frame is held to is the one set when its header completes:
+/// a header that came in part takes one set before the rest comes, and a
+/// frame started keeps its own through a later change, which holds from
+/// the next frame on.
+#[test]
+fn set_window_log_max_holds_from_the_next_header() {
+    let f = frame(&windowed(wd(28, 0), None, false), HI, None);
+    let call = |d: &mut Decompressor, src: &[u8]| {
+        let (mut read, mut written, mut out) = (0, 0, [0u8; 16]);
+        let r = d.decompress_stream(src, &mut read, &mut out, &mut written);
+        (r, read, out[..written].to_vec())
+    };
+
+    let mut d = Decompressor::new();
+    let (r, read, _) = call(&mut d, &f[..3]);
+    assert!(
+        matches!(r, Ok(1..)) && read == 3,
+        "header in part: {r:?}, {read} read"
+    );
+    d.set_window_log_max(28);
+    let (r, read, out) = call(&mut d, &f[3..]);
+    assert_eq!((r, read, out), (Ok(0), f.len() - 3, b"hi".to_vec()), "rest");
+
+    let mut d = Decompressor::new();
+    d.set_window_log_max(28);
+    let header = windowed(wd(28, 0), None, false).len();
+    let (r, read, _) = call(&mut d, &f[..header]);
+    assert!(r.is_ok() && read == header, "header: {r:?}, {read} read");
+    d.set_window_log_max(0);
+    let (r, read, out) = call(&mut d, &f[header..]);
+    assert_eq!(
+        (r, read, out),
+        (Ok(0), f.len() - header, b"hi".to_vec()),
+        "a frame started at 28"
+    );
+    let (r, _, _) = call(&mut d, &f);
+    assert!(is_window_limit(&r), "the next frame: {r:?}");
+}
+
+/// `DecompressReader::set_window_log_max` raises the limit of the reader's
+/// frames, with a dictionary too.
+#[test]
+fn reader_takes_the_limit_set() {
+    let f = frame(&windowed(wd(28, 0), None, false), HI, None);
+    let dict = DecodeDict::new(b"a raw content dictionary").unwrap();
+    for with_dict in [false, true] {
+        for (window_log_max, taken) in [(0, false), (27, false), (28, true), (31, true)] {
+            let mut r = if with_dict {
+                DecompressReader::with_dict(&f[..], &dict)
+            } else {
+                DecompressReader::new(&f[..])
+            };
+            r.set_window_log_max(window_log_max);
+            let mut content = Vec::new();
+            let got = r
+                .read_to_end(&mut content)
+                .map(|_| content)
+                .map_err(|e| e.to_string());
+            let what = format!("dict {with_dict} window_log_max {window_log_max}");
+            if taken {
+                assert_eq!(got.as_deref(), Ok(&b"hi"[..]), "{what}");
+            } else {
+                assert!(is_window_limit(&got), "{what}: {}", outcome(&got));
+            }
+        }
     }
 }

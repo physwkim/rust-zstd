@@ -169,22 +169,10 @@ pub struct DecodeOptions {
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
-    /// `ZSTD_d_windowLogMax`: `Decompressor::decompress_stream` refuses a
-    /// frame whose Window_Size is above `1 << window_log_max` before
-    /// decoding any of it, as ZSTD_decompressStream does to bound the
-    /// memory a frame takes. `0` (the default) is the limit of a new
-    /// ZSTD_DCtx, `ZSTD_MAXWINDOWSIZE_DEFAULT`: `(1 << 27) + 1`, one byte
-    /// past window log 27 (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`), where
-    /// `ZSTD_d_windowLogMax` 0 sets `1 << 27`, as 27 does. Values in
-    /// `10..=31` (`10..=30` where `usize` is 32 bits) set `1 << value`;
-    /// others panic in `Decompressor::with_options`, where
-    /// `ZSTD_DCtx_setParameter` returns `parameter_outOfBound`.
-    ///
-    /// As in libzstd, the limit binds only frames decoded in pieces: not
-    /// those of `decompress` or a `Decompressor`'s `decompress`
-    /// (ZSTD_decompressDCtx), which take no window buffer, and not a frame
-    /// one `decompress_stream` call gets whole, with a Frame_Content_Size
-    /// its output has room for (the shortcut to ZSTD_decompress_usingDDict).
+    /// `ZSTD_d_windowLogMax`: the window limit of
+    /// `Decompressor::decompress_stream`, as
+    /// `Decompressor::set_window_log_max` sets it; `0`, the default, is
+    /// that of a new ZSTD_DCtx.
     pub window_log_max: u32,
 }
 
