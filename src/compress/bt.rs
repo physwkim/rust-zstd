@@ -141,7 +141,7 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
                 // here. This and the long-match skip below stay branches:
                 // as selects they make the returned step, and so the next
                 // insert's hash load, wait on this whole tree walk.
-                std::hint::cold_path();
+                crate::hint::cold_path();
                 match_end_idx = match_index + match_length;
             }
         }
@@ -186,7 +186,7 @@ pub(crate) unsafe fn insert_bt1<M: MatchCount, const MLS: u32>(
     *larger_ptr = 0;
     let positions = if best_length > 384 {
         // speed optimization
-        std::hint::cold_path();
+        crate::hint::cold_path();
         192.min(best_length - 384)
     } else {
         0
