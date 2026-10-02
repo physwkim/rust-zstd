@@ -278,82 +278,6 @@ fn decompress_frames(
 }
 
 // ============================================================
-// BitReader (forward)
-// ============================================================
-
-struct BitReader<'s> {
-    idx: usize,
-    source: &'s [u8],
-}
-
-impl<'s> BitReader<'s> {
-    fn new(source: &'s [u8]) -> BitReader<'s> {
-        BitReader { idx: 0, source }
-    }
-
-    fn bits_left(&self) -> usize {
-        self.source.len() * 8 - self.idx
-    }
-
-    fn bits_read(&self) -> usize {
-        self.idx
-    }
-
-    fn return_bits(&mut self, n: usize) {
-        if n > self.idx {
-            panic!("Cannot return more bits than have been read");
-        }
-        self.idx -= n;
-    }
-
-    fn get_bits(&mut self, n: usize) -> Result<u64, String> {
-        if n > 64 {
-            return Err(format!("Cannot read {} bits, maximum is 64", n));
-        }
-        if self.bits_left() < n {
-            return Err(format!(
-                "Cannot read {} bits, only {} remaining",
-                n,
-                self.bits_left()
-            ));
-        }
-
-        let old_idx = self.idx;
-        let bits_left_in_current_byte = 8 - (self.idx % 8);
-        let bits_not_needed_in_current_byte = 8 - bits_left_in_current_byte;
-
-        let mut value = u64::from(self.source[self.idx / 8] >> bits_not_needed_in_current_byte);
-
-        if bits_left_in_current_byte >= n {
-            value &= (1 << n) - 1;
-            self.idx += n;
-        } else {
-            self.idx += bits_left_in_current_byte;
-            let full_bytes_needed = (n - bits_left_in_current_byte) / 8;
-            let bits_in_last_byte_needed = n - bits_left_in_current_byte - full_bytes_needed * 8;
-
-            let mut bit_shift = bits_left_in_current_byte;
-
-            for _ in 0..full_bytes_needed {
-                value |= u64::from(self.source[self.idx / 8]) << bit_shift;
-                self.idx += 8;
-                bit_shift += 8;
-            }
-
-            if bits_in_last_byte_needed > 0 {
-                let val_last_byte =
-                    u64::from(self.source[self.idx / 8]) & ((1 << bits_in_last_byte_needed) - 1);
-                value |= val_last_byte << bit_shift;
-                self.idx += bits_in_last_byte_needed;
-            }
-        }
-
-        debug_assert!(self.idx == old_idx + n);
-        Ok(value)
-    }
-}
-
-// ============================================================
 // FSE Table and Decoder
 // ============================================================
 
@@ -2210,129 +2134,83 @@ enum LiteralsSectionType {
 #[derive(Clone, Copy)]
 struct LiteralsSection {
     regenerated_size: u32,
-    compressed_size: Option<u32>,
-    num_streams: Option<u8>,
+    /// The section's bytes after its header: a Raw section's literals, an
+    /// RLE section's byte, or the tree description and streams.
+    content_size: u32,
     ls_type: LiteralsSectionType,
+    /// Huffman-coded literals in four streams rather than one.
+    four_streams: bool,
 }
 
 impl LiteralsSection {
-    fn new() -> LiteralsSection {
-        LiteralsSection {
-            regenerated_size: 0,
-            compressed_size: None,
-            num_streams: None,
-            ls_type: LiteralsSectionType::Raw,
-        }
-    }
-
-    fn section_type(raw: u8) -> Result<LiteralsSectionType, String> {
-        let t = raw & 0x3;
-        match t {
-            0 => Ok(LiteralsSectionType::Raw),
-            1 => Ok(LiteralsSectionType::RLE),
-            2 => Ok(LiteralsSectionType::Compressed),
-            3 => Ok(LiteralsSectionType::Treeless),
-            other => Err(format!("Illegal literal section type: {}", other)),
-        }
-    }
-
-    fn header_bytes_needed(&self, first_byte: u8) -> Result<u8, String> {
-        let ls_type = Self::section_type(first_byte)?;
-        let size_format = (first_byte >> 2) & 0x3;
-        match ls_type {
-            LiteralsSectionType::RLE | LiteralsSectionType::Raw => match size_format {
-                0 | 2 => Ok(1),
-                1 => Ok(2),
-                3 => Ok(3),
-                _ => unreachable!(),
-            },
-            LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => match size_format {
-                0 | 1 => Ok(3),
-                2 => Ok(4),
-                3 => Ok(5),
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    fn parse_from_header(&mut self, raw: &[u8]) -> Result<u8, String> {
-        let mut br = BitReader::new(raw);
-        let block_type = br.get_bits(2)? as u8;
-        self.ls_type = Self::section_type(block_type)?;
-        let size_format = br.get_bits(2)? as u8;
-
-        let byte_needed = self.header_bytes_needed(raw[0])?;
-        if raw.len() < byte_needed as usize {
-            return Err(format!(
+    /// Parse the Literals_Section_Header that starts `raw`: the section and
+    /// the header's length.
+    fn parse(raw: &[u8]) -> Result<(LiteralsSection, usize), String> {
+        let short = |need: usize| {
+            format!(
                 "Not enough bytes for literals header: have {}, need {}",
                 raw.len(),
-                byte_needed
-            ));
-        }
-
-        match self.ls_type {
-            LiteralsSectionType::RLE | LiteralsSectionType::Raw => {
-                self.compressed_size = None;
-                match size_format {
-                    0 | 2 => {
-                        self.regenerated_size = u32::from(raw[0]) >> 3;
-                        Ok(1)
-                    }
-                    1 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4) + (u32::from(raw[1]) << 4);
-                        Ok(2)
-                    }
-                    3 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + (u32::from(raw[2]) << 12);
-                        Ok(3)
-                    }
-                    _ => unreachable!(),
-                }
+                need
+            )
+        };
+        let Some(&first) = raw.first() else {
+            return Err(short(1));
+        };
+        let ls_type = match first & 3 {
+            0 => LiteralsSectionType::Raw,
+            1 => LiteralsSectionType::RLE,
+            2 => LiteralsSectionType::Compressed,
+            _ => LiteralsSectionType::Treeless,
+        };
+        let size_format = (first >> 2) & 3;
+        let len = match (ls_type, size_format) {
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, 0 | 2) => 1,
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, 1) => 2,
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, _) => 3,
+            (_, 0 | 1) => 3,
+            (_, 2) => 4,
+            (_, _) => 5,
+        };
+        let h = raw.get(..len).ok_or_else(|| short(len))?;
+        let b = |i: usize| u32::from(h[i]);
+        let (regenerated_size, content_size, four_streams) = match ls_type {
+            LiteralsSectionType::Raw | LiteralsSectionType::RLE => {
+                let size = match len {
+                    1 => b(0) >> 3,
+                    2 => (b(0) >> 4) + (b(1) << 4),
+                    _ => (b(0) >> 4) + (b(1) << 4) + (b(2) << 12),
+                };
+                let content = match ls_type {
+                    LiteralsSectionType::RLE => 1,
+                    _ => size,
+                };
+                (size, content, false)
             }
             LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-                match size_format {
-                    0 => {
-                        self.num_streams = Some(1);
-                    }
-                    1..=3 => {
-                        self.num_streams = Some(4);
-                    }
-                    _ => unreachable!(),
+                let (size, compressed) = match len {
+                    3 => (
+                        (b(0) >> 4) + ((b(1) & 0x3f) << 4),
+                        (b(1) >> 6) + (b(2) << 2),
+                    ),
+                    4 => (
+                        (b(0) >> 4) + (b(1) << 4) + ((b(2) & 0x3) << 12),
+                        (b(2) >> 2) + (b(3) << 6),
+                    ),
+                    _ => (
+                        (b(0) >> 4) + (b(1) << 4) + ((b(2) & 0x3F) << 12),
+                        (b(2) >> 6) + (b(3) << 2) + (b(4) << 10),
+                    ),
                 };
-
-                match size_format {
-                    0 | 1 => {
-                        self.regenerated_size =
-                            (u32::from(raw[0]) >> 4) + ((u32::from(raw[1]) & 0x3f) << 4);
-                        self.compressed_size =
-                            Some(u32::from(raw[1] >> 6) + (u32::from(raw[2]) << 2));
-                        Ok(3)
-                    }
-                    2 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + ((u32::from(raw[2]) & 0x3) << 12);
-                        self.compressed_size =
-                            Some((u32::from(raw[2]) >> 2) + (u32::from(raw[3]) << 6));
-                        Ok(4)
-                    }
-                    3 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + ((u32::from(raw[2]) & 0x3F) << 12);
-                        self.compressed_size = Some(
-                            (u32::from(raw[2]) >> 6)
-                                + (u32::from(raw[3]) << 2)
-                                + (u32::from(raw[4]) << 10),
-                        );
-                        Ok(5)
-                    }
-                    _ => unreachable!(),
-                }
+                (size, compressed, size_format != 0)
             }
-        }
+        };
+        let section = LiteralsSection {
+            regenerated_size,
+            content_size,
+            ls_type,
+            four_streams,
+        };
+        Ok((section, len))
     }
 }
 
@@ -2386,73 +2264,41 @@ impl CompressionModes {
 #[derive(Clone, Copy)]
 struct SequencesHeader {
     num_sequences: u32,
-    modes: Option<CompressionModes>,
+    /// The Symbol_Compression_Modes; all Predefined, unread, without
+    /// sequences, where the header has no such byte.
+    modes: CompressionModes,
 }
 
 impl SequencesHeader {
-    fn new() -> SequencesHeader {
-        SequencesHeader {
-            num_sequences: 0,
-            modes: None,
-        }
-    }
-
-    fn parse_from_header(&mut self, source: &[u8]) -> Result<u8, String> {
-        let mut bytes_read = 0;
-        if source.is_empty() {
-            return Err("Sequences header source is empty".to_string());
-        }
-
-        match source[0] {
-            0 => {
-                self.num_sequences = 0;
-                bytes_read += 1;
-            }
-            1..=127 => {
-                if source.len() < 2 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 2",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes::new(source[1])?);
-                bytes_read += 2;
-            }
-            128..=254 => {
-                if source.len() < 2 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 2",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = ((u32::from(source[0]) - 128) << 8) + u32::from(source[1]);
-                bytes_read += 2;
-                if self.num_sequences != 0 {
-                    if source.len() < 3 {
-                        return Err(format!(
-                            "Not enough bytes for sequences header: have {}, need 3",
-                            source.len()
-                        ));
-                    }
-                    self.modes = Some(CompressionModes::new(source[2])?);
-                    bytes_read += 1;
-                }
-            }
-            255 => {
-                if source.len() < 4 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 4",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
-                self.modes = Some(CompressionModes::new(source[3])?);
-                bytes_read += 4;
-            }
-        }
-
-        Ok(bytes_read)
+    /// Parse the Sequences_Section_Header that starts `source`: the header
+    /// and its length.
+    fn parse(source: &[u8]) -> Result<(SequencesHeader, usize), String> {
+        let short = |need: usize| {
+            format!(
+                "Not enough bytes for sequences header: have {}, need {}",
+                source.len(),
+                need
+            )
+        };
+        let (num_sequences, len) = match *source {
+            [] => return Err("Sequences header source is empty".to_string()),
+            [0, ..] => (0, 1),
+            [n @ 1..=127, ..] => (u32::from(n), 1),
+            [n @ 128..=254, low, ..] => (((u32::from(n) - 128) << 8) + u32::from(low), 2),
+            [128..=254] => return Err(short(2)),
+            [255, low, high, ..] => (u32::from(low) + (u32::from(high) << 8) + 0x7F00, 3),
+            [255, ..] => return Err(short(4)),
+        };
+        let modes = match num_sequences {
+            // No Symbol_Compression_Modes byte follows a zero count.
+            0 => CompressionModes(0),
+            _ => CompressionModes::new(*source.get(len).ok_or_else(|| short(len + 1))?)?,
+        };
+        let header = SequencesHeader {
+            num_sequences,
+            modes,
+        };
+        Ok((header, len + usize::from(num_sequences != 0)))
     }
 }
 
@@ -2852,22 +2698,17 @@ fn decompress_literals(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, String> {
-    let compressed_size = section
-        .compressed_size
-        .ok_or_else(|| "Missing compressed size".to_string())? as usize;
-    let num_streams = section
-        .num_streams
-        .ok_or_else(|| "Missing num_streams".to_string())?;
+    let four_streams = section.four_streams;
     let regenerated_size = section.regenerated_size as usize;
 
-    let source = &source[0..compressed_size];
+    let source = &source[0..section.content_size as usize];
     let mut bytes_read = 0usize;
 
     let table = match section.ls_type {
         LiteralsSectionType::Compressed => {
             bytes_read += scratch
                 .table
-                .build_decoder(source, regenerated_size, num_streams == 4)?
+                .build_decoder(source, regenerated_size, four_streams)?
                 as usize;
             &scratch.table
         }
@@ -2880,7 +2721,7 @@ fn decompress_literals(
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    huf_decompress(&mut target[start..], source, num_streams == 4, table)?;
+    huf_decompress(&mut target[start..], source, four_streams, table)?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
@@ -3075,12 +2916,8 @@ fn build_sequence_tables(
     source: &[u8],
     scratch: &mut FSEScratch,
 ) -> Result<usize, String> {
-    let modes = section
-        .modes
-        .ok_or_else(|| "Missing compression mode".to_string())?;
-
     let mut bytes_read = 0;
-    for (t, mode) in modes.all().into_iter().enumerate() {
+    for (t, mode) in section.modes.all().into_iter().enumerate() {
         bytes_read += build_sequence_table(mode, &source[bytes_read..], scratch, t)?;
     }
     Ok(bytes_read)
@@ -4684,24 +4521,16 @@ struct BlockParts<'a> {
 /// Block_Maximum_Size that is. The literals decode into the block, so they
 /// are held to it too, before anything is sized from their header.
 fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, String> {
-    let mut section = LiteralsSection::new();
-    let bytes_in_literals_header = section.parse_from_header(raw)?;
+    let (section, bytes_in_literals_header) = LiteralsSection::parse(raw)?;
     if section.regenerated_size as usize > block_size_max {
         return Err(format!(
             "Literals size {} exceeds Block_Maximum_Size {}",
             section.regenerated_size, block_size_max
         ));
     }
-    let raw = &raw[bytes_in_literals_header as usize..];
+    let raw = &raw[bytes_in_literals_header..];
 
-    let upper_limit_for_literals = match section.compressed_size {
-        Some(x) => x as usize,
-        None => match section.ls_type {
-            LiteralsSectionType::RLE => 1,
-            LiteralsSectionType::Raw => section.regenerated_size as usize,
-            _ => return Err("Bug: unexpected literals section type".to_string()),
-        },
-    };
+    let upper_limit_for_literals = section.content_size as usize;
 
     if raw.len() < upper_limit_for_literals {
         return Err(format!(
@@ -4714,13 +4543,12 @@ fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, Stri
     let literals_src = &raw[..upper_limit_for_literals];
     let raw = &raw[upper_limit_for_literals..];
 
-    let mut sequences = SequencesHeader::new();
-    let bytes_in_sequence_header = sequences.parse_from_header(raw)?;
+    let (sequences, bytes_in_sequence_header) = SequencesHeader::parse(raw)?;
     Ok(BlockParts {
         literals: section,
         literals_src,
         sequences,
-        sequences_src: &raw[bytes_in_sequence_header as usize..],
+        sequences_src: &raw[bytes_in_sequence_header..],
     })
 }
 
@@ -4963,7 +4791,7 @@ mod parallel {
         };
         let mut defs = [0; 3];
         if parts.sequences.num_sequences != 0 {
-            for (t, mode) in parts.sequences.modes?.all().into_iter().enumerate() {
+            for (t, mode) in parts.sequences.modes.all().into_iter().enumerate() {
                 if !matches!(mode, ModeType::Repeat) {
                     fse_def[t] = Some(i);
                 }
@@ -5082,11 +4910,8 @@ mod parallel {
             }
             return Ok(());
         }
-        let modes = seq
-            .modes
-            .ok_or_else(|| "Missing compression mode".to_string())?;
         let mut used = 0;
-        for (t, mode) in modes.all().into_iter().enumerate() {
+        for (t, mode) in seq.modes.all().into_iter().enumerate() {
             let d = plan.fse_def[t];
             if d == i {
                 slot.fse_from[t] = None;
@@ -5128,7 +4953,7 @@ mod parallel {
             .build_decoder(
                 def.parts.literals_src,
                 lit.regenerated_size as usize,
-                lit.num_streams == Some(4),
+                lit.four_streams,
             )
             .map(|_| ())
     }
@@ -5140,12 +4965,7 @@ mod parallel {
         t: usize,
         fse: &mut FSEScratch,
     ) -> Result<(), String> {
-        let modes = def
-            .parts
-            .sequences
-            .modes
-            .ok_or_else(|| "Missing compression mode".to_string())?
-            .all();
+        let modes = def.parts.sequences.modes.all();
         let src = def.parts.sequences_src;
         let mut used = 0;
         for (u, kind) in SEQ_TABLES.iter().enumerate().take(t) {
