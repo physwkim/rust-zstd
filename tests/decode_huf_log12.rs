@@ -264,6 +264,7 @@ fn check_frame(
             let options = DecodeOptions {
                 min_parallel_blocks,
                 simd,
+                window_log_max: 0,
             };
             let what = format!("{plan:?} simd={simd} mt={min_parallel_blocks}");
             match decompress_with_options(&f, &options) {

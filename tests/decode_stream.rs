@@ -6,10 +6,10 @@
 
 mod common;
 
-use common::{c_compress2, datasets, decompress_streaming, zstd_bulk, zstd_stream, MIB};
+use common::{c_compress2, datasets, decompress_streaming, read_all, zstd_bulk, zstd_stream, MIB};
 use rust_zstd::decode::DecodeOptions;
-use rust_zstd::{DecompressReader, Decompressor};
-use std::io::{self, Read};
+use rust_zstd::Decompressor;
+use std::io;
 use sys::ZSTD_cParameter::{
     ZSTD_c_checksumFlag, ZSTD_c_compressionLevel, ZSTD_c_contentSizeFlag, ZSTD_c_windowLog,
 };
@@ -523,51 +523,6 @@ fn match_at_the_window_edge_after_a_new_segment() {
     }
 }
 
-/// A reader of `data` that gives at most `piece` bytes a read, and fails
-/// with `Interrupted` before each other one.
-struct Pieces<'a> {
-    data: &'a [u8],
-    piece: usize,
-    interrupt: bool,
-}
-
-impl Read for Pieces<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.interrupt = !self.interrupt;
-        if self.interrupt {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
-        let n = self.data.len().min(self.piece).min(buf.len());
-        buf[..n].copy_from_slice(&self.data[..n]);
-        self.data = &self.data[n..];
-        Ok(n)
-    }
-}
-
-/// `DecompressReader` over a reader of `input` in pieces of `piece` bytes,
-/// read into a buffer of `room` bytes until it ends, retrying
-/// `Interrupted`; the content, or the error.
-fn read_all(input: &[u8], piece: usize, room: usize) -> io::Result<Vec<u8>> {
-    let mut r = DecompressReader::new(Pieces {
-        data: input,
-        piece,
-        interrupt: false,
-    });
-    let mut content = Vec::new();
-    let mut buf = vec![0u8; room];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => content.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    // It stays at the end.
-    assert_eq!(r.read(&mut buf).unwrap(), 0);
-    Ok(content)
-}
-
 /// The reader gives the content of a sequence of frames, whatever the
 /// pieces it reads and the buffers it fills.
 #[test]
@@ -577,11 +532,11 @@ fn reader_decodes_frame_sequence() {
     let want: Vec<u8> = frames.iter().flat_map(|(_, c)| c.clone()).collect();
     for piece in [1, 7, 4096, WHOLE] {
         for room in [7, 1 << 16] {
-            let got = read_all(&input, piece, room).unwrap();
+            let got = read_all(&input, piece, room, None).unwrap();
             assert!(got == want, "piece {piece} room {room}: content differs");
         }
     }
-    assert!(read_all(&[], 1, 1).unwrap().is_empty());
+    assert!(read_all(&[], 1, 1, None).unwrap().is_empty());
 }
 
 /// The reader fails with `InvalidData` and `decompress`'s error where
@@ -601,7 +556,7 @@ fn reader_fails_where_decompress_does() {
     for input in cases {
         let want = rust_zstd::decompress(input).unwrap_err();
         for piece in [7, WHOLE] {
-            let e = read_all(input, piece, 4096).unwrap_err();
+            let e = read_all(input, piece, 4096, None).unwrap_err();
             assert_eq!(
                 e.kind(),
                 io::ErrorKind::InvalidData,

@@ -70,6 +70,7 @@ fn largest_allocation(name: &str, f: &[u8]) -> usize {
             let opts = DecodeOptions {
                 min_parallel_blocks,
                 simd,
+                window_log_max: 0,
             };
             LARGEST.store(0, Ordering::Relaxed);
             let got = decompress_with_options(f, &opts).ok();

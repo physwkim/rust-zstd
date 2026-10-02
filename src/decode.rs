@@ -169,6 +169,11 @@ pub struct DecodeOptions {
     /// Use the SIMD level detected at run time; false forces the portable
     /// code.
     pub simd: bool,
+    /// `ZSTD_d_windowLogMax`: the window limit of
+    /// `Decompressor::decompress_stream`, as
+    /// `Decompressor::set_window_log_max` sets it; `0`, the default, is
+    /// that of a new ZSTD_DCtx.
+    pub window_log_max: u32,
 }
 
 impl DecodeOptions {
@@ -196,6 +201,7 @@ impl Default for DecodeOptions {
         DecodeOptions {
             min_parallel_blocks,
             simd: true,
+            window_log_max: 0,
         }
     }
 }
@@ -3244,6 +3250,16 @@ impl ExtHistory {
         len: 0,
         dict: false,
     };
+
+    /// The history of a frame's first segment: the content of the
+    /// dictionary it started from, empty without one.
+    fn dict(content: &[u8]) -> ExtHistory {
+        ExtHistory {
+            end: content.as_ptr_range().end,
+            len: content.len(),
+            dict: true,
+        }
+    }
 }
 
 /// A block's sequences, executed into the frame by `execute_with_copies`
@@ -4246,7 +4262,8 @@ impl Frame {
 }
 
 /// Where a `FrameDecoder` decodes frames to: for `decompress`, the output
-/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer.
+/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer
+/// (`RingOut`).
 trait FrameOut {
     /// Make ready for a frame whose matches reach at most `window` bytes
     /// back, and which decodes to `content_size` bytes if that is known.
@@ -4574,17 +4591,6 @@ struct VecOut<'d> {
     dict: &'d [u8],
 }
 
-impl VecOut<'_> {
-    /// The history before the current frame: the dictionary content.
-    fn ext(&self) -> ExtHistory {
-        ExtHistory {
-            end: self.dict.as_ptr_range().end,
-            len: self.dict.len(),
-            dict: true,
-        }
-    }
-}
-
 impl FrameOut for VecOut<'_> {
     fn start(&mut self, window: usize, _content_size: Option<u64>) {
         self.prefix = Prefix {
@@ -4597,7 +4603,7 @@ impl FrameOut for VecOut<'_> {
         let dst = self
             .prefix
             .dst(self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        Ok((dst, self.ext()))
+        Ok((dst, ExtHistory::dict(self.dict)))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {

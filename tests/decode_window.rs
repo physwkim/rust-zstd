@@ -70,6 +70,7 @@ fn check_vs(name: &str, f: &[u8], accept: bool, libzstd: bool) {
             let options = DecodeOptions {
                 min_parallel_blocks,
                 simd,
+                window_log_max: 0,
             };
             let ours = decompress_with_options(f, &options);
             let at = format!("{name} simd={simd} min_parallel_blocks={min_parallel_blocks}");
