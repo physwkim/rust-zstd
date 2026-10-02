@@ -4195,6 +4195,10 @@ struct Frame {
     content_size: Option<u64>,
     decoded: u64,
     checksum: Option<Xxh64>,
+    /// Blocks a batch decoded past the room its caller had, for the next
+    /// batch of the frame to take if no block is decoded before it.
+    #[cfg(feature = "parallel")]
+    ahead: parallel::Ahead,
 }
 
 impl Frame {
@@ -4206,6 +4210,8 @@ impl Frame {
             content_size: header.frame_content_size(),
             decoded: 0,
             checksum: header.descriptor.content_checksum_flag().then(Xxh64::new),
+            #[cfg(feature = "parallel")]
+            ahead: parallel::Ahead::default(),
         })
     }
 
@@ -4213,6 +4219,8 @@ impl Frame {
     /// frame that decodes past its Frame_Content_Size fails here, which
     /// keeps a decoder's buffer within that size.
     fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
+        #[cfg(feature = "parallel")]
+        self.ahead.outdate();
         self.decoded += bytes.len() as u64;
         if let Some(h) = &mut self.checksum {
             h.update(bytes);
@@ -5010,12 +5018,103 @@ mod parallel {
     }
 
     impl RingSlot {
+        fn new() -> RingSlot {
+            RingSlot {
+                claimed: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+                slot: Mutex::new(Slot::new()),
+            }
+        }
+
         /// Take block `i`'s decode; false if someone already has. A task
         /// that runs after block `i` has been decoded and its position
         /// reused finds a later block's claim and fails too.
         fn claim(&self, i: usize) -> bool {
             self.claimed.fetch_max(i + 1, Ordering::AcqRel) < i + 1
         }
+    }
+
+    /// What a batch stopped by its caller's room leaves for the next batch
+    /// of the frame: the ring its tasks decoded into, `ring[..held]`
+    /// holding the stage 2 of the blocks after the last one it executed,
+    /// with their input. The next batch takes those its input starts with,
+    /// byte for byte, unless a block has been decoded since. The ring, kept
+    /// for the frame's batches, is dropped with the frame.
+    #[derive(Default)]
+    pub(super) struct Ahead {
+        ring: Vec<RingSlot>,
+        held: usize,
+    }
+
+    impl Ahead {
+        /// A block has been decoded after the held ones' batch: they were
+        /// decoded from a state the frame has left.
+        pub(super) fn outdate(&mut self) {
+            self.held = 0;
+        }
+
+        /// Take the held blocks `data` starts with; returns how many. The
+        /// others are dropped.
+        fn take(&mut self, data: &[u8]) -> usize {
+            let (mut taken, mut from) = (0, 0);
+            for cell in &mut self.ring[..self.held] {
+                let input = &cell.slot.get_mut().unwrap_or_else(|e| e.into_inner()).input;
+                if data.get(from..from + input.len()) != Some(input) {
+                    break;
+                }
+                from += input.len();
+                taken += 1;
+            }
+            self.held = taken;
+            taken
+        }
+
+        /// The ring of a batch of `len` positions, the first holding the
+        /// blocks `take` took, which are its first.
+        fn ring(&mut self, len: usize) -> BatchRing<'_> {
+            if self.ring.len() < len {
+                self.ring.resize_with(len, RingSlot::new);
+            }
+            self.held = self.held.min(len);
+            let held = self.held;
+            let slots = &mut self.ring[..len];
+            for (k, cell) in slots.iter_mut().enumerate() {
+                let n = if k < held { k + 1 } else { 0 };
+                *cell.claimed.get_mut() = n;
+                *cell.done.get_mut() = n;
+                // Its tables are tagged with blocks of an earlier batch.
+                let slot = cell.slot.get_mut().unwrap_or_else(|e| e.into_inner());
+                slot.huf_from = None;
+                slot.fse_from = [None; 3];
+            }
+            BatchRing { slots, held }
+        }
+
+        /// After a batch on `ring[..len]` that executed `done` blocks,
+        /// which end in `data` at `ends`: hold the `ready` blocks after
+        /// them.
+        fn hold(&mut self, len: usize, data: &[u8], ends: &[usize], done: usize, ready: usize) {
+            if ready == 0 {
+                self.held = 0;
+                return;
+            }
+            // Those `take` took have their input already.
+            for j in done.max(self.held)..done + ready {
+                let cell = &mut self.ring[j % len];
+                let slot = cell.slot.get_mut().unwrap_or_else(|e| e.into_inner());
+                slot.input.clear();
+                slot.input.extend_from_slice(&data[ends[j - 1]..ends[j]]);
+            }
+            self.ring[..len].rotate_left(done % len);
+            self.held = ready;
+        }
+    }
+
+    /// The positions a batch's tasks decode into, the first `held` holding
+    /// the stage 2 of its first blocks.
+    struct BatchRing<'r> {
+        slots: &'r [RingSlot],
+        held: usize,
     }
 
     /// Publishes a finished decode on drop.
@@ -5038,6 +5137,8 @@ mod parallel {
         literals: Vec<u8>,
         seqs: Vec<RawSeq>,
         result: Result<(), DecodeError>,
+        /// The block, header included, while `Ahead` holds its stage 2.
+        input: Vec<u8>,
     }
 
     impl Slot {
@@ -5051,6 +5152,7 @@ mod parallel {
                 literals: Vec::new(),
                 seqs: Vec::new(),
                 result: Ok(()),
+                input: Vec::new(),
             }
         }
     }
@@ -5474,23 +5576,26 @@ mod parallel {
 
     impl FrameDecoder {
         /// Decode the blocks of the frame being decoded at the start of
-        /// `data`, from a block header on, that `located` gives for `room`
-        /// bytes of output, into `out`, the frame having started from
-        /// `dict` if given, unless the frame fits in one block: on the
-        /// current rayon pool if `Gate::pools` takes them, else one after
-        /// another as `process` would. Before each block but the first it
-        /// calls `next`, where the serial driver writes out the blocks
-        /// before, and stops if it returns false. Returns the `Event` of
-        /// the last block it decoded, or `None` if it decoded none, and
-        /// sets `read` to how much of `data` those blocks take, on failure
-        /// too.
+        /// `data`, from a block header on, into `out`, the frame having
+        /// started from `dict` if given, unless the frame fits in one
+        /// block: on the current rayon pool if `data` starts with blocks
+        /// the last call decoded ahead (`Ahead`) or `Gate::pools` takes the
+        /// blocks `located` gives for `room` bytes of output, else those
+        /// one after another as `process` would. Before each block but the
+        /// first it calls `next`, where the serial driver writes out the
+        /// blocks before, and stops if it returns false. Returns the
+        /// `Event` of the last block it decoded, or `None` if it decoded
+        /// none, and sets `read` to how much of `data` those blocks take,
+        /// on failure too.
         ///
-        /// On the pool it takes the blocks `plan_blocks` takes, and stops
-        /// before a block that fails, or that it cannot plan, and leaves
-        /// its scratch as the serial decoder would after the blocks before,
-        /// which then decodes that one and gives its verdict. The frame's
-        /// size checks, after each block and after the last, are the
-        /// serial ones, and fail here as there.
+        /// On the pool it takes the blocks `plan_blocks` takes for a ring's
+        /// worth of blocks past `room`: when `next` stops it, those decoded
+        /// after the last one executed are kept for the next call. It
+        /// stops before a block that fails, or that it cannot plan, and
+        /// leaves its scratch as the serial decoder would after the blocks
+        /// before, which then decodes that one and gives its verdict. The
+        /// frame's size checks, after each block and after the last, are
+        /// the serial ones, and fail here as there.
         ///
         /// Inline down to the stage and frame it never takes, which cost
         /// the serial driver a branch on every unit.
@@ -5527,11 +5632,13 @@ mod parallel {
             read: &mut usize,
             mut next: impl FnMut(&mut O) -> bool + Send,
         ) -> Result<Option<Event>, DecodeError> {
-            let (Stage::Block { frame, .. }, Some(gate)) = (&self.stage, self.parallel) else {
+            let (Stage::Block { frame, .. }, Some(gate)) = (&mut self.stage, self.parallel) else {
                 return Ok(None);
             };
             let block_size_max = frame.block_size_max;
-            if !gate.pools(located(data, block_size_max, room)) {
+            // Blocks decoded ahead have had their stage 2.
+            let held = frame.ahead.take(data);
+            if held == 0 && !gate.pools(located(data, block_size_max, room)) {
                 return self.decode_serially(data, dict, out, room, read, next);
             }
             let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &mut self.scratch)
@@ -5542,9 +5649,19 @@ mod parallel {
                 init: scratch,
                 dict: dict.and_then(DecodeDict::entropy),
             };
-            let batch = plan_blocks(data, block_size_max, start, room);
-            let (done, hist, accounted) =
-                run_batch(&batch.plans, frame, start, out, self.simd, &mut next);
+            // Past the blocks `room` takes, a ring's worth more decode ahead
+            // for the next call, if the room runs out first.
+            let positions = 2 * rayon::current_num_threads();
+            let reach = room.saturating_add(positions.saturating_mul(block_size_max));
+            let batch = plan_blocks(data, block_size_max, start, reach);
+            let len = positions.min(batch.plans.len());
+            // Out of the frame its blocks are accounted to while they run.
+            let mut ahead = std::mem::take(&mut frame.ahead);
+            let ring = ahead.ring(len);
+            let (done, ready, hist, accounted) =
+                run_batch(&batch.plans, frame, start, out, self.simd, &mut next, ring);
+            ahead.hold(len, data, &batch.ends, done, ready);
+            frame.ahead = ahead;
             let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
                 return Ok(None);
             };
@@ -5595,10 +5712,12 @@ mod parallel {
 
     /// Stages 2 and 3 of `plans`, blocks of `frame` from the tables and
     /// repeat offsets in `start`, into `out`, calling `next` before each
-    /// block but the first. Returns how many blocks it decoded, from the
-    /// first, up to one whose stage 2 or 3 fails or before which `next`
-    /// returns false, the repeat offsets after them, and the frame's size
-    /// check on them, which ends them where it fails.
+    /// block but the first, with tasks decoding into `ring`. Returns how many
+    /// blocks it decoded, from the first, up to one whose stage 2 or 3
+    /// fails or before which `next` returns false; in that last case how
+    /// many blocks after them had been decoded; the repeat offsets after
+    /// the blocks decoded, and the frame's size check on them, which ends
+    /// them where it fails.
     fn run_batch<O: FrameOut + Send>(
         plans: &[Plan<'_>],
         frame: &mut Frame,
@@ -5606,24 +5725,17 @@ mod parallel {
         out: &mut O,
         simd: Level,
         next: &mut (impl FnMut(&mut O) -> bool + Send),
-    ) -> (usize, [u32; 3], Result<(), DecodeError>) {
+        BatchRing { slots: ring, held }: BatchRing<'_>,
+    ) -> (usize, usize, [u32; 3], Result<(), DecodeError>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
         // spawned once block `i - ring.len()` has been executed from it, or
         // by the executing thread if no task has started it by the time
         // that thread needs block `i`, or waits for block `i - 1`. It
         // decodes no block further ahead, so a block it needs is never left
         // waiting behind the decode of a later one.
-        let ring: Vec<RingSlot> = (0..(2 * rayon::current_num_threads()).min(plans.len()))
-            .map(|_| RingSlot {
-                claimed: AtomicUsize::new(0),
-                done: AtomicUsize::new(0),
-                slot: Mutex::new(Slot::new()),
-            })
-            .collect();
-        let ring = &ring[..];
         let block_size_max = frame.block_size_max;
         let mut hist = start.init.offset_hist;
-        let mut done = 0;
+        let (mut done, mut stopped) = (0, false);
         let accounted = rayon::scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(cp)) = plans.get(i) else {
@@ -5642,12 +5754,17 @@ mod parallel {
                     slot.result = decode_block(&mut slot, i, cp, plans, start);
                 });
             };
-            for i in 0..ring.len() {
+            for i in held..ring.len() {
                 spawn_decode(i);
             }
             for (i, plan) in plans.iter().enumerate() {
-                if i != 0 && !next(out) {
-                    break;
+                if i != 0 {
+                    if !next(out) {
+                        stopped = true;
+                        break;
+                    }
+                    // Block `i - 1` has been executed from its position.
+                    spawn_decode(i - 1 + ring.len());
                 }
                 let cell = &ring[i % ring.len()];
                 let slot = match plan {
@@ -5687,13 +5804,31 @@ mod parallel {
                     break;
                 };
                 drop(slot);
-                spawn_decode(i + ring.len());
                 done = i + 1;
                 frame.block_decoded(bytes)?;
             }
+            if stopped {
+                // Claim the decodes no task has started, which the next
+                // batch may not take, so that their tasks return; the scope
+                // waits for the others.
+                for j in done..plans.len().min(done + ring.len()) {
+                    ring[j % ring.len()].claim(j);
+                }
+            }
             Ok(())
         });
-        (done, hist, accounted)
+        let ready = match accounted {
+            Ok(()) if stopped => (done..plans.len().min(done + ring.len()))
+                .take_while(|&j| {
+                    let cell = &ring[j % ring.len()];
+                    !matches!(plans[j], Plan::Compressed(_))
+                        || cell.done.load(Ordering::Acquire) == j + 1
+                            && cell.slot.lock().unwrap().result.is_ok()
+                })
+                .count(),
+            _ => 0,
+        };
+        (done, ready, hist, accounted)
     }
 
     /// Leave `scratch` as the serial decoder leaves it after `plans`, the
@@ -5774,6 +5909,62 @@ mod parallel {
             // Three compressed blocks of 100 bytes.
             for (min_bytes, want) in [(0, true), (299, true), (300, true), (301, false)] {
                 assert_eq!(pools("crczc", 100, 3, min_bytes), want, "{min_bytes}");
+            }
+        }
+
+        /// `Ahead::take` after a batch that executed the first of five
+        /// blocks and holds the next three: it takes those the next input
+        /// starts with, byte for byte, none once a block has been decoded
+        /// since, and drops the others; `Ahead::ring` then has them
+        /// decoded, and no table tagged with a block numbered for the batch
+        /// before.
+        #[test]
+        fn ahead_takes_the_held_blocks_input_starts_with() {
+            let data = blocks("czcrc", 100);
+            let ends: Vec<usize> = located(&data, BLOCK_SIZE_MAX, usize::MAX)
+                .map(|(_, _, end)| end)
+                .collect();
+            let held = || {
+                let mut ahead = Ahead::default();
+                ahead.ring(4);
+                ahead.hold(4, &data, &ends, 1, 3);
+                ahead
+            };
+            let next = &data[ends[0]..];
+            let mut changed = next.to_vec();
+            changed[ends[2] - ends[0] + 5] ^= 1;
+            for (what, input, want) in [
+                ("whole", next, 3),
+                ("third changed", &changed[..], 2),
+                ("cut in the second", &next[..ends[2] - ends[0] - 1], 1),
+                ("from the first block", &data[..], 0),
+            ] {
+                let mut ahead = held();
+                assert_eq!(ahead.take(input), want, "{what}");
+                assert_eq!(ahead.take(next), want, "{what}, again");
+            }
+            let mut ahead = held();
+            ahead.outdate();
+            assert_eq!(ahead.take(next), 0, "outdated");
+            // The taken blocks are the batch's first, decoded, and no table
+            // is tagged with a block of the batch before.
+            let mut ahead = held();
+            for cell in &mut ahead.ring {
+                let slot = cell.slot.get_mut().unwrap();
+                slot.huf_from = Some(START);
+                slot.fse_from = [Some(0), Some(1), Some(2)];
+            }
+            ahead.take(next);
+            let ring = ahead.ring(4);
+            let done: Vec<usize> = ring
+                .slots
+                .iter()
+                .map(|c| c.done.load(Ordering::Relaxed))
+                .collect();
+            assert_eq!((done, ring.held), (vec![1, 2, 3, 0], 3));
+            for cell in ring.slots {
+                let slot = cell.slot.lock().unwrap();
+                assert_eq!((slot.huf_from, slot.fse_from), (None, [None; 3]));
             }
         }
     }
