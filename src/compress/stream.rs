@@ -136,17 +136,24 @@ struct Frame {
 
 impl Frame {
     /// `ZSTD_CCtx_init_compressStream2` on `ctx` for `pledged` bytes, or an
-    /// unknown size, with `opts.dict` if set: the parameters and dictionary
-    /// use `ZSTD_compressBegin_internal` resolves for it, which a one-shot
-    /// frame of that size resolves too. A copied or loaded dictionary's
-    /// content starts the buffer, as it starts the one-shot frame's joined
-    /// input.
-    fn begin(opts: &CompressOptions, pledged: Option<u64>, mut ctx: Context) -> Self {
+    /// unknown size, with `prefix` if given, else `opts.dict` if set: the
+    /// parameters and dictionary use `ZSTD_compressBegin_internal` resolves
+    /// for it, which a one-shot frame of that size resolves too. A copied
+    /// or loaded dictionary's content starts the buffer, as it starts the
+    /// one-shot frame's joined input.
+    fn begin(
+        opts: &CompressOptions,
+        pledged: Option<u64>,
+        prefix: Option<&[u8]>,
+        mut ctx: Context,
+    ) -> Self {
         let size = frame_size(pledged);
         let cdict = opts.dict.clone();
-        let dict = cdict
-            .as_ref()
-            .map(|cdict| FrameDict::of(cdict, pledged, opts));
+        let dict = match (prefix, &cdict) {
+            (Some(prefix), _) => Some(FrameDict::prefix(prefix, pledged, opts)),
+            (None, Some(cdict)) => Some(FrameDict::of(cdict, pledged, opts)),
+            (None, None) => None,
+        };
         let dict = dict.as_ref();
         debug_assert!(dict.is_some() || !multithreaded(opts, size));
         let (frame_cparams, cparams, ldm_params) = match dict {
@@ -292,6 +299,23 @@ impl Compressor {
         }
     }
 
+    /// `ZSTD_CCtx_refPrefix`: `prefix`, copied, is the raw-content prefix
+    /// of the next frame alone, whether [`Compressor::compress`] or
+    /// [`Compressor::compress_stream`] starts it, in place of
+    /// [`CompressOptions::dict`]; see [`Compressor::compress_with_prefix`]
+    /// for what the frame is. An empty `prefix` clears it, and
+    /// [`Compressor::reset_stream`] keeps it, as libzstd's session reset
+    /// does. Only before a frame starts, else [`CompressError::StageWrong`].
+    pub fn set_prefix(&mut self, prefix: &[u8]) -> Result<(), CompressError> {
+        match self.stream.stage {
+            Stage::Idle => {
+                self.prefix = (!prefix.is_empty()).then(|| prefix.to_vec());
+                Ok(())
+            }
+            _ => Err(CompressError::StageWrong),
+        }
+    }
+
     /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)`: abandon the streaming
     /// frame in progress, its pending output and the pledged size; the
     /// options stay.
@@ -318,8 +342,9 @@ impl Compressor {
     /// writes for the same input when its size was pledged, however the
     /// input is cut into calls; without a pledged size, the header has no
     /// content size and the parameters, and how a dictionary is used, are
-    /// those of an unknown size. A frame with [`CompressOptions::dict`] is
-    /// one job.
+    /// those of an unknown size. A frame takes the prefix
+    /// [`Compressor::set_prefix`] left, else [`CompressOptions::dict`],
+    /// and is then one job.
     ///
     /// Errors: [`CompressError::SrcSizeWrong`] when the input passes the
     /// pledged size (the call consumes none of it) or ends short of it;
@@ -387,14 +412,16 @@ impl Compressor {
                 }
                 Stage::Idle => {
                     // A frame with a dictionary is one job.
-                    let dict = self.opts.dict.is_some();
+                    let dict = self.prefix.is_some() || self.opts.dict.is_some();
                     if !dict && multithreaded(&self.opts, frame_size(self.stream.pledged)) {
                         let what = "job_size streaming over JOBSIZE_MIN or of unknown size";
                         return Err(CompressError::Unsupported(what));
                     }
                     self.contexts.expand(1);
                     let ctx = self.contexts.take();
-                    let frame = Frame::begin(&self.opts, self.stream.pledged, ctx);
+                    let prefix = self.prefix.take();
+                    let frame =
+                        Frame::begin(&self.opts, self.stream.pledged, prefix.as_deref(), ctx);
                     self.stream.stage = Stage::Frame(Box::new(frame));
                 }
                 Stage::Frame(frame) => {

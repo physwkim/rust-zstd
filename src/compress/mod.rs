@@ -356,6 +356,9 @@ pub struct Compressor {
     serial_ldm: Option<LdmState>,
     /// The streaming session ([`Compressor::compress_stream`]).
     stream: stream::Session,
+    /// `prefixDict`: the raw-content prefix of the next frame alone
+    /// ([`Compressor::set_prefix`]).
+    prefix: Option<Vec<u8>>,
 }
 
 /// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
@@ -505,6 +508,7 @@ impl Compressor {
             contexts: ContextPool::default(),
             serial_ldm: None,
             stream: stream::Session::default(),
+            prefix: None,
         }
     }
 
@@ -534,22 +538,28 @@ impl Compressor {
         ms.map(MatchState::workspace_size).collect()
     }
 
-    /// Append one frame holding `src` to `out`. A streaming frame in
-    /// progress is abandoned first, as `ZSTD_compress2` resets the session.
+    /// Append one frame holding `src` to `out`, with the prefix
+    /// [`Compressor::set_prefix`] left for it, else
+    /// [`CompressOptions::dict`]. A streaming frame in progress is
+    /// abandoned first, as `ZSTD_compress2` resets the session.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         self.reset_stream();
         self.compress_next(src, out);
     }
 
-    /// The next frame, of `src` alone, appended to `out`, with
-    /// [`CompressOptions::dict`] if set.
+    /// The next frame, of `src` alone, appended to `out`: the
+    /// `ZSTD_CCtx_init_compressStream2` dictionary choice, the prefix if
+    /// one is left (single usage), else [`CompressOptions::dict`].
     fn compress_next(&mut self, src: &[u8], out: &mut Vec<u8>) {
-        match self.opts.dict.clone() {
-            Some(dict) => {
-                let dict = FrameDict::of(&dict, Some(src.len() as u64), &self.opts);
-                self.compress_frame(src, Some(&dict), out);
-            }
-            None => self.compress_frame(src, None, out),
+        let pledged = Some(src.len() as u64);
+        if let Some(prefix) = self.prefix.take() {
+            let dict = FrameDict::prefix(&prefix, pledged, &self.opts);
+            self.compress_frame(src, Some(&dict), out);
+        } else if let Some(dict) = self.opts.dict.clone() {
+            let dict = FrameDict::of(&dict, pledged, &self.opts);
+            self.compress_frame(src, Some(&dict), out);
+        } else {
+            self.compress_frame(src, None, out);
         }
     }
 
@@ -559,10 +569,13 @@ impl Compressor {
     /// are sized for `src` and the prefix, the frame header carries no
     /// dictionary ID, and decoding needs the same prefix as a raw-content
     /// dictionary. A prefix under 8 bytes is ignored. Replaces
-    /// [`CompressOptions::dict`] for this frame. A streaming frame in
-    /// progress is abandoned first, as for [`Compressor::compress`].
+    /// [`CompressOptions::dict`] for this frame, and a prefix
+    /// [`Compressor::set_prefix`] left, as `ZSTD_CCtx_refPrefix` replaces
+    /// the last. A streaming frame in progress is abandoned first, as for
+    /// [`Compressor::compress`].
     pub fn compress_with_prefix(&mut self, src: &[u8], prefix: &[u8], out: &mut Vec<u8>) {
         self.reset_stream();
+        self.prefix = None;
         let dict = FrameDict::prefix(prefix, Some(src.len() as u64), &self.opts);
         self.compress_frame(src, Some(&dict), out);
     }

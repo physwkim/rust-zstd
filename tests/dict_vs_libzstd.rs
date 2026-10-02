@@ -14,9 +14,9 @@
 //! [`DictAttach::Copy`]. `ZSTD_compress_usingDict` and
 //! `ZSTD_compress_usingCDict` frames are reported beside ours. Raw
 //! prefixes are gated against `ZSTD_CCtx_refPrefix`. Streams with a
-//! dictionary are our one-shot frames when their size is pledged, and
-//! pass the same gate against libzstd's `ZSTD_compressStream2` either
-//! way.
+//! dictionary or a prefix are our one-shot frames when their size is
+//! pledged, and pass the same gate against libzstd's
+//! `ZSTD_compressStream2` either way.
 
 mod common;
 
@@ -860,6 +860,22 @@ impl LibCDict {
     }
 }
 
+/// [`lib_stream`] at `level` with `ZSTD_CCtx_refPrefix(prefix)`.
+fn lib_stream_prefix(
+    src: &[u8],
+    prefix: &[u8],
+    level: i32,
+    pledged: bool,
+    chunk: usize,
+) -> Vec<u8> {
+    // SAFETY: a live context; `prefix` outlives the stream.
+    lib_stream(src, pledged, chunk, &[], |cctx| unsafe {
+        set(cctx, P::ZSTD_c_compressionLevel, level);
+        let r = sys::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr().cast(), prefix.len());
+        assert_eq!(sys::ZSTD_isError(r), 0);
+    })
+}
+
 /// `src` streamed with `cctx` at each of `chunks`: with the size pledged,
 /// `one_shot` byte for byte; without, the same frame at every chunk size,
 /// which `check` accepts (with the first chunk size) and which is returned.
@@ -1048,6 +1064,140 @@ fn sliding_buffer_with_a_dictionary() {
             check_streams(&what, &mut cctx, src, &chunks, &one_shot, check);
         }
     }
+}
+
+/// A prefix set with `set_prefix` is the next frame's alone, streamed or
+/// one-shot: pledged, the stream is `compress_with_prefix`'s frame however
+/// it is cut; of unknown size, it round trips with the prefix and passes
+/// the gate against libzstd's stream after `ZSTD_CCtx_refPrefix`. The
+/// frame after it has no prefix again, and the dictionary of the options
+/// comes back.
+#[test]
+fn prefix_streams() {
+    let mut failures = Vec::new();
+    for corpus in corpora() {
+        let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+        for level in [-5, 1, 3, 9, 19] {
+            let opts = CompressOptions {
+                level,
+                ..Default::default()
+            };
+            let mut cctx = Compressor::new(opts.clone());
+            for src in [&corpus.test[0], corpus.test.last().unwrap()] {
+                let what = format!("{} prefix L{level} {} bytes", corpus.name, src.len());
+                let one_shot = compress_with_prefix(src, &prefix, &opts);
+                let mut unpledged: Option<Vec<u8>> = None;
+                for chunk in STREAM_CHUNKS {
+                    let what = format!("{what} chunk {chunk}");
+                    cctx.set_prefix(&prefix).unwrap();
+                    let frame = ours_stream(&mut cctx, src, true, chunk, &[]);
+                    assert!(
+                        frame == one_shot,
+                        "{what}: pledged stream != one-shot frame"
+                    );
+                    cctx.set_prefix(&prefix).unwrap();
+                    let frame = ours_stream(&mut cctx, src, false, chunk, &[]);
+                    match &unpledged {
+                        None => {
+                            let mut dctx = DCtx::create();
+                            dctx.ref_prefix(&prefix).unwrap();
+                            let mut out = Vec::with_capacity(src.len());
+                            dctx.decompress(&mut out, &frame).unwrap_or_else(|e| {
+                                panic!("{what}: {}", zstd_safe::get_error_name(e))
+                            });
+                            assert!(out == **src, "{what}: libzstd decodes another input");
+                            assert_ours_decodes(&what, &frame, &prefix, src);
+                            unpledged = Some(frame);
+                        }
+                        Some(first) => {
+                            assert!(&frame == first, "{what}: unpledged stream differs")
+                        }
+                    }
+                    for pledged in [true, false] {
+                        let ours = if pledged {
+                            &one_shot
+                        } else {
+                            unpledged.as_ref().unwrap()
+                        };
+                        let lib = lib_stream_prefix(src, &prefix, level, pledged, chunk);
+                        let what = format!("{what} pledged {pledged}");
+                        if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
+                            failures.push(e);
+                        }
+                    }
+                }
+                // Single usage: the next frame has no prefix.
+                let plain = rust_zstd::compress::compress_with(src, &opts);
+                assert!(
+                    ours_stream(&mut cctx, src, true, 4096, &[]) == plain,
+                    "{what}: the frame after the prefix's"
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // The prefix replaces the options' dictionary for one frame.
+    let corpus = corpora().swap_remove(0);
+    let (_, trained) = dictionaries(&corpus).swap_remove(0);
+    let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+    let src = &corpus.test[0];
+    let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
+    let mut cctx = Compressor::new(dict_opts(&dict, Attach::Default));
+    cctx.set_prefix(&prefix).unwrap();
+    let frame = ours_stream(&mut cctx, src, true, 7, &[]);
+    assert!(frame == compress_with_prefix(src, &prefix, &CompressOptions::default()));
+    assert!(ours_stream(&mut cctx, src, true, 7, &[]) == compress_with_dict(src, &dict));
+}
+
+/// `set_prefix` only before a frame starts; the session reset keeps a
+/// prefix not yet used, as `ZSTD_CCtx_reset(ZSTD_reset_session_only)`
+/// keeps `prefixDict`; `Compressor::compress` uses it as the next frame;
+/// `compress_with_prefix` replaces it; an empty prefix clears it.
+#[test]
+fn set_prefix_stages() {
+    let corpus = corpora().swap_remove(1);
+    let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+    let src = corpus.test.last().unwrap();
+    let opts = CompressOptions::default();
+    let with_prefix = compress_with_prefix(src, &prefix, &opts);
+    let plain = rust_zstd::compress::compress_with(src, &opts);
+    let mut cctx = Compressor::new(opts.clone());
+    let mut dst = vec![0u8; 1 << 16];
+    let (mut src_pos, mut dst_pos) = (0, 0);
+    cctx.compress_stream(
+        &src[..1000],
+        &mut src_pos,
+        &mut dst,
+        &mut dst_pos,
+        EndDirective::Continue,
+    )
+    .unwrap();
+    assert_eq!(cctx.set_prefix(&prefix), Err(CompressError::StageWrong));
+    cctx.reset_stream();
+    cctx.set_prefix(&prefix).unwrap();
+    cctx.reset_stream();
+    assert!(ours_stream(&mut cctx, src, true, 64 << 10, &[]) == with_prefix);
+    cctx.set_prefix(&prefix).unwrap();
+    assert!(cctx.compress_to_vec(src) == with_prefix);
+    assert!(cctx.compress_to_vec(src) == plain);
+    cctx.set_prefix(&src[..100]).unwrap();
+    let mut out = Vec::new();
+    cctx.compress_with_prefix(src, &prefix, &mut out);
+    assert!(out == with_prefix);
+    assert!(cctx.compress_to_vec(src) == plain);
+    cctx.set_prefix(&prefix).unwrap();
+    cctx.set_prefix(&[]).unwrap();
+    assert!(cctx.compress_to_vec(src) == plain);
+    // A first End call is the one-shot frame with the prefix.
+    cctx.set_prefix(&prefix).unwrap();
+    let mut dst = vec![0u8; 1 << 18];
+    let (mut src_pos, mut dst_pos) = (0, 0);
+    let left = cctx
+        .compress_stream(src, &mut src_pos, &mut dst, &mut dst_pos, EndDirective::End)
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(dst[..dst_pos] == with_prefix[..]);
 }
 
 /// The dictionary is in the options, so it outlives the session: a frame

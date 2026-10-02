@@ -359,11 +359,12 @@ impl<'a> FrameDict<'a> {
         }
     }
 
-    /// `ZSTD_compress2` with `ZSTD_CCtx_refPrefix(prefix)` for an input of
-    /// `pledged` bytes (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`): `opts` sized
-    /// for the input and a dictionary of `prefix.len()` bytes, the prefix
-    /// loaded as raw content (`ZSTD_dct_rawContent`), unless it is under 8
-    /// bytes, without an ID, entropy tables or repeat offsets of its own.
+    /// `ZSTD_compress2` or `ZSTD_compressStream2` with
+    /// `ZSTD_CCtx_refPrefix(prefix)` for an input of `pledged` bytes
+    /// (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`): `opts` sized for the input and
+    /// a dictionary of `prefix.len()` bytes, the prefix loaded as raw
+    /// content (`ZSTD_dct_rawContent`), unless it is under 8 bytes, without
+    /// an ID, entropy tables or repeat offsets of its own.
     pub(super) fn prefix(prefix: &'a [u8], pledged: Option<u64>, opts: &CompressOptions) -> Self {
         let (frame, ldm) =
             opts.frame_cparams(opts.level, pledged, prefix.len(), CParamMode::NoAttachDict);
