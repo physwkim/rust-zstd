@@ -12,7 +12,7 @@
 
 use super::common::{
     byte, candidate_valid, hash_ptr, index_overlap_check, prefetch, read32, simd_level, tget, tset,
-    MatchCount, Src, HASH_READ_SIZE, K_SEARCH_STRENGTH,
+    write_tagged, MatchCount, Src, HASH_READ_SIZE, K_SEARCH_STRENGTH, SHORT_CACHE_TAG_BITS,
 };
 use super::matchstate::{Block, EnteredPrefix, MatchState};
 use super::seqstore::{offset_to_offbase, SeqStore, REPCODE1_TO_OFFBASE};
@@ -516,11 +516,13 @@ fn compress_block_level<const EXT: bool, C: MatchCount>(
     }
 }
 
-/// `ZSTD_fillHashTableForCCtx(ms, end, dtlm)`: `ZSTD_dtlm_fast` without
-/// `FULL`, `ZSTD_dtlm_full` with it. The CDict's
-/// `ZSTD_fillHashTableForCDict` writes the same slots: its short cache tag
-/// is the low byte of a hash 8 bits wider, whose high bits are this hash.
-fn fill_hash_table<const MLS: u32, const FULL: bool>(
+/// `ZSTD_fillHashTableForCCtx(ms, end, ZSTD_dtlm_fast)` without
+/// `FOR_CDICT`; with it `ZSTD_fillHashTableForCDict(ms, end,
+/// ZSTD_dtlm_full)`, which also inserts the two positions after each third
+/// one where their slot is empty, and tags every entry ([`write_tagged`]):
+/// the slot is the high bits of a hash [`SHORT_CACHE_TAG_BITS`] wider,
+/// the same slot as the untagged hash's.
+fn fill_hash_table<const MLS: u32, const FOR_CDICT: bool>(
     ms: &mut MatchState,
     src: Src,
     start: usize,
@@ -529,6 +531,7 @@ fn fill_hash_table<const MLS: u32, const FULL: bool>(
     const FAST_HASH_FILL_STEP: usize = 3;
     let hbits = ms.cparams.hash_log;
     assert!((1..=32).contains(&hbits));
+    assert!(!FOR_CDICT || hbits + SHORT_CACHE_TAG_BITS <= 32);
     assert!(end <= src.end());
     let (hash_table, _, _) = ms.ws.tables_mut();
     assert_eq!(hash_table.len(), 1usize << hbits);
@@ -537,32 +540,42 @@ fn fill_hash_table<const MLS: u32, const FULL: bool>(
     // with iend = end - HASH_READ_SIZE. Always insert every
     // fastHashFillStep position into the hash table.
     while ip + FAST_HASH_FILL_STEP + HASH_READ_SIZE < end + 2 {
-        // SAFETY: ip + 10 <= end <= src.end(); hash < 1 << hbits == len.
-        unsafe { tset(hash_table, hash_ptr::<MLS>(src, ip, hbits), ip) };
-        if FULL {
-            // Only load extra positions for ZSTD_dtlm_full, where their
-            // entry is still empty.
-            for p in 1..FAST_HASH_FILL_STEP {
-                // SAFETY: as above, ip + p + 8 <= ip + 10 <= end.
-                unsafe {
-                    let h = hash_ptr::<MLS>(src, ip + p, hbits);
-                    if tget(hash_table, h) == 0 {
-                        tset(hash_table, h, ip + p);
+        if FOR_CDICT {
+            let tbits = hbits + SHORT_CACHE_TAG_BITS;
+            // SAFETY: ip + 10 <= end <= src.end(); a hash of `tbits` bits
+            // shifted down by the tag is < 1 << hbits == len.
+            unsafe {
+                write_tagged(hash_table, hash_ptr::<MLS>(src, ip, tbits), ip);
+                // Only load extra positions for ZSTD_dtlm_full, where their
+                // entry is still empty.
+                for p in 1..FAST_HASH_FILL_STEP {
+                    // ip + p + 8 <= ip + 10 <= end.
+                    let hash_and_tag = hash_ptr::<MLS>(src, ip + p, tbits);
+                    if tget(hash_table, hash_and_tag >> SHORT_CACHE_TAG_BITS) == 0 {
+                        write_tagged(hash_table, hash_and_tag, ip + p);
                     }
                 }
             }
+        } else {
+            // SAFETY: ip + 10 <= end <= src.end(); hash < 1 << hbits == len.
+            unsafe { tset(hash_table, hash_ptr::<MLS>(src, ip, hbits), ip) };
         }
         ip += FAST_HASH_FILL_STEP;
     }
 }
 
 /// [`fill_hash_table`] for `ms.cparams.min_match`.
-fn fill_hash_table_from<const FULL: bool>(ms: &mut MatchState, src: Src, start: usize, end: usize) {
+fn fill_hash_table_from<const FOR_CDICT: bool>(
+    ms: &mut MatchState,
+    src: Src,
+    start: usize,
+    end: usize,
+) {
     match ms.cparams.min_match {
-        5 => fill_hash_table::<5, FULL>(ms, src, start, end),
-        6 => fill_hash_table::<6, FULL>(ms, src, start, end),
-        7 => fill_hash_table::<7, FULL>(ms, src, start, end),
-        _ => fill_hash_table::<4, FULL>(ms, src, start, end),
+        5 => fill_hash_table::<5, FOR_CDICT>(ms, src, start, end),
+        6 => fill_hash_table::<6, FOR_CDICT>(ms, src, start, end),
+        7 => fill_hash_table::<7, FOR_CDICT>(ms, src, start, end),
+        _ => fill_hash_table::<4, FOR_CDICT>(ms, src, start, end),
     }
 }
 
@@ -576,10 +589,10 @@ pub fn load_prefix(ms: &mut MatchState, src: Src, prefix: EnteredPrefix) {
     ms.next_to_update = end;
 }
 
-/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)` for
-/// entered dictionary content, into untagged tables: [`load_prefix`] that
-/// also inserts the two positions after each third one where their entry
-/// is empty.
+/// `ZSTD_fillHashTable(ms, end, ZSTD_dtlm_full, ZSTD_tfp_forCDict)` for a
+/// dictionary's entered content: [`load_prefix`] that also inserts the two
+/// positions after each third one where their entry is empty, every entry
+/// tagged (see [`fill_hash_table`]).
 pub fn load_dict_full(ms: &mut MatchState, src: Src, content: EnteredPrefix) {
     let end = ms.prefix_indices(content).end;
     assert!(end <= src.end());

@@ -42,7 +42,7 @@
 use std::ops::Range;
 
 use super::bt::ZSTD_OPT_SIZE;
-use super::common::{Src, HASH_READ_SIZE};
+use super::common::{Src, HASH_READ_SIZE, SHORT_CACHE_TAG_BITS};
 use super::lazy::{default_search_method, SearchMethod, DUBT_UNSORTED_MARK};
 use super::ldm::LdmParams;
 use super::opt::OptState;
@@ -679,12 +679,25 @@ impl Workspace {
     /// this one's but for `hashTable3`, which is zeroed instead, between
     /// `ZSTD_cwksp_mark_tables_dirty` and `_clean`: the index area then
     /// holds only values below the window end of `src`, which the owner
-    /// takes over, and nothing past it is vouched for any more.
-    fn copy_tables(&mut self, src: &Workspace) {
+    /// takes over, and nothing past it is vouched for any more. With
+    /// `tagged` (`ZSTD_CDictIndicesAreTagged`) the hash and chain tables'
+    /// entries lose their tags.
+    fn copy_tables(&mut self, src: &Workspace, tagged: bool) {
         let (hash, chain, tag) = self.tables_mut();
         let (src_hash, src_chain, src_tag) = src.tables();
-        hash.copy_from_slice(src_hash);
-        chain.copy_from_slice(src_chain);
+        if tagged {
+            let untag = |dst: &mut [u32], src: &[u32]| {
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = s >> SHORT_CACHE_TAG_BITS;
+                }
+            };
+            assert_eq!((hash.len(), chain.len()), (src_hash.len(), src_chain.len()));
+            untag(hash, src_hash);
+            untag(chain, src_chain);
+        } else {
+            hash.copy_from_slice(src_hash);
+            chain.copy_from_slice(src_chain);
+        }
         tag.copy_from_slice(src_tag);
         self.opt_tables_mut().2.fill(0);
         self.valid = self.layout.index_end();
@@ -1140,10 +1153,11 @@ impl MatchState {
         long.then_some(EnteredPrefix(indexed))
     }
 
-    /// `ZSTD_resetCCtx_byCopyingCDict` after the reset: the tables, window
-    /// and `next_to_update` of `dict`, a state that loaded dictionary
-    /// content ([`MatchState::enter_dict`]) at the positions where this
-    /// state's input lays it out, so the content needs no hashing again.
+    /// `ZSTD_resetCCtx_byCopyingCDict` after the reset: the tables (their
+    /// fast and dfast entries untagged), window and `next_to_update` of
+    /// `dict`, a state that loaded dictionary content
+    /// ([`MatchState::enter_dict`]) at the positions where this state's
+    /// input lays it out, so the content needs no hashing again.
     /// `hashTable3`, which a dictionary never fills, is zeroed; the row
     /// finder's salt is `dict`'s, which hashed its tags. The tables must
     /// have the same shape: `dict`'s parameters with any window log, and its
@@ -1164,7 +1178,8 @@ impl MatchState {
             "tables of another shape"
         );
         assert_eq!(self.search_method, dict.search_method);
-        self.ws.copy_tables(&dict.ws);
+        self.ws
+            .copy_tables(&dict.ws, dict.cparams.cdict_indices_are_tagged());
         let frequently = self.window.correct_frequently();
         self.window = dict.window;
         self.window.set_correct_frequently(frequently);

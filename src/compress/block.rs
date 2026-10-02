@@ -168,8 +168,10 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 pub enum TableLoad {
     /// `ZSTD_dtlm_fast`: every third position, as a context loads content.
     Fast,
-    /// `ZSTD_dtlm_full`: also the positions between them where their slot
-    /// is empty, as a CDict loads its content once for many frames.
+    /// `ZSTD_dtlm_full` with `ZSTD_tfp_forCDict`: also the positions
+    /// between them where their slot is empty, as a CDict loads its
+    /// content once for many frames, and every fast and dfast entry tagged
+    /// (`ZSTD_CDictIndicesAreTagged`, see [`MatchState::copy_dict`]).
     Full,
 }
 
@@ -1072,20 +1074,41 @@ mod tests {
     /// `ZSTD_dtlm_full` keeps every slot `ZSTD_dtlm_fast` writes, as each
     /// third position overwrites its slot either way, and gives empty slots
     /// the positions between them: fast's table and dfast's large one gain
-    /// entries, dfast's small table is unchanged.
+    /// entries, dfast's small table is unchanged. Its entries are tagged
+    /// with the low byte of a hash 8 bits wider than the slot's.
     #[test]
     fn full_table_load_fills_only_empty_slots() {
+        use crate::compress::common::{hash_ptr, SHORT_CACHE_TAG_BITS};
         let data = crate::compress::common::testutil::synthetic_text(100_000, 5);
         for level in [1, 3] {
             let cp = CParams::for_level(level, 1 << 20);
             let load = |how| {
                 let mut ms = MatchState::new(cp, 0);
                 load_dict(&mut ms, &data, 0..data.len(), how);
+                let src = ms.view(&data);
                 let (hash, chain, _) = ms.tables();
-                (hash.to_vec(), chain.to_vec(), ms.index(0))
+                (hash.to_vec(), chain.to_vec(), ms.index(0), src)
             };
-            let (fast_hash, fast_chain, base) = load(TableLoad::Fast);
-            let (full_hash, full_chain, _) = load(TableLoad::Full);
+            let (fast_hash, fast_chain, base, _) = load(TableLoad::Fast);
+            let (tagged_hash, tagged_chain, _, src) = load(TableLoad::Full);
+            let tbits = cp.hash_log + SHORT_CACHE_TAG_BITS;
+            for &e in tagged_hash.iter().filter(|&&e| e != 0) {
+                let idx = (e >> SHORT_CACHE_TAG_BITS) as usize;
+                // SAFETY: a filled position has 8 bytes after it in `data`.
+                let hash_and_tag = unsafe {
+                    match (cp.strategy, cp.min_match) {
+                        (Strategy::DFast, _) => hash_ptr::<8>(src, idx, tbits),
+                        (_, 5) => hash_ptr::<5>(src, idx, tbits),
+                        (_, 6) => hash_ptr::<6>(src, idx, tbits),
+                        (_, 7) => hash_ptr::<7>(src, idx, tbits),
+                        _ => hash_ptr::<4>(src, idx, tbits),
+                    }
+                };
+                assert_eq!(e & 0xff, hash_and_tag as u32 & 0xff, "L{level}: tag");
+            }
+            let untag = |t: Vec<u32>| t.into_iter().map(|e| e >> SHORT_CACHE_TAG_BITS).collect();
+            let (full_hash, full_chain): (Vec<u32>, Vec<u32>) =
+                (untag(tagged_hash), untag(tagged_chain));
             for (&f, &g) in fast_hash.iter().zip(&full_hash) {
                 assert!(f == 0 || f == g, "L{level}: slot {f} became {g}");
                 assert!(

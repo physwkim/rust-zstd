@@ -12,6 +12,12 @@ use std::sync::OnceLock;
 pub const HASH_READ_SIZE: usize = 8;
 /// `kSearchStrength`.
 pub const K_SEARCH_STRENGTH: u32 = 8;
+/// `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of a fast or dfast
+/// dictionary's table entry that hold a tag of its hash, above which the
+/// entry holds the index (`ZSTD_CDictIndicesAreTagged`).
+pub const SHORT_CACHE_TAG_BITS: u32 = 8;
+/// `ZSTD_SHORT_CACHE_TAG_MASK`.
+const SHORT_CACHE_TAG_MASK: usize = (1 << SHORT_CACHE_TAG_BITS) - 1;
 
 /// The input as the match finders address it: `window.base`. Byte `i` of
 /// the view is at index `i + lo()`, the index [`MatchState`] assigns to
@@ -148,6 +154,22 @@ pub unsafe fn tget(table: &[u32], h: usize) -> usize {
 pub unsafe fn tset(table: &mut [u32], h: usize, v: usize) {
     debug_assert!(h < table.len());
     *table.get_unchecked_mut(h) = v as u32;
+}
+
+/// `ZSTD_writeTaggedIndex(table, hashAndTag, idx)`: `hash_and_tag` is a
+/// hash [`SHORT_CACHE_TAG_BITS`] wider than the table's; its high bits are
+/// the slot, its low ones the tag stored below `idx`.
+///
+/// # Safety
+/// `hash_and_tag >> SHORT_CACHE_TAG_BITS < table.len()`.
+#[inline(always)]
+pub unsafe fn write_tagged(table: &mut [u32], hash_and_tag: usize, idx: usize) {
+    debug_assert!(idx >> (32 - SHORT_CACHE_TAG_BITS) == 0);
+    tset(
+        table,
+        hash_and_tag >> SHORT_CACHE_TAG_BITS,
+        (idx << SHORT_CACHE_TAG_BITS) | (hash_and_tag & SHORT_CACHE_TAG_MASK),
+    );
 }
 
 /// Is the table entry `idx` a usable candidate for position `cur`, i.e.

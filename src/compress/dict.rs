@@ -38,9 +38,10 @@
 //! [`WINDOW_START_INDEX`]: super::matchstate::WINDOW_START_INDEX
 
 use super::block::{self, BlockState, TableLoad};
+use super::common::SHORT_CACHE_TAG_BITS;
 use super::lazy::{default_search_method, SearchMethod};
 use super::ldm::LdmParams;
-use super::matchstate::MatchState;
+use super::matchstate::{MatchState, WINDOW_START_INDEX};
 use super::opt::DictStats;
 use super::params::{CParamMode, CParams, ZSTD_CLEVEL_DEFAULT};
 use super::{CompressError, CompressOptions};
@@ -134,9 +135,18 @@ impl CompressDict {
         let cparams = CParams::for_level_with(level, None, dict.len(), CParamMode::CreateCDict);
         let (id, entropy, content) = insert_dictionary(dict, content_type)?;
         let content = content.to_vec();
-        let mut ms = MatchState::new_for(cparams, 0, default_search_method(&cparams));
-        if !content.is_empty() {
-            block::load_dict(&mut ms, &content, 0..content.len(), TableLoad::Full);
+        // ZSTD_loadDictionaryContent with ZSTD_tfp_forCDict: tagged indices
+        // must leave the tag bits free, so only the suffix whose indices
+        // do is loaded, and the window starts there.
+        let origin = if cparams.cdict_indices_are_tagged() {
+            let max = (1usize << (32 - SHORT_CACHE_TAG_BITS)) - WINDOW_START_INDEX;
+            content.len().saturating_sub(max)
+        } else {
+            0
+        };
+        let mut ms = MatchState::new_for(cparams, origin, default_search_method(&cparams));
+        if origin < content.len() {
+            block::load_dict(&mut ms, &content, origin..content.len(), TableLoad::Full);
         }
         Ok(Self {
             content,
