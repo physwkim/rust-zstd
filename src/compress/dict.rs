@@ -234,14 +234,15 @@ impl CompressDict {
     }
 }
 
-/// `ZSTD_shouldAttachDict` for an input of `pledged` bytes: attach where
-/// the input is no larger than the cutoff of the dictionary's strategy
-/// ([`ATTACH_DICT_SIZE_CUTOFFS`]) or `pref` forces it, unless `pref`
+/// `ZSTD_shouldAttachDict` for an input of `pledged` bytes (`None`:
+/// `ZSTD_CONTENTSIZE_UNKNOWN`): attach where the input is unknown or no
+/// larger than the cutoff of the dictionary's strategy
+/// ([`ATTACH_DICT_SIZE_CUTOFFS`]), or `pref` forces it, unless `pref`
 /// forces a copy. There is no `dedicatedDictSearch` nor `forceWindow`
 /// here, which would force or forbid it.
-fn should_attach(dict: &CompressDict, pledged: u64, pref: DictAttach) -> bool {
+fn should_attach(dict: &CompressDict, pledged: Option<u64>, pref: DictAttach) -> bool {
     let cutoff = ATTACH_DICT_SIZE_CUTOFFS[dict.ms.cparams.strategy as usize];
-    (pledged <= cutoff || pref == DictAttach::Attach) && pref != DictAttach::Copy
+    (pledged.is_none_or(|p| p <= cutoff) || pref == DictAttach::Attach) && pref != DictAttach::Copy
 }
 
 impl fmt::Debug for CompressDict {
@@ -294,29 +295,34 @@ pub(super) struct FrameDict<'a> {
 
 impl<'a> FrameDict<'a> {
     /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` for an input of
-    /// `src_size` bytes, `opts.dict_attach` the attach preference: `opts`
-    /// at the dictionary's level, sized for the input and the dictionary
+    /// `pledged` bytes (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`),
+    /// `opts.dict_attach` the attach preference: `opts` at the
+    /// dictionary's level, sized for the input and the dictionary
     /// (`ZSTD_getCParamMode`: `ZSTD_cpm_attachDict` where
     /// `ZSTD_shouldAttachDict`, which leaves the dictionary out, else
     /// `ZSTD_cpm_noAttachDict`). Then (`ZSTD_compressBegin_internal`) for
-    /// an input below 128 KiB or six times the dictionary's size, unless
-    /// [`DictAttach::Load`], the dictionary's tables: attached, with its
-    /// parameters sized for the input alone, or copied, with its
-    /// parameters as they are, either way with the frame's window log;
-    /// else the frame's own tables loaded with the content. The
-    /// dictionary's entropy tables and repeat offsets either way.
-    pub(super) fn of(dict: &'a CompressDict, src_size: usize, opts: &CompressOptions) -> Self {
-        let pledged = src_size as u64;
+    /// an input of unknown size or below 128 KiB or six times the
+    /// dictionary's size, unless [`DictAttach::Load`], the dictionary's
+    /// tables: attached, with its parameters sized for the input alone, or
+    /// copied, with its parameters as they are, either way with the
+    /// frame's window log; else the frame's own tables loaded with the
+    /// content. The dictionary's entropy tables and repeat offsets either
+    /// way.
+    pub(super) fn of(dict: &'a CompressDict, pledged: Option<u64>, opts: &CompressOptions) -> Self {
         let attach = should_attach(dict, pledged, opts.dict_attach);
         let mode = if attach {
             CParamMode::AttachDict
         } else {
             CParamMode::NoAttachDict
         };
-        let (frame, ldm) = opts.frame_cparams(dict.level, src_size, dict.dict_size, mode);
+        let (frame, ldm) = opts.frame_cparams(dict.level, pledged, dict.dict_size, mode);
+        // The CDict's compressionLevel is never 0 here (ZSTD_NO_CLEVEL is
+        // the advanced API's), so that clause of libzstd's is left out.
         let use_tables = dict.dict_size > 0
-            && (pledged < USE_CDICT_PARAMS_SRCSIZE_CUTOFF
-                || pledged < dict.dict_size as u64 * USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER)
+            && pledged.is_none_or(|p| {
+                p < USE_CDICT_PARAMS_SRCSIZE_CUTOFF
+                    || p < dict.dict_size as u64 * USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER
+            })
             && opts.dict_attach != DictAttach::Load;
         let (applied, tables) = if use_tables && attach {
             // Resize working context table params for input only, since
@@ -324,7 +330,7 @@ impl<'a> FrameDict<'a> {
             let sized =
                 dict.ms
                     .cparams
-                    .adjust_with(Some(pledged), dict.dict_size, CParamMode::AttachDict);
+                    .adjust_with(pledged, dict.dict_size, CParamMode::AttachDict);
             let applied = CParams {
                 window_log: frame.window_log,
                 ..sized
@@ -354,13 +360,13 @@ impl<'a> FrameDict<'a> {
     }
 
     /// `ZSTD_compress2` with `ZSTD_CCtx_refPrefix(prefix)` for an input of
-    /// `src_size` bytes: `opts` sized for the input and a dictionary of
-    /// `prefix.len()` bytes, the prefix loaded as raw content
-    /// (`ZSTD_dct_rawContent`), unless it is under 8 bytes, without an ID,
-    /// entropy tables or repeat offsets of its own.
-    pub(super) fn prefix(prefix: &'a [u8], src_size: usize, opts: &CompressOptions) -> Self {
+    /// `pledged` bytes (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`): `opts` sized
+    /// for the input and a dictionary of `prefix.len()` bytes, the prefix
+    /// loaded as raw content (`ZSTD_dct_rawContent`), unless it is under 8
+    /// bytes, without an ID, entropy tables or repeat offsets of its own.
+    pub(super) fn prefix(prefix: &'a [u8], pledged: Option<u64>, opts: &CompressOptions) -> Self {
         let (frame, ldm) =
-            opts.frame_cparams(opts.level, src_size, prefix.len(), CParamMode::NoAttachDict);
+            opts.frame_cparams(opts.level, pledged, prefix.len(), CParamMode::NoAttachDict);
         let (_, _, content) = insert_dictionary(prefix, DictContentType::RawContent)
             .expect("raw content never fails to load");
         Self {
@@ -935,7 +941,7 @@ mod tests {
                     dict_attach,
                     ..Default::default()
                 };
-                let frame = FrameDict::of(&dict, 4 << 10, &opts);
+                let frame = FrameDict::of(&dict, Some(4 << 10), &opts);
                 let what = format!("level {level} {dict_attach:?}");
                 assert_eq!(frame.frame.window_log, window_log, "{what}");
                 assert_eq!(frame.applied.window_log, window_log, "{what}");

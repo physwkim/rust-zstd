@@ -89,9 +89,8 @@ impl Session {
     }
 }
 
-/// The size a frame of `pledged` bytes resolves its parameters for:
-/// `ZSTD_CONTENTSIZE_UNKNOWN` for an unknown one, the row of the largest
-/// inputs without a window shrink.
+/// `pledgedSrcSize` as the workspace sizing and the ZSTDMT check read it:
+/// `ZSTD_CONTENTSIZE_UNKNOWN`, larger than any input, for an unknown size.
 fn frame_size(pledged: Option<u64>) -> usize {
     pledged.map_or(usize::MAX, |p| usize::try_from(p).unwrap_or(usize::MAX))
 }
@@ -126,7 +125,7 @@ impl Frame {
     fn begin(opts: &CompressOptions, pledged: Option<u64>, mut ctx: Context) -> Self {
         let size = frame_size(pledged);
         debug_assert!(!multithreaded(opts, size));
-        let (cparams, ldm_params) = opts.frame_params(size);
+        let (cparams, ldm_params) = opts.frame_params(pledged);
         let mut header = Vec::new();
         write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum, 0);
         let sizing = block_sizing(opts, &cparams, false, header.len());

@@ -237,16 +237,18 @@ impl CompressOptions {
     }
 
     /// `ZSTD_getCParamsFromCCtxParams` and `ZSTD_resolveEnableLdm` for an
-    /// input of `src_size` bytes without a dictionary: the frame's
-    /// compression parameters and, when long distance matching resolves to
-    /// enabled, its parameters (`ZSTD_ldm_adjustParameters`).
-    fn frame_params(&self, src_size: usize) -> (CParams, Option<LdmParams>) {
+    /// input of `src_size` bytes (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`)
+    /// without a dictionary: the frame's compression parameters and, when
+    /// long distance matching resolves to enabled, its parameters
+    /// (`ZSTD_ldm_adjustParameters`).
+    fn frame_params(&self, src_size: Option<u64>) -> (CParams, Option<LdmParams>) {
         let (cparams, ldm) = self.frame_cparams(self.level, src_size, 0, CParamMode::NoAttachDict);
         (cparams, ldm.map(|requested| requested.adjusted(&cparams)))
     }
 
     /// `ZSTD_getCParamsFromCCtxParams` and `ZSTD_resolveEnableLdm` at
-    /// `level` for an input of `src_size` bytes and a dictionary of
+    /// `level` for an input of `src_size` bytes (`None`:
+    /// `ZSTD_CONTENTSIZE_UNKNOWN`) and a dictionary of
     /// `dict_size` bytes used in `mode`: the frame's compression parameters
     /// and, when long distance matching resolves to enabled, the requested
     /// parameters, which `ZSTD_ldm_adjustParameters` completes for the
@@ -263,7 +265,7 @@ impl CompressOptions {
     fn frame_cparams(
         &self,
         level: i32,
-        src_size: usize,
+        src_size: Option<u64>,
         dict_size: usize,
         mode: CParamMode,
     ) -> (CParams, Option<LdmParams>) {
@@ -279,11 +281,10 @@ impl CompressOptions {
             self.ldm_bucket_size_log,
             self.ldm_hash_rate_log,
         );
-        let src = Some(src_size as u64);
-        let mut cparams = CParams::for_level_with(level, src, dict_size, mode);
+        let mut cparams = CParams::for_level_with(level, src_size, dict_size, mode);
         if self.ldm == ParamSwitch::Enable {
             cparams.window_log = LDM_DEFAULT_WINDOW_LOG;
-            cparams = cparams.adjust_with(src, dict_size, mode);
+            cparams = cparams.adjust_with(src_size, dict_size, mode);
         }
         let enabled = match self.ldm {
             // wlog >= 27, strategy >= btopt
@@ -325,7 +326,7 @@ pub fn compress_with(data: &[u8], opts: &CompressOptions) -> Vec<u8> {
 pub fn compress_with_dict(data: &[u8], dict: &CompressDict) -> Vec<u8> {
     let mut out = Vec::new();
     let opts = CompressOptions::default();
-    let dict = FrameDict::of(dict, data.len(), &opts);
+    let dict = FrameDict::of(dict, Some(data.len() as u64), &opts);
     Compressor::new(opts).compress_frame(data, Some(&dict), &mut out);
     out
 }
@@ -539,7 +540,7 @@ impl Compressor {
         self.reset_stream();
         match self.opts.dict.clone() {
             Some(dict) => {
-                let dict = FrameDict::of(&dict, src.len(), &self.opts);
+                let dict = FrameDict::of(&dict, Some(src.len() as u64), &self.opts);
                 self.compress_frame(src, Some(&dict), out);
             }
             None => self.compress_frame(src, None, out),
@@ -556,7 +557,7 @@ impl Compressor {
     /// progress is abandoned first, as for [`Compressor::compress`].
     pub fn compress_with_prefix(&mut self, src: &[u8], prefix: &[u8], out: &mut Vec<u8>) {
         self.reset_stream();
-        let dict = FrameDict::prefix(prefix, src.len(), &self.opts);
+        let dict = FrameDict::prefix(prefix, Some(src.len() as u64), &self.opts);
         self.compress_frame(src, Some(&dict), out);
     }
 
@@ -567,7 +568,7 @@ impl Compressor {
         let (frame_cparams, cparams, ldm_params) = match dict {
             Some(dict) => dict.params(),
             None => {
-                let (cparams, ldm) = self.opts.frame_params(src.len());
+                let (cparams, ldm) = self.opts.frame_params(Some(src.len() as u64));
                 (cparams, cparams, ldm)
             }
         };
@@ -1581,7 +1582,7 @@ mod tests {
         ] {
             let src = data.as_slice();
             let opts = ldm_opts(level, ParamSwitch::Enable, Some(JOBSIZE_MIN));
-            let (cparams, ldm) = opts.frame_params(src.len());
+            let (cparams, ldm) = opts.frame_params(Some(src.len() as u64));
             let ldm = ldm.expect("enabled");
             let overlap = overlap_size(&cparams, opts.overlap_log, true);
             let job_size = job_size_for(opts.job_size, &cparams, true, overlap);
@@ -1641,21 +1642,23 @@ mod tests {
     fn ldm_switch_resolution() {
         let data = far_repeat(300 << 10, 400 << 10);
         for level in 1..=22 {
-            let (cp, ldm) = ldm_opts(level, ParamSwitch::Enable, None).frame_params(3 << 20);
+            let (cp, ldm) = ldm_opts(level, ParamSwitch::Enable, None).frame_params(Some(3 << 20));
             assert_eq!(cp.window_log, 22, "L{level}: 3 MiB adjusts 27 to 22");
             assert!(ldm.is_some_and(|p| p.window_log == 22));
-            let big = ldm_opts(level, ParamSwitch::Enable, None).frame_params(1 << 30);
+            let big = ldm_opts(level, ParamSwitch::Enable, None).frame_params(Some(1 << 30));
             assert_eq!(big.0.window_log, 27, "L{level}");
             for size in [3 << 20, 64 << 20, (64 << 20) + 1, 1 << 30] {
-                let auto = ldm_opts(level, ParamSwitch::Auto, None).frame_params(size);
+                let auto = ldm_opts(level, ParamSwitch::Auto, None).frame_params(Some(size as u64));
                 if level == 22 && size > 64 << 20 {
-                    let on = ldm_opts(level, ParamSwitch::Enable, None).frame_params(size);
+                    let on =
+                        ldm_opts(level, ParamSwitch::Enable, None).frame_params(Some(size as u64));
                     assert_eq!(auto, on, "L{level} {size}");
                     assert!(auto.1.is_some(), "L{level} {size}");
                 } else {
                     assert!(auto.1.is_none(), "L{level} {size}");
                     assert_eq!(auto.0, CParams::for_level(level, size), "L{level} {size}");
-                    let off = ldm_opts(level, ParamSwitch::Disable, None).frame_params(size);
+                    let off =
+                        ldm_opts(level, ParamSwitch::Disable, None).frame_params(Some(size as u64));
                     assert_eq!(off, auto, "L{level} {size}");
                 }
             }
@@ -1778,7 +1781,7 @@ mod tests {
         for level in [1, 3, 7, 11] {
             let opts = CompressOptions::parallel(level);
             assert_eq!((opts.job_size, opts.overlap_log), (Some(2 << 20), 8));
-            let (cparams, _) = opts.frame_params(data.len());
+            let (cparams, _) = opts.frame_params(Some(data.len() as u64));
             let overlap = overlap_size(&cparams, opts.overlap_log, false);
             let jobs = job_ranges(
                 data.len(),
@@ -1911,8 +1914,8 @@ mod tests {
             ldm: ParamSwitch::Enable,
             ..Default::default()
         };
-        let (big, big_ldm) = opts.frame_params(64 << 20);
-        let (small, small_ldm) = opts.frame_params(1024);
+        let (big, big_ldm) = opts.frame_params(Some(64 << 20));
+        let (small, small_ldm) = opts.frame_params(Some(1024));
         let mut ctx = Context::default();
         let ldm = JobLdm::Internal(big_ldm.unwrap());
         let method = default_search_method(&big);
