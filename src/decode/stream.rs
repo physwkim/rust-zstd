@@ -54,8 +54,7 @@ impl Decompressor {
     }
 
     /// A decompressor on the paths `opts` picks, with the window limit it
-    /// sets (`set_window_log_max`). `decompress_stream` decodes on the
-    /// current thread whatever `opts.min_parallel_blocks` says.
+    /// sets (`set_window_log_max`).
     ///
     /// # Panics
     /// Where `set_window_log_max` panics on `opts.window_log_max`.
@@ -201,6 +200,13 @@ impl Decompressor {
     /// its header, unless this call has all of it and room for its
     /// Frame_Content_Size (`set_window_log_max`).
     ///
+    /// With the `parallel` feature, when this call's input holds
+    /// `min_parallel_blocks` or more whole blocks of a frame (from `new`,
+    /// four on a pool of more than one thread) and `dst` has room for the
+    /// most they decode to, they decode on the current rayon pool; every
+    /// call reads, writes and returns what it would decoding them one after
+    /// another.
+    ///
     /// After an error the decompressor is stopped: every later call returns
     /// the same error, until `reset`.
     ///
@@ -274,6 +280,36 @@ impl Decompressor {
             }
             if self.dec.skipping() {
                 return Ok(self.hint());
+            }
+
+            // Whole blocks in the input decode in parallel, each written
+            // out before the next as at the top of this loop, the last one
+            // there.
+            #[cfg(feature = "parallel")]
+            if self.unit.is_empty() {
+                let dict = self.dict.as_ref();
+                let mut out = RingOut {
+                    ring: &mut self.ring,
+                    dict: dict.map_or(&[], DecodeDict::content),
+                };
+                let room = dst.len() - *dst_pos;
+                let mut read = 0;
+                let decoded = self.dec.decode_blocks_parallel(
+                    &src[*src_pos..],
+                    dict,
+                    &mut out,
+                    room,
+                    &mut read,
+                    |out| {
+                        *dst_pos += out.ring.flush(&mut dst[*dst_pos..]);
+                        out.ring.pending() == 0
+                    },
+                );
+                *src_pos += read;
+                if let Some(event) = decoded? {
+                    self.frame_ended = event == Event::FrameEnded;
+                    continue;
+                }
             }
 
             let input = &src[*src_pos..];

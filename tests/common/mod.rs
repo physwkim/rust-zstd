@@ -399,6 +399,78 @@ pub fn stream_room(chunk: usize) -> usize {
     chunk.min(1 << 16)
 }
 
+/// Output room for four blocks of 128 KiB, at which a call can take
+/// several whole blocks to decode in parallel; below the 1 MiB that
+/// decode_header_alloc holds decoding to, whose streaming checks
+/// allocate it.
+pub const PARALLEL_ROOM: usize = 1 << 19;
+
+/// Feed `input` to `serial` and `parallel` alike, at most `chunk` bytes of
+/// input and `room` bytes of output a call, as `stream_with` does, checking
+/// that every call returns, reads and writes the same, and then that
+/// `finish` gives the same.
+pub fn assert_lockstep(
+    what: &str,
+    serial: &mut Decompressor,
+    parallel: &mut Decompressor,
+    input: &[u8],
+    chunk: usize,
+    room: usize,
+) {
+    let (mut a, mut b) = (vec![0u8; room], vec![0u8; room]);
+    let mut pos = 0usize;
+    for call in 0.. {
+        let src = &input[pos..input.len().min(pos.saturating_add(chunk))];
+        let (mut read, mut written, mut b_read, mut b_written) = (0, 0, 0, 0);
+        let hint = serial.decompress_stream(src, &mut read, &mut a, &mut written);
+        let b_hint = parallel.decompress_stream(src, &mut b_read, &mut b, &mut b_written);
+        assert!(
+            (&hint, read, &a[..written]) == (&b_hint, b_read, &b[..b_written]),
+            "{what}, chunk {chunk}, room {room}, call {call}: serial gives {hint:?}, reading \
+             {read} and writing {written}; parallel {b_hint:?}, reading {b_read} and writing \
+             {b_written}"
+        );
+        pos += read;
+        if hint.is_err() || read == 0 && written == 0 && hint != Ok(0) {
+            break;
+        }
+    }
+    assert_eq!(serial.finish(), parallel.finish(), "{what}: finish");
+}
+
+/// `assert_lockstep` of `input` at `chunk`, with the room `stream_room`
+/// gives and with `PARALLEL_ROOM`, between serial decompressors and ones
+/// that decode every frame's whole blocks in parallel, at SIMD level
+/// `simd`, each with `dict` if given.
+///
+/// Only at chunks of 3 bytes or more, the least a whole block takes, and
+/// at the detected SIMD level: the parallel decoder executes a block with
+/// the serial one's code at either level.
+#[cfg(feature = "parallel")]
+pub fn assert_parallel_streams(
+    what: &str,
+    input: &[u8],
+    chunk: usize,
+    simd: bool,
+    dict: Option<&DecodeDict>,
+) {
+    if chunk < 3 || !simd {
+        return;
+    }
+    for room in [stream_room(chunk), PARALLEL_ROOM] {
+        let [mut serial, mut parallel] = [usize::MAX, 1].map(|min_parallel_blocks| {
+            let mut d = Decompressor::with_options(&DecodeOptions {
+                min_parallel_blocks,
+                simd,
+                window_log_max: 0,
+            });
+            d.set_dict(dict);
+            d
+        });
+        assert_lockstep(what, &mut serial, &mut parallel, input, chunk, room);
+    }
+}
+
 thread_local! {
     /// A serial decompressor per SIMD level, and the buffer its
     /// `decompress_into` calls fill, for every `assert_stream_parity_at`
@@ -596,9 +668,11 @@ pub fn check_streamed(
 /// output room up to 64 KiB, has the outcome of `decompress_with_options`,
 /// serial, at both SIMD levels: the same content or the same error, or
 /// the window limit's refusal where libzstd's streaming decoder refuses
-/// too (`check_streamed`). So does `Decompressor::decompress` on a
-/// decompressor every call reuses, and its `decompress_into` into a buffer
-/// every call reuses, without the exception.
+/// too (`check_streamed`); with the `parallel` feature, decoding whole
+/// blocks in parallel changes no call (`assert_parallel_streams`). So does
+/// `Decompressor::decompress` on a decompressor every call reuses, and its
+/// `decompress_into` into a buffer every call reuses, without the
+/// exception.
 pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
     for simd in [false, true] {
         let opts = DecodeOptions {
@@ -629,6 +703,8 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
             let got = decompress_streaming(input, chunk, stream_room(chunk), &opts);
             let what = format!("{name} simd={simd} chunk {chunk}");
             check_streamed(&what, input, chunk, simd, None, &got, &want);
+            #[cfg(feature = "parallel")]
+            assert_parallel_streams(&what, input, chunk, simd, None);
         }
     }
 }
