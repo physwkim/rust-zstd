@@ -6161,16 +6161,17 @@ mod parallel {
         /// block it decoded, or `None` if it decoded none, and sets `read`
         /// to how much of `data` those blocks take, on failure too.
         ///
-        /// If `room` takes all the whole blocks of `data`, none is left to
-        /// decode ahead, and the pool decodes them in one scope, from
-        /// `data` as borrowed. Otherwise the pipeline's chain takes them,
-        /// and those it planned past the last one executed keep decoding
-        /// after the call, for the next. It stops before a block that
-        /// fails, or that it cannot plan, and leaves the serial decoder's
-        /// state as the serial decoder would after the blocks before (on
-        /// `Pipeline::hand_back`, for a chain), which then decodes that one
-        /// and gives its verdict. The frame's size checks, after each block
-        /// and after the last, are the serial ones, and fail here as there.
+        /// If `room` takes all the whole blocks of `data`, or the rest of
+        /// the frame's content, none is left to decode ahead, and the pool
+        /// decodes them in one scope, from `data` as borrowed. Otherwise
+        /// the pipeline's chain takes them, and those it planned past the
+        /// last one executed keep decoding after the call, for the next.
+        /// It stops before a block that fails, or that it cannot plan, and
+        /// leaves the serial decoder's state as the serial decoder would
+        /// after the blocks before (on `Pipeline::hand_back`, for a chain),
+        /// which then decodes that one and gives its verdict. The frame's
+        /// size checks, after each block and after the last, are the serial
+        /// ones, and fail here as there.
         ///
         /// Inline down to the stage and frame it never takes, which cost
         /// the serial driver a branch on every unit.
@@ -6211,6 +6212,12 @@ mod parallel {
                 return Ok(None);
             };
             let block_size_max = frame.block_size_max;
+            // Room for the rest of the frame's content is room for all its
+            // blocks, however much more they could decode to.
+            let room = match frame.content_size {
+                Some(fcs) if fcs - frame.decoded <= room as u64 => usize::MAX,
+                _ => room,
+            };
             if !frame.pipeline.active() {
                 if !gate.pools(located(data, block_size_max, room)) {
                     return self.decode_serially(data, dict, out, room, read, next);
