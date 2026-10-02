@@ -61,14 +61,14 @@ each block ≤ 128 KB decompressed). Blocks can be:
 
 ```toml
 [dependencies]
-rust-zstd = "0.2"
+rust-zstd = "0.3"
 ```
 
 Parallel compression is enabled by default. To disable it (single-threaded, no rayon dependency):
 
 ```toml
 [dependencies]
-rust-zstd = { version = "0.2", default-features = false }
+rust-zstd = { version = "0.3", default-features = false }
 ```
 
 ## API

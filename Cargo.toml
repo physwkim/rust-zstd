@@ -1,6 +1,6 @@
 [package]
 name = "rust-zstd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Pure Rust Zstandard codec (compress and decompress), no C or FFI; depends on fearless_simd and bytemuck, plus rayon under the default parallel feature"
 license = "BSD-3-Clause AND MIT"
