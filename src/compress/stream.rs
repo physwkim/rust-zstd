@@ -167,10 +167,13 @@ impl Frame {
         let id = dict.map_or(0, FrameDict::id);
         write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum, id);
         let sizing = block_sizing(opts, &cparams, false, header.len());
-        let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
         let frequently = opts.overflow_correct_frequently;
         let method = dict.map_or_else(|| default_search_method(&cparams), FrameDict::search_method);
         let buf = dict.map_or_else(Vec::new, |dict| dict.content().to_vec());
+        let ldm = ldm_params.map_or(JobLdm::Off, |params| {
+            let start = dict.map_or(0..0, |dict| dict.ldm_content(false));
+            JobLdm::Internal(params, &buf, start)
+        });
         let (ms, scratch, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
         let start = JobStart::First(dict);
         let (blocks, state) = begin_job(ms, scratch, &buf, 0..buf.len(), start, sizing, true);

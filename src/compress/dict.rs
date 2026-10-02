@@ -60,6 +60,7 @@ use crate::constants::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_
 use crate::fse::{FseCTable, FseState, FseTableState};
 use crate::huf::{HufState, HufTable, HUF_TABLELOG_DEFAULT, HUF_TABLELOG_MAX};
 use std::fmt;
+use std::ops::Range;
 
 /// `ZSTD_MAGIC_DICTIONARY`: the first four bytes of a structured
 /// dictionary (RFC 8878 §5).
@@ -143,6 +144,9 @@ pub struct CompressDict {
     dict_size: usize,
     /// `dictID`: 0 for raw content.
     id: u32,
+    /// Whether the dictionary is structured, its content what follows the
+    /// entropy tables, else raw content ([`ContentKind`]).
+    structured: bool,
     /// `compressionLevel`, 0 resolved to [`ZSTD_CLEVEL_DEFAULT`].
     level: i32,
     /// `cBlockState`: the repeat offsets and entropy tables frames start
@@ -188,7 +192,12 @@ impl CompressDict {
             level
         };
         let cparams = CParams::for_level_with(level, None, dict.len(), CParamMode::CreateCDict);
-        let (id, entropy, content) = insert_dictionary(dict, content_type)?;
+        let (header, content) = insert_dictionary(dict, content_type)?;
+        let structured = header.is_some();
+        let (id, entropy) = header.map_or_else(
+            || (0, BlockState::initial()),
+            |header| (header.id, header.entropy),
+        );
         let content = content.to_vec();
         // ZSTD_loadDictionaryContent with ZSTD_tfp_forCDict: tagged indices
         // must leave the tag bits free, so only the suffix whose indices
@@ -207,6 +216,7 @@ impl CompressDict {
             content,
             dict_size: dict.len(),
             id,
+            structured,
             level,
             opt_stats: DictStats::of(&entropy),
             entropy,
@@ -258,6 +268,21 @@ impl fmt::Debug for CompressDict {
     }
 }
 
+/// What a frame's dictionary content is, which decides the long distance
+/// matching states that load it ([`FrameDict::ldm_content`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentKind {
+    /// A structured CDict's: `ZSTD_loadZstdDictionary` loads it into the
+    /// match state alone (no `ldmState`).
+    Structured,
+    /// A raw content CDict's: `ZSTD_loadDictionaryContent` loads it into
+    /// `cctx->ldmState` too.
+    Raw,
+    /// A `ZSTD_CCtx_refPrefix` prefix, raw content that ZSTDMT's serial
+    /// state also loads (`ZSTDMT_serialState_reset`).
+    Prefix,
+}
+
 /// Where a frame's tables get the dictionary's content from.
 enum Tables<'a> {
     /// `ZSTD_resetCCtx_byAttachingCDict`: none; the finders search a
@@ -278,6 +303,7 @@ enum Tables<'a> {
 /// finders, and [`FrameDict::id`] goes in the frame header.
 pub(super) struct FrameDict<'a> {
     content: &'a [u8],
+    kind: ContentKind,
     id: u32,
     /// The frame's parameters (`ZSTD_getCParamsFromCCtxParams`), which
     /// resolve the post-block splitter and long distance matching.
@@ -352,6 +378,11 @@ impl<'a> FrameDict<'a> {
         };
         Self {
             content: &dict.content,
+            kind: if dict.structured {
+                ContentKind::Structured
+            } else {
+                ContentKind::Raw
+            },
             id: dict.id,
             frame,
             applied,
@@ -371,10 +402,11 @@ impl<'a> FrameDict<'a> {
     pub(super) fn prefix(prefix: &'a [u8], pledged: Option<u64>, opts: &CompressOptions) -> Self {
         let (frame, ldm) =
             opts.frame_cparams(opts.level, pledged, prefix.len(), CParamMode::NoAttachDict);
-        let (_, _, content) = insert_dictionary(prefix, DictContentType::RawContent)
+        let (_, content) = insert_dictionary(prefix, DictContentType::RawContent)
             .expect("raw content never fails to load");
         Self {
             content,
+            kind: ContentKind::Prefix,
             id: 0,
             frame,
             applied: frame,
@@ -421,6 +453,31 @@ impl<'a> FrameDict<'a> {
         (self.frame, self.applied, ldm)
     }
 
+    /// The positions of `content ++ input` a long distance matching state
+    /// for the frame starts from: the range's start is its window's origin,
+    /// and it loads the range first ([`LdmState::load_dict`]). Raw content
+    /// the frame's one context loads, which `ZSTD_loadDictionaryContent`
+    /// enters into `cctx->ldmState` too; for ZSTDMT's serial state (`mt`),
+    /// a prefix alone (`ZSTDMT_serialState_reset`), as only job 0 sees a
+    /// CDict. Else none, the window starting at the input: a structured
+    /// dictionary's content is not loaded there, and copied or attached
+    /// tables leave `cctx->ldmState` empty.
+    ///
+    /// [`LdmState::load_dict`]: super::ldm::LdmState::load_dict
+    pub(super) fn ldm_content(&self, mt: bool) -> Range<usize> {
+        let end = self.content().len();
+        let loaded = match (self.kind, &self.tables) {
+            (ContentKind::Structured, _) | (_, Tables::Copy(_) | Tables::Attach(_)) => false,
+            (ContentKind::Raw, Tables::Load) => !mt,
+            (ContentKind::Prefix, Tables::Load) => true,
+        };
+        if loaded {
+            0..end
+        } else {
+            end..end
+        }
+    }
+
     /// The lazy finder the frame's tables are for: a used dictionary's
     /// (`useRowMatchFinder` from the CDict), else the frame's default.
     pub(super) fn search_method(&self) -> SearchMethod {
@@ -453,33 +510,43 @@ impl<'a> FrameDict<'a> {
     }
 }
 
-/// `ZSTD_compress_insertDictionary` before the content load: the
-/// dictionary's ID, the block state frames start from, and the content to
-/// load. A dictionary under 8 bytes is ignored, raw content (`RawContent`,
-/// or `Auto` without the magic number) loads whole with the initial block
-/// state (`ZSTD_reset_compressedBlockState`), and a structured dictionary
-/// gives its ID, entropy tables and repeat offsets ([`load_entropy`]) and
-/// the rest as content.
+/// A structured dictionary's header.
+struct Header {
+    /// `dictID`.
+    id: u32,
+    /// The block state frames start from: its entropy tables and repeat
+    /// offsets.
+    entropy: BlockState,
+}
+
+/// `ZSTD_compress_insertDictionary` before the content load: a
+/// structured dictionary's header, and the content to load. A dictionary
+/// under 8 bytes is ignored, raw content (`RawContent`, or `Auto` without
+/// the magic number) loads whole without a header (frames start from the
+/// initial block state, `ZSTD_reset_compressedBlockState`, with no ID),
+/// and a structured dictionary gives its ID, entropy tables and repeat
+/// offsets ([`load_entropy`]) and the rest as content.
 fn insert_dictionary(
     dict: &[u8],
     content_type: DictContentType,
-) -> Result<(u32, BlockState, &[u8]), CompressError> {
-    let initial = || BlockState::initial();
+) -> Result<(Option<Header>, &[u8]), CompressError> {
     if dict.len() < 8 {
         return match content_type {
             DictContentType::FullDict => Err(CompressError::DictionaryWrong),
-            _ => Ok((0, initial(), &[])),
+            _ => Ok((None, &[])),
         };
     }
     let structured = read_le32(dict, 0) == ZSTD_MAGIC_DICTIONARY;
     match (content_type, structured) {
-        (DictContentType::RawContent, _) | (DictContentType::Auto, false) => {
-            Ok((0, initial(), dict))
-        }
+        (DictContentType::RawContent, _) | (DictContentType::Auto, false) => Ok((None, dict)),
         (DictContentType::FullDict, false) => Err(CompressError::DictionaryWrong),
         (_, true) => {
             let (entropy, header_len) = load_entropy(dict)?;
-            Ok((read_le32(dict, 4), entropy, &dict[header_len..]))
+            let header = Header {
+                id: read_le32(dict, 4),
+                entropy,
+            };
+            Ok((Some(header), &dict[header_len..]))
         }
     }
 }
@@ -765,8 +832,8 @@ mod tests {
         let structured = Parts::valid().dict();
         let raw = b"0123456789abcdef";
         let wrong = Err(CompressError::DictionaryWrong);
-        assert_eq!(insert_dictionary(&raw[..7], FullDict).map(|r| r.0), wrong);
-        assert_eq!(insert_dictionary(raw, FullDict).map(|r| r.0), wrong);
+        assert_eq!(insert_dictionary(&raw[..7], FullDict).map(|r| r.1), wrong);
+        assert_eq!(insert_dictionary(raw, FullDict).map(|r| r.1), wrong);
         for (dict, ct) in [
             (&raw[..7], Auto),
             (&raw[..7], RawContent),
@@ -774,16 +841,15 @@ mod tests {
             (raw, RawContent),
             (&structured[..], RawContent),
         ] {
-            let (id, entropy, content) = insert_dictionary(dict, ct).unwrap();
-            assert_eq!(id, 0);
-            assert_eq!(entropy.rep, BlockState::initial().rep);
-            assert!(matches!(entropy.huf, HufState::None));
+            let (header, content) = insert_dictionary(dict, ct).unwrap();
+            assert!(header.is_none());
             let whole = if dict.len() < 8 { &[][..] } else { dict };
             assert_eq!(content, whole);
         }
         for ct in [Auto, FullDict] {
-            let (id, entropy, content) = insert_dictionary(&structured, ct).unwrap();
-            assert_eq!((id, entropy.rep), (ID, REP));
+            let (header, content) = insert_dictionary(&structured, ct).unwrap();
+            let header = header.unwrap();
+            assert_eq!((header.id, header.entropy.rep), (ID, REP));
             assert_eq!(content, Parts::valid().content);
         }
     }
@@ -956,6 +1022,66 @@ mod tests {
                 assert_eq!(frame.frame.window_log, window_log, "{what}");
                 assert_eq!(frame.applied.window_log, window_log, "{what}");
             }
+        }
+    }
+
+    /// The long distance matching states that load a frame's dictionary
+    /// content: raw content where the frame loads its tables, into its one
+    /// context alone unless it is a prefix (ZSTDMT's serial state too);
+    /// never a structured dictionary's, nor copied or attached tables'.
+    #[test]
+    fn ldm_loads_raw_content_of_loaded_tables() {
+        let raw: Vec<u8> = (0..64 << 10).map(|i| (i * 7 % 251) as u8).collect();
+        let n = raw.len();
+        let raw_dict = CompressDict::new(&raw, 3).unwrap();
+        let structured = CompressDict::new(&Parts::valid().dict(), 3).unwrap();
+        let opts = |dict_attach| CompressOptions {
+            dict_attach,
+            ..Default::default()
+        };
+        let (auto, small, large) = (opts(DictAttach::Auto), Some(4 << 10), Some(1 << 20));
+        let cases = [
+            (
+                "raw loaded",
+                FrameDict::of(&raw_dict, large, &auto),
+                0..n,
+                n..n,
+            ),
+            (
+                "raw forced load",
+                FrameDict::of(&raw_dict, small, &opts(DictAttach::Load)),
+                0..n,
+                n..n,
+            ),
+            (
+                "raw copied",
+                FrameDict::of(&raw_dict, small, &opts(DictAttach::Copy)),
+                n..n,
+                n..n,
+            ),
+            (
+                "raw attached",
+                FrameDict::of(&raw_dict, small, &auto),
+                0..0,
+                0..0,
+            ),
+            (
+                "structured loaded",
+                FrameDict::of(&structured, large, &auto),
+                64..64,
+                64..64,
+            ),
+            ("prefix", FrameDict::prefix(&raw, large, &auto), 0..n, 0..n),
+            (
+                "short prefix",
+                FrameDict::prefix(&raw[..7], large, &auto),
+                0..0,
+                0..0,
+            ),
+        ];
+        for (what, frame, single, mt) in cases {
+            assert_eq!(frame.ldm_content(false), single, "{what}");
+            assert_eq!(frame.ldm_content(true), mt, "{what}");
         }
     }
 }

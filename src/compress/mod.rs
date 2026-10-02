@@ -376,11 +376,12 @@ struct Context {
 
 /// Where a job's long distance matches come from: nowhere, the frame's
 /// serial state (ZSTDMT's `rawSeqStore`), or the context's own state with
-/// these parameters, block by block (`ZSTD_buildSeqStore`).
+/// these parameters, block by block (`ZSTD_buildSeqStore`), started on the
+/// data at the given positions ([`reset_ldm_state`]).
 enum JobLdm<'a> {
     Off,
     External(&'a mut RawSeqStore),
-    Internal(LdmParams),
+    Internal(LdmParams, &'a [u8], Range<usize>),
 }
 
 impl Context {
@@ -403,7 +404,7 @@ impl Context {
         frequently: bool,
     ) -> (&'a mut MatchState, &'a mut BlockScratch, BlockLdm<'a>) {
         let ldm_params = match &ldm {
-            JobLdm::Internal(params) => Some(params),
+            JobLdm::Internal(params, ..) => Some(params),
             JobLdm::Off | JobLdm::External(_) => None,
         };
         let needed = needed_space(&cparams, method, ldm_params, pledged as u64);
@@ -425,9 +426,13 @@ impl Context {
         let ldm = match ldm {
             JobLdm::Off => BlockLdm::Off,
             JobLdm::External(seqs) => BlockLdm::External(seqs),
-            JobLdm::Internal(params) => {
-                BlockLdm::Internal(reset_ldm_state(&mut self.ldm_state, params, 0, frequently))
-            }
+            JobLdm::Internal(params, data, start) => BlockLdm::Internal(reset_ldm_state(
+                &mut self.ldm_state,
+                params,
+                data,
+                start,
+                frequently,
+            )),
         };
         (ms, &mut self.scratch, ldm)
     }
@@ -603,6 +608,9 @@ impl Compressor {
             _ => src,
         };
         let src_start = data.len() - src.len();
+        // Where a long distance matching state starts, for the frame's one
+        // context or (`mt`) ZSTDMT's serial state.
+        let ldm_start = |mt| dict.map_or(src_start..src_start, |dict| dict.ldm_content(mt));
         out.reserve(src.len() + 64);
         let header_start = out.len();
         write_frame_header(
@@ -620,7 +628,9 @@ impl Compressor {
         let method = dict.map_or_else(|| default_search_method(&cparams), FrameDict::search_method);
         if src.is_empty() {
             // ZSTD_compress2 resets a context for the empty frame too.
-            let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
+            let ldm = ldm_params.map_or(JobLdm::Off, |params| {
+                JobLdm::Internal(params, data, ldm_start(false))
+            });
             let frequently = self.opts.overflow_correct_frequently;
             self.contexts.expand(1);
             self.contexts.with_context(|ctx| {
@@ -648,14 +658,19 @@ impl Compressor {
         let later_sizing = block_sizing(&self.opts, &frame_cparams, mt, header_len);
         let pipelined = cfg!(feature = "parallel");
         // ZSTDMT_serialState: every job's long distance matches from the one
-        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them, its
-        // window starting at the input (a CDict's content is job 0's alone).
-        // A single-threaded frame generates each block's as it compresses
-        // the block (ZSTD_buildSeqStore), from its context's state.
+        // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
+        // single-threaded frame generates each block's as it compresses the
+        // block (ZSTD_buildSeqStore), from its context's state.
         let frequently = self.opts.overflow_correct_frequently;
-        let mut serial_ldm = ldm_params
-            .filter(|_| mt)
-            .map(|params| reset_ldm_state(&mut self.serial_ldm, params, src_start, frequently));
+        let mut serial_ldm = ldm_params.filter(|_| mt).map(|params| {
+            reset_ldm_state(
+                &mut self.serial_ldm,
+                params,
+                data,
+                ldm_start(true),
+                frequently,
+            )
+        });
         let max_seqs = ldm_params.map_or(0, |p| job_size / p.min_match_length as usize);
         run_jobs(
             &jobs,
@@ -674,7 +689,7 @@ impl Compressor {
                 let ldm = match ldm_params {
                     None => JobLdm::Off,
                     Some(_) if mt => JobLdm::External(seqs),
-                    Some(params) => JobLdm::Internal(params),
+                    Some(params) => JobLdm::Internal(params, data, ldm_start(false)),
                 };
                 let (start, cparams, method, sizing) = if k == 0 {
                     (JobStart::First(dict), cparams, method, sizing)
@@ -712,23 +727,28 @@ impl Compressor {
 }
 
 /// The long distance matching state in `slot` reset for a frame with
-/// `params` whose window starts at position `first`, allocated on first
-/// use, with the overflow correction knob `frequently` (see
-/// [`CompressOptions`]).
-fn reset_ldm_state(
-    slot: &mut Option<LdmState>,
+/// `params`, allocated on first use, with the overflow correction knob
+/// `frequently` (see [`CompressOptions`]): its window starts at position
+/// `start.start` of `data`, and it loads the dictionary content
+/// `data[start]` first, if any ([`FrameDict::ldm_content`]).
+fn reset_ldm_state<'a>(
+    slot: &'a mut Option<LdmState>,
     params: LdmParams,
-    first: usize,
+    data: &[u8],
+    start: Range<usize>,
     frequently: bool,
-) -> &mut LdmState {
+) -> &'a mut LdmState {
     let state = match slot.take() {
         Some(mut state) => {
-            state.reset(params, first);
+            state.reset(params, start.start);
             slot.insert(state)
         }
-        None => slot.insert(LdmState::new(params, first)),
+        None => slot.insert(LdmState::new(params, start.start)),
     };
     state.set_correct_frequently(frequently);
+    if !start.is_empty() {
+        state.load_dict(data, start);
+    }
     state
 }
 
@@ -1959,12 +1979,12 @@ mod tests {
         let (big, big_ldm) = opts.frame_params(Some(64 << 20));
         let (small, small_ldm) = opts.frame_params(Some(1024));
         let mut ctx = Context::default();
-        let ldm = JobLdm::Internal(big_ldm.unwrap());
+        let ldm = JobLdm::Internal(big_ldm.unwrap(), &[], 0..0);
         let method = default_search_method(&big);
         let (_, scratch, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
         scratch.reserve(ZSTD_BLOCKSIZE_MAX);
         for n in 1..=129 {
-            let ldm = JobLdm::Internal(small_ldm.unwrap());
+            let ldm = JobLdm::Internal(small_ldm.unwrap(), &[], 0..0);
             let method = default_search_method(&small);
             let (_, scratch, _) = ctx.reset(small, method, 0, ldm, 1024, false);
             let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;

@@ -345,6 +345,25 @@ fn lib_ref_prefix(src: &[u8], prefix: &[u8], level: i32) -> Vec<u8> {
     out
 }
 
+/// `ZSTD_compress2` at `level` with `params` after
+/// `ZSTD_CCtx_refPrefix(prefix)`.
+fn lib_prefix_with(src: &[u8], prefix: &[u8], level: i32, params: &[(P, i32)]) -> Vec<u8> {
+    lib_frame(
+        // SAFETY: a live context, `out` of its length.
+        |cctx, out| unsafe {
+            set(cctx, P::ZSTD_c_compressionLevel, level);
+            for &(param, value) in params {
+                set(cctx, param, value);
+            }
+            let (p, n) = (prefix.as_ptr().cast(), prefix.len());
+            assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refPrefix(cctx, p, n)), 0);
+            let (dst, cap) = (out.as_mut_ptr().cast(), out.len());
+            sys::ZSTD_compress2(cctx, dst, cap, src.as_ptr().cast(), src.len())
+        },
+        src.len(),
+    )
+}
+
 /// libzstd's decode of `frame` with `dict` (`ZSTD_decompress_usingDict`)
 /// and ours ([`assert_ours_decodes`]) are `src`.
 fn assert_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
@@ -669,8 +688,10 @@ fn reused_dictionaries_are_byte_stable() {
     }
 }
 
-/// Long distance matching and a checksum with a dictionary, on an input
-/// large enough for the frame's own tables.
+/// Long distance matching and a checksum with a dictionary or a prefix,
+/// on an input of 100 KiB, for which the frame copies the dictionary's
+/// tables, and of 1 MiB, for which it loads its own, raw content into
+/// the long distance matcher too.
 #[test]
 fn dictionary_with_ldm_and_checksum() {
     let corpus = corpora().swap_remove(2);
@@ -681,26 +702,50 @@ fn dictionary_with_ldm_and_checksum() {
         }
         src.extend_from_slice(s);
     }
+    let params = [
+        (P::ZSTD_c_enableLongDistanceMatching, 1),
+        (P::ZSTD_c_checksumFlag, 1),
+    ];
+    let mut failures = Vec::new();
     for (kind, dict) in dictionaries(&corpus) {
         for level in [3, 19] {
-            let what = format!("source {kind} L{level} ldm+checksum");
-            let ours = Compressor::new(CompressOptions {
-                ldm: ParamSwitch::Enable,
-                checksum: true,
-                dict: Some(Arc::new(CompressDict::new(&dict, level).unwrap())),
-                ..Default::default()
-            })
-            .compress_to_vec(&src);
-            assert_decodes(&what, &ours, &dict, &src);
-            let params = [
-                (P::ZSTD_c_enableLongDistanceMatching, 1),
-                (P::ZSTD_c_checksumFlag, 1),
-            ];
-            let lib = LibCDict::new(&dict, level).compress(&src, Attach::Default, &params);
-            println!("{what}: ours {} libzstd {}", ours.len(), lib.len());
-            common::check_size(&what, ours.len(), lib.len()).unwrap();
+            let ours_dict = Arc::new(CompressDict::new(&dict, level).unwrap());
+            let lib_dict = LibCDict::new(&dict, level);
+            for src in [&src[..100 << 10], &src] {
+                let mut frames = Vec::new();
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let ours = Compressor::new(CompressOptions {
+                        ldm: ParamSwitch::Enable,
+                        checksum: true,
+                        ..dict_opts(&ours_dict, attach)
+                    })
+                    .compress_to_vec(src);
+                    let lib = lib_dict.compress(src, attach, &params);
+                    frames.push((format!("{kind} {attach:?}"), ours, lib));
+                }
+                if kind == "raw" {
+                    let opts = CompressOptions {
+                        level,
+                        ldm: ParamSwitch::Enable,
+                        checksum: true,
+                        ..Default::default()
+                    };
+                    let ours = compress_with_prefix(src, &dict, &opts);
+                    let lib = lib_prefix_with(src, &dict, level, &params);
+                    frames.push(("prefix".to_string(), ours, lib));
+                }
+                for (what, ours, lib) in frames {
+                    let what = format!("source {what} L{level} {} bytes ldm+checksum", src.len());
+                    assert_decodes(&what, &ours, &dict, src);
+                    println!("{what}: ours {} libzstd {}", ours.len(), lib.len());
+                    if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
+                        failures.push(e);
+                    }
+                }
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// `f`'s frame, which with the parallel feature must be the same on rayon
@@ -772,7 +817,7 @@ fn multithreaded_dictionary_frames_pass_the_gate() {
                         failures.push(e);
                     }
                 }
-                if kind != "raw" || ldm == ParamSwitch::Enable {
+                if kind != "raw" {
                     continue;
                 }
                 let what = format!("prefix L{level} job {job_size} ldm {ldm:?}");
@@ -784,20 +829,7 @@ fn multithreaded_dictionary_frames_pass_the_gate() {
                 };
                 let frame = same_on_pools(&what, || compress_with_prefix(&src, &dict, &opts));
                 assert_decodes(&what, &frame, &dict, &src);
-                let lib = lib_frame(
-                    // SAFETY: a live context, `out` of its length.
-                    |cctx, out| unsafe {
-                        set(cctx, P::ZSTD_c_compressionLevel, level);
-                        for &(param, value) in &params {
-                            set(cctx, param, value);
-                        }
-                        let (p, n) = (dict.as_ptr().cast(), dict.len());
-                        assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refPrefix(cctx, p, n)), 0);
-                        let (dst, cap) = (out.as_mut_ptr().cast(), out.len());
-                        sys::ZSTD_compress2(cctx, dst, cap, src.as_ptr().cast(), src.len())
-                    },
-                    src.len(),
-                );
+                let lib = lib_prefix_with(&src, &dict, level, &params);
                 if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
                     failures.push(e);
                 }
