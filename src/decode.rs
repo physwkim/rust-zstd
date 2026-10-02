@@ -1425,12 +1425,10 @@ impl<'s> BitDStream<'s> {
                 bits_consumed: padding,
             })
         } else {
-            let mut buf = [0u8; 8];
-            buf[..src.len()].copy_from_slice(src);
             Ok(BitDStream {
                 src,
                 ptr: 0,
-                container: u64::from_le_bytes(buf),
+                container: read_le_short(src),
                 bits_consumed: padding + (8 - src.len() as u32) * 8,
             })
         }
@@ -1524,6 +1522,26 @@ impl<'s> BitDStream<'s> {
     /// True when exactly every bit of the stream was consumed.
     fn is_finished(&self) -> bool {
         self.ptr == 0 && self.bits_consumed == 64
+    }
+}
+
+/// `src`, of 1 to 8 bytes, as a little-endian number, read in registers as
+/// BIT_initDStream reads it. Copied into a zeroed `[u8; 8]` instead, its
+/// bytes reach the 8-byte load through narrower stores, which the CPU
+/// cannot forward.
+#[inline(always)]
+fn read_le_short(src: &[u8]) -> u64 {
+    let n = src.len();
+    if n >= 4 {
+        // Overlapping reads: the bytes both cover land in the same place.
+        let lo = u32::from_le_bytes(src[..4].try_into().unwrap());
+        let hi = u32::from_le_bytes(src[n - 4..].try_into().unwrap());
+        u64::from(lo) | u64::from(hi) << (8 * (n - 4))
+    } else {
+        let mid = n / 2;
+        u64::from(src[0])
+            | u64::from(src[mid]) << (8 * mid)
+            | u64::from(src[n - 1]) << (8 * (n - 1))
     }
 }
 
@@ -5772,6 +5790,22 @@ mod tests {
         let mut out = vec![0u8; dst_size];
         huf_decompress(&mut out, &section[used..], four, &t)?;
         Ok(out)
+    }
+
+    /// `read_le_short` reads every length from 1 to 8 bytes as the bytes
+    /// zero-padded to 8 read.
+    #[test]
+    fn read_le_short_matches_padded_read() {
+        let bytes = [0x11, 0x82, 0x23, 0xF4, 0x45, 0x96, 0x67, 0xA8];
+        for n in 1..=8 {
+            let mut padded = [0u8; 8];
+            padded[..n].copy_from_slice(&bytes[..n]);
+            assert_eq!(
+                read_le_short(&bytes[..n]),
+                u64::from_le_bytes(padded),
+                "{n} bytes"
+            );
+        }
     }
 
     /// RFC 8878 §4.2.2: a Huffman stream is consumed exactly, so the
