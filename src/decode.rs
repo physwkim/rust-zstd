@@ -3244,6 +3244,16 @@ impl ExtHistory {
         len: 0,
         dict: false,
     };
+
+    /// The history of a frame's first segment: the content of the
+    /// dictionary it started from, empty without one.
+    fn dict(content: &[u8]) -> ExtHistory {
+        ExtHistory {
+            end: content.as_ptr_range().end,
+            len: content.len(),
+            dict: true,
+        }
+    }
 }
 
 /// A block's sequences, executed into the frame by `execute_with_copies`
@@ -4246,7 +4256,8 @@ impl Frame {
 }
 
 /// Where a `FrameDecoder` decodes frames to: for `decompress`, the output
-/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer.
+/// `Vec` (`VecOut`); for `Decompressor`, its window's round buffer
+/// (`RingOut`).
 trait FrameOut {
     /// Make ready for a frame whose matches reach at most `window` bytes
     /// back, and which decodes to `content_size` bytes if that is known.
@@ -4574,17 +4585,6 @@ struct VecOut<'d> {
     dict: &'d [u8],
 }
 
-impl VecOut<'_> {
-    /// The history before the current frame: the dictionary content.
-    fn ext(&self) -> ExtHistory {
-        ExtHistory {
-            end: self.dict.as_ptr_range().end,
-            len: self.dict.len(),
-            dict: true,
-        }
-    }
-}
-
 impl FrameOut for VecOut<'_> {
     fn start(&mut self, window: usize, _content_size: Option<u64>) {
         self.prefix = Prefix {
@@ -4597,7 +4597,7 @@ impl FrameOut for VecOut<'_> {
         let dst = self
             .prefix
             .dst(self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
-        Ok((dst, self.ext()))
+        Ok((dst, ExtHistory::dict(self.dict)))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
