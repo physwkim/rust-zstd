@@ -269,7 +269,7 @@ impl Decompressor {
     /// Drop the input and output in hand, and any error, for input that
     /// starts with a new frame. The dictionary stays.
     pub fn reset(&mut self) {
-        self.dec.stage = Stage::FrameHeader;
+        self.dec.leave_frame();
         self.unit.clear();
         self.ring.flushed = self.ring.end;
         self.frame_ended = false;
