@@ -656,7 +656,12 @@ impl Compressor {
         let sizing = block_sizing(&self.opts, &cparams, mt, header_len);
         let later_method = default_search_method(&frame_cparams);
         let later_sizing = block_sizing(&self.opts, &frame_cparams, mt, header_len);
-        let pipelined = cfg!(feature = "parallel");
+        // The frame goes to rayon only with work to run side by side, jobs
+        // or blocks the pipelined loop overlaps; any other runs on the
+        // calling thread in either build. Entering the pool from outside
+        // it is a thread hop, which cut 4 KiB frames from 0.91x libzstd's
+        // speed to 0.72x.
+        let parallel = cfg!(feature = "parallel") && (n_jobs > 1 || sizing.overlaps(src.len()));
         // ZSTDMT_serialState: every job's long distance matches from the one
         // state, in job order, at most ZSTD_ldm_getMaxNbSeq of them. A
         // single-threaded frame generates each block's as it compresses the
@@ -675,7 +680,7 @@ impl Compressor {
         run_jobs(
             &jobs,
             &mut self.contexts,
-            pipelined,
+            parallel,
             // ZSTDMT_serialState_update
             |job, seqs| {
                 if let Some(checksum) = &mut checksum {
@@ -708,7 +713,7 @@ impl Compressor {
                     job,
                     k + 1 == n_jobs,
                     split,
-                    pipelined,
+                    parallel,
                     ctx,
                     out,
                 )
@@ -2259,6 +2264,40 @@ mod tests {
                     "job {inner} ran inside job {k} on thread {thread:?}"
                 );
             }
+        }
+    }
+
+    /// A frame enters rayon, expanding the pool to a context per worker, only
+    /// with work to run side by side: one job whose second block is under
+    /// `MIN_OVERLAP` bytes runs on the calling thread and keeps one context,
+    /// one job whose second block holds `MIN_OVERLAP` bytes or two jobs do
+    /// not. The frames are the same either way.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn frame_enters_rayon_only_with_work_for_it() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let data = text(JOBSIZE_MIN + 1);
+        let at = ZSTD_BLOCKSIZE_MAX + block::MIN_OVERLAP;
+        let cases = [
+            (4 << 10, None, 1),
+            (ZSTD_BLOCKSIZE_MAX, None, 1),
+            (at - 1, None, 1),
+            (at, None, 3),
+            (JOBSIZE_MIN + 1, Some(JOBSIZE_MIN), 3),
+        ];
+        for (len, job_size, contexts) in cases {
+            let opts = CompressOptions {
+                level: 1,
+                job_size,
+                ..Default::default()
+            };
+            let mut cx = Compressor::new(opts.clone());
+            let frame = pool.install(|| cx.compress_to_vec(&data[..len]));
+            assert_eq!(cx.contexts.capacity, contexts, "{len} bytes, {job_size:?}");
+            assert!(frame == compress_with(&data[..len], &opts), "{len} bytes");
         }
     }
 
