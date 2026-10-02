@@ -100,6 +100,49 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 ];
 
 // ============================================================
+// Errors
+// ============================================================
+
+/// Why decoding failed: a message, made out of line. Every function of the
+/// decoder returns it, and the public API turns it into a `String`. A
+/// `Result` carrying it comes back in registers when its value takes a
+/// word, and making it writes nothing into the `Result`'s slot. A `String`
+/// error is three words, written there by `format!`: that call keeps the
+/// slot, `Ok` value included, in memory, where the value's fields are
+/// stored one by one and copied in wider loads, which the CPU cannot
+/// forward from those stores.
+#[derive(Debug, PartialEq)]
+struct DecodeError(Box<str>);
+
+impl From<String> for DecodeError {
+    #[cold]
+    #[inline(never)]
+    fn from(msg: String) -> Self {
+        DecodeError(msg.into_boxed_str())
+    }
+}
+
+impl From<&str> for DecodeError {
+    #[cold]
+    #[inline(never)]
+    fn from(msg: &str) -> Self {
+        DecodeError(msg.into())
+    }
+}
+
+impl From<DecodeError> for String {
+    fn from(e: DecodeError) -> String {
+        e.0.into_string()
+    }
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ============================================================
 // Public API
 // ============================================================
 
@@ -138,6 +181,10 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// Which frames decode follows RFC 8878, not libzstd: every block, raw,
 /// RLE or compressed, holds and decodes to at most Block_Maximum_Size
 /// bytes (lines 545-569).
+///
+/// Content of at most 1 KiB comes back in a `Vec` of exactly its length;
+/// larger content may come back with the room the decoder reserved past
+/// it.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_options(data, &DecodeOptions::default())
 }
@@ -223,7 +270,33 @@ pub fn decompress_with_dict_options(
 ) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     decompress_frames(&mut FrameDecoder::new(opts), data, dict, &mut output)?;
-    Ok(output)
+    Ok(take_output(&mut output))
+}
+
+/// The most content a Vec-returning decode (`decompress` and the like, and
+/// `Decompressor::decompress` and the like) copies out of the buffer it
+/// decoded into, into a `Vec` of exactly its length. That buffer has
+/// `MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH` bytes of room past the content
+/// (`Dst`), so handed over as it is, a few bytes of content would come
+/// back in a 131 KB allocation, which glibc serves from the top of the
+/// heap, merging it back on free. The copy costs less than that
+/// allocation up to about 1 KiB of content (about 280 fewer instructions a
+/// call on 120-960 B frames) and more from about 1.2 KiB on (about 350
+/// more), where glibc no longer serves it from its thread cache (chunks
+/// of up to 1032 bytes); larger content is handed over with the room.
+const COPY_OUT_MAX: usize = 1024;
+
+/// The `Vec` a Vec-returning decode returns for the content decoded into
+/// `buf`: a copy of exactly its length if that is at most `COPY_OUT_MAX`,
+/// leaving `buf` empty with its room for the next decode, or else `buf`
+/// itself.
+fn take_output(buf: &mut Vec<u8>) -> Vec<u8> {
+    if buf.len() > COPY_OUT_MAX {
+        return std::mem::take(buf);
+    }
+    let out = buf.as_slice().to_vec();
+    buf.clear();
+    out
 }
 
 /// The one-shot driver (ZSTD_decompressMultiFrame): decode the frames of
@@ -235,7 +308,7 @@ fn decompress_frames(
     data: &[u8],
     dict: Option<&DecodeDict>,
     output: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), DecodeError> {
     let mut out = VecOut {
         output,
         prefix: Prefix {
@@ -275,82 +348,6 @@ fn decompress_frames(
             pos += read;
             decoded?;
         }
-    }
-}
-
-// ============================================================
-// BitReader (forward)
-// ============================================================
-
-struct BitReader<'s> {
-    idx: usize,
-    source: &'s [u8],
-}
-
-impl<'s> BitReader<'s> {
-    fn new(source: &'s [u8]) -> BitReader<'s> {
-        BitReader { idx: 0, source }
-    }
-
-    fn bits_left(&self) -> usize {
-        self.source.len() * 8 - self.idx
-    }
-
-    fn bits_read(&self) -> usize {
-        self.idx
-    }
-
-    fn return_bits(&mut self, n: usize) {
-        if n > self.idx {
-            panic!("Cannot return more bits than have been read");
-        }
-        self.idx -= n;
-    }
-
-    fn get_bits(&mut self, n: usize) -> Result<u64, String> {
-        if n > 64 {
-            return Err(format!("Cannot read {} bits, maximum is 64", n));
-        }
-        if self.bits_left() < n {
-            return Err(format!(
-                "Cannot read {} bits, only {} remaining",
-                n,
-                self.bits_left()
-            ));
-        }
-
-        let old_idx = self.idx;
-        let bits_left_in_current_byte = 8 - (self.idx % 8);
-        let bits_not_needed_in_current_byte = 8 - bits_left_in_current_byte;
-
-        let mut value = u64::from(self.source[self.idx / 8] >> bits_not_needed_in_current_byte);
-
-        if bits_left_in_current_byte >= n {
-            value &= (1 << n) - 1;
-            self.idx += n;
-        } else {
-            self.idx += bits_left_in_current_byte;
-            let full_bytes_needed = (n - bits_left_in_current_byte) / 8;
-            let bits_in_last_byte_needed = n - bits_left_in_current_byte - full_bytes_needed * 8;
-
-            let mut bit_shift = bits_left_in_current_byte;
-
-            for _ in 0..full_bytes_needed {
-                value |= u64::from(self.source[self.idx / 8]) << bit_shift;
-                self.idx += 8;
-                bit_shift += 8;
-            }
-
-            if bits_in_last_byte_needed > 0 {
-                let val_last_byte =
-                    u64::from(self.source[self.idx / 8]) & ((1 << bits_in_last_byte_needed) - 1);
-                value |= val_last_byte << bit_shift;
-                self.idx += bits_in_last_byte_needed;
-            }
-        }
-
-        debug_assert!(self.idx == old_idx + n);
-        Ok(value)
     }
 }
 
@@ -440,7 +437,7 @@ impl FSETable {
         source: &[u8],
         max_log: u8,
         codes: Option<(&[u32], &[u8])>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DecodeError> {
         self.reset();
         let bytes_read = self.read_probabilities(source, max_log)?;
         // RFC 8878 lines 1372-1373: two or more symbols of nonzero
@@ -448,7 +445,7 @@ impl FSETable {
         // FSE_readNCount does not check this.
         let nonzero = self.symbol_probabilities.iter().filter(|&&c| c != 0);
         if nonzero.count() < 2 {
-            return Err("FSE table has fewer than two symbols of nonzero probability".to_string());
+            return Err("FSE table has fewer than two symbols of nonzero probability".into());
         }
         self.build_decoding_table(codes);
         Ok(bytes_read)
@@ -461,7 +458,7 @@ impl FSETable {
         acc_log: u8,
         probs: &[i32],
         codes: Option<(&[u32], &[u8])>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DecodeError> {
         self.reset();
         let cells: i64 = probs.iter().map(|&p| i64::from(p.abs())).sum();
         if !(ACC_LOG_OFFSET..=FSE_MAX_TABLE_LOG).contains(&acc_log)
@@ -474,7 +471,8 @@ impl FSETable {
                 probs.len(),
                 cells,
                 acc_log
-            ));
+            )
+            .into());
         }
         self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
@@ -581,14 +579,14 @@ impl FSETable {
     /// Read the normalized counts header (FSE_readNCount): four bits of
     /// accuracy log, then one count per symbol, with repeat flags after
     /// each zero count. Returns the header's length in bytes.
-    fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, String> {
+    fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, DecodeError> {
         if source.len() < 8 {
             // The body reads 4 bytes at a time up to the header's end.
             let mut buffer = [0u8; 8];
             buffer[..source.len()].copy_from_slice(source);
             let n = self.read_ncount_body(&buffer, max_log)?;
             if n > source.len() {
-                return Err("FSE table header extends past its input".to_string());
+                return Err("FSE table header extends past its input".into());
             }
             return Ok(n);
         }
@@ -596,7 +594,7 @@ impl FSETable {
     }
 
     /// FSE_readNCount_body; requires `src.len() >= 8`.
-    fn read_ncount_body(&mut self, src: &[u8], max_log: u8) -> Result<usize, String> {
+    fn read_ncount_body(&mut self, src: &[u8], max_log: u8) -> Result<usize, DecodeError> {
         debug_assert!(src.len() >= 8);
         let iend = src.len();
         let read32 = |at: usize| u32::from_le_bytes(src[at..at + 4].try_into().unwrap());
@@ -609,7 +607,7 @@ impl FSETable {
         let mut bit_stream = read32(ip);
         let mut nb_bits = (bit_stream & 0xF) + u32::from(ACC_LOG_OFFSET);
         if nb_bits > u32::from(max_log) {
-            return Err(format!("Accuracy log {} exceeds max {}", nb_bits, max_log));
+            return Err(format!("Accuracy log {} exceeds max {}", nb_bits, max_log).into());
         }
         self.accuracy_log = nb_bits as u8;
         bit_stream >>= 4;
@@ -701,13 +699,14 @@ impl FSETable {
                 "FSE counts leave {} of {} cells unassigned",
                 remaining - 1,
                 1u32 << self.accuracy_log
-            ));
+            )
+            .into());
         }
         if charnum > max_sv1 {
-            return Err(format!("Too many symbols: {}", charnum));
+            return Err(format!("Too many symbols: {}", charnum).into());
         }
         if bit_count > 32 {
-            return Err("FSE table header extends past its input".to_string());
+            return Err("FSE table header extends past its input".into());
         }
         counts.truncate(charnum);
         Ok(ip + ((bit_count + 7) >> 3) as usize)
@@ -740,7 +739,7 @@ fn fse_decompress_weights(
     table: &FSETable,
     src: &[u8],
     out: &mut [u8; 255],
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     let dt = table.decode();
     let table_log = u32::from(table.accuracy_log);
     let mut br = BitDStream::new(src)?;
@@ -750,7 +749,7 @@ fn fse_decompress_weights(
     let mut state2 = br.read_bits(table_log);
     br.reload();
     if br.reload() == HufStreamStatus::Overflow {
-        return Err("Huffman weights stream is too short".to_string());
+        return Err("Huffman weights stream is too short".into());
     }
     // FSE_decodeSymbol: the state's symbol, then the next state. Every
     // cell's `next_state` plus its `num_bits` bits stays below the table
@@ -760,7 +759,7 @@ fn fse_decompress_weights(
         *state = usize::from(cell.next_state) + br.read_bits(u32::from(cell.num_bits));
         cell.base_value as u8
     };
-    let too_many = || Err("Too many Huffman weights".to_string());
+    let too_many = || Err("Too many Huffman weights".into());
     let omax = out.len();
     let mut op = 0;
     while br.reload() == HufStreamStatus::Unfinished && op < omax - 3 {
@@ -845,10 +844,10 @@ type HufCells<T> = [T; 1 << HUF_FAST_TABLE_LOG];
 
 /// `cells` as a built table; a build sizes it once, and every later build
 /// writes every cell.
-fn huf_cells<T>(cells: &[T]) -> Result<&HufCells<T>, String> {
+fn huf_cells<T>(cells: &[T]) -> Result<&HufCells<T>, DecodeError> {
     cells
         .try_into()
-        .map_err(|_| "Huffman table is uninitialized".to_string())
+        .map_err(|_| "Huffman table is uninitialized".into())
 }
 
 /// Relative cost of the single- and double-symbol decoders, indexed by the
@@ -1011,7 +1010,7 @@ impl HuffmanTable {
         source: &[u8],
         dst_size: usize,
         four_streams: bool,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, DecodeError> {
         self.max_num_bits = 0;
         let (bytes_used, nb_weights) = self.read_weights(source)?;
         self.weight_stats(nb_weights)?;
@@ -1042,19 +1041,18 @@ impl HuffmanTable {
     /// `header - 127` 4-bit weights, a smaller one by that many bytes of
     /// FSE-compressed weights. Returns the length of the description and
     /// the number of weights read.
-    fn read_weights(&mut self, source: &[u8]) -> Result<(usize, usize), String> {
+    fn read_weights(&mut self, source: &[u8]) -> Result<(usize, usize), DecodeError> {
         let Some(&header) = source.first() else {
-            return Err("Huffman source is empty".to_string());
+            return Err("Huffman source is empty".into());
         };
         let header = usize::from(header);
         if header >= 128 {
             let nb_weights = header - 127;
             let size = nb_weights.div_ceil(2);
             let Some(packed) = source.get(1..1 + size) else {
-                return Err(format!(
-                    "Not enough bytes for {} raw Huffman weights",
-                    nb_weights
-                ));
+                return Err(
+                    format!("Not enough bytes for {} raw Huffman weights", nb_weights).into(),
+                );
             };
             for (pair, &b) in self.weights.as_chunks_mut::<2>().0.iter_mut().zip(packed) {
                 pair[0] = b >> 4;
@@ -1067,7 +1065,8 @@ impl HuffmanTable {
                     "Not enough bytes for weights: have {}, need {}",
                     source.len() - 1,
                     header
-                ));
+                )
+                .into());
             };
             let ncount = self.fse_table.build_decoder(src, 6, None)?;
             let out = self.weights.first_chunk_mut::<255>().unwrap();
@@ -1079,7 +1078,7 @@ impl HuffmanTable {
     /// The statistics and checks of HUF_readStats_body over the
     /// `nb_weights` weights read: symbols per weight, the table log, the
     /// implied last weight and a full binary tree.
-    fn weight_stats(&mut self, nb_weights: usize) -> Result<(), String> {
+    fn weight_stats(&mut self, nb_weights: usize) -> Result<(), DecodeError> {
         let weights = &self.weights[..nb_weights];
         // Weights are at most 15 (4 raw bits) and fewer than 256: count
         // them in `WeightLanes` rather than in memory, where runs of one
@@ -1090,11 +1089,7 @@ impl HuffmanTable {
         }
         if (HUF_TABLELOG_MAX as u8 + 1..16).any(|w| counts.get(w) != 0) {
             let w = weights.iter().find(|&&w| u32::from(w) > HUF_TABLELOG_MAX);
-            return Err(format!(
-                "Weight {} exceeds max {}",
-                w.unwrap(),
-                HUF_TABLELOG_MAX
-            ));
+            return Err(format!("Weight {} exceeds max {}", w.unwrap(), HUF_TABLELOG_MAX).into());
         }
         let mut rank_stats = [0u32; HUF_TABLELOG_MAX as usize + 1];
         let mut weight_total = 0u32;
@@ -1103,16 +1098,16 @@ impl HuffmanTable {
             weight_total += *n * ((1 << w) >> 1);
         }
         if weight_total == 0 {
-            return Err("Missing weights".to_string());
+            return Err("Missing weights".into());
         }
         let table_log = highest_bit_set(weight_total);
         if table_log > HUF_TABLELOG_MAX {
-            return Err(format!("Max bits {} too high", table_log));
+            return Err(format!("Max bits {} too high", table_log).into());
         }
         // The last weight completes the total to a power of 2.
         let rest = (1 << table_log) - weight_total;
         if !rest.is_power_of_two() {
-            return Err(format!("Leftover {} is not a power of 2", rest));
+            return Err(format!("Leftover {} is not a power of 2", rest).into());
         }
         let last_weight = highest_bit_set(rest);
         self.weights[nb_weights] = last_weight as u8;
@@ -1120,10 +1115,7 @@ impl HuffmanTable {
         // A full binary tree has an even number of leaves at its deepest
         // level, and at least two.
         if rank_stats[1] < 2 || rank_stats[1] & 1 != 0 {
-            return Err(format!(
-                "Huffman tree has {} symbols of weight 1",
-                rank_stats[1]
-            ));
+            return Err(format!("Huffman tree has {} symbols of weight 1", rank_stats[1]).into());
         }
         self.rank_stats = rank_stats;
         self.nb_symbols = nb_weights + 1;
@@ -1446,12 +1438,12 @@ struct BitDStream<'s> {
 }
 
 impl<'s> BitDStream<'s> {
-    fn new(src: &'s [u8]) -> Result<Self, String> {
+    fn new(src: &'s [u8]) -> Result<Self, DecodeError> {
         let Some(&last) = src.last() else {
-            return Err("Huffman stream is empty".to_string());
+            return Err("Huffman stream is empty".into());
         };
         if last == 0 {
-            return Err("Huffman stream has no end mark".to_string());
+            return Err("Huffman stream has no end mark".into());
         }
         // Zero padding above the end mark, plus the mark itself.
         let padding = last.leading_zeros() + 1;
@@ -1464,12 +1456,10 @@ impl<'s> BitDStream<'s> {
                 bits_consumed: padding,
             })
         } else {
-            let mut buf = [0u8; 8];
-            buf[..src.len()].copy_from_slice(src);
             Ok(BitDStream {
                 src,
                 ptr: 0,
-                container: u64::from_le_bytes(buf),
+                container: read_le_short(src),
                 bits_consumed: padding + (8 - src.len() as u32) * 8,
             })
         }
@@ -1566,6 +1556,26 @@ impl<'s> BitDStream<'s> {
     }
 }
 
+/// `src`, of 1 to 8 bytes, as a little-endian number, read in registers as
+/// BIT_initDStream reads it. Copied into a zeroed `[u8; 8]` instead, its
+/// bytes reach the 8-byte load through narrower stores, which the CPU
+/// cannot forward.
+#[inline(always)]
+fn read_le_short(src: &[u8]) -> u64 {
+    let n = src.len();
+    if n >= 4 {
+        // Overlapping reads: the bytes both cover land in the same place.
+        let lo = u32::from_le_bytes(src[..4].try_into().unwrap());
+        let hi = u32::from_le_bytes(src[n - 4..].try_into().unwrap());
+        u64::from(lo) | u64::from(hi) << (8 * (n - 4))
+    } else {
+        let mid = n / 2;
+        u64::from(src[0])
+            | u64::from(src[mid]) << (8 * mid)
+            | u64::from(src[n - 1]) << (8 * (n - 1))
+    }
+}
+
 #[inline(always)]
 fn read_le64(src: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(src[at..at + 8].try_into().unwrap())
@@ -1627,12 +1637,12 @@ fn huf_decode_stream_x1(out: &mut [u8], br: &mut BitDStream<'_>, dt: &HufCells<H
 
 /// Single-stream literals (HUF_decompress1X1_usingDTable_internal_body).
 #[inline(never)]
-fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+fn huf_decompress_1x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), DecodeError> {
     let dt = huf_cells(&table.decode)?;
     let mut br = BitDStream::new(src)?;
     huf_decode_stream_x1(out, &mut br, dt);
     if !br.is_finished() {
-        return Err("Huffman stream not fully consumed".to_string());
+        return Err("Huffman stream not fully consumed".into());
     }
     Ok(())
 }
@@ -1649,18 +1659,15 @@ struct HufStreams {
 }
 
 impl HufStreams {
-    fn split(src: &[u8], dst_size: usize) -> Result<HufStreams, String> {
+    fn split(src: &[u8], dst_size: usize) -> Result<HufStreams, DecodeError> {
         if src.len() < 10 {
-            return Err(format!(
-                "Huffman 4-stream input too short: {} bytes",
-                src.len()
-            ));
+            return Err(format!("Huffman 4-stream input too short: {} bytes", src.len()).into());
         }
         let len1 = usize::from(u16::from_le_bytes([src[0], src[1]]));
         let len2 = usize::from(u16::from_le_bytes([src[2], src[3]]));
         let len3 = usize::from(u16::from_le_bytes([src[4], src[5]]));
         if 6 + len1 + len2 + len3 > src.len() {
-            return Err("Huffman jump table exceeds input".to_string());
+            return Err("Huffman jump table exceeds input".into());
         }
         let istart = [6, 6 + len1, 6 + len1 + len2, 6 + len1 + len2 + len3];
         let iend = [istart[1], istart[2], istart[3], src.len()];
@@ -1671,7 +1678,7 @@ impl HufStreams {
         // MIN_LITERALS_FOR_4_STREAMS (6) also rejects 0, 3 and 4 (R2-6).
         let segment = dst_size.div_ceil(4);
         if 3 * segment > dst_size {
-            return Err("Huffman 4-stream segments exceed output".to_string());
+            return Err("Huffman 4-stream segments exceed output".into());
         }
         Ok(HufStreams {
             istart,
@@ -1708,7 +1715,7 @@ fn huf_fast_args_init(
     streams: &HufStreams,
     src: &[u8],
     dst_size: usize,
-) -> Result<Option<HufFastArgs>, String> {
+) -> Result<Option<HufFastArgs>, DecodeError> {
     let segment = streams.segment;
     if 3 * segment >= dst_size {
         return Ok(None);
@@ -1721,7 +1728,7 @@ fn huf_fast_args_init(
         }
         let last = src[streams.iend[s] - 1];
         if last == 0 {
-            return Err("Huffman stream has no end mark".to_string());
+            return Err("Huffman stream has no end mark".into());
         }
         // HUF_initFastDStream: the padding above the end mark and the mark
         // itself count as consumed.
@@ -1743,14 +1750,14 @@ fn huf_remaining_dstream<'s>(
     streams: &HufStreams,
     s: usize,
     src: &'s [u8],
-) -> Result<BitDStream<'s>, String> {
+) -> Result<BitDStream<'s>, DecodeError> {
     let start = streams.istart[s];
     let stream = streams.stream(src, s);
     let ip = args.ip[s];
     // A fully consumed stream leaves the container at most 8 bytes below
     // its start; anything lower is corruption.
     if ip + 8 < start {
-        return Err("Huffman stream overran its start".to_string());
+        return Err("Huffman stream overran its start".into());
     }
     let (ptr, below) = if ip >= start {
         (ip - start, 0)
@@ -1759,7 +1766,7 @@ fn huf_remaining_dstream<'s>(
     };
     let bits_consumed = args.bits[s].trailing_zeros() + below as u32 * 8;
     if bits_consumed > 64 {
-        return Err("Huffman stream overran its start".to_string());
+        return Err("Huffman stream overran its start".into());
     }
     Ok(BitDStream {
         src: stream,
@@ -1936,7 +1943,7 @@ unsafe fn huf_4x2_fast_loop(args: &mut HufFastArgs, out: &mut [u8], src: &[u8], 
 /// advances all four streams in lockstep, 4 symbols each per reload. Both
 /// finish each stream with `huf_decode_stream_x1`.
 #[inline(never)]
-fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), DecodeError> {
     let dt = huf_cells(&table.decode)?;
     let dst_size = out.len();
     let streams = HufStreams::split(src, dst_size)?;
@@ -1948,12 +1955,12 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
         for s in 0..4 {
             let end = streams.segment_end(s, dst_size);
             if args.op[s] > end {
-                return Err("Huffman stream overran its segment".to_string());
+                return Err("Huffman stream overran its segment".into());
             }
             let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
             huf_decode_stream_x1(&mut out[args.op[s]..end], &mut br, dt);
             if !br.is_finished() {
-                return Err("Huffman stream not fully consumed".to_string());
+                return Err("Huffman stream not fully consumed".into());
             }
         }
         return Ok(());
@@ -2003,7 +2010,7 @@ fn huf_decompress_4x1(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     huf_decode_stream_x1(&mut o4[p..], &mut b4, dt);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
-        return Err("Huffman stream not fully consumed".to_string());
+        return Err("Huffman stream not fully consumed".into());
     }
     Ok(())
 }
@@ -2090,12 +2097,12 @@ fn huf_decode_stream_x2(
 /// Single-stream literals with the double-symbol table
 /// (HUF_decompress1X2_usingDTable_internal_body).
 #[inline(never)]
-fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), DecodeError> {
     let dt = huf_cells(&table.decode_x2)?;
     let mut br = BitDStream::new(src)?;
     huf_decode_stream_x2(out, &mut br, dt, table);
     if !br.is_finished() {
-        return Err("Huffman stream not fully consumed".to_string());
+        return Err("Huffman stream not fully consumed".into());
     }
     Ok(())
 }
@@ -2106,7 +2113,7 @@ fn huf_decompress_1x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
 /// shared loop; the plain loop's trip count is bounded by the last stream.
 /// The fast loop takes the same sections as in `huf_decompress_4x1`.
 #[inline(never)]
-fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), String> {
+fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Result<(), DecodeError> {
     let dt = huf_cells(&table.decode_x2)?;
     let oend = out.len();
     let streams = HufStreams::split(src, oend)?;
@@ -2118,12 +2125,12 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
         for s in 0..4 {
             let end = streams.segment_end(s, oend);
             if args.op[s] > end {
-                return Err("Huffman stream overran its segment".to_string());
+                return Err("Huffman stream overran its segment".into());
             }
             let mut br = huf_remaining_dstream(&args, &streams, s, src)?;
             huf_decode_stream_x2(&mut out[args.op[s]..end], &mut br, dt, table);
             if !br.is_finished() {
-                return Err("Huffman stream not fully consumed".to_string());
+                return Err("Huffman stream not fully consumed".into());
             }
         }
         return Ok(());
@@ -2162,7 +2169,7 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     }
 
     if op1 > op_start2 || op2 > op_start3 || op3 > op_start4 {
-        return Err("Huffman stream overran its segment".to_string());
+        return Err("Huffman stream overran its segment".into());
     }
 
     huf_decode_stream_x2(&mut out[op1..op_start2], &mut b1, dt, table);
@@ -2171,7 +2178,7 @@ fn huf_decompress_4x2(out: &mut [u8], src: &[u8], table: &HuffmanTable) -> Resul
     huf_decode_stream_x2(&mut out[op4..], &mut b4, dt, table);
 
     if !(b1.is_finished() && b2.is_finished() && b3.is_finished() && b4.is_finished()) {
-        return Err("Huffman stream not fully consumed".to_string());
+        return Err("Huffman stream not fully consumed".into());
     }
     Ok(())
 }
@@ -2211,129 +2218,84 @@ enum LiteralsSectionType {
 #[derive(Clone, Copy)]
 struct LiteralsSection {
     regenerated_size: u32,
-    compressed_size: Option<u32>,
-    num_streams: Option<u8>,
+    /// The section's bytes after its header: a Raw section's literals, an
+    /// RLE section's byte, or the tree description and streams.
+    content_size: u32,
     ls_type: LiteralsSectionType,
+    /// Huffman-coded literals in four streams rather than one.
+    four_streams: bool,
 }
 
 impl LiteralsSection {
-    fn new() -> LiteralsSection {
-        LiteralsSection {
-            regenerated_size: 0,
-            compressed_size: None,
-            num_streams: None,
-            ls_type: LiteralsSectionType::Raw,
-        }
-    }
-
-    fn section_type(raw: u8) -> Result<LiteralsSectionType, String> {
-        let t = raw & 0x3;
-        match t {
-            0 => Ok(LiteralsSectionType::Raw),
-            1 => Ok(LiteralsSectionType::RLE),
-            2 => Ok(LiteralsSectionType::Compressed),
-            3 => Ok(LiteralsSectionType::Treeless),
-            other => Err(format!("Illegal literal section type: {}", other)),
-        }
-    }
-
-    fn header_bytes_needed(&self, first_byte: u8) -> Result<u8, String> {
-        let ls_type = Self::section_type(first_byte)?;
-        let size_format = (first_byte >> 2) & 0x3;
-        match ls_type {
-            LiteralsSectionType::RLE | LiteralsSectionType::Raw => match size_format {
-                0 | 2 => Ok(1),
-                1 => Ok(2),
-                3 => Ok(3),
-                _ => unreachable!(),
-            },
-            LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => match size_format {
-                0 | 1 => Ok(3),
-                2 => Ok(4),
-                3 => Ok(5),
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    fn parse_from_header(&mut self, raw: &[u8]) -> Result<u8, String> {
-        let mut br = BitReader::new(raw);
-        let block_type = br.get_bits(2)? as u8;
-        self.ls_type = Self::section_type(block_type)?;
-        let size_format = br.get_bits(2)? as u8;
-
-        let byte_needed = self.header_bytes_needed(raw[0])?;
-        if raw.len() < byte_needed as usize {
-            return Err(format!(
+    /// Parse the Literals_Section_Header that starts `raw`: the section and
+    /// the header's length.
+    #[inline(always)]
+    fn parse(raw: &[u8]) -> Result<(LiteralsSection, usize), DecodeError> {
+        let short = |need: usize| {
+            format!(
                 "Not enough bytes for literals header: have {}, need {}",
                 raw.len(),
-                byte_needed
-            ));
-        }
-
-        match self.ls_type {
-            LiteralsSectionType::RLE | LiteralsSectionType::Raw => {
-                self.compressed_size = None;
-                match size_format {
-                    0 | 2 => {
-                        self.regenerated_size = u32::from(raw[0]) >> 3;
-                        Ok(1)
-                    }
-                    1 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4) + (u32::from(raw[1]) << 4);
-                        Ok(2)
-                    }
-                    3 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + (u32::from(raw[2]) << 12);
-                        Ok(3)
-                    }
-                    _ => unreachable!(),
-                }
+                need
+            )
+        };
+        let Some(&first) = raw.first() else {
+            return Err(short(1).into());
+        };
+        let ls_type = match first & 3 {
+            0 => LiteralsSectionType::Raw,
+            1 => LiteralsSectionType::RLE,
+            2 => LiteralsSectionType::Compressed,
+            _ => LiteralsSectionType::Treeless,
+        };
+        let size_format = (first >> 2) & 3;
+        let len = match (ls_type, size_format) {
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, 0 | 2) => 1,
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, 1) => 2,
+            (LiteralsSectionType::Raw | LiteralsSectionType::RLE, _) => 3,
+            (_, 0 | 1) => 3,
+            (_, 2) => 4,
+            (_, _) => 5,
+        };
+        let h = raw.get(..len).ok_or_else(|| short(len))?;
+        let b = |i: usize| u32::from(h[i]);
+        let (regenerated_size, content_size, four_streams) = match ls_type {
+            LiteralsSectionType::Raw | LiteralsSectionType::RLE => {
+                let size = match len {
+                    1 => b(0) >> 3,
+                    2 => (b(0) >> 4) + (b(1) << 4),
+                    _ => (b(0) >> 4) + (b(1) << 4) + (b(2) << 12),
+                };
+                let content = match ls_type {
+                    LiteralsSectionType::RLE => 1,
+                    _ => size,
+                };
+                (size, content, false)
             }
             LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-                match size_format {
-                    0 => {
-                        self.num_streams = Some(1);
-                    }
-                    1..=3 => {
-                        self.num_streams = Some(4);
-                    }
-                    _ => unreachable!(),
+                let (size, compressed) = match len {
+                    3 => (
+                        (b(0) >> 4) + ((b(1) & 0x3f) << 4),
+                        (b(1) >> 6) + (b(2) << 2),
+                    ),
+                    4 => (
+                        (b(0) >> 4) + (b(1) << 4) + ((b(2) & 0x3) << 12),
+                        (b(2) >> 2) + (b(3) << 6),
+                    ),
+                    _ => (
+                        (b(0) >> 4) + (b(1) << 4) + ((b(2) & 0x3F) << 12),
+                        (b(2) >> 6) + (b(3) << 2) + (b(4) << 10),
+                    ),
                 };
-
-                match size_format {
-                    0 | 1 => {
-                        self.regenerated_size =
-                            (u32::from(raw[0]) >> 4) + ((u32::from(raw[1]) & 0x3f) << 4);
-                        self.compressed_size =
-                            Some(u32::from(raw[1] >> 6) + (u32::from(raw[2]) << 2));
-                        Ok(3)
-                    }
-                    2 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + ((u32::from(raw[2]) & 0x3) << 12);
-                        self.compressed_size =
-                            Some((u32::from(raw[2]) >> 2) + (u32::from(raw[3]) << 6));
-                        Ok(4)
-                    }
-                    3 => {
-                        self.regenerated_size = (u32::from(raw[0]) >> 4)
-                            + (u32::from(raw[1]) << 4)
-                            + ((u32::from(raw[2]) & 0x3F) << 12);
-                        self.compressed_size = Some(
-                            (u32::from(raw[2]) >> 6)
-                                + (u32::from(raw[3]) << 2)
-                                + (u32::from(raw[4]) << 10),
-                        );
-                        Ok(5)
-                    }
-                    _ => unreachable!(),
-                }
+                (size, compressed, size_format != 0)
             }
-        }
+        };
+        let section = LiteralsSection {
+            regenerated_size,
+            content_size,
+            ls_type,
+            four_streams,
+        };
+        Ok((section, len))
     }
 }
 
@@ -2355,11 +2317,9 @@ enum ModeType {
 impl CompressionModes {
     /// The Symbol_Compression_Modes byte, whose Reserved bits 1-0 must be
     /// zero (ZSTD_decodeSeqHeaders' corruption_detected).
-    fn new(byte: u8) -> Result<Self, String> {
+    fn new(byte: u8) -> Result<Self, DecodeError> {
         if byte & 3 != 0 {
-            return Err(format!(
-                "Symbol compression modes {byte:#04x}: reserved bits set"
-            ));
+            return Err(format!("Symbol compression modes {byte:#04x}: reserved bits set").into());
         }
         Ok(Self(byte))
     }
@@ -2387,73 +2347,42 @@ impl CompressionModes {
 #[derive(Clone, Copy)]
 struct SequencesHeader {
     num_sequences: u32,
-    modes: Option<CompressionModes>,
+    /// The Symbol_Compression_Modes; all Predefined, unread, without
+    /// sequences, where the header has no such byte.
+    modes: CompressionModes,
 }
 
 impl SequencesHeader {
-    fn new() -> SequencesHeader {
-        SequencesHeader {
-            num_sequences: 0,
-            modes: None,
-        }
-    }
-
-    fn parse_from_header(&mut self, source: &[u8]) -> Result<u8, String> {
-        let mut bytes_read = 0;
-        if source.is_empty() {
-            return Err("Sequences header source is empty".to_string());
-        }
-
-        match source[0] {
-            0 => {
-                self.num_sequences = 0;
-                bytes_read += 1;
-            }
-            1..=127 => {
-                if source.len() < 2 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 2",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes::new(source[1])?);
-                bytes_read += 2;
-            }
-            128..=254 => {
-                if source.len() < 2 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 2",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = ((u32::from(source[0]) - 128) << 8) + u32::from(source[1]);
-                bytes_read += 2;
-                if self.num_sequences != 0 {
-                    if source.len() < 3 {
-                        return Err(format!(
-                            "Not enough bytes for sequences header: have {}, need 3",
-                            source.len()
-                        ));
-                    }
-                    self.modes = Some(CompressionModes::new(source[2])?);
-                    bytes_read += 1;
-                }
-            }
-            255 => {
-                if source.len() < 4 {
-                    return Err(format!(
-                        "Not enough bytes for sequences header: have {}, need 4",
-                        source.len()
-                    ));
-                }
-                self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
-                self.modes = Some(CompressionModes::new(source[3])?);
-                bytes_read += 4;
-            }
-        }
-
-        Ok(bytes_read)
+    /// Parse the Sequences_Section_Header that starts `source`: the header
+    /// and its length.
+    #[inline(always)]
+    fn parse(source: &[u8]) -> Result<(SequencesHeader, usize), DecodeError> {
+        let short = |need: usize| {
+            format!(
+                "Not enough bytes for sequences header: have {}, need {}",
+                source.len(),
+                need
+            )
+        };
+        let (num_sequences, len) = match *source {
+            [] => return Err("Sequences header source is empty".into()),
+            [0, ..] => (0, 1),
+            [n @ 1..=127, ..] => (u32::from(n), 1),
+            [n @ 128..=254, low, ..] => (((u32::from(n) - 128) << 8) + u32::from(low), 2),
+            [128..=254] => return Err(short(2).into()),
+            [255, low, high, ..] => (u32::from(low) + (u32::from(high) << 8) + 0x7F00, 3),
+            [255, ..] => return Err(short(4).into()),
+        };
+        let modes = match num_sequences {
+            // No Symbol_Compression_Modes byte follows a zero count.
+            0 => CompressionModes(0),
+            _ => CompressionModes::new(*source.get(len).ok_or_else(|| short(len + 1))?)?,
+        };
+        let header = SequencesHeader {
+            num_sequences,
+            modes,
+        };
+        Ok((header, len + usize::from(num_sequences != 0)))
     }
 }
 
@@ -2565,7 +2494,7 @@ impl FrameDescriptor {
         self.0 & 0x3
     }
 
-    fn frame_content_size_bytes(&self) -> Result<u8, String> {
+    fn frame_content_size_bytes(&self) -> Result<u8, DecodeError> {
         match self.frame_content_size_flag() {
             0 => {
                 if self.single_segment_flag() {
@@ -2577,17 +2506,17 @@ impl FrameDescriptor {
             1 => Ok(2),
             2 => Ok(4),
             3 => Ok(8),
-            other => Err(format!("Invalid frame content size flag: {}", other)),
+            other => Err(format!("Invalid frame content size flag: {}", other).into()),
         }
     }
 
-    fn dictionary_id_bytes(&self) -> Result<u8, String> {
+    fn dictionary_id_bytes(&self) -> Result<u8, DecodeError> {
         match self.dict_id_flag() {
             0 => Ok(0),
             1 => Ok(1),
             2 => Ok(2),
             3 => Ok(4),
-            other => Err(format!("Invalid dict id flag: {}", other)),
+            other => Err(format!("Invalid dict id flag: {}", other).into()),
         }
     }
 }
@@ -2602,7 +2531,7 @@ struct FrameHeader {
 }
 
 impl FrameHeader {
-    fn window_size(&self) -> Result<u64, String> {
+    fn window_size(&self) -> Result<u64, DecodeError> {
         if self.descriptor.single_segment_flag() {
             Ok(self.frame_content_size.unwrap_or(0))
         } else {
@@ -2612,7 +2541,7 @@ impl FrameHeader {
             let window_log = 10 + u32::from(exp);
             // frameParameter_windowTooLarge of ZSTD_getFrameHeader
             if window_log > ZSTD_WINDOWLOG_MAX {
-                return Err(format!("Window log {} too large", window_log));
+                return Err(format!("Window log {} too large", window_log).into());
             }
             let window_base = 1u64 << window_log;
             let window_add = (window_base / 8) * u64::from(mantissa);
@@ -2620,7 +2549,7 @@ impl FrameHeader {
             let window_size = window_base + window_add;
 
             if window_size < MIN_WINDOW_SIZE {
-                Err(format!("Window size {} too small", window_size))
+                Err(format!("Window size {} too small", window_size).into())
             } else {
                 Ok(window_size)
             }
@@ -2637,13 +2566,13 @@ impl FrameHeader {
 // ============================================================
 
 struct FrameDecoderError {
-    msg: String,
+    msg: DecodeError,
     /// A skippable frame's Frame_Size: the length of its User_Data.
     skip_size: Option<u32>,
 }
 
 impl FrameDecoderError {
-    fn new(msg: String) -> Self {
+    fn new(msg: DecodeError) -> Self {
         Self {
             msg,
             skip_size: None,
@@ -2652,7 +2581,7 @@ impl FrameDecoderError {
 
     fn skip(size: u32) -> Self {
         Self {
-            msg: format!("Skippable frame with Frame_Size {}", size),
+            msg: format!("Skippable frame with Frame_Size {}", size).into(),
             skip_size: Some(size),
         }
     }
@@ -2679,6 +2608,7 @@ const SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
 /// fewest bytes ZSTD_decompressMultiFrame takes for another frame.
 const FRAME_HEADER_PREFIX_LEN: usize = 5;
 
+#[inline(always)]
 fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderError> {
     let magic_num = src
         .get(..4)
@@ -2698,10 +2628,9 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
     }
 
     if magic_num != ZSTD_MAGIC {
-        return Err(FrameDecoderError::new(format!(
-            "Bad magic number: 0x{:X}",
-            magic_num
-        )));
+        return Err(FrameDecoderError::new(
+            format!("Bad magic number: 0x{:X}", magic_num).into(),
+        ));
     }
 
     let desc = FrameDescriptor(*src.get(pos).ok_or_else(|| {
@@ -2711,10 +2640,9 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
     // ZSTD_getFrameHeader_advanced: bit 3 is reserved and must be zero
     // (frameParameter_unsupported); bit 4, unused, is ignored.
     if desc.0 & 0x08 != 0 {
-        return Err(FrameDecoderError::new(format!(
-            "Frame header descriptor {:#04x}: reserved bit set",
-            desc.0
-        )));
+        return Err(FrameDecoderError::new(
+            format!("Frame header descriptor {:#04x}: reserved bit set", desc.0).into(),
+        ));
     }
 
     let mut frame_header = FrameHeader {
@@ -2768,10 +2696,11 @@ fn parse_frame_header(src: &[u8]) -> Result<(FrameHeader, usize), FrameDecoderEr
 
 /// Parse the block header at the start of `src`, in a frame whose
 /// Block_Maximum_Size is `block_size_max`.
-fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, String> {
+#[inline(always)]
+fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, DecodeError> {
     let buf: [u8; 3] = src
         .get(..3)
-        .ok_or_else(|| "Error reading block header: truncated".to_string())?
+        .ok_or_else(|| DecodeError::from("Error reading block header: truncated"))?
         .try_into()
         .unwrap();
 
@@ -2786,7 +2715,7 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, 
     };
 
     if block_type == BlockType::Reserved {
-        return Err("Found reserved block type".to_string());
+        return Err("Found reserved block type".into());
     }
 
     let block_size = u32::from(buf[0] >> 3) | (u32::from(buf[1]) << 5) | (u32::from(buf[2]) << 13);
@@ -2797,7 +2726,8 @@ fn parse_block_header(src: &[u8], block_size_max: usize) -> Result<BlockHeader, 
         return Err(format!(
             "Block size {} exceeds Block_Maximum_Size {}",
             block_size, block_size_max
-        ));
+        )
+        .into());
     }
 
     let decompressed_size = match block_type {
@@ -2828,7 +2758,7 @@ fn decode_literals(
     repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
-) -> Result<u32, String> {
+) -> Result<u32, DecodeError> {
     match section.ls_type {
         LiteralsSectionType::Raw => {
             target.extend(&source[0..section.regenerated_size as usize]);
@@ -2852,36 +2782,31 @@ fn decompress_literals(
     repeat: Option<&HuffmanTable>,
     source: &[u8],
     target: &mut Vec<u8>,
-) -> Result<u32, String> {
-    let compressed_size = section
-        .compressed_size
-        .ok_or_else(|| "Missing compressed size".to_string())? as usize;
-    let num_streams = section
-        .num_streams
-        .ok_or_else(|| "Missing num_streams".to_string())?;
+) -> Result<u32, DecodeError> {
+    let four_streams = section.four_streams;
     let regenerated_size = section.regenerated_size as usize;
 
-    let source = &source[0..compressed_size];
+    let source = &source[0..section.content_size as usize];
     let mut bytes_read = 0usize;
 
     let table = match section.ls_type {
         LiteralsSectionType::Compressed => {
             bytes_read += scratch
                 .table
-                .build_decoder(source, regenerated_size, num_streams == 4)?
+                .build_decoder(source, regenerated_size, four_streams)?
                 as usize;
             &scratch.table
         }
         _ => repeat.unwrap_or(&scratch.table),
     };
     if table.max_num_bits == 0 {
-        return Err("Uninitialized Huffman table for treeless literals".to_string());
+        return Err("Uninitialized Huffman table for treeless literals".into());
     }
 
     let source = &source[bytes_read..];
     let start = target.len();
     target.resize(start + regenerated_size, 0);
-    huf_decompress(&mut target[start..], source, num_streams == 4, table)?;
+    huf_decompress(&mut target[start..], source, four_streams, table)?;
     bytes_read += source.len();
 
     Ok(bytes_read as u32)
@@ -2893,7 +2818,7 @@ fn huf_decompress(
     source: &[u8],
     four_streams: bool,
     t: &HuffmanTable,
-) -> Result<(), String> {
+) -> Result<(), DecodeError> {
     match (four_streams, t.is_x2) {
         (true, true) => huf_decompress_4x2(out, source, t),
         (true, false) => huf_decompress_4x1(out, source, t),
@@ -3075,13 +3000,9 @@ fn build_sequence_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
-) -> Result<usize, String> {
-    let modes = section
-        .modes
-        .ok_or_else(|| "Missing compression mode".to_string())?;
-
+) -> Result<usize, DecodeError> {
     let mut bytes_read = 0;
-    for (t, mode) in modes.all().into_iter().enumerate() {
+    for (t, mode) in section.modes.all().into_iter().enumerate() {
         bytes_read += build_sequence_table(mode, &source[bytes_read..], scratch, t)?;
     }
     Ok(bytes_read)
@@ -3127,7 +3048,7 @@ fn build_sequence_table(
     source: &[u8],
     scratch: &mut FSEScratch,
     t: usize,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     let kind = &SEQ_TABLES[t];
     let codes = Some((kind.base, kind.bits));
     match mode {
@@ -3139,10 +3060,10 @@ fn build_sequence_table(
         }
         ModeType::RLE => {
             let Some(&code) = source.first() else {
-                return Err(format!("Missing byte for RLE {} table", kind.name));
+                return Err(format!("Missing byte for RLE {} table", kind.name).into());
             };
             if code > kind.max_code {
-                return Err(format!("RLE {} code {} exceeds max", kind.name, code));
+                return Err(format!("RLE {} code {} exceeds max", kind.name, code).into());
             }
             scratch.source[t] = SeqTableSource::Own;
             scratch.own_mut(t).build_rle(code, kind.base, kind.bits);
@@ -3154,10 +3075,7 @@ fn build_sequence_table(
         }
         ModeType::Repeat => {
             if !scratch.repeatable(t) {
-                return Err(format!(
-                    "Repeat mode without a previous {} table",
-                    kind.name
-                ));
+                return Err(format!("Repeat mode without a previous {} table", kind.name).into());
             }
             Ok(0)
         }
@@ -3177,7 +3095,7 @@ enum SeqError {
 
 #[cold]
 #[inline(never)]
-fn seq_error_message(e: SeqError) -> String {
+fn seq_error_message(e: SeqError) -> DecodeError {
     match e {
         SeqError::NotEnoughLiterals => "Sequence needs more literals than the block has".into(),
         SeqError::BlockTooLarge => "Block content exceeds block size limit".into(),
@@ -3278,7 +3196,7 @@ trait BlockSequences {
         w: W,
         offset_hist: &mut [u32; 3],
         dst: Dst,
-    ) -> Result<usize, String>;
+    ) -> Result<usize, DecodeError>;
 }
 
 /// Execute `seqs` with the copies for its block, for the fused decoder and
@@ -3297,7 +3215,7 @@ unsafe fn execute_with_copies<S: BlockSequences>(
     offset_hist: &mut [u32; 3],
     block_size_max: usize,
     dst: Dst,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
     let Dst { base, op, window } = dst;
     let end = match simd {
@@ -3322,7 +3240,8 @@ unsafe fn execute_with_copies<S: BlockSequences>(
         return Err(format!(
             "Block decodes to {} bytes, past Block_Maximum_Size {}",
             decoded, block_size_max
-        ));
+        )
+        .into());
     }
     Ok(end)
 }
@@ -3342,7 +3261,7 @@ unsafe fn execute_portable<W: WildCopy, S: BlockSequences>(
     base: *mut u8,
     op: usize,
     window: usize,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
@@ -3360,7 +3279,7 @@ unsafe fn execute_avx2<W: WildCopy, S: BlockSequences>(
     base: *mut u8,
     op: usize,
     window: usize,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     seqs.execute(w, offset_hist, Dst { base, op, window })
 }
 
@@ -3385,7 +3304,7 @@ impl BlockSequences for SeqInput<'_> {
         w: W,
         offset_hist: &mut [u32; 3],
         dst: Dst,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DecodeError> {
         run_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
     }
 }
@@ -3408,7 +3327,7 @@ impl BlockSequences for ExtSeqInput<'_> {
         w: W,
         offset_hist: &mut [u32; 3],
         dst: Dst,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DecodeError> {
         run_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
     }
 }
@@ -3429,7 +3348,7 @@ unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
     ext: ExtHistory,
     offset_hist: &mut [u32; 3],
     dst: Dst,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     let Dst {
         base: out,
         op,
@@ -3454,7 +3373,7 @@ unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
     // `next_state + (1 << num_bits) <= table size`, so a state is always a
     // valid index of a table with exactly `1 << accuracy_log` cells.
     if ll_dt.len() != 1 << ll_log || of_dt.len() != 1 << of_log || ml_dt.len() != 1 << ml_log {
-        return Err("FSE table is uninitialized".to_string());
+        return Err("FSE table is uninitialized".into());
     }
     let literals_len = literals.len() - WILDCOPY_OVERLENGTH;
     let oend = op + MAX_BLOCK_SIZE;
@@ -3511,7 +3430,7 @@ unsafe fn run_sequences<W: WildCopy, const EXT: bool>(
     let lit_pos = cur.lit as usize - lit_start as usize;
 
     if !br.is_finished() {
-        return Err("Sequence bitstream not fully consumed".to_string());
+        return Err("Sequence bitstream not fully consumed".into());
     }
 
     // Last literals segment.
@@ -4268,7 +4187,7 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(header: &FrameHeader) -> Result<Frame, String> {
+    fn new(header: &FrameHeader) -> Result<Frame, DecodeError> {
         let window_size = header.window_size()?;
         Ok(Frame {
             window: usize::try_from(window_size).unwrap_or(usize::MAX),
@@ -4282,7 +4201,7 @@ impl Frame {
     /// Account for the bytes a block decoded to, while they are in cache: a
     /// frame that decodes past its Frame_Content_Size fails here, which
     /// keeps a decoder's buffer within that size.
-    fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn block_decoded(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
         self.decoded += bytes.len() as u64;
         if let Some(h) = &mut self.checksum {
             h.update(bytes);
@@ -4302,11 +4221,12 @@ impl Frame {
             .is_some_and(|fcs| fcs <= self.block_size_max as u64)
     }
 
-    fn content_size_mismatch(&self, fcs: u64) -> String {
+    fn content_size_mismatch(&self, fcs: u64) -> DecodeError {
         format!(
             "Frame content size mismatch: header says {}, decoded {}",
             fcs, self.decoded
         )
+        .into()
     }
 }
 
@@ -4322,7 +4242,7 @@ trait FrameOut {
     /// The destination of the frame's next block and the history before
     /// its segment, which meet the `Dst` and `ExtHistory` contracts, or an
     /// error if there is no room for it.
-    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String>;
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), DecodeError>;
 
     /// Take the block written to the last `block_dst` up to `end` (from its
     /// `base`), and return the block's bytes.
@@ -4414,7 +4334,7 @@ impl FrameDecoder {
         unit: &[u8],
         out: &mut impl FrameOut,
         dict: Option<&DecodeDict>,
-    ) -> Result<Event, String> {
+    ) -> Result<Event, DecodeError> {
         match &mut self.stage {
             Stage::FrameHeader => self.frame_header(unit, out, dict),
             Stage::Skip { .. } => unreachable!("skippable frame content is skipped, not a unit"),
@@ -4437,7 +4357,7 @@ impl FrameDecoder {
                     return Err(format!(
                         "Content checksum mismatch: frame says {:#010x}, content hashes to {:#010x}",
                         stored, computed
-                    ));
+                    ).into());
                 }
                 self.stage = Stage::FrameHeader;
                 Ok(Event::FrameEnded)
@@ -4450,7 +4370,7 @@ impl FrameDecoder {
         unit: &[u8],
         out: &mut impl FrameOut,
         dict: Option<&DecodeDict>,
-    ) -> Result<Event, String> {
+    ) -> Result<Event, DecodeError> {
         let header = match parse_frame_header(unit) {
             Ok((header, _)) => header,
             Err(e) => match e.skip_frame_size() {
@@ -4472,9 +4392,10 @@ impl FrameDecoder {
                 return Err(format!(
                     "Frame needs dictionary {id}, dictionary {} is loaded",
                     d.id()
-                ))
+                )
+                .into())
             }
-            (id, None) => return Err(format!("Frame needs dictionary {id}, none is loaded")),
+            (id, None) => return Err(format!("Frame needs dictionary {id}, none is loaded").into()),
         }
         let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
         scratch.reset();
@@ -4491,7 +4412,7 @@ impl FrameDecoder {
 
     /// After the frame's last block: check its size, then expect its
     /// checksum, if it has one.
-    fn blocks_ended(&mut self) -> Result<Event, String> {
+    fn blocks_ended(&mut self) -> Result<Event, DecodeError> {
         let Stage::Block { frame, .. } = std::mem::replace(&mut self.stage, Stage::FrameHeader)
         else {
             unreachable!("blocks end in Stage::Block");
@@ -4516,7 +4437,7 @@ impl FrameDecoder {
     /// unit, fewer than `unit_len(partial)`: the bytes the one-shot input
     /// ends with, or those `Decompressor` holds when it finishes. It may
     /// end only between frames.
-    fn end_of_input(&self, partial: &[u8]) -> Result<(), String> {
+    fn end_of_input(&self, partial: &[u8]) -> Result<(), DecodeError> {
         Err(match &self.stage {
             Stage::FrameHeader if partial.is_empty() => return Ok(()),
             // ZSTD_decompressMultiFrame: a frame starts wherever at least
@@ -4525,12 +4446,13 @@ impl FrameDecoder {
             Stage::FrameHeader if partial.len() < FRAME_HEADER_PREFIX_LEN => format!(
                 "Input not entirely consumed: {} bytes left, too few for a frame",
                 partial.len()
-            ),
+            )
+            .into(),
             Stage::FrameHeader => match parse_frame_header(partial) {
                 Err(e) => frame_header_error(e),
                 Ok(_) => unreachable!("a whole frame header is a unit"),
             },
-            Stage::Skip { .. } => "Skippable frame extends past end of input".to_string(),
+            Stage::Skip { .. } => "Skippable frame extends past end of input".into(),
             Stage::Block {
                 frame,
                 header: None,
@@ -4540,8 +4462,8 @@ impl FrameDecoder {
             },
             Stage::Block {
                 header: Some(_), ..
-            } => BLOCK_CONTENT_TRUNCATED.to_string(),
-            Stage::Checksum { .. } => "Error reading checksum: truncated".to_string(),
+            } => BLOCK_CONTENT_TRUNCATED.into(),
+            Stage::Checksum { .. } => "Error reading checksum: truncated".into(),
         })
     }
 }
@@ -4554,8 +4476,8 @@ const BLOCK_CONTENT_TRUNCATED: &str = "Block content extends past end of input";
 /// Content_Checksum's length.
 const CHECKSUM_LEN: usize = 4;
 
-fn frame_header_error(e: FrameDecoderError) -> String {
-    format!("Frame header error: {}", e)
+fn frame_header_error(e: FrameDecoderError) -> DecodeError {
+    format!("Frame header error: {}", e).into()
 }
 
 /// The length of the frame header that starts `head` (ZSTD_frameHeaderSize),
@@ -4598,7 +4520,7 @@ fn decode_block(
     dict: Option<&DictEntropy>,
     out: &mut impl FrameOut,
     simd: Level,
-) -> Result<(), String> {
+) -> Result<(), DecodeError> {
     let (dst, ext) = out.block_dst()?;
     // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
     // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
@@ -4619,7 +4541,7 @@ fn decode_block(
             BlockType::Compressed => {
                 decompress_block(content, frame.block_size_max, scratch, dict, dst, ext, simd)?
             }
-            BlockType::Reserved => return Err("Reserved block type encountered".to_string()),
+            BlockType::Reserved => return Err("Reserved block type encountered".into()),
         };
         out.commit(end)
     };
@@ -4645,7 +4567,7 @@ impl FrameOut for VecOut<'_> {
         };
     }
 
-    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
+    fn block_dst(&mut self) -> Result<(Dst, ExtHistory), DecodeError> {
         let dst = self
             .prefix
             .dst(self.output, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
@@ -4666,7 +4588,7 @@ impl FrameOut for VecOut<'_> {
 /// has to grow the buffer (and move everything decoded). A content size
 /// past what the blocks can decode to fails the size check, so it gets no
 /// room beyond that, unless the frame fits in one block.
-fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(), String> {
+fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(), DecodeError> {
     let Some(fcs) = frame.content_size else {
         return Ok(());
     };
@@ -4678,10 +4600,10 @@ fn reserve_frame(output: &mut Vec<u8>, frame: &Frame, blocks: &[u8]) -> Result<(
     let want = usize::try_from(content)
         .ok()
         .and_then(|n| n.checked_add(MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH))
-        .ok_or_else(|| format!("Frame content size {} too large", fcs))?;
+        .ok_or_else(|| DecodeError::from(format!("Frame content size {} too large", fcs)))?;
     output
         .try_reserve(want)
-        .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e))
+        .map_err(|e| format!("Cannot reserve {} bytes of output: {}", want, e).into())
 }
 
 /// The most the blocks at the start of `data` decode to: the sum of each
@@ -4732,44 +4654,38 @@ struct BlockParts<'a> {
 /// `parse_block_header` has held to `block_size_max`, in a frame whose
 /// Block_Maximum_Size that is. The literals decode into the block, so they
 /// are held to it too, before anything is sized from their header.
-fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, String> {
-    let mut section = LiteralsSection::new();
-    let bytes_in_literals_header = section.parse_from_header(raw)?;
+#[inline(always)]
+fn split_block(raw: &[u8], block_size_max: usize) -> Result<BlockParts<'_>, DecodeError> {
+    let (section, bytes_in_literals_header) = LiteralsSection::parse(raw)?;
     if section.regenerated_size as usize > block_size_max {
         return Err(format!(
             "Literals size {} exceeds Block_Maximum_Size {}",
             section.regenerated_size, block_size_max
-        ));
+        )
+        .into());
     }
-    let raw = &raw[bytes_in_literals_header as usize..];
+    let raw = &raw[bytes_in_literals_header..];
 
-    let upper_limit_for_literals = match section.compressed_size {
-        Some(x) => x as usize,
-        None => match section.ls_type {
-            LiteralsSectionType::RLE => 1,
-            LiteralsSectionType::Raw => section.regenerated_size as usize,
-            _ => return Err("Bug: unexpected literals section type".to_string()),
-        },
-    };
+    let upper_limit_for_literals = section.content_size as usize;
 
     if raw.len() < upper_limit_for_literals {
         return Err(format!(
             "Malformed section header: expected {} bytes, have {}",
             upper_limit_for_literals,
             raw.len()
-        ));
+        )
+        .into());
     }
 
     let literals_src = &raw[..upper_limit_for_literals];
     let raw = &raw[upper_limit_for_literals..];
 
-    let mut sequences = SequencesHeader::new();
-    let bytes_in_sequence_header = sequences.parse_from_header(raw)?;
+    let (sequences, bytes_in_sequence_header) = SequencesHeader::parse(raw)?;
     Ok(BlockParts {
         literals: section,
         literals_src,
         sequences,
-        sequences_src: &raw[bytes_in_sequence_header as usize..],
+        sequences_src: &raw[bytes_in_sequence_header..],
     })
 }
 
@@ -4782,7 +4698,7 @@ fn decode_block_literals(
     huf: &mut HuffmanScratch,
     repeat: Option<&HuffmanTable>,
     target: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), DecodeError> {
     target.clear();
     target.reserve(parts.literals.regenerated_size as usize + WILDCOPY_OVERLENGTH);
     let used = decode_literals(&parts.literals, huf, repeat, parts.literals_src, target)?;
@@ -4811,7 +4727,7 @@ unsafe fn decompress_block(
     dst: Dst,
     ext: ExtHistory,
     simd: Level,
-) -> Result<usize, String> {
+) -> Result<usize, DecodeError> {
     let parts = split_block(raw, block_size_max)?;
     let repeat = dict
         .filter(|_| workspace.huf_from_dict)
@@ -4845,10 +4761,7 @@ unsafe fn decompress_block(
         }
     } else {
         if !raw.is_empty() {
-            return Err(format!(
-                "Extra bits remaining: {} bits",
-                raw.len() as isize * 8
-            ));
+            return Err(format!("Extra bits remaining: {} bits", raw.len() as isize * 8).into());
         }
         // `split_block` held the literals to `block_size_max`, within the
         // room `dst` has.
@@ -5012,7 +4925,7 @@ mod parallel {
         };
         let mut defs = [0; 3];
         if parts.sequences.num_sequences != 0 {
-            for (t, mode) in parts.sequences.modes?.all().into_iter().enumerate() {
+            for (t, mode) in parts.sequences.modes.all().into_iter().enumerate() {
                 if !matches!(mode, ModeType::Repeat) {
                     fse_def[t] = Some(i);
                 }
@@ -5072,7 +4985,7 @@ mod parallel {
         fse_from: [Option<usize>; 3],
         literals: Vec<u8>,
         seqs: Vec<RawSeq>,
-        result: Result<(), String>,
+        result: Result<(), DecodeError>,
     }
 
     impl Slot {
@@ -5098,7 +5011,7 @@ mod parallel {
         plan: &CompressedPlan<'_>,
         plans: &[Plan<'_>],
         start: FrameStart<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DecodeError> {
         if let Some(d) = plan.huf_def {
             if d == i {
                 // `decode_block_literals` builds it from this block.
@@ -5124,18 +5037,14 @@ mod parallel {
         let src = plan.parts.sequences_src;
         if seq.num_sequences == 0 {
             if !src.is_empty() {
-                return Err(format!(
-                    "Extra bits remaining: {} bits",
-                    src.len() as isize * 8
-                ));
+                return Err(
+                    format!("Extra bits remaining: {} bits", src.len() as isize * 8).into(),
+                );
             }
             return Ok(());
         }
-        let modes = seq
-            .modes
-            .ok_or_else(|| "Missing compression mode".to_string())?;
         let mut used = 0;
-        for (t, mode) in modes.all().into_iter().enumerate() {
+        for (t, mode) in seq.modes.all().into_iter().enumerate() {
             let d = plan.fse_def[t];
             if d == i {
                 slot.fse_from[t] = None;
@@ -5171,13 +5080,16 @@ mod parallel {
     /// Build `table` from the tree description of compressed block `def`'s
     /// literals, with the arguments of its own build in
     /// `decompress_literals`, so the same table kind (X1 / X2).
-    fn build_huf_from(def: &CompressedPlan<'_>, table: &mut HuffmanTable) -> Result<(), String> {
+    fn build_huf_from(
+        def: &CompressedPlan<'_>,
+        table: &mut HuffmanTable,
+    ) -> Result<(), DecodeError> {
         let lit = &def.parts.literals;
         table
             .build_decoder(
                 def.parts.literals_src,
                 lit.regenerated_size as usize,
-                lit.num_streams == Some(4),
+                lit.four_streams,
             )
             .map(|_| ())
     }
@@ -5188,13 +5100,8 @@ mod parallel {
         def: &CompressedPlan<'_>,
         t: usize,
         fse: &mut FSEScratch,
-    ) -> Result<(), String> {
-        let modes = def
-            .parts
-            .sequences
-            .modes
-            .ok_or_else(|| "Missing compression mode".to_string())?
-            .all();
+    ) -> Result<(), DecodeError> {
+        let modes = def.parts.sequences.modes.all();
         let src = def.parts.sequences_src;
         let mut used = 0;
         for (u, kind) in SEQ_TABLES.iter().enumerate().take(t) {
@@ -5203,7 +5110,9 @@ mod parallel {
                     FSETable::new(kind.max_code).read_probabilities(&src[used..], kind.max_log)?
                 }
                 ModeType::RLE if used < src.len() => 1,
-                ModeType::RLE => return Err(format!("Missing byte for RLE {} table", kind.name)),
+                ModeType::RLE => {
+                    return Err(format!("Missing byte for RLE {} table", kind.name).into())
+                }
                 ModeType::Predefined | ModeType::Repeat => 0,
             };
         }
@@ -5217,7 +5126,7 @@ mod parallel {
     fn seq_stream_begin<'a>(
         bit_stream: &'a [u8],
         tables: [&'a FSETable; 3],
-    ) -> Result<SeqStream<'a>, String> {
+    ) -> Result<SeqStream<'a>, DecodeError> {
         let logs = tables.map(|t| u32::from(t.accuracy_log));
         // Every state is `accuracy_log` bits or `next_state + bits` of a
         // cell, which `build_decoding_table` / `build_rle` keep below
@@ -5227,7 +5136,7 @@ mod parallel {
             .zip(logs)
             .any(|(t, log)| t.decode().len() != 1 << log)
         {
-            return Err("FSE table is uninitialized".to_string());
+            return Err("FSE table is uninitialized".into());
         }
         let mut br = BitDStream::new(bit_stream)?;
         let mut states = [0; 3];
@@ -5248,7 +5157,7 @@ mod parallel {
         bit_stream: &[u8],
         tables: [&FSETable; 3],
         seqs: &mut Vec<RawSeq>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DecodeError> {
         let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, tables)?;
         let mut st = [ll, ml, of];
         // Zero-fill first: when the executing thread last read these lines
@@ -5266,13 +5175,13 @@ mod parallel {
         }
         let (last, rest) = seqs
             .split_last_mut()
-            .ok_or_else(|| "Missing sequences".to_string())?;
+            .ok_or_else(|| DecodeError::from("Missing sequences"))?;
         for s in rest {
             *s = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
         }
         *last = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
         if !br.is_finished() {
-            return Err("Sequence bitstream not fully consumed".to_string());
+            return Err("Sequence bitstream not fully consumed".into());
         }
         Ok(())
     }
@@ -5384,7 +5293,7 @@ mod parallel {
         block_size_max: usize,
         out: &'o mut impl FrameOut,
         simd: Level,
-    ) -> Result<&'o [u8], String> {
+    ) -> Result<&'o [u8], DecodeError> {
         let (dst, ext) = out.block_dst()?;
         // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A
         // raw or RLE block decodes to at most `block_size_max <=
@@ -5441,7 +5350,7 @@ mod parallel {
             w: W,
             offset_hist: &mut [u32; 3],
             dst: Dst,
-        ) -> Result<usize, String> {
+        ) -> Result<usize, DecodeError> {
             execute_sequences::<W, false>(w, self, ExtHistory::NONE, offset_hist, dst)
         }
     }
@@ -5460,7 +5369,7 @@ mod parallel {
             w: W,
             offset_hist: &mut [u32; 3],
             dst: Dst,
-        ) -> Result<usize, String> {
+        ) -> Result<usize, DecodeError> {
             execute_sequences::<W, true>(w, self.seqs, self.ext, offset_hist, dst)
         }
     }
@@ -5478,7 +5387,7 @@ mod parallel {
         ext: ExtHistory,
         offset_hist: &mut [u32; 3],
         dst: Dst,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DecodeError> {
         let out = dst.base;
         let mut hist = offset_hist.map(|o| o as usize);
         let lit = literals.as_ptr();
@@ -5540,7 +5449,7 @@ mod parallel {
             room: usize,
             read: &mut usize,
             next: impl FnMut(&mut O) -> bool + Send,
-        ) -> Result<Option<Event>, String> {
+        ) -> Result<Option<Event>, DecodeError> {
             match &self.stage {
                 Stage::Block {
                     frame,
@@ -5563,7 +5472,7 @@ mod parallel {
             room: usize,
             read: &mut usize,
             mut next: impl FnMut(&mut O) -> bool + Send,
-        ) -> Result<Option<Event>, String> {
+        ) -> Result<Option<Event>, DecodeError> {
             let (
                 Stage::Block {
                     frame,
@@ -5632,7 +5541,7 @@ mod parallel {
         simd: Level,
         pooled: bool,
         next: &mut (impl FnMut(&mut O) -> bool + Send),
-    ) -> (usize, [u32; 3], Result<(), String>) {
+    ) -> (usize, [u32; 3], Result<(), DecodeError>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
         // spawned once block `i - ring.len()` has been executed from it, or
         // by the executing thread if no task has started it by the time
@@ -5657,7 +5566,7 @@ mod parallel {
         let mut hist = start.init.offset_hist;
         let mut done = 0;
         // `spawn_decode(i)` starts a task for block `i` if it is compressed.
-        let mut run = |spawn_decode: &dyn Fn(usize)| -> Result<(), String> {
+        let mut run = |spawn_decode: &dyn Fn(usize)| -> Result<(), DecodeError> {
             for i in 0..ring.len() {
                 spawn_decode(i);
             }
@@ -5743,7 +5652,7 @@ mod parallel {
         scratch: &mut DecoderScratch,
         plans: &[Plan<'_>],
         hist: [u32; 3],
-    ) -> Result<(), String> {
+    ) -> Result<(), DecodeError> {
         scratch.offset_hist = hist;
         let (mut huf, mut fse) = (None, None);
         for plan in plans {
@@ -5988,7 +5897,7 @@ mod tests {
         dst_size: usize,
         four: bool,
         x2: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, DecodeError> {
         let mut t = HuffmanTable::new();
         let (used, nb_weights) = t.read_weights(section)?;
         t.weight_stats(nb_weights)?;
@@ -5996,6 +5905,22 @@ mod tests {
         let mut out = vec![0u8; dst_size];
         huf_decompress(&mut out, &section[used..], four, &t)?;
         Ok(out)
+    }
+
+    /// `read_le_short` reads every length from 1 to 8 bytes as the bytes
+    /// zero-padded to 8 read.
+    #[test]
+    fn read_le_short_matches_padded_read() {
+        let bytes = [0x11, 0x82, 0x23, 0xF4, 0x45, 0x96, 0x67, 0xA8];
+        for n in 1..=8 {
+            let mut padded = [0u8; 8];
+            padded[..n].copy_from_slice(&bytes[..n]);
+            assert_eq!(
+                read_le_short(&bytes[..n]),
+                u64::from_le_bytes(padded),
+                "{n} bytes"
+            );
+        }
     }
 
     /// RFC 8878 §4.2.2: a Huffman stream is consumed exactly, so the
@@ -6510,9 +6435,9 @@ mod tests {
             _: W,
             _: &mut [u32; 3],
             _: Dst,
-        ) -> Result<usize, String> {
+        ) -> Result<usize, DecodeError> {
             let name = std::any::type_name::<W>();
-            Err(name.rsplit("::").next().unwrap_or(name).to_string())
+            Err(name.rsplit("::").next().unwrap_or(name).into())
         }
     }
 
@@ -6537,7 +6462,8 @@ mod tests {
             let mut out = Vec::new();
             let dst = prefix.dst(&mut out, MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH);
             // SAFETY: `Prefix::dst` meets the `Dst` contract.
-            unsafe { execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, dst) }.unwrap_err()
+            let e = unsafe { execute_with_copies(level, t, CopyProbe, &mut [1, 4, 8], 0, dst) };
+            String::from(e.unwrap_err())
         };
         let mut t = FSETable::new(MAX_OFFSET_CODE);
         for (level, plain, short) in levels {
@@ -6648,7 +6574,7 @@ mod tests {
                         })
                     };
                     if let Some(e) = if dict { error_dict } else { error } {
-                        assert_eq!(got.err().as_deref(), Some(e), "{name}");
+                        assert_eq!(got.err().map(String::from).as_deref(), Some(e), "{name}");
                         continue;
                     }
                     let mut want = [ext, &seg[..]].concat();
@@ -6815,5 +6741,48 @@ mod tests {
         let compressed = crate::compress::compress_to_vec(&data);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// Every Vec-returning decode, with and without a dictionary, returns
+    /// content of at most `COPY_OUT_MAX` bytes in a `Vec` of exactly its
+    /// length and larger content with the room `reserve_frame` left past
+    /// it (`take_output`); a `Decompressor` does so call after call, below
+    /// the bound again after content above it.
+    #[test]
+    fn vec_output_capacity_bound() {
+        let raw_dict: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        let dict = DecodeDict::new(&raw_dict).unwrap();
+        let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, &raw_dict).unwrap();
+        let mut d = crate::Decompressor::new();
+        let room = MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH;
+        for n in [
+            COPY_OUT_MAX - 1,
+            COPY_OUT_MAX,
+            COPY_OUT_MAX + 1,
+            COPY_OUT_MAX - 1,
+        ] {
+            let content: Vec<u8> = (0..n)
+                .map(|i| b"zstd frame "[i % 11] ^ (i / 97) as u8)
+                .collect();
+            let plain = zstd::bulk::compress(&content, 3).unwrap();
+            let framed = with_dict.compress(&content).unwrap();
+            for (api, out) in [
+                ("decompress", decompress(&plain)),
+                ("decompress_with_dict", decompress_with_dict(&framed, &dict)),
+                ("Decompressor::decompress", d.decompress(&plain)),
+                (
+                    "Decompressor::decompress_with_dict",
+                    d.decompress_with_dict(&framed, &dict),
+                ),
+            ] {
+                let out = out.unwrap();
+                assert!(out == content, "{api} {n}: content differs");
+                if n <= COPY_OUT_MAX {
+                    assert_eq!(out.capacity(), n, "{api} {n}");
+                } else {
+                    assert!(out.capacity() >= n + room, "{api} {n}: {}", out.capacity());
+                }
+            }
+        }
     }
 }
