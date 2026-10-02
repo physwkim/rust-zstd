@@ -157,7 +157,7 @@ let ddict = DecodeDict::new(&dict_bytes).unwrap();
 let original = decompress_with_dict(&frame, &ddict).unwrap();
 ```
 
-`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Combining a dictionary with the streaming APIs is not yet supported and returns `CompressError::Unsupported`.
+`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Streaming compression (`compress_stream`, `Encoder`) uses `CompressOptions::dict` as `ZSTD_compressStream2` uses `ZSTD_CCtx_refCDict`; streaming decompression with a dictionary is not yet supported.
 
 ## Performance
 

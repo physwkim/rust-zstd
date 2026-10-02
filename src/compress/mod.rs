@@ -172,12 +172,12 @@ pub struct CompressOptions {
     #[doc(hidden)]
     pub overflow_correct_frequently: bool,
     /// `ZSTD_CCtx_refCDict`: compress every frame with this dictionary, as
-    /// `ZSTD_compress2` does: its level supersedes `level`, the frame
-    /// header carries its ID, and the frame is one job whatever
-    /// `job_size` says (ZSTDMT with a dictionary is not supported yet).
-    /// Streaming with a dictionary is not supported yet either:
-    /// [`Compressor::compress_stream`] and [`Encoder`] fail with
-    /// [`CompressError::Unsupported`]. See [`CompressDict`] and [`dict`].
+    /// `ZSTD_compress2` and `ZSTD_compressStream2` do: its level supersedes
+    /// `level`, the frame header carries its ID, and the frame is one job
+    /// whatever `job_size` says (ZSTDMT with a dictionary is not supported
+    /// yet). A streaming frame sizes its use of the dictionary for the
+    /// pledged size, an unknown one as libzstd does (attached, with
+    /// [`DictAttach::Auto`]). See [`CompressDict`] and [`dict`].
     pub dict: Option<Arc<CompressDict>>,
     /// `ZSTD_c_forceAttachDict`: whether a frame searches `dict`'s tables
     /// in place or copies them, see [`DictAttach`]. Default
@@ -538,6 +538,12 @@ impl Compressor {
     /// progress is abandoned first, as `ZSTD_compress2` resets the session.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         self.reset_stream();
+        self.compress_next(src, out);
+    }
+
+    /// The next frame, of `src` alone, appended to `out`, with
+    /// [`CompressOptions::dict`] if set.
+    fn compress_next(&mut self, src: &[u8], out: &mut Vec<u8>) {
         match self.opts.dict.clone() {
             Some(dict) => {
                 let dict = FrameDict::of(&dict, Some(src.len() as u64), &self.opts);

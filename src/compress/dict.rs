@@ -229,7 +229,7 @@ impl CompressDict {
     }
 
     /// The dictionary's match state and loaded content, to attach.
-    fn dict_match_state(&self) -> DictMatchState<'_> {
+    pub(super) fn dict_match_state(&self) -> DictMatchState<'_> {
         DictMatchState::new(&self.ms, &self.content)
     }
 }
@@ -294,12 +294,12 @@ pub(super) struct FrameDict<'a> {
 }
 
 impl<'a> FrameDict<'a> {
-    /// `ZSTD_compress2` with `ZSTD_CCtx_refCDict(dict)` for an input of
-    /// `pledged` bytes (`None`: `ZSTD_CONTENTSIZE_UNKNOWN`),
-    /// `opts.dict_attach` the attach preference: `opts` at the
-    /// dictionary's level, sized for the input and the dictionary
-    /// (`ZSTD_getCParamMode`: `ZSTD_cpm_attachDict` where
-    /// `ZSTD_shouldAttachDict`, which leaves the dictionary out, else
+    /// `ZSTD_compress2` or `ZSTD_compressStream2` with
+    /// `ZSTD_CCtx_refCDict(dict)` for an input of `pledged` bytes (`None`:
+    /// `ZSTD_CONTENTSIZE_UNKNOWN`), `opts.dict_attach` the attach
+    /// preference: `opts` at the dictionary's level, sized for the input
+    /// and the dictionary (`ZSTD_getCParamMode`: `ZSTD_cpm_attachDict`
+    /// where `ZSTD_shouldAttachDict`, which leaves the dictionary out, else
     /// `ZSTD_cpm_noAttachDict`). Then (`ZSTD_compressBegin_internal`) for
     /// an input of unknown size or below 128 KiB or six times the
     /// dictionary's size, unless [`DictAttach::Load`], the dictionary's
