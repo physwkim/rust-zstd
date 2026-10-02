@@ -140,7 +140,7 @@ let mut data = Vec::new();
 dec.read_to_end(&mut data)?;
 ```
 
-Under the adapters sit libzstd-style push state machines — `Compressor::compress_stream` (with `Continue`/`Flush`/`End` directives, `ZSTD_compressStream2` shape) and `Decompressor::decompress_stream` — for callers that manage their own buffers. Streaming decompression holds only the window, so arbitrarily large frames decode in bounded memory.
+Under the adapters sit libzstd-style push state machines — `Compressor::compress_stream` (with `Continue`/`Flush`/`End` directives, `ZSTD_compressStream2` shape) and `Decompressor::decompress_stream` — for callers that manage their own buffers. Streaming decompression holds the window and at most 1 MiB past it, so arbitrarily large frames decode in bounded memory.
 
 ### Dictionaries
 

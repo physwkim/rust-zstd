@@ -815,14 +815,20 @@ fn offset_before_dict_start_is_an_error() {
 /// RFC 8878 lines 1838-1844: an offset past Window_Size may reach the
 /// dictionary while the frame has decoded at most Window_Size bytes, and
 /// not after. The frame is libzstd's with a 256 KiB window, relabelled to
-/// 128 KiB; its first block is the `fresh` bytes up to 128 KiB, and the
-/// second starts with what is left of them then a match into the
-/// dictionary. libzstd enforces no window on offsets and decodes both.
+/// 128 KiB; its blocks of `max_block` bytes hold the `fresh` bytes, the
+/// last of them starting with what is left of them then a match into the
+/// dictionary: at Window_Size, or past it, where the round buffer gives
+/// the block no history before it. libzstd enforces no window on offsets
+/// and decodes all.
 #[test]
 fn dict_reach_ends_at_window_size() {
     let content = lcg_bytes(64 * 1024, 81);
     let dict = ddict(&content);
-    for (fresh, ok) in [(128 * 1024, true), (128 * 1024 + 1, false)] {
+    for (fresh, max_block, ok) in [
+        (128 * 1024, 128 * 1024, true),
+        (128 * 1024 + 1, 128 * 1024, false),
+        (160 * 1024 + 1, 32 * 1024, false),
+    ] {
         let src = [&lcg_bytes(fresh, 82)[..], &content[..4000]].concat();
         let mut frame = c_compress_dict(
             &src,
@@ -831,6 +837,7 @@ fn dict_reach_ends_at_window_size() {
                 (P::ZSTD_c_compressionLevel, 3),
                 (P::ZSTD_c_windowLog, 18),
                 (P::ZSTD_c_contentSizeFlag, 0),
+                (P::ZSTD_c_experimentalParam18, max_block),
             ],
         );
         assert_decodes("256 KiB window", &frame, &dict, &src);
@@ -847,7 +854,7 @@ fn dict_reach_ends_at_window_size() {
             assert_decodes("match at Window_Size", &frame, &dict, &src);
         } else {
             assert_rejects(
-                "match past Window_Size",
+                &format!("match past Window_Size, after {fresh} bytes"),
                 &frame,
                 Some(&dict),
                 "exceeds Window_Size",

@@ -9,9 +9,10 @@ use std::io::{self, Read};
 /// of any size (ZSTD_decompressStream). It decodes with the same
 /// `FrameDecoder` as `decompress`, so it gives the same verdict on every
 /// input, keeping at most one unit of input (a block) and one window of
-/// output: a frame decodes in memory bounded by its Window_Size, by its
-/// Frame_Content_Size when that is smaller, and by what it has decoded
-/// to so far. The one exception is libzstd's: a frame whose Window_Size
+/// output, with a margin of eight blocks, at most 1 MiB, for a frame that
+/// decodes past its window: a frame decodes in memory bounded by its
+/// Window_Size and that margin, by its Frame_Content_Size when that is
+/// smaller, and by what it has decoded to so far. The one exception is libzstd's: a frame whose Window_Size
 /// is above the limit `set_window_log_max` sets, by default `(1 << 27) + 1`,
 /// is refused unless one call gets it whole. With the `parallel` feature it
 /// also keeps, once a call has decoded blocks of a frame on the rayon pool
@@ -562,6 +563,13 @@ impl<R: Read> Read for DecompressReader<R> {
 /// Room a block's destination has past its start (the `Dst` contract).
 const BLOCK_ROOM: usize = MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH;
 
+/// Blocks of its Block_Maximum_Size, `min(window, MAX_BLOCK_SIZE)`, that a
+/// frame decoding past its window holds in a segment of the round buffer
+/// past Window_Size and a block's room, so at most 896 KiB. A block that
+/// starts that far into a segment reaches nothing before it, and decodes
+/// without the extDict checks and copies.
+const RING_MARGIN_BLOCKS: usize = 7;
+
 /// The window of the frame being decoded, as a round buffer (ZSTD_DStream's
 /// `outBuff`): blocks decode one after another into a segment that starts
 /// at 0, until the next block might not fit; the next segment then starts
@@ -569,18 +577,24 @@ const BLOCK_ROOM: usize = MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH;
 ///
 /// The buffer grows with what the frame decodes to, doubling, up to
 /// `full`: `reach + WILDCOPY_OVERLENGTH + BLOCK_ROOM` bytes, `reach` being
-/// the frame's Window_Size or its smaller Frame_Content_Size. So the frame
-/// header's claims allocate nothing, and a frame never takes more than
-/// `full`, nor more than what it has decoded and a block's room.
+/// the frame's Window_Size or its smaller Frame_Content_Size, and the
+/// `RING_MARGIN_BLOCKS` margin unless Frame_Content_Size is at most
+/// Window_Size. So the frame header's claims allocate nothing, and a frame
+/// never takes more than `full`, at most Window_Size and 1 MiB and 64
+/// bytes, nor more than what it has decoded and a block's room.
 ///
 /// A segment ends only in a buffer of `full` bytes or more, after more than
-/// `reach + WILDCOPY_OVERLENGTH` bytes. A frame that decodes to `reach`
-/// bytes at most has one segment, so its `reach` is its window when it has
-/// two. A match at `avail` bytes into the current segment then copies
-/// from at most `window` bytes back, so from no earlier than
-/// `WILDCOPY_OVERLENGTH + 1` bytes past `avail` in the previous segment,
-/// ahead of every byte the current segment's copies wrote over it,
-/// overshoot included.
+/// `full - BLOCK_ROOM` bytes, at least `reach + WILDCOPY_OVERLENGTH`. A
+/// frame that decodes to `reach` bytes at most has one segment, so its
+/// `reach` is its window when it has two. A match at `avail` bytes into
+/// the current segment then copies from at most `window` bytes back, so
+/// from no earlier than `WILDCOPY_OVERLENGTH + 1` bytes past `avail` in the
+/// previous segment, ahead of every byte the current segment's copies wrote
+/// over it, overshoot included. A block that starts more than `window`
+/// bytes into its segment has no `ExtHistory`: no match reaches past the
+/// segment's start from there, an offset past Window_Size being refused
+/// whatever the history (a dictionary's too, the frame having decoded more
+/// than Window_Size bytes), and offset 0 with none.
 ///
 /// The `ExtHistory` of the first segment is the content of the dictionary
 /// the frame started from (`RingOut`), which a match may reach while the
@@ -647,8 +661,13 @@ impl FrameOut for RingOut<'_> {
         let reach = content_size
             .and_then(|n| usize::try_from(n).ok())
             .map_or(window, |n| n.min(window));
+        let margin = if content_size.is_some_and(|n| n <= window as u64) {
+            0
+        } else {
+            RING_MARGIN_BLOCKS * window.min(MAX_BLOCK_SIZE)
+        };
         ring.window = window;
-        ring.full = reach.saturating_add(WILDCOPY_OVERLENGTH + BLOCK_ROOM);
+        ring.full = reach.saturating_add(WILDCOPY_OVERLENGTH + BLOCK_ROOM + margin);
         ring.end = 0;
         ring.ext_end = 0;
         ring.flushed = 0;
@@ -663,13 +682,14 @@ impl FrameOut for RingOut<'_> {
         }
         if ring.end + BLOCK_ROOM > ring.buf.len() {
             // With `ring.buf.len() >= ring.full`, `ring.end` is past
-            // `reach + WILDCOPY_OVERLENGTH`.
+            // `ring.full - BLOCK_ROOM`.
             ring.ext_end = ring.end;
             ring.end = 0;
             ring.flushed = 0;
         }
         let base = ring.buf.as_mut_ptr();
         let ext = match ring.ext_end {
+            _ if ring.end > ring.window => ExtHistory::NONE,
             0 => ExtHistory::dict(self.dict),
             len => ExtHistory {
                 // SAFETY: `ext_end` is within the buffer.

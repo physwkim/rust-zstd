@@ -126,7 +126,8 @@ fn content_checksum_is_verified() {
         ("empty", vec![]),
         ("1 byte", vec![42]),
         ("text 1000", text(1000)),
-        ("text 1 MiB", text(1 << 20)),
+        // Past level 1's 512 KiB window and the round buffer's margin.
+        ("text 2 MiB", text(2 << 20)),
         ("random 300000", lcg_bytes(300_000, 5)),
     ];
     let mut raw_altered = 0;

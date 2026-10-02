@@ -3157,7 +3157,9 @@ struct Dst {
 /// it: the `len` bytes that end at `end` (libzstd's `virtualStart` to
 /// `dictEnd`). They are initialized; writes to the segment may land in
 /// them (the streaming round buffer reuses them), so they are only read
-/// through raw pointers.
+/// through raw pointers. A match that starts in them, at `avail` bytes
+/// into the segment, starts in another allocation than the segment's, or
+/// more than `WILDCOPY_OVERLENGTH` bytes past `base + avail`.
 #[derive(Clone, Copy)]
 struct ExtHistory {
     end: *const u8,
@@ -3206,12 +3208,8 @@ trait BlockSequences {
     ) -> Result<usize, DecodeError>;
 }
 
-/// Execute `seqs` with the copies for its block, for the fused decoder and
-/// the MT decoder's stage 3 alike: 32-byte ones on the AVX2 level, 16-byte
-/// ones otherwise, and the `ShortOffsets` variants when the block's offsets
-/// table gives many short offsets. Each copy type runs in a function of its
-/// own. The block may decode to `block_size_max` bytes (RFC 8878 lines
-/// 566-568). Returns the block's end in `dst`.
+/// `execute_with` for a block whose offsets table is `offsets`: with the
+/// `ShortOffsets` copies when it gives many short offsets.
 ///
 /// # Safety
 /// `dst` meets the `Dst` contract.
@@ -3224,6 +3222,27 @@ unsafe fn execute_with_copies<S: BlockSequences>(
     dst: Dst,
 ) -> Result<usize, DecodeError> {
     let short = short_offset_share(offsets) >= SHORT_OFFSET_SHARE_MIN;
+    execute_with(simd, short, seqs, offset_hist, block_size_max, dst)
+}
+
+/// Execute `seqs` with the copies for its block, for the fused decoder and
+/// the MT decoder's stage 3 alike: 32-byte ones on the AVX2 level, 16-byte
+/// ones otherwise, and the `ShortOffsets` variants when `short`. Each copy
+/// type runs in a function of its own. The block may decode to
+/// `block_size_max` bytes (RFC 8878 lines 566-568). Returns the block's end
+/// in `dst`.
+///
+/// # Safety
+/// `dst` meets the `Dst` contract.
+#[inline(always)]
+unsafe fn execute_with<S: BlockSequences>(
+    simd: Level,
+    short: bool,
+    seqs: S,
+    offset_hist: &mut [u32; 3],
+    block_size_max: usize,
+    dst: Dst,
+) -> Result<usize, DecodeError> {
     let Dst { base, op, window } = dst;
     let end = match simd {
         // SAFETY: fearless_simd makes an `Avx2` only after detecting AVX2
@@ -3611,17 +3630,29 @@ fn exec_sequence<W: WildCopy, const EXT: bool>(
         if !EXT {
             return Err(SeqError::OffsetTooFar);
         }
+        let avail = o_lit_end - lim.prefix as usize;
+        // A match that starts `back` bytes before the end of `ext` and ends
+        // `WILDCOPY_OVERLENGTH` bytes or more before it (`offset` is then
+        // not 0) copies on here: out of line, its copy cost streamed
+        // rssrc_8M L3 MT decode 7%, with every wrap of the round buffer.
+        let back = offset.wrapping_sub(avail);
+        if back <= lim.ext.len && back >= ml + WILDCOPY_OVERLENGTH {
+            // SAFETY: as below for the literals. The match reads `ml + 31`
+            // bytes from `back` bytes before the end of `ext`, within it,
+            // and lies apart from the segment or ahead of `dst` by more
+            // than `W::WIDTH` bytes (the `ExtHistory` contract).
+            unsafe {
+                copy_literals(w, op, lit, ll);
+                w.wildcopy(op.add(ll), lim.ext.end.sub(back), ml);
+                cur.lit = lit.add(ll);
+                cur.op = op.add(ll + ml);
+            }
+            return Ok(());
+        }
         // SAFETY: as below, the checks above hold; the match starts before
         // the segment, which `exec_sequence_ext` takes from there.
         unsafe {
-            exec_sequence_ext(
-                w,
-                op,
-                lit,
-                (ll, ml, offset),
-                o_lit_end - lim.prefix as usize,
-                lim.ext,
-            )?;
+            exec_sequence_ext(w, op, lit, (ll, ml, offset), avail, lim.ext)?;
             cur.lit = lit.add(ll);
             cur.op = op.add(ll + ml);
         }
@@ -3751,7 +3782,7 @@ unsafe fn copy16(dst: *mut u8, src: *const u8) {
 ///
 /// # Safety
 /// `len + 31` bytes readable at `src` and writable at `dst`, and either the
-/// two ranges are disjoint or `dst - src >= 16`.
+/// two ranges are disjoint or `dst - src >= 16` or `src - dst >= 16`.
 #[inline(always)]
 unsafe fn wildcopy(mut dst: *mut u8, mut src: *const u8, len: usize) {
     copy16(dst, src);
@@ -3783,7 +3814,8 @@ trait WildCopy: Copy {
     ///
     /// # Safety
     /// `len + 31` bytes readable at `src` and writable at `dst`, and either
-    /// the two ranges are disjoint or `dst - src >= WIDTH`.
+    /// the two ranges are disjoint or `dst - src >= WIDTH` or `src - dst >=
+    /// WIDTH`: the chunks go forward, and each is read before it is written.
     unsafe fn wildcopy(self, dst: *mut u8, src: *const u8, len: usize);
 
     /// Copy the `ml`-byte match that starts `offset` bytes before `dst`,
@@ -4078,7 +4110,8 @@ fn wide_chunks(dist: usize) -> bool {
 ///
 /// # Safety
 /// The CPU supports AVX2; `len + 31` bytes readable at `src` and writable
-/// at `dst`, and either the two ranges are disjoint or `dst - src >= 32`.
+/// at `dst`, and either the two ranges are disjoint or `dst - src >= 32` or
+/// `src - dst >= 32`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -4815,7 +4848,7 @@ mod parallel {
     use std::any::Any;
     use std::collections::VecDeque;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Batches with fewer compressed blocks decode on the calling thread.
@@ -5048,13 +5081,18 @@ mod parallel {
     /// or the executing thread (`take`), then done once its decode is in
     /// `slot` (`decoded`). A task whose block someone else took, or whose
     /// cell has since been handed another block, finds a ticket it cannot
-    /// take and returns.
+    /// take and returns. While the decode runs, the executing thread reads
+    /// only what it has published (`Published`), and the slot once it is
+    /// done.
     struct Cell {
         /// `2 * ticket` while the block of `ticket` is planned, one more
         /// once it is taken.
         claim: AtomicUsize,
         /// `2 * ticket + 1` once the block of `ticket` is decoded.
         done: AtomicUsize,
+        /// What the decode of the block of the ticket last handed has
+        /// published.
+        published: Published,
         slot: Mutex<Slot>,
     }
 
@@ -5064,13 +5102,18 @@ mod parallel {
                 // Taken, of no block: nothing is to decode yet.
                 claim: AtomicUsize::new(1),
                 done: AtomicUsize::new(0),
+                published: Published::new(),
                 slot: Mutex::new(Slot::new()),
             }
         }
 
         /// Plan the block of `ticket`, once the cell's block before it has
-        /// been executed or given up.
+        /// been executed or given up and no task decodes into the cell.
         fn hand(&self, ticket: usize) {
+            // Before the decode by the claim's release, and before the
+            // executing thread's loads: the planning thread is that thread,
+            // or one whatever moved the decoder there synchronized with.
+            self.published.progress.store(0, Ordering::Relaxed);
             self.claim.store(ticket.wrapping_mul(2), Ordering::Release);
         }
 
@@ -5087,14 +5130,36 @@ mod parallel {
             self.done.load(Ordering::Acquire) == ticket.wrapping_mul(2) | 1
         }
 
+        /// Whether the executing thread can start on the block of
+        /// `ticket`: its decode is done or has published.
+        fn startable(&self, ticket: usize) -> bool {
+            self.decoded(ticket) || self.published.progress.load(Ordering::Acquire) != 0
+        }
+
+        /// The slot of the block of `ticket` once its decode is done: its
+        /// stage 2, or the panic of its decode resumed.
+        fn finished(&self, ticket: usize) -> MutexGuard<'_, Slot> {
+            let mut spins = 0;
+            while !self.decoded(ticket) {
+                pause(&mut spins);
+            }
+            decoded_slot(self)
+        }
+
         /// Decode the block of `ticket`, taken, into the slot with `decode`,
-        /// then mark it done, on a panic too, which the slot keeps for the
+        /// which publishes into the cell's `Published` as it goes, then
+        /// mark it done, on a panic too, which the slot keeps for the
         /// executing thread to resume.
-        fn decode(&self, ticket: usize, decode: impl FnOnce(&mut Slot) -> Result<(), DecodeError>) {
+        fn decode(
+            &self,
+            ticket: usize,
+            decode: impl FnOnce(&mut Slot, &Published) -> Result<(), DecodeError>,
+        ) {
             let _done = MarkDone(&self.done, ticket.wrapping_mul(2) | 1);
             let mut slot = lock(&self.slot);
             let slot = &mut *slot;
-            let decoded = panic::catch_unwind(AssertUnwindSafe(|| decode(&mut *slot)));
+            let decoded =
+                panic::catch_unwind(AssertUnwindSafe(|| decode(&mut *slot, &self.published)));
             slot.result = match decoded {
                 Ok(result) => result,
                 Err(payload) => {
@@ -5102,6 +5167,65 @@ mod parallel {
                     Err("Block decode panicked".into())
                 }
             };
+        }
+    }
+
+    /// Wait a little for another thread: spin, then hand the CPU to a
+    /// worker the kernel may have queued on it.
+    fn pause(spins: &mut u32) {
+        if *spins < 64 {
+            *spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+
+    /// What the decode of a cell's block makes readable before it ends, so
+    /// that the executing thread executes the block's sequences while the
+    /// rest decode: the first `progress` of its sequences, at `seqs`, and
+    /// with the first of them the block's literals, with
+    /// `WILDCOPY_OVERLENGTH` bytes of slack, and whether its offsets are
+    /// short (`SHORT_OFFSET_SHARE_MIN`). The decode writes none of those
+    /// again, nor moves them, and they stay until the cell is handed
+    /// another block, which waits for the executing thread to be done
+    /// with this one.
+    struct Published {
+        progress: AtomicUsize,
+        literals: AtomicPtr<u8>,
+        literals_len: AtomicUsize,
+        seqs: AtomicPtr<RawSeq>,
+        short: AtomicBool,
+    }
+
+    impl Published {
+        fn new() -> Published {
+            Published {
+                progress: AtomicUsize::new(0),
+                literals: AtomicPtr::new(ptr::null_mut()),
+                literals_len: AtomicUsize::new(0),
+                seqs: AtomicPtr::new(ptr::null_mut()),
+                short: AtomicBool::new(false),
+            }
+        }
+
+        /// The block's literals, and whether its offsets are short, to
+        /// publish with the first sequences.
+        fn literals(&self, literals: &[u8], short: bool) {
+            let at = literals.as_ptr().cast_mut();
+            self.literals.store(at, Ordering::Relaxed);
+            self.literals_len.store(literals.len(), Ordering::Relaxed);
+            self.short.store(short, Ordering::Relaxed);
+        }
+
+        /// Where the block's sequences go, to publish with the first.
+        fn sequences(&self, seqs: *mut RawSeq) {
+            self.seqs.store(seqs, Ordering::Relaxed);
+        }
+
+        /// Publish the first `n` sequences, decoded, `n` above 0.
+        fn decoded(&self, n: usize) {
+            self.progress.store(n, Ordering::Release);
         }
     }
 
@@ -5141,6 +5265,8 @@ mod parallel {
         fse: FSEScratch,
         fse_from: [Option<u64>; 3],
         literals: Vec<u8>,
+        /// Room for the block's sequences, which stage 2 writes past the
+        /// length and publishes (`Published`).
         seqs: Vec<RawSeq>,
         result: Result<(), DecodeError>,
         /// The detached decode of the block handed to the cell, until it
@@ -5223,8 +5349,8 @@ mod parallel {
     }
 
     impl Job {
-        /// Stage 2 into `slot`.
-        fn decode(&self, slot: &mut Slot) -> Result<(), DecodeError> {
+        /// Stage 2 into `slot`, publishing into `publish`.
+        fn decode(&self, slot: &mut Slot, publish: &Published) -> Result<(), DecodeError> {
             let block_size_max = self.start.block_size_max;
             let plan = CompressedPlan {
                 parts: split_block(&self.content, block_size_max)?,
@@ -5241,7 +5367,7 @@ mod parallel {
                     .find(|(id, _)| *id == d)
                     .map(|(_, p)| p)
             };
-            decode_block(slot, self.id, &plan, def, self.start.view())
+            decode_block(slot, publish, self.id, &plan, def, self.start.view())
         }
     }
 
@@ -5256,8 +5382,8 @@ mod parallel {
     /// The decode of the block of `ticket`, taken, from the job its cell
     /// holds.
     fn run_taken(cell: &Cell, ticket: usize) {
-        cell.decode(ticket, |slot| match slot.job.take() {
-            Some(job) => job.decode(slot),
+        cell.decode(ticket, |slot, publish| match slot.job.take() {
+            Some(job) => job.decode(slot, publish),
             None => Err("Block decode without a job".into()),
         });
     }
@@ -5351,18 +5477,22 @@ mod parallel {
     /// block, of the earlier blocks whose table descriptions it uses and of
     /// the tables and repeat offsets the chain started from; nothing of
     /// the frame, the decoder, its dictionary or a caller's input. It
-    /// writes only its cell's slot, so it may outlive the call that
-    /// planned it, and the frame. Only `run`, on the thread that executes
-    /// the frame's blocks, applies a task's result: in plan order, to a
-    /// block whose bytes the call's input holds where it executes it, and
-    /// only while the frame has decoded no block outside the chain since it
-    /// started; the serial decoder's `hand_back` ends the chain before it
-    /// decodes one. A block leaves the chain only by being executed or
+    /// writes only its cell's slot and what it publishes there
+    /// (`Published`), so it may outlive the call that planned it, and the
+    /// frame. Only `run`, on the thread that executes the frame's blocks,
+    /// applies a task's result: in plan order, to a block whose bytes the
+    /// call's input holds where it executes it, and only while the frame
+    /// has decoded no block outside the chain since it started; the serial
+    /// decoder's `hand_back` ends the chain before it decodes one. It
+    /// executes a block's sequences as the task publishes them, and keeps
+    /// the block, and its repeat offsets, once the task has ended without
+    /// an error. A block leaves the chain only by being executed or
     /// through `retire`, on every other way out: input that differs
     /// (`rewind`), a block decoded outside the chain (`hand_back`), the
     /// frame's end or reset or drop (`Drop`). `retire` cancels a decode no
-    /// task has started; one running finishes into its cell, which is read
-    /// next only for a block planned after.
+    /// task has started; one running finishes into its cell, which is
+    /// handed a block planned after only once no task holds it
+    /// (`idle_cell`).
     #[derive(Default)]
     pub(super) struct Pipeline {
         /// The next block or start id: none is used twice in the frame.
@@ -5690,13 +5820,13 @@ mod parallel {
                     }
                     (_, None) => break,
                 };
-                let slot = match &p.job {
+                let stage2 = match &p.job {
                     Some((job, cell)) => {
                         let ticket = job.id as usize;
                         if cell.take(ticket) {
                             run_taken(cell, ticket);
                         }
-                        while !cell.decoded(ticket) {
+                        while !cell.startable(ticket) {
                             // If no task has started the block after either,
                             // the pool is behind: decode it here meanwhile.
                             match chain.queue.get(1).and_then(|n| n.job.as_ref()) {
@@ -5706,28 +5836,15 @@ mod parallel {
                                 _ => std::thread::yield_now(),
                             }
                         }
-                        let slot = decoded_slot(cell);
-                        if slot.result.is_err() {
-                            break;
-                        }
-                        Some(slot)
+                        Some((&**cell, ticket))
                     }
                     None => None,
                 };
-                let start = chain.start.view();
                 let hist = &mut chain.hist;
-                let Ok(bytes) = execute_block(
-                    &plan,
-                    slot.as_deref(),
-                    start,
-                    hist,
-                    block_size_max,
-                    out,
-                    simd,
-                ) else {
+                let Ok(bytes) = execute_block(&plan, stage2, hist, block_size_max, out, simd)
+                else {
                     break;
                 };
-                drop(slot);
                 let p = chain.queue.pop_front().unwrap();
                 let (len, ended) = (p.len(), p.block.last_block);
                 chain.queued_len -= len;
@@ -5747,10 +5864,12 @@ mod parallel {
     }
 
     /// Stage 2 for compressed block `id`, of a run starting with the
-    /// tables in `start`; `def` gives the sections of the earlier blocks of
-    /// the run whose table descriptions it uses.
+    /// tables in `start`, publishing its sequences into `publish` as it
+    /// decodes them; `def` gives the sections of the earlier blocks of the
+    /// run whose table descriptions it uses.
     fn decode_block<'p, 'a: 'p>(
         slot: &mut Slot,
+        publish: &Published,
         id: u64,
         plan: &CompressedPlan<'_>,
         def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
@@ -5801,7 +5920,15 @@ mod parallel {
             }
         }
         let tables = seq_tables(plan, &slot.fse, start);
-        decode_sequences(seq.num_sequences, &src[used..], tables, &mut slot.seqs)
+        let short = short_offset_share(tables[1]) >= SHORT_OFFSET_SHARE_MIN;
+        publish.literals(&slot.literals, short);
+        decode_sequences(
+            seq.num_sequences,
+            &src[used..],
+            tables,
+            &mut slot.seqs,
+            publish,
+        )
     }
 
     /// The sections of block `d`, which described a table a later block
@@ -5901,12 +6028,20 @@ mod parallel {
     /// LL, OF, ML decoding tables.
     type SeqStream<'a> = (BitDStream<'a>, [usize; 3], [&'a [FSEEntry]; 3]);
 
-    /// Stage 2's sequence loop: `run_sequences` without execution.
+    /// Sequences stage 2 decodes between two publications: each costs a
+    /// store, and the executing thread, which executes them faster than
+    /// they decode, waits for at most as many.
+    const PUBLISH_EVERY: usize = 256;
+
+    /// Stage 2's sequence loop: `run_sequences` without execution. It
+    /// publishes the sequences into `publish` `PUBLISH_EVERY` at a time,
+    /// the last only once the bitstream is checked.
     fn decode_sequences(
         num_sequences: u32,
         bit_stream: &[u8],
         tables: [&FSETable; 3],
         seqs: &mut Vec<RawSeq>,
+        publish: &Published,
     ) -> Result<(), DecodeError> {
         let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, tables)?;
         let mut st = [ll, ml, of];
@@ -5915,24 +6050,35 @@ mod parallel {
         // at memory bandwidth, where the loop's 12-byte stores would stall
         // on one cross-CCD invalidation per line (4x slower on Zen 5).
         let n = num_sequences as usize;
+        if n == 0 {
+            return Err("Missing sequences".into());
+        }
         seqs.clear();
         seqs.reserve(n);
-        // SAFETY: `n` elements are reserved, and zero bytes are a valid
-        // `RawSeq` (three u32s).
-        unsafe {
-            ptr::write_bytes(seqs.as_mut_ptr(), 0, n);
-            seqs.set_len(n);
+        // The sequences go past the length, through `base` alone: the
+        // executing thread reads those published while the rest decode.
+        let base = seqs.as_mut_ptr();
+        // SAFETY: `n` elements are reserved.
+        unsafe { ptr::write_bytes(base, 0, n) };
+        publish.sequences(base);
+        let mut at = 0;
+        while at < n - 1 {
+            let end = (at + PUBLISH_EVERY).min(n - 1);
+            for i in at..end {
+                let s = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
+                // SAFETY: `n` elements are reserved.
+                unsafe { base.add(i).write(s) };
+            }
+            at = end;
+            publish.decoded(at);
         }
-        let (last, rest) = seqs
-            .split_last_mut()
-            .ok_or_else(|| DecodeError::from("Missing sequences"))?;
-        for s in rest {
-            *s = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
-        }
-        *last = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
+        let last = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
+        // SAFETY: as in the loop.
+        unsafe { base.add(n - 1).write(last) };
         if !br.is_finished() {
             return Err("Sequence bitstream not fully consumed".into());
         }
+        publish.decoded(n);
         Ok(())
     }
 
@@ -6033,12 +6179,14 @@ mod parallel {
         temp
     }
 
-    /// Stage 3 for one block, whose stage 2, if compressed, decoded into
-    /// `slot`: write it to `out` and return its bytes.
+    /// Stage 3 for one block, whose stage 2, if compressed, runs in the
+    /// cell `stage2` names, under its ticket: write it to `out` and return
+    /// its bytes. The block's sequences execute as stage 2 publishes them;
+    /// the block and its repeat offsets count once stage 2 has ended
+    /// without an error.
     fn execute_block<'o>(
         plan: &Plan<'_>,
-        slot: Option<&Slot>,
-        start: FrameStart<'_>,
+        stage2: Option<(&Cell, usize)>,
         hist: &mut [u32; 3],
         block_size_max: usize,
         out: &'o mut impl FrameOut,
@@ -6063,23 +6211,26 @@ mod parallel {
                     dst.op + len
                 }
                 Plan::Compressed(cp) => {
-                    let slot = slot.expect("a compressed block is executed from its stage 2");
-                    let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
-                    if cp.parts.sequences.num_sequences == 0 {
+                    let (cell, ticket) =
+                        stage2.expect("a compressed block is executed from its stage 2");
+                    let num = cp.parts.sequences.num_sequences as usize;
+                    if num == 0 {
+                        let slot = cell.finished(ticket);
+                        stage2_result(&slot)?;
+                        let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
                         ptr::copy_nonoverlapping(slot.literals.as_ptr(), at, literals_len);
                         dst.op + literals_len
                     } else {
-                        let seqs = DecodedSeqs {
-                            seqs: &slot.seqs,
-                            literals: &slot.literals,
-                        };
-                        let offsets = seq_tables(cp, &slot.fse, start)[1];
-                        if ext.len == 0 {
-                            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
-                        } else {
-                            let seqs = ExtDecodedSeqs { seqs, ext };
-                            execute_with_copies(simd, offsets, seqs, hist, block_size_max, dst)?
-                        }
+                        let mut h = *hist;
+                        let runs = PublishedRuns { cell, ticket };
+                        let end =
+                            execute_published(runs, num, ext, &mut h, block_size_max, dst, simd);
+                        // Stage 2's error first: it may have published
+                        // only part of the sequences.
+                        stage2_result(&cell.finished(ticket))?;
+                        let end = end?;
+                        *hist = h;
+                        end
                     }
                 }
             };
@@ -6087,10 +6238,98 @@ mod parallel {
         }
     }
 
-    /// A block's sequences as stage 2 decoded them, with its literals
-    /// followed by `WILDCOPY_OVERLENGTH` bytes of slack.
+    /// Whether stage 2 decoded the block in `slot`. Its error stays in the
+    /// slot: a chain that stops at the block may execute it again.
+    fn stage2_result(slot: &Slot) -> Result<(), DecodeError> {
+        match slot.result {
+            Ok(()) => Ok(()),
+            Err(_) => Err("Block's stage 2 failed".into()),
+        }
+    }
+
+    /// Execute the `num` sequences `runs` publishes into `dst`, as
+    /// `execute_with` does, waiting for each run of them; returns the
+    /// block's end.
+    ///
+    /// # Safety
+    /// `dst` meets the `Dst` contract and `ext` the `ExtHistory` one.
+    unsafe fn execute_published(
+        runs: PublishedRuns<'_>,
+        num: usize,
+        ext: ExtHistory,
+        hist: &mut [u32; 3],
+        block_size_max: usize,
+        dst: Dst,
+        simd: Level,
+    ) -> Result<usize, DecodeError> {
+        // The literals are published with the first run.
+        runs.ready(0)?;
+        let p = &runs.cell.published;
+        let literals = std::slice::from_raw_parts(
+            p.literals.load(Ordering::Relaxed),
+            p.literals_len.load(Ordering::Relaxed),
+        );
+        let short = p.short.load(Ordering::Relaxed);
+        let seqs = DecodedSeqs {
+            seqs: p.seqs.load(Ordering::Relaxed),
+            runs,
+            num,
+            literals,
+        };
+        if ext.len == 0 {
+            execute_with(simd, short, seqs, hist, block_size_max, dst)
+        } else {
+            let seqs = ExtDecodedSeqs { seqs, ext };
+            execute_with(simd, short, seqs, hist, block_size_max, dst)
+        }
+    }
+
+    /// The runs of sequences the decode of the block of `ticket` publishes
+    /// in `cell`.
+    #[derive(Clone, Copy)]
+    struct PublishedRuns<'a> {
+        cell: &'a Cell,
+        ticket: usize,
+    }
+
+    impl PublishedRuns<'_> {
+        /// How many sequences are published, once more than `have` are,
+        /// or an error once the decode has ended without publishing more.
+        #[inline(always)]
+        fn ready(self, have: usize) -> Result<usize, DecodeError> {
+            let n = self.cell.published.progress.load(Ordering::Acquire);
+            if n > have {
+                return Ok(n);
+            }
+            self.wait(have)
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn wait(self, have: usize) -> Result<usize, DecodeError> {
+            let mut spins = 0;
+            loop {
+                // Done before the count: a decode that is done has
+                // published all it does.
+                let done = self.cell.decoded(self.ticket);
+                let n = self.cell.published.progress.load(Ordering::Acquire);
+                if n > have {
+                    return Ok(n);
+                }
+                if done {
+                    return Err("Block's sequences not decoded".into());
+                }
+                pause(&mut spins);
+            }
+        }
+    }
+
+    /// A block's sequences as stage 2 publishes them, `num` at `seqs`,
+    /// with its literals followed by `WILDCOPY_OVERLENGTH` bytes of slack.
     struct DecodedSeqs<'a> {
-        seqs: &'a [RawSeq],
+        seqs: *const RawSeq,
+        runs: PublishedRuns<'a>,
+        num: usize,
         literals: &'a [u8],
     }
 
@@ -6125,8 +6364,9 @@ mod parallel {
         }
     }
 
-    /// Execute decoded sequences into `dst` from `dst.op` on; returns the
-    /// block's end. Same contract as `run_sequences`.
+    /// Execute decoded sequences into `dst` from `dst.op` on, each run as
+    /// it is published; returns the block's end. Same contract as
+    /// `run_sequences`.
     ///
     /// # Safety
     /// `dst` meets the `Dst` contract, and `ext` the `ExtHistory` one when
@@ -6134,7 +6374,12 @@ mod parallel {
     #[inline(always)]
     unsafe fn execute_sequences<W: WildCopy, const EXT: bool>(
         w: W,
-        DecodedSeqs { seqs, literals }: DecodedSeqs<'_>,
+        DecodedSeqs {
+            seqs,
+            runs,
+            num,
+            literals,
+        }: DecodedSeqs<'_>,
         ext: ExtHistory,
         offset_hist: &mut [u32; 3],
         dst: Dst,
@@ -6155,11 +6400,17 @@ mod parallel {
             ext,
             window: dst.window,
         };
-        for s in seqs {
-            let ll = s.ll as usize;
-            let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-            exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
-                .map_err(seq_error_message)?;
+        let mut at = 0;
+        while at < num {
+            let end = runs.ready(at)?;
+            // Published, so written for good.
+            for s in std::slice::from_raw_parts(seqs.add(at), end - at) {
+                let ll = s.ll as usize;
+                let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
+                exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
+                    .map_err(seq_error_message)?;
+            }
+            at = end;
         }
         // Last literals; both cursors only advanced within their buffers.
         let rest = lim.lit_limit as usize - cur.lit as usize;
@@ -6436,7 +6687,9 @@ mod parallel {
         let decode = |i: usize, cell: &Cell| {
             if let Plan::Compressed(cp) = &plans[i] {
                 let id = base + i as u64;
-                cell.decode(ticket(i), |slot| decode_block(slot, id, cp, def, start));
+                cell.decode(ticket(i), |slot, publish| {
+                    decode_block(slot, publish, id, cp, def, start)
+                });
             }
         };
         let mut hist = start.init.offset_hist;
@@ -6466,13 +6719,13 @@ mod parallel {
                     // Block `i - 1` has been executed from its cell.
                     spawn_decode(i - 1 + ring.len());
                 }
-                let slot = match plan {
+                let stage2 = match plan {
                     Plan::Compressed(_) => {
                         let cell = &*ring[i % ring.len()];
                         if cell.take(ticket(i)) {
                             decode(i, cell);
                         }
-                        while !cell.decoded(ticket(i)) {
+                        while !cell.startable(ticket(i)) {
                             // If no task has started block `i + 1` either,
                             // the decoders are behind: decode it here while
                             // block `i` finishes. Its cell is free, as block
@@ -6487,26 +6740,14 @@ mod parallel {
                                 _ => std::thread::yield_now(),
                             }
                         }
-                        let slot = decoded_slot(cell);
-                        if slot.result.is_err() {
-                            break;
-                        }
-                        Some(slot)
+                        Some((cell, ticket(i)))
                     }
                     _ => None,
                 };
-                let Ok(bytes) = execute_block(
-                    plan,
-                    slot.as_deref(),
-                    start,
-                    &mut hist,
-                    block_size_max,
-                    out,
-                    simd,
-                ) else {
+                let Ok(bytes) = execute_block(plan, stage2, &mut hist, block_size_max, out, simd)
+                else {
                     break;
                 };
-                drop(slot);
                 done = i + 1;
                 frame.block_decoded(bytes)?;
             }
@@ -6601,8 +6842,10 @@ mod parallel {
         /// A cell's tickets: one handed is taken once, by whoever comes
         /// first, and is done once decoded; an earlier ticket, a task's
         /// whose block someone else took or whose cell was handed another,
-        /// is neither takeable nor done. A decode that panics is done, and
-        /// its panic resumes on the thread that executes the block.
+        /// is neither takeable nor done. A ticket handed has published
+        /// nothing, whatever the cell's decode before it published. A
+        /// decode that panics is done, and its panic resumes on the thread
+        /// that executes the block.
         #[test]
         fn cell_tickets_are_taken_once() {
             let cell = Cell::new();
@@ -6611,12 +6854,16 @@ mod parallel {
             assert!(!cell.decoded(7));
             assert!(cell.take(7), "planned");
             assert!(!cell.take(7), "taken");
-            cell.decode(7, |_| Ok(()));
-            assert!(cell.decoded(7));
+            cell.decode(7, |_, publish| {
+                publish.decoded(1);
+                Ok(())
+            });
+            assert!(cell.decoded(7) && cell.startable(7));
             cell.hand(8);
             assert!(!cell.take(7) && !cell.decoded(8), "handed the next");
+            assert!(!cell.startable(8), "nothing published");
             assert!(cell.take(8));
-            cell.decode(8, |_| panic!("stage 2"));
+            cell.decode(8, |_, _| panic!("stage 2"));
             assert!(cell.decoded(8));
             let resumed = panic::catch_unwind(AssertUnwindSafe(|| drop(decoded_slot(&cell))));
             let payload = resumed.expect_err("the decode's panic");
@@ -6928,6 +7175,257 @@ mod parallel {
                 assert!(decoded_slot(cell).result.is_ok());
                 assert!(job.upgrade().is_none() && planned.start.upgrade().is_none());
             });
+        }
+
+        /// `n` sequences of four literals and a match of them, at offset 4:
+        /// the sequences, their literals, and what they decode to.
+        fn echoes(n: usize) -> (Vec<RawSeq>, Vec<u8>, Vec<u8>) {
+            let offset = 4 + ZSTD_REP_NUM as u32;
+            let seqs = vec![
+                RawSeq {
+                    ll: 4,
+                    ml: 4,
+                    off_base: offset,
+                };
+                n
+            ];
+            let literals: Vec<u8> = (0..4 * n).map(|i| (i * 7 + i / 251) as u8).collect();
+            let decoded = literals.chunks(4).flat_map(|c| [c, c].concat()).collect();
+            (seqs, literals, decoded)
+        }
+
+        /// A compressed block of `n` sequences, whose stage 2 the tests
+        /// below fake.
+        fn block_of(n: usize) -> Vec<u8> {
+            // No literals, `n`, predefined tables, a byte of bitstream.
+            let mut block = vec![0];
+            if n < 128 {
+                block.push(n as u8);
+            } else {
+                block.extend_from_slice(&[(n >> 8) as u8 + 128, n as u8]);
+            }
+            if n != 0 {
+                block.extend_from_slice(&[0, 1]);
+            }
+            block
+        }
+
+        /// Stage 2 of a block that decodes to `seqs` and `literals`: it
+        /// publishes the sequences up to each of `ends` in turn, calling
+        /// `step` after each, then ends with `result`.
+        fn fake_stage2(
+            slot: &mut Slot,
+            publish: &Published,
+            (seqs, literals, short): (&[RawSeq], &[u8], bool),
+            ends: &[usize],
+            step: &dyn Fn(),
+            result: Result<(), DecodeError>,
+        ) -> Result<(), DecodeError> {
+            slot.literals.clear();
+            slot.literals.extend_from_slice(literals);
+            slot.literals
+                .resize(literals.len() + WILDCOPY_OVERLENGTH, 0);
+            publish.literals(&slot.literals, short);
+            slot.seqs.clear();
+            slot.seqs.reserve(seqs.len());
+            let base = slot.seqs.as_mut_ptr();
+            publish.sequences(base);
+            let mut at = 0;
+            for &end in ends {
+                for (i, s) in seqs.iter().enumerate().take(end).skip(at) {
+                    // SAFETY: reserved.
+                    unsafe { base.add(i).write(*s) };
+                }
+                publish.decoded(end);
+                at = end;
+                step();
+            }
+            result
+        }
+
+        /// Stage 3 of the block of `n` sequences in `cell`, ticket 1, into
+        /// `output`, with a dictionary of `dict`: the result, and the
+        /// repeat offsets after it, from 1, 4 and 8.
+        fn stage3(
+            cell: &Cell,
+            n: usize,
+            dict: &[u8],
+            output: &mut Vec<u8>,
+            simd: Level,
+        ) -> (Result<usize, DecodeError>, [u32; 3]) {
+            let block = block_of(n);
+            let plan = Plan::Compressed(CompressedPlan {
+                parts: split_block(&block, BLOCK_SIZE_MAX).unwrap(),
+                huf_def: None,
+                fse_def: [0; 3],
+            });
+            let mut out = VecOut {
+                output,
+                prefix: Prefix {
+                    start: 0,
+                    window: 1 << 20,
+                },
+                dict,
+            };
+            let mut hist = [1, 4, 8];
+            let executed = execute_block(
+                &plan,
+                Some((cell, 1)),
+                &mut hist,
+                BLOCK_SIZE_MAX,
+                &mut out,
+                simd,
+            );
+            (executed.map(<[u8]>::len), hist)
+        }
+
+        /// The repeat offsets after `n` sequences of `echoes`.
+        fn echoes_hist(n: usize) -> [u32; 3] {
+            (0..n.min(3)).fold([1, 4, 8], |h, _| [4, h[0], h[1]])
+        }
+
+        /// Runs that end at each of `ends` up to `n`, the last at `n`.
+        fn runs_of(n: usize, every: usize) -> Vec<usize> {
+            let mut ends: Vec<usize> = (every..n).step_by(every).collect();
+            ends.push(n);
+            ends
+        }
+
+        /// Stage 3 executes a block's sequences as stage 2 publishes them,
+        /// at once or run by run, around `PUBLISH_EVERY` and past two of
+        /// its runs, with stage 2 done before stage 3 starts or still
+        /// publishing on another thread, with and without history before
+        /// the frame and short-offset copies: each way the block decodes
+        /// as a whole, with the same repeat offsets.
+        #[test]
+        fn published_runs_execute_as_the_whole_block() {
+            let mut levels = vec![Level::fallback()];
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if let Level::Avx2(w) = Level::new() {
+                levels.push(Level::Avx2(w));
+            }
+            let every = PUBLISH_EVERY;
+            for n in [1, 2, 3, every - 1, every, every + 1, 2 * every + 1, 1000] {
+                let (seqs, literals, decoded) = echoes(n);
+                let runs = [vec![n], runs_of(n, every), runs_of(n, 1), runs_of(n, 7)];
+                for (ends, threaded) in runs.iter().flat_map(|e| [(e, false), (e, true)]) {
+                    for (&simd, dict, short) in levels
+                        .iter()
+                        .flat_map(|l| [(l, &[][..], false), (l, &[9u8; 16][..], true)])
+                    {
+                        let what = format!("{n} in {} runs, threaded {threaded}", ends.len());
+                        let cell = Cell::new();
+                        cell.hand(1);
+                        assert!(!cell.startable(1), "{what}: handed");
+                        assert!(cell.take(1));
+                        let decode = || {
+                            let step = || {
+                                if threaded {
+                                    std::thread::sleep(std::time::Duration::from_micros(50));
+                                }
+                            };
+                            let block = (&seqs[..], &literals[..], short);
+                            cell.decode(1, |slot, publish| {
+                                fake_stage2(slot, publish, block, ends, &step, Ok(()))
+                            });
+                        };
+                        let mut output = Vec::new();
+                        let (executed, hist) = std::thread::scope(|s| {
+                            if threaded {
+                                s.spawn(decode);
+                                while !cell.startable(1) {
+                                    std::thread::yield_now();
+                                }
+                            } else {
+                                decode();
+                            }
+                            stage3(&cell, n, dict, &mut output, simd)
+                        });
+                        assert_eq!(executed, Ok(8 * n), "{what}");
+                        assert!(output == decoded, "{what}: output");
+                        assert_eq!(hist, echoes_hist(n), "{what}: offsets");
+                    }
+                }
+            }
+        }
+
+        /// A stage 2 that fails, before it publishes, after part of the
+        /// sequences, or after all of them, or that panics after part, or
+        /// that succeeds with a last sequence stage 3 rejects: stage 3
+        /// fails, or resumes the panic, and neither commits the block nor
+        /// changes the repeat offsets, whatever of it executed.
+        /// A block without sequences commits its literals once stage 2
+        /// is done, and only if it succeeded.
+        #[test]
+        fn failed_stage2_keeps_its_block_out() {
+            let simd = Level::new();
+            let n = 2 * PUBLISH_EVERY + 1;
+            let (seqs, literals, _) = echoes(n);
+            let block = (&seqs[..], &literals[..], false);
+            for ends in [vec![], vec![PUBLISH_EVERY], runs_of(n, PUBLISH_EVERY)] {
+                let cell = Cell::new();
+                cell.hand(1);
+                assert!(cell.take(1));
+                let failed = || Err("stage 2".into());
+                cell.decode(1, |slot, publish| {
+                    fake_stage2(slot, publish, block, &ends, &|| (), failed())
+                });
+                assert!(cell.startable(1));
+                let mut output = vec![5];
+                let (executed, hist) = stage3(&cell, n, &[], &mut output, simd);
+                assert!(executed.is_err(), "{ends:?}");
+                assert_eq!((output, hist), (vec![5], [1, 4, 8]), "{ends:?}");
+                // Still failed for a chain that executes it again.
+                let (again, _) = stage3(&cell, n, &[], &mut Vec::new(), simd);
+                assert!(again.is_err(), "{ends:?} again");
+            }
+            let mut far = seqs.clone();
+            far[n - 1].off_base = (1 << 16) + ZSTD_REP_NUM as u32;
+            let cell = Cell::new();
+            cell.hand(1);
+            assert!(cell.take(1));
+            let ends = runs_of(n, PUBLISH_EVERY);
+            let rejected = (&far[..], &literals[..], false);
+            cell.decode(1, |slot, publish| {
+                fake_stage2(slot, publish, rejected, &ends, &|| (), Ok(()))
+            });
+            let mut output = vec![5];
+            let (executed, hist) = stage3(&cell, n, &[], &mut output, simd);
+            assert_eq!(
+                executed,
+                Err("Match offset reaches before the frame start".into())
+            );
+            assert_eq!((output, hist), (vec![5], [1, 4, 8]), "rejected");
+            let cell = Cell::new();
+            cell.hand(1);
+            assert!(cell.take(1));
+            cell.decode(1, |slot, publish| {
+                fake_stage2(slot, publish, block, &[PUBLISH_EVERY], &|| (), Ok(()))?;
+                panic!("stage 2")
+            });
+            let mut output = vec![5];
+            let mut hist = [1, 4, 8];
+            let resumed = panic::catch_unwind(AssertUnwindSafe(|| {
+                (_, hist) = stage3(&cell, n, &[], &mut output, simd);
+            }));
+            let payload = resumed.expect_err("the decode's panic");
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"stage 2"));
+            assert_eq!((output, hist), (vec![5], [1, 4, 8]));
+            for result in [Ok(()), Err("stage 2".into())] {
+                let ok = result.is_ok();
+                let cell = Cell::new();
+                cell.hand(1);
+                assert!(cell.take(1));
+                let literals = (&[][..], &literals[..100], false);
+                cell.decode(1, |slot, publish| {
+                    fake_stage2(slot, publish, literals, &[], &|| (), result)
+                });
+                let mut output = Vec::new();
+                let (executed, hist) = stage3(&cell, 0, &[], &mut output, simd);
+                assert_eq!(executed.is_ok(), ok);
+                let committed = if ok { literals.1 } else { &[] };
+                assert_eq!((&output[..], hist), (committed, [1, 4, 8]), "{ok}");
+            }
         }
     }
 }
@@ -7750,8 +8248,9 @@ mod tests {
     }
 
     /// A match reaches back through the segment into `ExtHistory` up to
-    /// its first byte and no further, wholly inside it or running on into
-    /// the segment, still bounded by Window_Size; without history it stops
+    /// its first byte and no further, wholly inside it (ending
+    /// `WILDCOPY_OVERLENGTH` bytes or more before its end, or nearer) or
+    /// running on into the segment, still bounded by Window_Size; without history it stops
     /// at the segment, as in one-shot decoding. Into a dictionary it may
     /// reach past Window_Size, while the segment before it holds at most
     /// Window_Size bytes. Each rejection names the bound it crossed.
@@ -7776,6 +8275,10 @@ mod tests {
             (11, 30, 64, 1 << 20, OK, OK),
             (20, 4, 64, 1 << 20, OK, OK),
             (20, 34, 64, 1 << 20, OK, OK),
+            (45, 4, 64, 1 << 20, OK, OK),
+            (46, 4, 64, 1 << 20, OK, OK),
+            (71, 30, 64, 1 << 20, OK, OK),
+            (72, 30, 64, 1 << 20, OK, OK),
             (74, 4, 64, 1 << 20, OK, OK),
             (74, 34, 64, 1 << 20, OK, OK),
             (75, 4, 64, 1 << 20, FRAME, DICT),

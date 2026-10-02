@@ -290,15 +290,18 @@ fn mt_streams_match_serial_streams() {
 /// decoding them in parallel reads, writes and returns what the serial one
 /// does, failing ones included. The frames are ones the parallel decoder
 /// takes: one whose Frame_Content_Size, checked after its blocks, exceeds
-/// its 1 KiB window, and one without. With room for every block, a call
-/// decodes them in one scope; with room for two, the pipeline decodes the
-/// blocks past it ahead, a failing one among them.
+/// its 1 KiB window, past which and the round buffer's margin of seven
+/// blocks (RLE ones after its first) it starts a new segment, and one
+/// without. With room for every block, a call decodes them in one scope;
+/// with room for two, the pipeline decodes the blocks past it ahead, a
+/// failing one among them.
 #[test]
 fn mt_stream_verdicts_match_serial() {
     use sys::ZSTD_cParameter::{ZSTD_c_checksumFlag, ZSTD_c_contentSizeFlag, ZSTD_c_windowLog};
     // Room for every block of these frames.
     const ROOM: usize = 1 << 16;
     let mut data = b"The quick brown fox jumps over the lazy dog. ".repeat(60);
+    data.splice(1024..1024, (1..8u8).flat_map(|i| [i; 1024]));
     data.extend_from_slice(&lcg_bytes(1500, 11));
     data.extend_from_slice(&b"abcabcabd".repeat(200));
     let mut inputs = Vec::new();
@@ -338,12 +341,13 @@ fn mt_stream_verdicts_match_serial() {
 }
 
 /// Frames of 1 KiB blocks, in a 1 KiB window so that the parallel decoder
-/// takes them, whose batches hold no compressed block, one fewer than
-/// `min_parallel_blocks`, or that many of one byte fewer than
-/// `min_parallel_bytes` (all decoded one after another), or exactly that
-/// many bytes (on the pool), among raw and RLE blocks: whole,
-/// truncated and corrupted, every call reads, writes and returns what the
-/// serial decoder does.
+/// takes them, and past it and the round buffer's margin of seven blocks
+/// (RLE ones after the first) in a new segment, whose batches hold no
+/// compressed block, one fewer than `min_parallel_blocks`, or that many of
+/// one byte fewer than `min_parallel_bytes` (all decoded one after
+/// another), or exactly that many bytes (on the pool), among raw and RLE
+/// blocks: whole, truncated and corrupted, every call reads, writes and
+/// returns what the serial decoder does.
 #[test]
 fn mt_batches_either_side_of_the_gate() {
     use sys::ZSTD_cParameter::ZSTD_c_windowLog;
@@ -353,7 +357,7 @@ fn mt_batches_either_side_of_the_gate() {
     let text = b"The quick brown fox jumps over the lazy dog. ".repeat(24);
     let mut cases = Vec::new();
     // Block types: `r` raw (0), `z` RLE (1), `c` compressed (2).
-    for kinds in ["rzrzr", "crzcz", "crczc"] {
+    for kinds in ["rzzzzzzzzrzr", "czzzzzzzrzcz", "czzzzzzzrczc"] {
         let mut data = Vec::new();
         for (i, kind) in kinds.bytes().enumerate() {
             data.extend(match kind {
@@ -375,7 +379,7 @@ fn mt_batches_either_side_of_the_gate() {
             .filter(|b| b.ty == 2)
             .map(|b| b.c_size - 3)
             .sum();
-        if kinds == "crczc" {
+        if kinds == "czzzzzzzrczc" {
             for min_bytes in [bytes, bytes + 1] {
                 let name = format!("{kinds} min_parallel_bytes {min_bytes} of {bytes}");
                 cases.push((name, c.clone(), data.clone(), min_bytes));
