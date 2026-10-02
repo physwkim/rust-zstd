@@ -13,6 +13,11 @@ use std::io::{self, Read};
 /// Frame_Content_Size when that is smaller, and by what it has decoded
 /// to so far.
 ///
+/// One made `with_dict`, or given a dictionary by `set_dict`, starts every
+/// frame from it (ZSTD_DCtx_refDDict), as `decompress_with_dict` does: the
+/// frames of `decompress_stream` and of `decompress`, one after another,
+/// until `set_dict` changes it.
+///
 /// Its `decompress` and `decompress_with_dict` take whole input, as the
 /// functions of those names do, and keep its tables and buffers for the
 /// next call (ZSTD_decompressDCtx, ZSTD_decompress_usingDDict);
@@ -20,6 +25,8 @@ use std::io::{self, Read};
 /// the caller keeps too.
 pub struct Decompressor {
     dec: FrameDecoder,
+    /// The dictionary frames start from, unless a call names another.
+    dict: Option<DecodeDict>,
     /// The start of a unit that came in pieces.
     unit: Vec<u8>,
     ring: Ring,
@@ -48,6 +55,7 @@ impl Decompressor {
     pub fn with_options(opts: &DecodeOptions) -> Self {
         Decompressor {
             dec: FrameDecoder::new(opts),
+            dict: None,
             unit: Vec::new(),
             ring: Ring::default(),
             frame_ended: false,
@@ -55,8 +63,29 @@ impl Decompressor {
         }
     }
 
-    /// Decompress `src`, whole, as the function `decompress` does, with the
-    /// tables and buffers this decompressor keeps from call to call
+    /// A decompressor whose frames start from `dict`, as `set_dict` gives
+    /// it.
+    pub fn with_dict(dict: &DecodeDict) -> Self {
+        let mut d = Self::new();
+        d.set_dict(Some(dict));
+        d
+    }
+
+    /// Start every frame from `dict` from now on, or from no dictionary
+    /// (ZSTD_DCtx_refDDict): the frames `decompress_stream` and `decompress`
+    /// decode, until the next `set_dict`. The dictionary is shared, not
+    /// copied.
+    ///
+    /// A frame in progress started from the dictionary before, so it first
+    /// resets the streaming state, as `reset` does.
+    pub fn set_dict(&mut self, dict: Option<&DecodeDict>) {
+        self.reset();
+        self.dict = dict.cloned();
+    }
+
+    /// Decompress `src`, whole, as the function `decompress` does, or as
+    /// `decompress_with_dict` does with this decompressor's dictionary if it
+    /// has one, with the tables and buffers it keeps from call to call
     /// (ZSTD_decompressDCtx). With the `parallel` feature, frames of four
     /// or more blocks decode on the current rayon pool if the pool `new`
     /// found had more than one thread.
@@ -79,10 +108,10 @@ impl Decompressor {
         self.decompress_whole(src, None, dst)
     }
 
-    /// `decompress` with dictionary `dict`, as the function
-    /// `decompress_with_dict` decodes (ZSTD_decompress_usingDDict). Only
-    /// this call uses `dict`: the next one starts from the dictionary it is
-    /// given, or none.
+    /// `decompress` with dictionary `dict` in place of the decompressor's
+    /// own, as the function `decompress_with_dict` decodes
+    /// (ZSTD_decompress_usingDDict). Only this call uses `dict`: the next
+    /// one starts from the dictionary it is given, or the decompressor's.
     ///
     /// It resets the streaming state before decoding and again after, as
     /// `decompress` does.
@@ -107,6 +136,9 @@ impl Decompressor {
         self.decompress_whole(src, Some(dict), dst)
     }
 
+    /// Decode `src` into `dst`, each frame from `dict`, or without one from
+    /// the decompressor's own dictionary.
+    #[inline(always)]
     fn decompress_whole(
         &mut self,
         src: &[u8],
@@ -115,6 +147,7 @@ impl Decompressor {
     ) -> Result<(), String> {
         self.reset();
         dst.clear();
+        let dict = dict.or(self.dict.as_ref());
         let result = decompress_frames(&mut self.dec, src, dict, dst);
         // An error leaves the frame decoder inside a frame, and `dst` with
         // the content before it.
@@ -128,7 +161,7 @@ impl Decompressor {
     /// Decode the input at `src[*src_pos..]` into `dst[*dst_pos..]`,
     /// advancing both positions past what it reads and writes. It takes
     /// frames, skippable ones included, one after another, as `decompress`
-    /// does.
+    /// does, each from the decompressor's dictionary if it has one.
     ///
     /// Returns 0 once a frame has been decoded and its content written out;
     /// the next call starts on the next frame. Otherwise it stopped for
@@ -174,7 +207,7 @@ impl Decompressor {
     }
 
     /// Drop the input and output in hand, and any error, for input that
-    /// starts with a new frame.
+    /// starts with a new frame. The dictionary stays.
     pub fn reset(&mut self) {
         self.dec.stage = Stage::FrameHeader;
         self.unit.clear();
@@ -233,7 +266,12 @@ impl Decompressor {
                 }
                 &self.unit[..]
             };
-            let event = self.dec.process(unit, &mut self.ring, None)?;
+            let dict = self.dict.as_ref();
+            let mut out = RingOut {
+                ring: &mut self.ring,
+                dict: dict.map_or(&[], DecodeDict::content),
+            };
+            let event = self.dec.process(unit, &mut out, dict)?;
             self.unit.clear();
             self.frame_ended = event == Event::FrameEnded;
         }
@@ -246,8 +284,9 @@ impl Decompressor {
 }
 
 /// An `io::Read` of the content of the frames `inner` reads, decoded one
-/// after another by a `Decompressor`. It fails with `InvalidData` and the
-/// `Decompressor`'s error where `decompress` fails on the same input,
+/// after another by a `Decompressor`, from a dictionary if made `with_dict`.
+/// It fails with `InvalidData` and the `Decompressor`'s error where
+/// `decompress` (or `decompress_with_dict`) fails on the same input,
 /// truncated input included.
 pub struct DecompressReader<R> {
     inner: R,
@@ -271,6 +310,14 @@ impl<R: Read> DecompressReader<R> {
             len: 0,
             eof: false,
         }
+    }
+
+    /// The reader of `inner`'s frames, each decoded from `dict`
+    /// (`Decompressor::with_dict`).
+    pub fn with_dict(inner: R, dict: &DecodeDict) -> Self {
+        let mut r = Self::new(inner);
+        r.dec.set_dict(Some(dict));
+        r
     }
 
     /// The reader of the frames. Input it has read and not decoded yet is
@@ -329,6 +376,12 @@ const BLOCK_ROOM: usize = MAX_BLOCK_SIZE + WILDCOPY_OVERLENGTH;
 /// `WILDCOPY_OVERLENGTH + 1` bytes past `avail` in the previous segment,
 /// ahead of every byte the current segment's copies wrote over it,
 /// overshoot included.
+///
+/// The `ExtHistory` of the first segment is the content of the dictionary
+/// the frame started from (`RingOut`), which a match may reach while the
+/// frame has decoded at most Window_Size bytes. A second segment starts
+/// only after more than `window + WILDCOPY_OVERLENGTH` bytes, past that
+/// reach, so no later segment has the dictionary before it.
 #[derive(Default)]
 struct Ring {
     buf: Vec<u8>,
@@ -376,34 +429,43 @@ impl Ring {
     }
 }
 
-impl FrameOut for Ring {
+/// A `Decompressor`'s `Ring` as the `FrameOut` of its frames, with the
+/// content of the dictionary they start from, empty without one.
+struct RingOut<'a> {
+    ring: &'a mut Ring,
+    dict: &'a [u8],
+}
+
+impl FrameOut for RingOut<'_> {
     fn start(&mut self, window: usize, content_size: Option<u64>) {
+        let ring = &mut *self.ring;
         let reach = content_size
             .and_then(|n| usize::try_from(n).ok())
             .map_or(window, |n| n.min(window));
-        self.window = window;
-        self.full = reach.saturating_add(WILDCOPY_OVERLENGTH + BLOCK_ROOM);
-        self.end = 0;
-        self.ext_end = 0;
-        self.flushed = 0;
+        ring.window = window;
+        ring.full = reach.saturating_add(WILDCOPY_OVERLENGTH + BLOCK_ROOM);
+        ring.end = 0;
+        ring.ext_end = 0;
+        ring.flushed = 0;
     }
 
     fn block_dst(&mut self) -> Result<(Dst, ExtHistory), String> {
-        debug_assert_eq!(self.pending(), 0, "the ring is written out");
-        if self.end + BLOCK_ROOM > self.buf.len() && self.buf.len() < self.full {
-            debug_assert_eq!(self.ext_end, 0, "a full buffer for a second segment");
-            self.grow()?;
+        let ring = &mut *self.ring;
+        debug_assert_eq!(ring.pending(), 0, "the ring is written out");
+        if ring.end + BLOCK_ROOM > ring.buf.len() && ring.buf.len() < ring.full {
+            debug_assert_eq!(ring.ext_end, 0, "a full buffer for a second segment");
+            ring.grow()?;
         }
-        if self.end + BLOCK_ROOM > self.buf.len() {
-            // With `self.buf.len() >= self.full`, `self.end` is past
+        if ring.end + BLOCK_ROOM > ring.buf.len() {
+            // With `ring.buf.len() >= ring.full`, `ring.end` is past
             // `reach + WILDCOPY_OVERLENGTH`.
-            self.ext_end = self.end;
-            self.end = 0;
-            self.flushed = 0;
+            ring.ext_end = ring.end;
+            ring.end = 0;
+            ring.flushed = 0;
         }
-        let base = self.buf.as_mut_ptr();
-        let ext = match self.ext_end {
-            0 => ExtHistory::NONE,
+        let base = ring.buf.as_mut_ptr();
+        let ext = match ring.ext_end {
+            0 => ExtHistory::dict(self.dict),
             len => ExtHistory {
                 // SAFETY: `ext_end` is within the buffer.
                 end: unsafe { base.add(len) },
@@ -413,15 +475,16 @@ impl FrameOut for Ring {
         };
         let dst = Dst {
             base,
-            op: self.end,
-            window: self.window,
+            op: ring.end,
+            window: ring.window,
         };
         Ok((dst, ext))
     }
 
     unsafe fn commit(&mut self, end: usize) -> &[u8] {
-        let start = self.end;
-        self.end = end;
-        &self.buf[start..end]
+        let ring = &mut *self.ring;
+        let start = ring.end;
+        ring.end = end;
+        &ring.buf[start..end]
     }
 }

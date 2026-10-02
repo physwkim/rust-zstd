@@ -5,9 +5,10 @@
 
 #![allow(dead_code)]
 
-use rust_zstd::decode::{decompress_with_options, DecodeOptions};
-use rust_zstd::Decompressor;
+use rust_zstd::decode::{decompress_with_options, DecodeDict, DecodeOptions};
+use rust_zstd::{DecompressReader, Decompressor};
 use std::cell::RefCell;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zstd::zstd_safe::zstd_sys as sys;
 
@@ -359,7 +360,17 @@ pub fn decompress_streaming(
     room: usize,
     opts: &DecodeOptions,
 ) -> Result<Vec<u8>, String> {
-    let mut d = Decompressor::with_options(opts);
+    stream_with(&mut Decompressor::with_options(opts), input, chunk, room)
+}
+
+/// `decompress_streaming` with `d`, which must stand at the start of a
+/// frame.
+pub fn stream_with(
+    d: &mut Decompressor,
+    input: &[u8],
+    chunk: usize,
+    room: usize,
+) -> Result<Vec<u8>, String> {
     let mut content = Vec::new();
     let mut out = vec![0u8; room];
     let mut pos = 0usize;
@@ -469,4 +480,58 @@ pub fn assert_stream_parity_at(name: &str, input: &[u8], chunks: &[usize]) {
 /// `assert_stream_parity_at` at `STREAM_CHUNKS`.
 pub fn assert_stream_parity(name: &str, input: &[u8]) {
     assert_stream_parity_at(name, input, &STREAM_CHUNKS);
+}
+
+/// A reader of `data` that gives at most `piece` bytes a read, and fails
+/// with `Interrupted` before each other one.
+pub struct Pieces<'a> {
+    data: &'a [u8],
+    piece: usize,
+    interrupt: bool,
+}
+
+impl Read for Pieces<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.interrupt = !self.interrupt;
+        if self.interrupt {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let n = self.data.len().min(self.piece).min(buf.len());
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        Ok(n)
+    }
+}
+
+/// `DecompressReader` over a reader of `input` in pieces of `piece` bytes,
+/// with `dict` if given, read into a buffer of `room` bytes until it ends,
+/// retrying `Interrupted`; the content, or the error.
+pub fn read_all(
+    input: &[u8],
+    piece: usize,
+    room: usize,
+    dict: Option<&DecodeDict>,
+) -> io::Result<Vec<u8>> {
+    let pieces = Pieces {
+        data: input,
+        piece,
+        interrupt: false,
+    };
+    let mut r = match dict {
+        Some(dict) => DecompressReader::with_dict(pieces, dict),
+        None => DecompressReader::new(pieces),
+    };
+    let mut content = Vec::new();
+    let mut buf = vec![0u8; room];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => content.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // It stays at the end.
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+    Ok(content)
 }

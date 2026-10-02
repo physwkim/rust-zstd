@@ -3,11 +3,13 @@
 //! decoder path, dictionaries libzstd rejects are rejected, and frames
 //! with the wrong or no dictionary, or offsets reaching past the
 //! dictionary or the window, are errors. A reused `Decompressor` gives
-//! the same verdicts.
+//! the same verdicts, and so does one holding the dictionary, streaming
+//! the input in pieces of any size.
 
 mod common;
 
-use common::lcg_bytes;
+use common::{lcg_bytes, read_all, stream_room, stream_with, STREAM_CHUNKS};
+use rust_zstd::compress::{compress_with_dict, CompressDict};
 use rust_zstd::decode::{
     decompress_with_dict, decompress_with_dict_options, DecodeDict, DecodeOptions, Decompressor,
 };
@@ -185,6 +187,98 @@ fn c_decompress_dict(frame: &[u8], dict: &[u8], capacity: usize) -> Option<Vec<u
     }
 }
 
+/// ZSTD_compress_usingCDict with a CDict of `dict` at `level`.
+fn c_compress_using_cdict(src: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
+    // SAFETY: as `c_compress_dict`; the CDict outlives its use.
+    unsafe {
+        let cdict = sys::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), level);
+        assert!(!cdict.is_null(), "create CDict");
+        let cctx = sys::ZSTD_createCCtx();
+        let mut out = vec![0u8; sys::ZSTD_compressBound(src.len())];
+        let n = sys::ZSTD_compress_usingCDict(
+            cctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            src.as_ptr().cast(),
+            src.len(),
+            cdict,
+        );
+        assert_eq!(sys::ZSTD_isError(n), 0, "compress level {level}");
+        sys::ZSTD_freeCCtx(cctx);
+        sys::ZSTD_freeCDict(cdict);
+        out.truncate(n);
+        out
+    }
+}
+
+/// libzstd's verdict on `input` with `dict`, which its one-shot decoder
+/// (ZSTD_decompress_usingDDict, with room for `capacity` bytes) and its
+/// streaming one (ZSTD_DCtx_refDDict, then ZSTD_decompressStream until the
+/// input ends between frames) must agree on: the content, or None.
+fn c_decode_ddict(input: &[u8], dict: &[u8], capacity: usize) -> Option<Vec<u8>> {
+    // SAFETY: each context is used only here, with the DDict, which
+    // outlives it, and with buffers whose sizes it is given.
+    unsafe {
+        let ddict = sys::ZSTD_createDDict(dict.as_ptr().cast(), dict.len());
+        assert!(!ddict.is_null(), "create DDict");
+        let dctx = sys::ZSTD_createDCtx();
+        let mut out = vec![0u8; capacity];
+        let n = sys::ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            input.as_ptr().cast(),
+            input.len(),
+            ddict,
+        );
+        sys::ZSTD_freeDCtx(dctx);
+        let one_shot = (sys::ZSTD_isError(n) == 0).then(|| {
+            out.truncate(n);
+            out
+        });
+
+        let dctx = sys::ZSTD_createDCtx();
+        assert_eq!(sys::ZSTD_isError(sys::ZSTD_DCtx_refDDict(dctx, ddict)), 0);
+        let mut content = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut src = sys::ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        // No input is no frame, which ends between frames.
+        let mut hint = 0;
+        let streamed = loop {
+            if src.pos == src.size && hint == 0 {
+                break Some(content);
+            }
+            let mut dst = sys::ZSTD_outBuffer {
+                dst: buf.as_mut_ptr().cast(),
+                size: buf.len(),
+                pos: 0,
+            };
+            hint = sys::ZSTD_decompressStream(dctx, &mut dst, &mut src);
+            if sys::ZSTD_isError(hint) != 0 {
+                break None;
+            }
+            content.extend_from_slice(&buf[..dst.pos]);
+            if src.pos == src.size && hint != 0 && dst.pos < dst.size {
+                // Mid-frame, with all the content written out.
+                break None;
+            }
+        };
+        sys::ZSTD_freeDCtx(dctx);
+        sys::ZSTD_freeDDict(ddict);
+        assert!(
+            one_shot == streamed,
+            "libzstd one-shot {:?}, streaming {:?}",
+            one_shot.as_ref().map(Vec::len),
+            streamed.as_ref().map(Vec::len)
+        );
+        one_shot
+    }
+}
+
 /// Whether libzstd's ZSTD_createDDict (auto content type) loads `dict`.
 fn c_loads_dict(dict: &[u8]) -> bool {
     // SAFETY: `dict` is read during the call only.
@@ -243,7 +337,80 @@ fn reused_into(k: usize, frame: &[u8], dict: Option<&DecodeDict>) -> Result<Vec<
     })
 }
 
-/// `frame` decodes to `src` with `dict` on every path, fresh and reused.
+thread_local! {
+    /// A serial decompressor for each SIMD level, which each check gives
+    /// its dictionary by `set_dict`, so that each streams after others with
+    /// other dictionaries, none, or errors.
+    static HOLDING: RefCell<[Decompressor; 2]> = RefCell::new([false, true].map(|simd| {
+        Decompressor::with_options(&DecodeOptions {
+            min_parallel_blocks: usize::MAX,
+            simd,
+        })
+    }));
+}
+
+fn outcome(r: &Result<Vec<u8>, String>) -> String {
+    match r {
+        Ok(content) => format!("{} bytes", content.len()),
+        Err(e) => format!("error {e:?}"),
+    }
+}
+
+/// A decompressor holding `dict`, or none, gives the outcome of the
+/// one-shot `decompress_with_dict_options` (serial) on `input` at both
+/// SIMD levels, the same content or the same error: streaming at each of
+/// `STREAM_CHUNKS`, with as much output room up to 64 KiB, and through its
+/// `decompress`. So does `DecompressReader::with_dict`, in pieces of 7
+/// bytes and whole.
+fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
+    for simd in [false, true] {
+        let opts = DecodeOptions {
+            min_parallel_blocks: usize::MAX,
+            simd,
+        };
+        let want = decompress_with_dict_options(input, dict, &opts);
+        HOLDING.with_borrow_mut(|h| {
+            let d = &mut h[usize::from(simd)];
+            for chunk in STREAM_CHUNKS {
+                d.set_dict(dict);
+                let got = stream_with(d, input, chunk, stream_room(chunk));
+                assert!(
+                    got == want,
+                    "{what} simd={simd} chunk {chunk}: streaming gives {} where one-shot gives {}",
+                    outcome(&got),
+                    outcome(&want)
+                );
+            }
+            let got = d.decompress(input);
+            assert!(
+                got == want,
+                "{what} simd={simd}: decompress with the dictionary held gives {} where \
+                 one-shot gives {}",
+                outcome(&got),
+                outcome(&want)
+            );
+        });
+        if !simd {
+            // `DecompressReader` decodes at the detected level.
+            continue;
+        }
+        for piece in [7, usize::MAX] {
+            let got = read_all(input, piece, 4096, dict).map_err(|e| {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}");
+                e.to_string()
+            });
+            assert!(
+                got == want,
+                "{what} piece {piece}: the reader gives {} where one-shot gives {}",
+                outcome(&got),
+                outcome(&want)
+            );
+        }
+    }
+}
+
+/// `frame` decodes to `src` with `dict` on every path, fresh and reused,
+/// and streaming with the dictionary held (`assert_streams`).
 fn assert_decodes(what: &str, frame: &[u8], dict: &DecodeDict, src: &[u8]) {
     for (k, (opts, path)) in paths().into_iter().enumerate() {
         for (got, how) in [
@@ -257,10 +424,12 @@ fn assert_decodes(what: &str, frame: &[u8], dict: &DecodeDict, src: &[u8]) {
             }
         }
     }
+    assert_streams(what, frame, Some(dict));
 }
 
 /// `frame` fails with `dict` on every path, fresh and reused, with an
-/// error containing `want`.
+/// error containing `want`, and streaming with the dictionary held
+/// (`assert_streams`).
 fn assert_rejects(what: &str, frame: &[u8], dict: Option<&DecodeDict>, want: &str) {
     for (k, (opts, path)) in paths().into_iter().enumerate() {
         for (got, how) in [
@@ -274,6 +443,7 @@ fn assert_rejects(what: &str, frame: &[u8], dict: Option<&DecodeDict>, want: &st
             }
         }
     }
+    assert_streams(what, frame, dict);
 }
 
 const LEVELS: [i32; 10] = [-5, 1, 2, 3, 5, 7, 12, 16, 19, 22];
@@ -640,6 +810,332 @@ fn dict_reach_ends_at_window_size() {
                 Some(&dict),
                 "exceeds Window_Size",
             );
+        }
+    }
+}
+
+/// A decompressor holding a dictionary starts every frame from it, across
+/// frames, `reset` and its `decompress`, until `set_dict` changes it;
+/// `decompress_with_dict` names another for its call only. `set_dict`
+/// mid-frame starts the stream over.
+#[test]
+fn held_dict_starts_every_frame() {
+    let (raw_a, raw_b) = (trained_dict(), entropy_dict());
+    let a = DecodeDict::new(&raw_a).unwrap();
+    let b = DecodeDict::new(&raw_b).unwrap();
+    let src = records(60, 101);
+    let fa = c_compress_using_dict(&src, &raw_a, 3);
+    let fb = c_compress_using_dict(&src, &raw_b, 19);
+    let fa2 = [&fa[..], &fa].concat();
+    let want = Ok(src.clone());
+    for (opts, path) in paths() {
+        let mut d = Decompressor::with_options(&opts);
+        d.set_dict(Some(&a));
+        assert_eq!(stream(&mut d, &fa), want, "{path}: a");
+        assert_eq!(
+            stream(&mut d, &fa2),
+            Ok([&src[..], &src].concat()),
+            "{path}: a twice"
+        );
+        d.reset();
+        assert_eq!(stream(&mut d, &fa), want, "{path}: a after reset");
+        assert_eq!(d.decompress(&fa), want, "{path}: decompress a");
+        assert_eq!(d.decompress_with_dict(&fb, &b), want, "{path}: b once");
+        assert_eq!(d.decompress(&fa), want, "{path}: a after b once");
+        let e = stream(&mut d, &fb).unwrap_err();
+        assert!(e.contains("dictionary"), "{path}: b streamed with a: {e}");
+
+        // Half of a frame, then `set_dict`.
+        let (mut src_pos, mut dst_pos) = (0, 0);
+        let mut out = vec![0u8; 1 << 20];
+        d.set_dict(Some(&b));
+        d.decompress_stream(&fb[..fb.len() / 2], &mut src_pos, &mut out, &mut dst_pos)
+            .unwrap();
+        assert!(d.finish().is_err(), "{path}: mid-frame");
+        d.set_dict(Some(&a));
+        assert_eq!(stream(&mut d, &fa), want, "{path}: a after half of b");
+
+        d.set_dict(None);
+        let e = stream(&mut d, &fa).unwrap_err();
+        assert!(e.contains("none is loaded"), "{path}: a without: {e}");
+        let e = d.decompress(&fa).unwrap_err();
+        assert!(
+            e.contains("none is loaded"),
+            "{path}: decompress a without: {e}"
+        );
+    }
+    assert_eq!(Decompressor::with_dict(&a).decompress(&fa), want);
+    assert_eq!(stream(&mut Decompressor::with_dict(&b), &fb), want);
+}
+
+/// Frames of our encoder and of ZSTD_compress_usingCDict, which libzstd
+/// decodes, decode with the dictionary on every path and streaming.
+#[test]
+fn our_and_cdict_frames_decode() {
+    for (raw, name) in dicts() {
+        let dict = DecodeDict::new(&raw).unwrap();
+        for (n, seed) in [(1, 111), (40, 112), (800, 113)] {
+            let src = records(n, seed);
+            for level in [-5, 1, 3, 9, 19] {
+                let ours = compress_with_dict(&src, &CompressDict::new(&raw, level).unwrap());
+                let cdict = c_compress_using_cdict(&src, &raw, level);
+                for (frame, by) in [(ours, "ours"), (cdict, "CDict")] {
+                    let what = format!("{name}: {by} {} bytes level {level}", src.len());
+                    assert_eq!(
+                        c_decode_ddict(&frame, &raw, src.len() + 1024).as_deref(),
+                        Some(&src[..]),
+                        "{what}: libzstd"
+                    );
+                    assert_decodes(&what, &frame, &dict, &src);
+                }
+            }
+        }
+    }
+}
+
+/// Frames with windows of 1 KiB to 128 KiB over 250 KB of records, with
+/// and without Frame_Content_Size: streaming, the round buffer starts over
+/// many times, the first segment after the dictionary and the others after
+/// the segment before.
+#[test]
+fn dict_frames_past_small_windows() {
+    let src = records(2000, 121);
+    for (raw, name) in dicts() {
+        let dict = DecodeDict::new(&raw).unwrap();
+        for window_log in [10, 12, 15, 17] {
+            for content_size in [0, 1] {
+                let frame = c_compress_dict(
+                    &src,
+                    &raw,
+                    &[
+                        (P::ZSTD_c_compressionLevel, 3),
+                        (P::ZSTD_c_windowLog, window_log),
+                        (P::ZSTD_c_contentSizeFlag, content_size),
+                    ],
+                );
+                let what = format!("{name}: window log {window_log} fcs {content_size}");
+                assert_eq!(
+                    c_decode_ddict(&frame, &raw, src.len()).as_deref(),
+                    Some(&src[..]),
+                    "{what}: libzstd"
+                );
+                assert_decodes(&what, &frame, &dict, &src);
+            }
+        }
+    }
+}
+
+/// Skippable frame of `size` bytes of User_Data, `fill` each.
+fn skippable(size: u32, fill: u8) -> Vec<u8> {
+    let mut f = 0x184D_2A53u32.to_le_bytes().to_vec();
+    f.extend_from_slice(&size.to_le_bytes());
+    f.resize(8 + size as usize, fill);
+    f
+}
+
+/// Frames with and without a dictionary, and skippable ones, one after
+/// another: with the dictionary held every frame starts from it, the plain
+/// ones too, as libzstd decodes the input with ZSTD_DCtx_refDDict; those
+/// decode to their content with a raw-content dictionary, which they never
+/// reach. Without one, the first frame naming it fails, after the content
+/// before it is written out.
+#[test]
+fn interleaved_dict_and_plain_frames() {
+    let mut cases = dicts();
+    cases.push((records(150, 131), "raw content"));
+    for (raw, name) in cases {
+        let dict = DecodeDict::new(&raw).unwrap();
+        let (a, b, c) = (records(5, 132), records(300, 133), records(40, 134));
+        let parts = [
+            (zstd::bulk::compress(&b, 3).unwrap(), &b[..], "plain"),
+            (c_compress_using_dict(&a, &raw, 3), &a, "dict"),
+            (skippable(100, 7), &[], "skippable"),
+            (zstd::bulk::compress(&c, 19).unwrap(), &c, "plain"),
+            (
+                compress_with_dict(&c, &CompressDict::new(&raw, 1).unwrap()),
+                &c,
+                "ours",
+            ),
+            (
+                c_compress_dict(
+                    &a,
+                    &raw,
+                    &[(P::ZSTD_c_compressionLevel, 3), (P::ZSTD_c_dictIDFlag, 0)],
+                ),
+                &a,
+                "no id",
+            ),
+            (c_compress_using_cdict(&b, &raw, 12), &b, "CDict"),
+            (zstd::bulk::compress(&a, 1).unwrap(), &a, "plain"),
+        ];
+        let input: Vec<u8> = parts.iter().flat_map(|(f, _, _)| f.clone()).collect();
+        let content: Vec<u8> = parts.iter().flat_map(|(_, c, _)| c.to_vec()).collect();
+        let what = format!("{name}: {}", parts.map(|(_, _, k)| k).join(", "));
+
+        let lib = c_decode_ddict(&input, &raw, content.len() + 1024);
+        let ours = decompress_with_dict(&input, &dict);
+        assert_eq!(ours.as_ref().ok(), lib.as_ref(), "{what}: libzstd");
+        if dict.id() == 0 {
+            assert!(ours.as_ref() == Ok(&content), "{what}: content");
+        }
+        assert_streams(&what, &input, Some(&dict));
+
+        assert_streams(&what, &input, None);
+        if dict.id() != 0 {
+            let e = rust_zstd::decompress(&input).unwrap_err();
+            assert!(e.contains("none is loaded"), "{what}: {e}");
+            let mut d = Decompressor::new();
+            let (mut src_pos, mut dst_pos) = (0, 0);
+            let mut out = vec![0u8; 1 << 20];
+            let mut got = Err(String::new());
+            for end in (7..input.len()).step_by(7).chain([input.len()]) {
+                got = d.decompress_stream(&input[..end], &mut src_pos, &mut out, &mut dst_pos);
+                if got.is_err() {
+                    break;
+                }
+            }
+            assert_eq!(got, Err(e), "{what}: streamed without");
+            assert!(out[..dst_pos] == b[..], "{what}: content before");
+        }
+    }
+}
+
+/// A dictionary frame for the truncation and corruption sweeps, with its
+/// dictionary and content.
+struct SweepFrame {
+    name: String,
+    frame: Vec<u8>,
+    raw: Vec<u8>,
+    src: Vec<u8>,
+}
+
+/// Dictionary frames of each kind: a one-block frame with a checksum, many
+/// blocks of at most 1 KiB with Huffman literals forced, and a frame of our
+/// encoder; then one raw-content dictionary frame.
+fn sweep_frames() -> Vec<SweepFrame> {
+    let mut cases = Vec::new();
+    for (raw, name) in dicts() {
+        let src = records(4, 141);
+        let frame = c_compress_dict(
+            &src,
+            &raw,
+            &[(P::ZSTD_c_compressionLevel, 3), (P::ZSTD_c_checksumFlag, 1)],
+        );
+        cases.push(SweepFrame {
+            name: format!("{name}: one block"),
+            frame,
+            raw: raw.clone(),
+            src,
+        });
+        let src = records(12, 142);
+        let frame = c_compress_dict(
+            &src,
+            &raw,
+            &[
+                (P::ZSTD_c_compressionLevel, 19),
+                (P::ZSTD_c_experimentalParam18, 1024),
+                (P::ZSTD_c_experimentalParam5, 1),
+            ],
+        );
+        cases.push(SweepFrame {
+            name: format!("{name}: small blocks"),
+            frame,
+            raw: raw.clone(),
+            src,
+        });
+        let src = records(6, 143);
+        let frame = compress_with_dict(&src, &CompressDict::new(&raw, 3).unwrap());
+        cases.push(SweepFrame {
+            name: format!("{name}: ours"),
+            frame,
+            raw,
+            src,
+        });
+    }
+    let raw = records(30, 144);
+    let src = records(5, 145);
+    cases.push(SweepFrame {
+        name: "raw content".to_string(),
+        frame: c_compress_using_dict(&src, &raw, 3),
+        raw,
+        src,
+    });
+    cases
+}
+
+/// `input` gets libzstd's verdict with `raw` on every path, and its
+/// content when accepted, but where RFC 8878 decides otherwise; and it
+/// streams as it decodes in one shot.
+///
+/// RFC 8878 rejects two kinds of corrupt frames libzstd accepts with a
+/// DDict. One has a Huffman stream that is not consumed exactly, which
+/// libzstd's X2 decoder lets pass at its last symbol (HUF_decodeLastSymbolX2
+/// clamps the bits consumed); ours rejects it, as for every table
+/// (R1-6, R2-3). The other has an offset into the dictionary's header or
+/// entropy tables: only the content is history (RFC 8878 lines 1835-1837),
+/// as for ZSTD_decompress_usingDict, which rejects it, but a DDict's
+/// history starts at the dictionary's first byte (ZSTD_copyDDictParameters).
+fn assert_libzstd_verdict(what: &str, input: &[u8], raw: &[u8], dict: &DecodeDict) {
+    let lib = c_decode_ddict(input, raw, 1 << 20);
+    for (opts, path) in paths() {
+        let ours = decompress_with_dict_options(input, Some(dict), &opts);
+        if ours.as_ref().ok() == lib.as_ref() {
+            continue;
+        }
+        let rfc = match &ours {
+            Err(e) if lib.is_some() && e == "Huffman stream not fully consumed" => true,
+            Err(e) if lib.is_some() && e.contains("before the dictionary start") => {
+                c_decompress_dict(input, raw, 1 << 20).is_none()
+            }
+            _ => false,
+        };
+        assert!(
+            rfc,
+            "{what} ({path}): libzstd {:?}, ours {}",
+            lib.as_ref().map(Vec::len),
+            outcome(&ours)
+        );
+    }
+    assert_streams(what, input, Some(dict));
+}
+
+/// A dictionary frame cut short anywhere is an error, as for libzstd, and
+/// streams to the same error at every chunk size; only no input at all
+/// decodes, to nothing.
+#[test]
+fn truncated_dict_frames_verdict_matches_libzstd() {
+    for SweepFrame {
+        name,
+        frame,
+        raw,
+        src,
+    } in sweep_frames()
+    {
+        let dict = DecodeDict::new(&raw).unwrap();
+        assert_eq!(decompress_with_dict(&frame, &dict), Ok(src), "{name}");
+        for cut in 0..frame.len() {
+            let what = format!("{name} cut {cut}");
+            assert_libzstd_verdict(&what, &frame[..cut], &raw, &dict);
+            assert_eq!(decompress_with_dict(&frame[..cut], &dict).is_ok(), cut == 0);
+        }
+    }
+}
+
+/// A dictionary frame with any byte altered gets libzstd's verdict, and
+/// its content when accepted, and streams as it decodes in one shot.
+#[test]
+fn corrupt_dict_frames_verdict_matches_libzstd() {
+    for SweepFrame {
+        name, frame, raw, ..
+    } in sweep_frames()
+    {
+        let dict = DecodeDict::new(&raw).unwrap();
+        for at in 0..frame.len() {
+            for x in [0x01u8, 0x80, 0xFF, 0x55] {
+                let mut bad = frame.clone();
+                bad[at] ^= x;
+                assert_libzstd_verdict(&format!("{name} byte {at} ^ {x:#x}"), &bad, &raw, &dict);
+            }
         }
     }
 }
