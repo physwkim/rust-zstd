@@ -131,12 +131,22 @@ pub enum BlockKind {
     Compressed,
 }
 
-/// `ZSTD_isRLE`: every byte of `data` equals the first one.
+/// `ZSTD_isRLE`: every byte of `data` equals the first one. As in C, 32
+/// bytes are compared per step as words; a byte iterator's early exit
+/// keeps LLVM from vectorizing and scans an RLE block a byte per cycle.
 pub fn is_rle(data: &[u8]) -> bool {
-    match data.split_first() {
-        Some((&first, rest)) => rest.iter().all(|&b| b == first),
-        None => false,
-    }
+    let Some(&first) = data.first() else {
+        return false;
+    };
+    let splat = u64::from_ne_bytes([first; 8]);
+    let (chunks, rest) = data.as_chunks::<32>();
+    chunks.iter().all(|chunk| {
+        let words = chunk.as_chunks::<8>().0;
+        words
+            .iter()
+            .fold(0, |diff, &word| diff | (u64::from_ne_bytes(word) ^ splat))
+            == 0
+    }) && rest.iter().all(|&b| b == first)
 }
 
 /// `ZSTD_noCompressBlock`.
@@ -1047,6 +1057,23 @@ mod tests {
     use super::*;
     use crate::compress::common::HASH_READ_SIZE;
     use crate::compress::lazy::SearchMethod;
+
+    /// `is_rle` against its definition at every length around the 32-byte
+    /// step and its 8-byte words, with one byte changed at each position,
+    /// including the first byte, the remainder and the last byte.
+    #[test]
+    fn is_rle_matches_its_definition() {
+        for len in (0..=100).chain([ZSTD_BLOCKSIZE_MAX - 1, ZSTD_BLOCKSIZE_MAX]) {
+            let mut data = vec![0xa7u8; len];
+            assert_eq!(is_rle(&data), len > 0, "len {len}");
+            let positions = (0..len.min(100)).chain(len.saturating_sub(40)..len);
+            for at in positions {
+                data[at] ^= 1;
+                assert!(!is_rle(&data) || len == 1, "len {len} at {at}");
+                data[at] ^= 1;
+            }
+        }
+    }
 
     /// `ZSTD_loadDictionaryContent` leaves a prefix of `HASH_READ_SIZE`
     /// bytes or less unindexed, `nextToUpdate` at its start and the row

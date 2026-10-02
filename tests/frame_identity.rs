@@ -6,7 +6,8 @@
 //! plus a 4 MiB input as one job (default options) and in 512 KiB jobs
 //! (several jobs with overlap), both also with a content checksum, those
 //! frames gated against libzstd's (`ZSTD_c_checksumFlag` 1, and for the
-//! jobs `ZSTD_c_nbWorkers` 2). Inputs are generated from fixed seeds, so the
+//! jobs `ZSTD_c_nbWorkers` 2), and in 512 KiB jobs with a raw-content
+//! dictionary and with it as a prefix. Inputs are generated from fixed seeds, so the
 //! gate needs no file outside the repository and both feature builds must
 //! match the same file (serial and parallel agreement). Each frame is also
 //! compressed on a reused `Compressor` and must equal the fresh frame, and
@@ -25,10 +26,12 @@
 
 mod common;
 
-use rust_zstd::compress::{CParams, CompressOptions, Compressor};
+use rust_zstd::compress::{CParams, CompressDict, CompressOptions, Compressor};
+use rust_zstd::decode::{decompress_with_dict, DecodeDict};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const EDGE_SIZES: [usize; 8] = [
     1000,
@@ -145,7 +148,53 @@ fn compute() -> BTreeMap<String, String> {
     let inputs = [("text", text(LARGE, 1)), ("binary", binary(LARGE, 2))];
     let mut rows = BTreeMap::new();
     for (name, data) in &inputs {
+        // Raw content for the dictionary and prefix frames, of the input's
+        // kind and seed 3.
+        let content = if *name == "text" {
+            text(64 << 10, 3)
+        } else {
+            binary(64 << 10, 3)
+        };
         for level in LEVELS {
+            // 512 KiB jobs with a dictionary (`+d`) or a prefix (`+p`):
+            // only the first job starts from it.
+            let dict = Arc::new(CompressDict::new(&content, level).unwrap());
+            for with in ["d", "p"] {
+                let opts = CompressOptions {
+                    level,
+                    job_size: Some(512 << 10),
+                    dict: (with == "d").then(|| dict.clone()),
+                    ..CompressOptions::default()
+                };
+                let frame = if with == "d" {
+                    rust_zstd::compress_with(data, &opts)
+                } else {
+                    let mut frame = Vec::new();
+                    Compressor::new(opts).compress_with_prefix(data, &content, &mut frame);
+                    frame
+                };
+                let decoded = decompress_with_dict(&frame, &DecodeDict::new(&content).unwrap());
+                assert!(
+                    decoded.unwrap() == *data,
+                    "{name} L{level} +{with}: our decoder"
+                );
+                let decoded = zstd::bulk::Decompressor::with_dictionary(&content)
+                    .and_then(|mut d| d.decompress(&frame, LARGE));
+                assert!(
+                    decoded.unwrap() == *data,
+                    "{name} L{level} +{with}: libzstd"
+                );
+                let strategy = CParams::for_level(level, LARGE).strategy;
+                rows.insert(
+                    format!("{name:<6} {LARGE:>7} L{level:<2} 512K+{with}"),
+                    format!(
+                        "{:<8} {:>8} {:016x}",
+                        format!("{strategy:?}"),
+                        frame.len(),
+                        fnv64(&frame)
+                    ),
+                );
+            }
             let mut cases: Vec<(usize, Option<usize>, bool)> =
                 EDGE_SIZES.iter().map(|&n| (n, None, false)).collect();
             for checksum in [false, true] {
