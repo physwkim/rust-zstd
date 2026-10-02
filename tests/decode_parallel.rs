@@ -416,3 +416,139 @@ fn mt_batches_either_side_of_the_gate() {
         }
     });
 }
+
+/// `assert_lockstep` at the output room `room`, the first call reading
+/// `first` and the others `then`, from where the calls before stopped
+/// reading; returns the content written.
+fn lockstep_switching(
+    what: &str,
+    serial: &mut Decompressor,
+    parallel: &mut Decompressor,
+    [first, then]: [&[u8]; 2],
+    room: usize,
+) -> Vec<u8> {
+    let (mut a, mut b) = (vec![0u8; room], vec![0u8; room]);
+    let (mut pos, mut content) = (0, Vec::new());
+    for call in 0.. {
+        let src = &[first, then][usize::from(call != 0)][pos..];
+        let (mut read, mut written, mut b_read, mut b_written) = (0, 0, 0, 0);
+        let hint = serial.decompress_stream(src, &mut read, &mut a, &mut written);
+        let b_hint = parallel.decompress_stream(src, &mut b_read, &mut b, &mut b_written);
+        assert!(
+            (&hint, read, &a[..written]) == (&b_hint, b_read, &b[..b_written]),
+            "{what}, call {call}: serial gives {hint:?}, reading {read} and writing \
+             {written}; parallel {b_hint:?}, reading {b_read} and writing {b_written}"
+        );
+        content.extend_from_slice(&a[..written]);
+        pos += read;
+        if hint.is_err() || read == 0 && written == 0 && hint != Ok(0) {
+            break;
+        }
+    }
+    assert_eq!(serial.finish(), parallel.finish(), "{what}: finish");
+    content
+}
+
+/// A stream whose input after the first call is another frame's, the same
+/// up to a block that the first call's batch decoded ahead, past its room,
+/// or one after: the parallel decoder takes the blocks decoded ahead up to
+/// that one, and decodes the rest of the other frame as the serial one does.
+#[test]
+fn mt_stream_takes_blocks_decoded_ahead_only_where_input_matches() {
+    use sys::ZSTD_cParameter::{ZSTD_c_checksumFlag, ZSTD_c_windowLog};
+    // A few blocks of 1 KiB, in a 1 KiB window.
+    const ROOM: usize = 4 << 10;
+    const BLOCK: usize = 1 << 10;
+    let words: Vec<&[u8]> = [
+        &b"quick "[..],
+        b"brown ",
+        b"fox ",
+        b"jumps ",
+        b"over ",
+        b"lazy ",
+    ]
+    .to_vec();
+    let mut data = Vec::new();
+    for (i, r) in lcg_bytes(8000, 5).into_iter().enumerate() {
+        data.extend_from_slice(words[usize::from(r) % words.len()]);
+        data.push(b'a' + (i % 26) as u8);
+    }
+    data.truncate(40 * BLOCK);
+    let params = [(ZSTD_c_windowLog, 10), (ZSTD_c_checksumFlag, 1)];
+    let a = zstd_small_blocks_with(&data, 3, BLOCK as i32, &params);
+    let (blocks, _) = frame_blocks(&a, data.len());
+    // Where each block starts in `a`, after the frame header, and in the
+    // content.
+    let mut starts = vec![(
+        a.len() - 4 - blocks.iter().map(|b| b.c_size).sum::<usize>(),
+        0,
+    )];
+    for b in &blocks {
+        let &(c, d) = starts.last().unwrap();
+        starts.push((c + b.c_size, d + b.size));
+    }
+    // The first unread block after the first call.
+    let mut serial = decompressor(usize::MAX);
+    let (mut read, mut written) = (0, 0);
+    serial
+        .decompress_stream(&a, &mut read, &mut vec![0u8; ROOM], &mut written)
+        .unwrap();
+    let first = starts.iter().position(|&(c, _)| c == read).unwrap();
+    pool(4).install(|| {
+        // Pools of four threads decode up to eight blocks ahead.
+        for d in first..first + 9 {
+            let mut other = data.clone();
+            other[starts[d].1 + BLOCK / 2] ^= 0x20;
+            let b = zstd_small_blocks_with(&other, 3, BLOCK as i32, &params);
+            let (start, end) = (starts[d].0, starts[d + 1].0);
+            assert_eq!(a[..start], b[..start], "block {d}");
+            assert_ne!(a[..end], b[..end], "block {d}");
+            let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+            let what = format!("changed in block {d}");
+            let got = lockstep_switching(&what, &mut serial, &mut parallel, [&a, &b], ROOM);
+            assert!(got == other, "{what}");
+        }
+    });
+}
+
+/// Streams of 1 KiB blocks whose Huffman and FSE tables change every few
+/// blocks, at rooms that stop batches a block or a few in, so that the
+/// next call's batch takes blocks decoded ahead with tables the frame has
+/// since replaced, or decodes them again: every call reads, writes and
+/// returns what the serial decoder does.
+#[test]
+fn mt_streams_change_tables_between_batches() {
+    use sys::ZSTD_cParameter::ZSTD_c_windowLog;
+    const BLOCK: usize = 1 << 10;
+    let alphabets: [&[&[u8]]; 3] = [
+        &[b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy "],
+        &[b"0123 ", b"4567, ", b"89. ", b"1000 ", b"-42 "],
+        &[b"ALPHA ", b"BETA; ", b"GAMMA ", b"DELTA! ", b"ZETA "],
+    ];
+    let mut data = Vec::new();
+    for (i, r) in lcg_bytes(40 * BLOCK / 5, 9).into_iter().enumerate() {
+        // Segments of two to three blocks.
+        let words = alphabets[(i / 500 + i / 1300) % 3];
+        data.extend_from_slice(words[usize::from(r) % words.len()]);
+    }
+    data.truncate(40 * BLOCK);
+    let mut cases = Vec::new();
+    for level in [1, 19] {
+        let c = zstd_small_blocks_with(&data, level, BLOCK as i32, &[(ZSTD_c_windowLog, 10)]);
+        assert_eq!(decode_mt(&c).unwrap(), data);
+        cases.push((format!("L{level}"), c));
+    }
+    for threads in [2, 3, 4, 8] {
+        pool(threads).install(|| {
+            for (name, c) in &cases {
+                for chunk in [300, 700, 1000, 1500, 2000, 3000, 5000, usize::MAX] {
+                    for room in [1, 2, 3, 4, 5, 6, 7, 9, 13].map(|n| n * BLOCK) {
+                        let [mut serial, mut parallel] = [usize::MAX, 1].map(decompressor);
+                        let what = format!("{name} {threads} threads");
+                        assert_lockstep(&what, &mut serial, &mut parallel, c, chunk, room);
+                    }
+                }
+            }
+        });
+    }
+}

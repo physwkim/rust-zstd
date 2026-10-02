@@ -13,7 +13,11 @@ use std::io::{self, Read};
 /// Frame_Content_Size when that is smaller, and by what it has decoded
 /// to so far. The one exception is libzstd's: a frame whose Window_Size
 /// is above the limit `set_window_log_max` sets, by default `(1 << 27) + 1`,
-/// is refused unless one call gets it whole.
+/// is refused unless one call gets it whole. With the `parallel` feature it
+/// also keeps, once a call has decoded blocks of a frame on the rayon pool
+/// and until the frame ends, the buffers they decoded into: one per block
+/// of up to twice the pool's threads, holding blocks decoded ahead for the
+/// next call, with their input.
 ///
 /// One made `with_dict`, or given a dictionary by `set_dict`, starts every
 /// frame from it (ZSTD_DCtx_refDDict), as `decompress_with_dict` does: the
@@ -216,8 +220,10 @@ impl Decompressor {
     /// four on a pool of more than one thread) and `dst` has room for the
     /// most they decode to, they decode on the current rayon pool if that
     /// many of them are compressed, of `min_parallel_bytes` or more in all
-    /// (8 KiB from `new`); every call reads, writes and returns what it
-    /// would decoding them one after another.
+    /// (8 KiB from `new`). The pool decodes up to twice its threads' worth
+    /// of blocks more, which the next call takes where its input starts
+    /// with the same bytes. Every call reads, writes and returns what it
+    /// would decoding the blocks one after another.
     ///
     /// After an error the decompressor is stopped: every later call returns
     /// the same error, until `reset`.
