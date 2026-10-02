@@ -3805,9 +3805,13 @@ impl WildCopy for Fallback {
         if offset >= 16 {
             // Two chunks before the first length test: `wildcopy`'s
             // `len <= 16` exit and loop exit mispredict on source code's
-            // matches.
+            // matches. Past a match of at most 16 bytes the second chunk
+            // is overshoot and copies `src` again: from `src + 16`, below
+            // offset 32 it loads the first chunk's store, a wait on every
+            // sequence that left mixed_1M (offset 16, 7 bytes) 19% slower.
             copy16(dst, src);
-            copy16(dst.add(16), src.add(16));
+            let s2 = if ml > 16 { src.add(16) } else { src };
+            copy16(dst.add(16), s2);
             if ml > 32 {
                 wildcopy(dst.add(32), src.add(32), ml - 32);
             }
