@@ -155,6 +155,21 @@ impl Window {
         }
     }
 
+    /// `ZSTD_loadDictionaryContent`'s `ZSTD_window_update` and
+    /// `loadedDictEnd` on a long distance matching window that starts at
+    /// the dictionary content at positions `content`
+    /// ([`LdmState::load_dict`](super::ldm::LdmState::load_dict)): the
+    /// window reaches the content's end, and the content is a dictionary
+    /// ([`Window::load_dict`]).
+    pub(crate) fn enter_dict(&mut self, content: Range<usize>) {
+        assert!(
+            self.next_src == content.start && self.index(content.start) == WINDOW_START_INDEX,
+            "dictionary content {content:?} does not start the window"
+        );
+        self.extend_to(content.end);
+        self.load_dict();
+    }
+
     /// `ZSTD_resetCCtx_byAttachingCDict`'s window, before any input: the
     /// input starts no lower than `dict_end`, the index where an attached
     /// dictionary's content ends in its own window (`ZSTD_window_clear`
@@ -1161,7 +1176,9 @@ impl MatchState {
     /// and [`MatchState::enter_prefix`], whose [`EnteredBlock`] and
     /// [`EnteredPrefix`] the finders and the strategies' `load_prefix`
     /// require; outside a test, this is the only caller of the private
-    /// [`Window::extend_to`] and [`MatchState::correct_overflow_if_needed`].
+    /// [`Window::extend_to`] but for [`Window::enter_dict`], a long
+    /// distance matching window's, and of
+    /// [`MatchState::correct_overflow_if_needed`].
     fn enter(&mut self, input: Range<usize>, indexed: Option<Range<usize>>, dict: bool) {
         assert!(
             self.window.next_src <= input.start && input.start <= input.end,
