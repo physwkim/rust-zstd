@@ -4203,6 +4203,10 @@ enum Stage {
     Checksum { computed: u32 },
 }
 
+// Every frame builds a `Stage::Block`, moves it and leaves it: with drop
+// glue, each of those cost a frame of one block a call or more.
+const _: () = assert!(!std::mem::needs_drop::<Stage>());
+
 /// What the unit `FrameDecoder::process` took was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Event {
@@ -4228,10 +4232,6 @@ struct Frame {
     content_size: Option<u64>,
     decoded: u64,
     checksum: Option<Xxh64>,
-    /// The frame's blocks decoding on detached pool tasks, kept from call
-    /// to call.
-    #[cfg(feature = "parallel")]
-    pipeline: parallel::Pipeline,
 }
 
 impl Frame {
@@ -4243,8 +4243,6 @@ impl Frame {
             content_size: header.frame_content_size(),
             decoded: 0,
             checksum: header.descriptor.content_checksum_flag().then(Xxh64::new),
-            #[cfg(feature = "parallel")]
-            pipeline: parallel::Pipeline::default(),
         })
     }
 
@@ -4315,6 +4313,13 @@ struct FrameDecoder {
     /// `None` if never.
     #[cfg(feature = "parallel")]
     parallel: Option<parallel::Gate>,
+    /// The blocks of the frame being decoded on pool tasks, kept from call
+    /// to call: none until the frame first takes blocks to the pool, and
+    /// none again once the decoder leaves the frame (`leave_frame`). Here
+    /// rather than in `Frame`, so that `Stage` has no drop glue: a frame
+    /// that never takes blocks to the pool builds, moves and drops none.
+    #[cfg(feature = "parallel")]
+    pipeline: Option<Box<parallel::Pipeline>>,
 }
 
 impl FrameDecoder {
@@ -4325,7 +4330,29 @@ impl FrameDecoder {
             simd: opts.simd_level(),
             #[cfg(feature = "parallel")]
             parallel: parallel::Gate::new(opts),
+            #[cfg(feature = "parallel")]
+            pipeline: None,
         }
+    }
+
+    /// Leave the current stage for `Stage::FrameHeader`, returning it: the
+    /// only way out of `Stage::Block`, so that a frame's pipeline ends with
+    /// the frame.
+    fn leave_frame(&mut self) -> Stage {
+        // The test inline, the drop out of line: as `self.pipeline = None`,
+        // a frame with no pipeline paid a call into the drop glue.
+        #[cfg(feature = "parallel")]
+        if let Some(pipeline) = self.pipeline.take() {
+            std::hint::cold_path();
+            drop(pipeline);
+        }
+        std::mem::replace(&mut self.stage, Stage::FrameHeader)
+    }
+
+    /// Whether a chain of the frame's pipeline is running.
+    #[cfg(feature = "parallel")]
+    fn chain_active(&self) -> bool {
+        self.pipeline.as_ref().is_some_and(|p| p.active())
     }
 
     /// Inside a skippable frame's User_Data.
@@ -4395,6 +4422,12 @@ impl FrameDecoder {
                     return Ok(Event::Continue);
                 };
                 let scratch = self.scratch.get_or_insert_with(DecoderScratch::new);
+                // The serial decoder's tables are those the frame's chain
+                // left in use.
+                #[cfg(feature = "parallel")]
+                if let Some(pipeline) = &mut self.pipeline {
+                    pipeline.hand_back(scratch)?;
+                }
                 let dict = dict.and_then(DecodeDict::entropy);
                 decode_block(&block, unit, frame, scratch, dict, out, self.simd)?;
                 if !block.last_block {
@@ -4454,6 +4487,11 @@ impl FrameDecoder {
             scratch.load_dict(e);
         }
         out.start(frame.window, frame.content_size);
+        #[cfg(feature = "parallel")]
+        debug_assert!(
+            self.pipeline.is_none(),
+            "the last frame's pipeline ended with it"
+        );
         self.stage = Stage::Block {
             frame,
             header: None,
@@ -4464,8 +4502,7 @@ impl FrameDecoder {
     /// After the frame's last block: check its size, then expect its
     /// checksum, if it has one.
     fn blocks_ended(&mut self) -> Result<Event, DecodeError> {
-        let Stage::Block { frame, .. } = std::mem::replace(&mut self.stage, Stage::FrameHeader)
-        else {
+        let Stage::Block { frame, .. } = self.leave_frame() else {
             unreachable!("blocks end in Stage::Block");
         };
         if let Some(fcs) = frame.content_size {
@@ -4563,6 +4600,11 @@ fn locate_block(src: &[u8], block_size_max: usize) -> Option<(BlockHeader, &[u8]
 
 /// Decode `block` with `content` into `out`, a block of `frame`, which
 /// started from the tables of `dict` if given.
+///
+/// Inline in `process` and, with the `parallel` feature, in
+/// `decode_serially`: out of line, the call cost a frame of one block
+/// about 70 instructions.
+#[inline(always)]
 fn decode_block(
     block: &BlockHeader,
     content: &[u8],
@@ -4572,9 +4614,6 @@ fn decode_block(
     out: &mut impl FrameOut,
     simd: Level,
 ) -> Result<(), DecodeError> {
-    // The serial decoder's tables are those the frame's chain left in use.
-    #[cfg(feature = "parallel")]
-    frame.pipeline.hand_back(scratch)?;
     let (dst, ext) = out.block_dst()?;
     // SAFETY: `block_dst` meets the `Dst` and `ExtHistory` contracts. A raw
     // or RLE block decodes to at most `block_size_max <= MAX_BLOCK_SIZE`
@@ -5621,7 +5660,7 @@ mod parallel {
         next_id: u64,
         /// The calls of `run` so far.
         calls: u64,
-        /// Boxed, to keep `Stage` small.
+        /// The chain running, if any.
         chain: Option<Box<Chain>>,
         /// Cells no block of the chain has, the pool's tasks perhaps still
         /// holding some.
@@ -6668,7 +6707,7 @@ mod parallel {
                 Some(fcs) if fcs - frame.decoded <= room as u64 => usize::MAX,
                 _ => room,
             };
-            if !frame.pipeline.active() {
+            if !self.chain_active() {
                 if !gate.pools(located(data, block_size_max, room)) {
                     return self.decode_serially(data, dict, out, room, read, next);
                 }
@@ -6697,9 +6736,9 @@ mod parallel {
         ) -> Result<Option<Event>, DecodeError> {
             match &self.stage {
                 Stage::Block {
-                    frame,
                     header: Some(block),
-                } if frame.pipeline.active() => {
+                    ..
+                } if self.chain_active() => {
                     let held = Some((*block, content));
                     self.decode_detached(Input { held, data }, dict, out, read, next)
                 }
@@ -6723,7 +6762,7 @@ mod parallel {
                 return Ok(None);
             };
             let block_size_max = frame.block_size_max;
-            let pipeline = &mut frame.pipeline;
+            let pipeline = self.pipeline.get_or_insert_default();
             let start = FrameStart {
                 id: pipeline.new_id(),
                 init: scratch,
@@ -6733,7 +6772,7 @@ mod parallel {
             let ring = pipeline.ring((2 * rayon::current_num_threads()).min(batch.plans.len()));
             let (done, hist, accounted) =
                 run_batch(&batch, frame, start, out, self.simd, &mut next, &ring);
-            frame.pipeline.free.extend(ring);
+            self.pipeline.get_or_insert_default().free.extend(ring);
             let Some(&end) = done.checked_sub(1).and_then(|i| batch.ends.get(i)) else {
                 return Ok(None);
             };
@@ -6773,13 +6812,11 @@ mod parallel {
             else {
                 return Ok(None);
             };
-            // Out of the frame its blocks are accounted to while they run.
-            let mut pipeline = std::mem::take(&mut frame.pipeline);
+            let pipeline = self.pipeline.get_or_insert_default();
             if !pipeline.active() {
                 pipeline.start(scratch, dict, frame.block_size_max);
             }
             let ran = pipeline.run(input, frame, out, simd, read, &mut next);
-            frame.pipeline = pipeline;
             // The held block, if any, is the first it executed.
             if !matches!(ran, Ok(None)) {
                 *header = None;
@@ -6791,10 +6828,10 @@ mod parallel {
             }
         }
 
-        /// `decode_block_batch` on blocks the pool does not take: the
-        /// blocks `located` gives, decoded one after another as `process`
-        /// decodes them, here rather than by the serial driver so that
-        /// none is located twice.
+        /// `decode_block_batch` on blocks the pool does not take, with no
+        /// chain running: the blocks `located` gives, decoded one after
+        /// another as `process` decodes them, here rather than by the
+        /// serial driver so that none is located twice.
         fn decode_serially<O: FrameOut>(
             &mut self,
             data: &[u8],
@@ -7126,10 +7163,12 @@ mod parallel {
 
         impl PlannedJobs {
             fn of(dec: &FrameDecoder) -> PlannedJobs {
-                let Stage::Block { frame, .. } = &dec.stage else {
-                    panic!("inside the frame");
-                };
-                let chain = frame.pipeline.chain.as_ref().expect("a chain");
+                assert!(matches!(dec.stage, Stage::Block { .. }), "inside the frame");
+                let chain = dec
+                    .pipeline
+                    .as_ref()
+                    .and_then(|p| p.chain.as_ref())
+                    .expect("a chain");
                 let jobs = chain
                     .queue
                     .iter()
@@ -7242,7 +7281,9 @@ mod parallel {
                         assert!(!cell.decoded(*id as usize), "{what}: {id} queued");
                     }
                     match what {
-                        "reset" => dec.stage = Stage::FrameHeader,
+                        "reset" => {
+                            dec.leave_frame();
+                        }
                         "drop" => drop(dec),
                         _ => {
                             let (frame, _) = small_blocks(&words());
