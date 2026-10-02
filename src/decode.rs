@@ -5081,40 +5081,92 @@ mod parallel {
     /// or the executing thread (`take`), then done once its decode is in
     /// `slot` (`decoded`). A task whose block someone else took, or whose
     /// cell has since been handed another block, finds a ticket it cannot
-    /// take and returns. While the decode runs, the executing thread reads
-    /// only what it has published (`Published`), and the slot once it is
-    /// done.
+    /// take and returns. The decode does the block's literals, then its
+    /// sequences; for the block the executing thread executes next, the
+    /// sequences first, then the literals unless that thread has taken
+    /// those meanwhile (`literals`). While the decode runs, the executing
+    /// thread reads only what it has published (`Published`), the literals
+    /// once they are done, and the slot once it is done.
     struct Cell {
         /// `2 * ticket` while the block of `ticket` is planned, one more
         /// once it is taken.
         claim: AtomicUsize,
         /// `2 * ticket + 1` once the block of `ticket` is decoded.
         done: AtomicUsize,
+        /// `2 * ticket` while the literals of the block of `ticket` are to
+        /// decode, one more once someone has taken them.
+        lit_claim: AtomicUsize,
+        /// `2 * ticket + 1` once the literals of the block of `ticket` are
+        /// decoded.
+        lit_done: AtomicUsize,
+        /// Whether the decode of the block last handed does its sequences
+        /// first.
+        sequences_first: AtomicBool,
         /// What the decode of the block of the ticket last handed has
         /// published.
         published: Published,
         slot: Mutex<Slot>,
+        lits: Mutex<LitSlot>,
     }
 
     impl Cell {
         fn new() -> Cell {
+            let DecoderScratch { huf, fse, .. } = DecoderScratch::new();
             Cell {
                 // Taken, of no block: nothing is to decode yet.
                 claim: AtomicUsize::new(1),
                 done: AtomicUsize::new(0),
+                lit_claim: AtomicUsize::new(1),
+                lit_done: AtomicUsize::new(0),
+                sequences_first: AtomicBool::new(false),
                 published: Published::new(),
-                slot: Mutex::new(Slot::new()),
+                slot: Mutex::new(Slot::new(fse)),
+                lits: Mutex::new(LitSlot::new(huf)),
             }
         }
 
         /// Plan the block of `ticket`, once the cell's block before it has
-        /// been executed or given up and no task decodes into the cell.
-        fn hand(&self, ticket: usize) {
+        /// been executed or given up and no task decodes into the cell;
+        /// `next` if the executing thread executes it next, so its decode
+        /// does the sequences first, the literals being that thread's to
+        /// decode meanwhile.
+        fn hand(&self, ticket: usize, next: bool) {
             // Before the decode by the claim's release, and before the
             // executing thread's loads: the planning thread is that thread,
             // or one whatever moved the decoder there synchronized with.
             self.published.progress.store(0, Ordering::Relaxed);
+            self.sequences_first.store(next, Ordering::Relaxed);
+            self.lit_claim
+                .store(ticket.wrapping_mul(2), Ordering::Relaxed);
             self.claim.store(ticket.wrapping_mul(2), Ordering::Release);
+        }
+
+        /// Decode the literals of the block of `ticket` into the cell with
+        /// `decode`, unless someone has taken them, and return them, locked.
+        /// The executing thread takes them when it comes to the block before
+        /// the block's decode has, which, for the block `hand` expects that
+        /// thread to execute next, decodes the sequences first. A panic of
+        /// `decode` leaves them failed.
+        fn literals(
+            &self,
+            ticket: usize,
+            decode: impl FnOnce(&mut LitSlot) -> Result<(), DecodeError>,
+        ) -> Option<MutexGuard<'_, LitSlot>> {
+            let planned = ticket.wrapping_mul(2);
+            self.lit_claim
+                .compare_exchange(planned, planned | 1, Ordering::AcqRel, Ordering::Relaxed)
+                .ok()?;
+            let _done = MarkDone(&self.lit_done, planned | 1);
+            let mut lits = lock(&self.lits);
+            match panic::catch_unwind(AssertUnwindSafe(|| decode(&mut lits))) {
+                Ok(result) => lits.result = result,
+                Err(payload) => {
+                    lits.result = Err("Literals decode panicked".into());
+                    drop(lits);
+                    panic::resume_unwind(payload);
+                }
+            }
+            Some(lits)
         }
 
         /// Take the decode of the block of `ticket`; false if someone has,
@@ -5131,9 +5183,22 @@ mod parallel {
         }
 
         /// Whether the executing thread can start on the block of
-        /// `ticket`: its decode is done or has published.
+        /// `ticket`: its decode is done, or has published and its literals
+        /// are done.
         fn startable(&self, ticket: usize) -> bool {
-            self.decoded(ticket) || self.published.progress.load(Ordering::Acquire) != 0
+            self.decoded(ticket)
+                || (self.published.progress.load(Ordering::Acquire) != 0
+                    && self.lit_done.load(Ordering::Acquire) == ticket.wrapping_mul(2) | 1)
+        }
+
+        /// The literals of the block of `ticket`, which someone has taken,
+        /// once they are done.
+        fn decoded_literals(&self, ticket: usize) -> MutexGuard<'_, LitSlot> {
+            let mut spins = 0;
+            while self.lit_done.load(Ordering::Acquire) != ticket.wrapping_mul(2) | 1 {
+                pause(&mut spins);
+            }
+            lock(&self.lits)
         }
 
         /// The slot of the block of `ticket` once its decode is done: its
@@ -5147,19 +5212,19 @@ mod parallel {
         }
 
         /// Decode the block of `ticket`, taken, into the slot with `decode`,
-        /// which publishes into the cell's `Published` as it goes, then
-        /// mark it done, on a panic too, which the slot keeps for the
-        /// executing thread to resume.
+        /// which publishes into the cell's `Published` as it goes, and the
+        /// literals unless taken, then mark it done, on a panic too, which
+        /// the slot keeps for the executing thread to resume.
         fn decode(
             &self,
             ticket: usize,
-            decode: impl FnOnce(&mut Slot, &Published) -> Result<(), DecodeError>,
+            decode: impl FnOnce(&mut Slot, Decoding<'_>) -> Result<(), DecodeError>,
         ) {
             let _done = MarkDone(&self.done, ticket.wrapping_mul(2) | 1);
             let mut slot = lock(&self.slot);
             let slot = &mut *slot;
-            let decoded =
-                panic::catch_unwind(AssertUnwindSafe(|| decode(&mut *slot, &self.published)));
+            let at = Decoding { cell: self, ticket };
+            let decoded = panic::catch_unwind(AssertUnwindSafe(|| decode(&mut *slot, at)));
             slot.result = match decoded {
                 Ok(result) => result,
                 Err(payload) => {
@@ -5167,6 +5232,38 @@ mod parallel {
                     Err("Block decode panicked".into())
                 }
             };
+        }
+    }
+
+    /// The decode of the block of `ticket` in `cell`, taken: where it
+    /// publishes the sequences, and the claim on the literals.
+    #[derive(Clone, Copy)]
+    struct Decoding<'c> {
+        cell: &'c Cell,
+        ticket: usize,
+    }
+
+    impl Decoding<'_> {
+        fn published(&self) -> &Published {
+            &self.cell.published
+        }
+
+        /// Decode the block's literals with `literals`, unless the
+        /// executing thread has taken them, and its sequences with
+        /// `sequences`, in the order `hand` set.
+        fn stage2(
+            &self,
+            sequences: impl FnOnce() -> Result<(), DecodeError>,
+            literals: impl FnOnce(&mut LitSlot) -> Result<(), DecodeError>,
+        ) -> Result<(), DecodeError> {
+            if self.cell.sequences_first.load(Ordering::Relaxed) {
+                sequences()?;
+                drop(self.cell.literals(self.ticket, literals));
+            } else {
+                drop(self.cell.literals(self.ticket, literals));
+                sequences()?;
+            }
+            Ok(())
         }
     }
 
@@ -5183,17 +5280,14 @@ mod parallel {
 
     /// What the decode of a cell's block makes readable before it ends, so
     /// that the executing thread executes the block's sequences while the
-    /// rest decode: the first `progress` of its sequences, at `seqs`, and
-    /// with the first of them the block's literals, with
-    /// `WILDCOPY_OVERLENGTH` bytes of slack, and whether its offsets are
-    /// short (`SHORT_OFFSET_SHARE_MIN`). The decode writes none of those
-    /// again, nor moves them, and they stay until the cell is handed
-    /// another block, which waits for the executing thread to be done
-    /// with this one.
+    /// rest decode: the first `progress` of them, at `seqs`, and with the
+    /// first whether the block's offsets are short
+    /// (`SHORT_OFFSET_SHARE_MIN`). The decode writes none of those again,
+    /// nor moves them, and they stay until the cell is handed another
+    /// block, which waits for the executing thread to be done with this
+    /// one.
     struct Published {
         progress: AtomicUsize,
-        literals: AtomicPtr<u8>,
-        literals_len: AtomicUsize,
         seqs: AtomicPtr<RawSeq>,
         short: AtomicBool,
     }
@@ -5202,25 +5296,16 @@ mod parallel {
         fn new() -> Published {
             Published {
                 progress: AtomicUsize::new(0),
-                literals: AtomicPtr::new(ptr::null_mut()),
-                literals_len: AtomicUsize::new(0),
                 seqs: AtomicPtr::new(ptr::null_mut()),
                 short: AtomicBool::new(false),
             }
         }
 
-        /// The block's literals, and whether its offsets are short, to
-        /// publish with the first sequences.
-        fn literals(&self, literals: &[u8], short: bool) {
-            let at = literals.as_ptr().cast_mut();
-            self.literals.store(at, Ordering::Relaxed);
-            self.literals_len.store(literals.len(), Ordering::Relaxed);
-            self.short.store(short, Ordering::Relaxed);
-        }
-
-        /// Where the block's sequences go, to publish with the first.
-        fn sequences(&self, seqs: *mut RawSeq) {
+        /// Where the block's sequences go, and whether its offsets are
+        /// short, to publish with the first.
+        fn start(&self, seqs: *mut RawSeq, short: bool) {
             self.seqs.store(seqs, Ordering::Relaxed);
+            self.short.store(short, Ordering::Relaxed);
         }
 
         /// Publish the first `n` sequences, decoded, `n` above 0.
@@ -5229,9 +5314,9 @@ mod parallel {
         }
     }
 
-    /// A cell's slot. A decode that panics leaves its payload in the slot
-    /// rather than poisoning the lock.
-    fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
+    /// A cell's slot or literals. A decode that panics leaves its payload
+    /// in the slot, or its literals failed, rather than poisoning the lock.
+    fn lock<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
         slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -5255,16 +5340,13 @@ mod parallel {
         }
     }
 
-    /// Per-cell worker state: tables tagged with the id of the block that
-    /// defined them (so a run of blocks reusing one table builds it once;
-    /// ids are never reused within the frame), and the decoded literals and
-    /// sequences of the current block.
+    /// Per-cell state of the decode of a block's sequences: tables tagged
+    /// with the id of the block that defined them (so a run of blocks
+    /// reusing one table builds it once; ids are never reused within the
+    /// frame), and the decoded sequences of the current block.
     struct Slot {
-        huf: HuffmanScratch,
-        huf_from: Option<u64>,
         fse: FSEScratch,
         fse_from: [Option<u64>; 3],
-        literals: Vec<u8>,
         /// Room for the block's sequences, which stage 2 writes past the
         /// length and publishes (`Published`).
         seqs: Vec<RawSeq>,
@@ -5277,18 +5359,36 @@ mod parallel {
     }
 
     impl Slot {
-        fn new() -> Slot {
-            let scratch = DecoderScratch::new();
+        fn new(fse: FSEScratch) -> Slot {
             Slot {
-                huf: scratch.huf,
-                huf_from: None,
-                fse: scratch.fse,
+                fse,
                 fse_from: [None; 3],
-                literals: Vec::new(),
                 seqs: Vec::new(),
                 result: Ok(()),
                 job: None,
                 panic: None,
+            }
+        }
+    }
+
+    /// Per-cell state of the decode of a block's literals, by whoever took
+    /// them (`Cell::literals`): the Huffman table, tagged as `Slot`'s, the
+    /// literals followed by `WILDCOPY_OVERLENGTH` bytes of slack, and how
+    /// their decode ended.
+    struct LitSlot {
+        huf: HuffmanScratch,
+        huf_from: Option<u64>,
+        literals: Vec<u8>,
+        result: Result<(), DecodeError>,
+    }
+
+    impl LitSlot {
+        fn new(huf: HuffmanScratch) -> LitSlot {
+            LitSlot {
+                huf,
+                huf_from: None,
+                literals: Vec::new(),
+                result: Ok(()),
             }
         }
     }
@@ -5348,9 +5448,23 @@ mod parallel {
         start: Arc<StartTables>,
     }
 
+    /// The sections of the blocks a block takes table descriptions from.
+    type Described<'a> = [Option<(u64, BlockParts<'a>)>; 4];
+
+    /// The section of block `d` among `defs`.
+    fn def_in<'p, 'a>(defs: &'p Described<'a>) -> impl Fn(u64) -> Option<&'p BlockParts<'a>> {
+        move |d| {
+            defs.iter()
+                .flatten()
+                .find(|(id, _)| *id == d)
+                .map(|(_, p)| p)
+        }
+    }
+
     impl Job {
-        /// Stage 2 into `slot`, publishing into `publish`.
-        fn decode(&self, slot: &mut Slot, publish: &Published) -> Result<(), DecodeError> {
+        /// The block's plan, and the sections of the blocks whose table
+        /// descriptions it uses.
+        fn split(&self) -> Result<(CompressedPlan<'_>, Described<'_>), DecodeError> {
             let block_size_max = self.start.block_size_max;
             let plan = CompressedPlan {
                 parts: split_block(&self.content, block_size_max)?,
@@ -5361,13 +5475,19 @@ mod parallel {
                 let (id, content) = d.as_ref()?;
                 Some((*id, split_block(content, block_size_max).ok()?))
             });
-            let def = |d| {
-                defs.iter()
-                    .flatten()
-                    .find(|(id, _)| *id == d)
-                    .map(|(_, p)| p)
-            };
-            decode_block(slot, publish, self.id, &plan, def, self.start.view())
+            Ok((plan, defs))
+        }
+
+        /// Stage 2 into `slot`, as `at` publishes it.
+        fn decode(&self, slot: &mut Slot, at: Decoding<'_>) -> Result<(), DecodeError> {
+            let (plan, defs) = self.split()?;
+            decode_block(slot, at, self.id, &plan, def_in(&defs), self.start.view())
+        }
+
+        /// The block's literals into `lits`.
+        fn literals(&self, lits: &mut LitSlot) -> Result<(), DecodeError> {
+            let (plan, defs) = self.split()?;
+            decode_literals(lits, self.id, &plan, def_in(&defs), self.start.view())
         }
     }
 
@@ -5382,8 +5502,8 @@ mod parallel {
     /// The decode of the block of `ticket`, taken, from the job its cell
     /// holds.
     fn run_taken(cell: &Cell, ticket: usize) {
-        cell.decode(ticket, |slot, publish| match slot.job.take() {
-            Some(job) => job.decode(slot, publish),
+        cell.decode(ticket, |slot, at| match slot.job.take() {
+            Some(job) => job.decode(slot, at),
             None => Err("Block decode without a job".into()),
         });
     }
@@ -5477,22 +5597,24 @@ mod parallel {
     /// block, of the earlier blocks whose table descriptions it uses and of
     /// the tables and repeat offsets the chain started from; nothing of
     /// the frame, the decoder, its dictionary or a caller's input. It
-    /// writes only its cell's slot and what it publishes there
+    /// writes only its cell's slot, the cell's literals unless the
+    /// executing thread has taken them, and what it publishes there
     /// (`Published`), so it may outlive the call that planned it, and the
     /// frame. Only `run`, on the thread that executes the frame's blocks,
     /// applies a task's result: in plan order, to a block whose bytes the
     /// call's input holds where it executes it, and only while the frame
     /// has decoded no block outside the chain since it started; the serial
     /// decoder's `hand_back` ends the chain before it decodes one. It
-    /// executes a block's sequences as the task publishes them, and keeps
-    /// the block, and its repeat offsets, once the task has ended without
-    /// an error. A block leaves the chain only by being executed or
-    /// through `retire`, on every other way out: input that differs
-    /// (`rewind`), a block decoded outside the chain (`hand_back`), the
-    /// frame's end or reset or drop (`Drop`). `retire` cancels a decode no
-    /// task has started; one running finishes into its cell, which is
-    /// handed a block planned after only once no task holds it
-    /// (`idle_cell`).
+    /// decodes a block's literals itself if it comes to the block before
+    /// the task has taken them, executes its sequences as the task
+    /// publishes them, and keeps the block, and its repeat offsets, once
+    /// the task and the literals have ended without an error. A block
+    /// leaves the chain only by being executed or through `retire`, on
+    /// every other way out: input that differs (`rewind`), a block decoded
+    /// outside the chain (`hand_back`), the frame's end or reset or drop
+    /// (`Drop`). `retire` cancels a decode no task has started; one running
+    /// finishes into its cell, which is handed a block planned after only
+    /// once no task holds it (`idle_cell`).
     #[derive(Default)]
     pub(super) struct Pipeline {
         /// The next block or start id: none is used twice in the frame.
@@ -5726,7 +5848,7 @@ mod parallel {
                         }
                         chain.defs.ids = ids;
                         lock(&cell.slot).job = Some(job.clone());
-                        cell.hand(id as usize);
+                        cell.hand(id as usize, chain.queue.is_empty());
                         let task = cell.clone();
                         rayon::spawn_fifo(move || run_job(&task, id as usize));
                         Some((job, cell))
@@ -5826,6 +5948,8 @@ mod parallel {
                         if cell.take(ticket) {
                             run_taken(cell, ticket);
                         }
+                        // While a task decodes the sequences.
+                        let literals = cell.literals(ticket, |lits| job.literals(lits));
                         while !cell.startable(ticket) {
                             // If no task has started the block after either,
                             // the pool is behind: decode it here meanwhile.
@@ -5836,7 +5960,11 @@ mod parallel {
                                 _ => std::thread::yield_now(),
                             }
                         }
-                        Some((&**cell, ticket))
+                        Some(Stage2 {
+                            cell,
+                            ticket,
+                            literals,
+                        })
                     }
                     None => None,
                 };
@@ -5864,12 +5992,28 @@ mod parallel {
     }
 
     /// Stage 2 for compressed block `id`, of a run starting with the
-    /// tables in `start`, publishing its sequences into `publish` as it
-    /// decodes them; `def` gives the sections of the earlier blocks of the
-    /// run whose table descriptions it uses.
+    /// tables in `start`: its literals unless the executing thread has
+    /// taken them, and its sequences into `slot`, published as `at` gives
+    /// as they decode, in the order `at` gives; `def` gives the sections of
+    /// the earlier blocks of the run whose table descriptions it uses.
     fn decode_block<'p, 'a: 'p>(
         slot: &mut Slot,
-        publish: &Published,
+        at: Decoding<'_>,
+        id: u64,
+        plan: &CompressedPlan<'_>,
+        def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
+        start: FrameStart<'_>,
+    ) -> Result<(), DecodeError> {
+        at.stage2(
+            || decode_block_sequences(slot, at.published(), id, plan, &def, start),
+            |lits| decode_literals(lits, id, plan, &def, start),
+        )
+    }
+
+    /// The literals of compressed block `id` into `lits`, as for
+    /// `decode_block`.
+    fn decode_literals<'p, 'a: 'p>(
+        lits: &mut LitSlot,
         id: u64,
         plan: &CompressedPlan<'_>,
         def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
@@ -5878,23 +6022,35 @@ mod parallel {
         if let Some(d) = plan.huf_def {
             if d == id {
                 // `decode_block_literals` builds it from this block.
-                slot.huf_from = None;
+                lits.huf_from = None;
             } else if d == start.id {
-                if slot.huf_from != Some(d) {
-                    slot.huf.table.copy_from(start.init.huf_table(start.dict));
-                    slot.huf_from = Some(d);
+                if lits.huf_from != Some(d) {
+                    lits.huf.table.copy_from(start.init.huf_table(start.dict));
+                    lits.huf_from = Some(d);
                 }
-            } else if slot.huf_from != Some(d) {
-                slot.huf_from = None;
-                build_huf_from(described(&def, d)?, &mut slot.huf.table)?;
-                slot.huf_from = Some(d);
+            } else if lits.huf_from != Some(d) {
+                lits.huf_from = None;
+                build_huf_from(described(&def, d)?, &mut lits.huf.table)?;
+                lits.huf_from = Some(d);
             }
         }
-        decode_block_literals(&plan.parts, &mut slot.huf, None, &mut slot.literals)?;
+        decode_block_literals(&plan.parts, &mut lits.huf, None, &mut lits.literals)?;
         if plan.huf_def == Some(id) {
-            slot.huf_from = Some(id);
+            lits.huf_from = Some(id);
         }
+        Ok(())
+    }
 
+    /// The sequences of compressed block `id` into `slot`, published into
+    /// `publish`, as for `decode_block`.
+    fn decode_block_sequences<'p, 'a: 'p>(
+        slot: &mut Slot,
+        publish: &Published,
+        id: u64,
+        plan: &CompressedPlan<'_>,
+        def: impl Fn(u64) -> Option<&'p BlockParts<'a>>,
+        start: FrameStart<'_>,
+    ) -> Result<(), DecodeError> {
         slot.seqs.clear();
         let seq = plan.parts.sequences;
         let src = plan.parts.sequences_src;
@@ -5920,8 +6076,6 @@ mod parallel {
             }
         }
         let tables = seq_tables(plan, &slot.fse, start);
-        let short = short_offset_share(tables[1]) >= SHORT_OFFSET_SHARE_MIN;
-        publish.literals(&slot.literals, short);
         decode_sequences(
             seq.num_sequences,
             &src[used..],
@@ -6060,7 +6214,10 @@ mod parallel {
         let base = seqs.as_mut_ptr();
         // SAFETY: `n` elements are reserved.
         unsafe { ptr::write_bytes(base, 0, n) };
-        publish.sequences(base);
+        publish.start(
+            base,
+            short_offset_share(tables[1]) >= SHORT_OFFSET_SHARE_MIN,
+        );
         let mut at = 0;
         while at < n - 1 {
             let end = (at + PUBLISH_EVERY).min(n - 1);
@@ -6179,14 +6336,23 @@ mod parallel {
         temp
     }
 
-    /// Stage 3 for one block, whose stage 2, if compressed, runs in the
-    /// cell `stage2` names, under its ticket: write it to `out` and return
-    /// its bytes. The block's sequences execute as stage 2 publishes them;
-    /// the block and its repeat offsets count once stage 2 has ended
-    /// without an error.
+    /// The stage 2 of a compressed block for `execute_block`: the cell and
+    /// ticket it decodes under, and its literals if the executing thread
+    /// decoded them (`Cell::literals`), else whoever took them does.
+    struct Stage2<'c> {
+        cell: &'c Cell,
+        ticket: usize,
+        literals: Option<MutexGuard<'c, LitSlot>>,
+    }
+
+    /// Stage 3 for one block, whose stage 2, if compressed, is `stage2`:
+    /// write it to `out` and return its bytes. The block's sequences
+    /// execute as stage 2 publishes them, once its literals are done; the
+    /// block and its repeat offsets count once stage 2 and the literals
+    /// have ended without an error.
     fn execute_block<'o>(
         plan: &Plan<'_>,
-        stage2: Option<(&Cell, usize)>,
+        stage2: Option<Stage2<'_>>,
         hist: &mut [u32; 3],
         block_size_max: usize,
         out: &'o mut impl FrameOut,
@@ -6211,69 +6377,80 @@ mod parallel {
                     dst.op + len
                 }
                 Plan::Compressed(cp) => {
-                    let (cell, ticket) =
-                        stage2.expect("a compressed block is executed from its stage 2");
+                    let Stage2 {
+                        cell,
+                        ticket,
+                        literals,
+                    } = stage2.expect("a compressed block is executed from its stage 2");
+                    let lits = literals.unwrap_or_else(|| cell.decoded_literals(ticket));
                     let num = cp.parts.sequences.num_sequences as usize;
-                    if num == 0 {
-                        let slot = cell.finished(ticket);
-                        stage2_result(&slot)?;
-                        let literals_len = slot.literals.len() - WILDCOPY_OVERLENGTH;
-                        ptr::copy_nonoverlapping(slot.literals.as_ptr(), at, literals_len);
-                        dst.op + literals_len
-                    } else {
-                        let mut h = *hist;
-                        let runs = PublishedRuns { cell, ticket };
-                        let end =
-                            execute_published(runs, num, ext, &mut h, block_size_max, dst, simd);
-                        // Stage 2's error first: it may have published
-                        // only part of the sequences.
-                        stage2_result(&cell.finished(ticket))?;
-                        let end = end?;
-                        *hist = h;
-                        end
-                    }
+                    let mut h = *hist;
+                    let end = match stage2_result(&lits.result) {
+                        Err(e) => Err(e),
+                        Ok(()) if num == 0 => {
+                            let len = lits.literals.len() - WILDCOPY_OVERLENGTH;
+                            ptr::copy_nonoverlapping(lits.literals.as_ptr(), at, len);
+                            Ok(dst.op + len)
+                        }
+                        Ok(()) => {
+                            let runs = PublishedRuns { cell, ticket, num };
+                            let literals = &lits.literals[..];
+                            execute_published(
+                                runs,
+                                literals,
+                                ext,
+                                &mut h,
+                                block_size_max,
+                                dst,
+                                simd,
+                            )
+                        }
+                    };
+                    // Stage 2's error first: it may have published only
+                    // part of the sequences.
+                    stage2_result(&cell.finished(ticket).result)?;
+                    let end = end?;
+                    *hist = h;
+                    end
                 }
             };
             Ok(out.commit(end))
         }
     }
 
-    /// Whether stage 2 decoded the block in `slot`. Its error stays in the
-    /// slot: a chain that stops at the block may execute it again.
-    fn stage2_result(slot: &Slot) -> Result<(), DecodeError> {
-        match slot.result {
+    /// Whether a stage 2 decode, of a block's sequences or literals, with
+    /// `result` succeeded. Its error stays in the cell: a chain that stops
+    /// at the block may execute it again.
+    fn stage2_result(result: &Result<(), DecodeError>) -> Result<(), DecodeError> {
+        match result {
             Ok(()) => Ok(()),
             Err(_) => Err("Block's stage 2 failed".into()),
         }
     }
 
-    /// Execute the `num` sequences `runs` publishes into `dst`, as
-    /// `execute_with` does, waiting for each run of them; returns the
-    /// block's end.
+    /// Execute the sequences `runs` publishes, with `literals`, followed by
+    /// `WILDCOPY_OVERLENGTH` bytes of slack, into `dst`, as `execute_with`
+    /// does, waiting for each run of them; returns the block's end.
     ///
     /// # Safety
     /// `dst` meets the `Dst` contract and `ext` the `ExtHistory` one.
     unsafe fn execute_published(
         runs: PublishedRuns<'_>,
-        num: usize,
+        literals: &[u8],
         ext: ExtHistory,
         hist: &mut [u32; 3],
         block_size_max: usize,
         dst: Dst,
         simd: Level,
     ) -> Result<usize, DecodeError> {
-        // The literals are published with the first run.
+        // Where they are, and whether the offsets are short, is published
+        // with the first run.
         runs.ready(0)?;
         let p = &runs.cell.published;
-        let literals = std::slice::from_raw_parts(
-            p.literals.load(Ordering::Relaxed),
-            p.literals_len.load(Ordering::Relaxed),
-        );
         let short = p.short.load(Ordering::Relaxed);
         let seqs = DecodedSeqs {
             seqs: p.seqs.load(Ordering::Relaxed),
             runs,
-            num,
             literals,
         };
         if ext.len == 0 {
@@ -6284,12 +6461,13 @@ mod parallel {
         }
     }
 
-    /// The runs of sequences the decode of the block of `ticket` publishes
-    /// in `cell`.
+    /// The runs of the `num` sequences the decode of the block of `ticket`
+    /// publishes in `cell`.
     #[derive(Clone, Copy)]
     struct PublishedRuns<'a> {
         cell: &'a Cell,
         ticket: usize,
+        num: usize,
     }
 
     impl PublishedRuns<'_> {
@@ -6324,12 +6502,11 @@ mod parallel {
         }
     }
 
-    /// A block's sequences as stage 2 publishes them, `num` at `seqs`,
-    /// with its literals followed by `WILDCOPY_OVERLENGTH` bytes of slack.
+    /// A block's sequences as stage 2 publishes them, at `seqs`, with its
+    /// literals followed by `WILDCOPY_OVERLENGTH` bytes of slack.
     struct DecodedSeqs<'a> {
         seqs: *const RawSeq,
         runs: PublishedRuns<'a>,
-        num: usize,
         literals: &'a [u8],
     }
 
@@ -6377,7 +6554,6 @@ mod parallel {
         DecodedSeqs {
             seqs,
             runs,
-            num,
             literals,
         }: DecodedSeqs<'_>,
         ext: ExtHistory,
@@ -6401,7 +6577,7 @@ mod parallel {
             window: dst.window,
         };
         let mut at = 0;
-        while at < num {
+        while at < runs.num {
             let end = runs.ready(at)?;
             // Published, so written for good.
             for s in std::slice::from_raw_parts(seqs.add(at), end - at) {
@@ -6687,8 +6863,8 @@ mod parallel {
         let decode = |i: usize, cell: &Cell| {
             if let Plan::Compressed(cp) = &plans[i] {
                 let id = base + i as u64;
-                cell.decode(ticket(i), |slot, publish| {
-                    decode_block(slot, publish, id, cp, def, start)
+                cell.decode(ticket(i), |slot, at| {
+                    decode_block(slot, at, id, cp, def, start)
                 });
             }
         };
@@ -6700,7 +6876,7 @@ mod parallel {
                     return;
                 };
                 let cell = &*ring[i % ring.len()];
-                cell.hand(ticket(i));
+                cell.hand(ticket(i), i == 0);
                 s.spawn_fifo(move |_| {
                     if cell.take(ticket(i)) {
                         decode(i, cell);
@@ -6720,11 +6896,15 @@ mod parallel {
                     spawn_decode(i - 1 + ring.len());
                 }
                 let stage2 = match plan {
-                    Plan::Compressed(_) => {
+                    Plan::Compressed(cp) => {
                         let cell = &*ring[i % ring.len()];
                         if cell.take(ticket(i)) {
                             decode(i, cell);
                         }
+                        // While a task decodes the sequences.
+                        let id = base + i as u64;
+                        let literals = cell
+                            .literals(ticket(i), |lits| decode_literals(lits, id, cp, def, start));
                         while !cell.startable(ticket(i)) {
                             // If no task has started block `i + 1` either,
                             // the decoders are behind: decode it here while
@@ -6740,7 +6920,11 @@ mod parallel {
                                 _ => std::thread::yield_now(),
                             }
                         }
-                        Some((cell, ticket(i)))
+                        Some(Stage2 {
+                            cell,
+                            ticket: ticket(i),
+                            literals,
+                        })
                     }
                     _ => None,
                 };
@@ -6842,29 +7026,42 @@ mod parallel {
         /// A cell's tickets: one handed is taken once, by whoever comes
         /// first, and is done once decoded; an earlier ticket, a task's
         /// whose block someone else took or whose cell was handed another,
-        /// is neither takeable nor done. A ticket handed has published
-        /// nothing, whatever the cell's decode before it published. A
-        /// decode that panics is done, and its panic resumes on the thread
-        /// that executes the block.
+        /// is neither takeable nor done. So for its literals: taken once,
+        /// an earlier ticket's not at all. A ticket handed has published
+        /// nothing and has no literals, whatever the cell's decode before
+        /// it did, and is startable once its decode is done, or has
+        /// published with its literals done. A decode that panics is done,
+        /// and its panic resumes on the thread that executes the block.
         #[test]
         fn cell_tickets_are_taken_once() {
             let cell = Cell::new();
             assert!(!cell.take(0) && !cell.decoded(0), "new");
-            cell.hand(7);
+            assert!(cell.literals(0, |_| Ok(())).is_none(), "new literals");
+            cell.hand(7, false);
             assert!(!cell.decoded(7));
             assert!(cell.take(7), "planned");
             assert!(!cell.take(7), "taken");
-            cell.decode(7, |_, publish| {
-                publish.decoded(1);
+            cell.decode(7, |_, at| {
+                at.published().decoded(1);
                 Ok(())
             });
             assert!(cell.decoded(7) && cell.startable(7));
-            cell.hand(8);
+            cell.hand(8, true);
             assert!(!cell.take(7) && !cell.decoded(8), "handed the next");
             assert!(!cell.startable(8), "nothing published");
-            assert!(cell.take(8));
-            cell.decode(8, |_, _| panic!("stage 2"));
-            assert!(cell.decoded(8));
+            assert!(cell.literals(7, |_| Ok(())).is_none(), "earlier literals");
+            cell.published.decoded(1);
+            assert!(!cell.startable(8), "published, literals to decode");
+            assert!(cell.literals(8, |_| Ok(())).is_some(), "literals planned");
+            let twice = cell.literals(8, |_| panic!("literals decoded twice"));
+            assert!(twice.is_none(), "literals taken");
+            assert!(cell.startable(8), "published, literals done");
+            cell.hand(9, false);
+            cell.published.decoded(1);
+            assert!(!cell.startable(9), "the literals of the ticket before");
+            assert!(cell.take(9));
+            cell.decode(9, |_, _| panic!("stage 2"));
+            assert!(cell.decoded(9));
             let resumed = panic::catch_unwind(AssertUnwindSafe(|| drop(decoded_slot(&cell))));
             let payload = resumed.expect_err("the decode's panic");
             assert_eq!(payload.downcast_ref::<&str>(), Some(&"stage 2"));
@@ -7210,29 +7407,33 @@ mod parallel {
             block
         }
 
-        /// Stage 2 of a block that decodes to `seqs` and `literals`: it
-        /// publishes the sequences up to each of `ends` in turn, calling
-        /// `step` after each, then ends with `result`.
-        fn fake_stage2(
+        /// The stage 2 of a block, faked: its sequences, its literals, and
+        /// whether its offsets are short.
+        #[derive(Clone, Copy)]
+        struct Fake<'a> {
+            seqs: &'a [RawSeq],
+            literals: &'a [u8],
+            short: bool,
+        }
+
+        /// The sequences of `fake` into `slot`, published up to each of
+        /// `ends` in turn, calling `step` after each, then ending with
+        /// `result`.
+        fn fake_sequences(
             slot: &mut Slot,
             publish: &Published,
-            (seqs, literals, short): (&[RawSeq], &[u8], bool),
+            fake: Fake<'_>,
             ends: &[usize],
             step: &dyn Fn(),
             result: Result<(), DecodeError>,
         ) -> Result<(), DecodeError> {
-            slot.literals.clear();
-            slot.literals.extend_from_slice(literals);
-            slot.literals
-                .resize(literals.len() + WILDCOPY_OVERLENGTH, 0);
-            publish.literals(&slot.literals, short);
             slot.seqs.clear();
-            slot.seqs.reserve(seqs.len());
+            slot.seqs.reserve(fake.seqs.len());
             let base = slot.seqs.as_mut_ptr();
-            publish.sequences(base);
+            publish.start(base, fake.short);
             let mut at = 0;
             for &end in ends {
-                for (i, s) in seqs.iter().enumerate().take(end).skip(at) {
+                for (i, s) in fake.seqs.iter().enumerate().take(end).skip(at) {
                     // SAFETY: reserved.
                     unsafe { base.add(i).write(*s) };
                 }
@@ -7243,11 +7444,65 @@ mod parallel {
             result
         }
 
-        /// Stage 3 of the block of `n` sequences in `cell`, ticket 1, into
-        /// `output`, with a dictionary of `dict`: the result, and the
-        /// repeat offsets after it, from 1, 4 and 8.
+        /// The literals `literals` into `lits`, or none and an error unless
+        /// `ok`.
+        fn fake_literals(lits: &mut LitSlot, literals: &[u8], ok: bool) -> Result<(), DecodeError> {
+            lits.literals.clear();
+            if !ok {
+                return Err("literals".into());
+            }
+            lits.literals.extend_from_slice(literals);
+            lits.literals
+                .resize(literals.len() + WILDCOPY_OVERLENGTH, 0);
+            Ok(())
+        }
+
+        /// A task's stage 2 of `fake` at `at`: `fake_sequences`, and the
+        /// literals unless taken, which call `step` and fail unless
+        /// `literals_ok`, setting `took`, in the order `at` gives.
+        fn fake_stage2(
+            slot: &mut Slot,
+            at: Decoding<'_>,
+            fake: Fake<'_>,
+            ends: &[usize],
+            step: &dyn Fn(),
+            (result, literals_ok): (Result<(), DecodeError>, bool),
+            took: &AtomicBool,
+        ) -> Result<(), DecodeError> {
+            at.stage2(
+                || fake_sequences(slot, at.published(), fake, ends, step, result),
+                |lits| {
+                    step();
+                    took.store(true, Ordering::Relaxed);
+                    fake_literals(lits, fake.literals, literals_ok)
+                },
+            )
+        }
+
+        /// The executing thread's claim on the literals of ticket 1 in
+        /// `cell`: `fake_literals` after `wait`, setting `took`, unless
+        /// someone has taken them.
+        fn claim<'c>(
+            cell: &'c Cell,
+            literals: &[u8],
+            ok: bool,
+            wait: &dyn Fn(),
+            took: &AtomicBool,
+        ) -> Option<MutexGuard<'c, LitSlot>> {
+            cell.literals(1, |lits| {
+                wait();
+                took.store(true, Ordering::Relaxed);
+                fake_literals(lits, literals, ok)
+            })
+        }
+
+        /// Stage 3 of the block of `n` sequences in `cell`, ticket 1, with
+        /// `literals` if the executing thread decoded them, into `output`,
+        /// with a dictionary of `dict`: the result, and the repeat offsets
+        /// after it, from 1, 4 and 8.
         fn stage3(
             cell: &Cell,
+            literals: Option<MutexGuard<'_, LitSlot>>,
             n: usize,
             dict: &[u8],
             output: &mut Vec<u8>,
@@ -7268,9 +7523,14 @@ mod parallel {
                 dict,
             };
             let mut hist = [1, 4, 8];
+            let stage2 = Stage2 {
+                cell,
+                ticket: 1,
+                literals,
+            };
             let executed = execute_block(
                 &plan,
-                Some((cell, 1)),
+                Some(stage2),
                 &mut hist,
                 BLOCK_SIZE_MAX,
                 &mut out,
@@ -7291,12 +7551,25 @@ mod parallel {
             ends
         }
 
+        /// When the executing thread claims a block's literals: before its
+        /// task starts, between two of its publishes, or once the task has
+        /// taken them.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Claim {
+            Before,
+            During,
+            After,
+        }
+
         /// Stage 3 executes a block's sequences as stage 2 publishes them,
         /// at once or run by run, around `PUBLISH_EVERY` and past two of
         /// its runs, with stage 2 done before stage 3 starts or still
         /// publishing on another thread, with and without history before
-        /// the frame and short-offset copies: each way the block decodes
-        /// as a whole, with the same repeat offsets.
+        /// the frame and short-offset copies, and with the literals decoded
+        /// once, before or after the sequences, by the task or by the
+        /// executing thread, before the task starts or while it publishes:
+        /// each way the block decodes as a whole, with the same repeat
+        /// offsets.
         #[test]
         fn published_runs_execute_as_the_whole_block() {
             let mut levels = vec![Level::fallback()];
@@ -7305,126 +7578,308 @@ mod parallel {
                 levels.push(Level::Avx2(w));
             }
             let every = PUBLISH_EVERY;
+            let handoffs = [
+                (false, Claim::After),
+                (false, Claim::Before),
+                (false, Claim::During),
+                (true, Claim::Before),
+                (true, Claim::During),
+                (true, Claim::After),
+            ];
             for n in [1, 2, 3, every - 1, every, every + 1, 2 * every + 1, 1000] {
                 let (seqs, literals, decoded) = echoes(n);
                 let runs = [vec![n], runs_of(n, every), runs_of(n, 1), runs_of(n, 7)];
                 for (ends, threaded) in runs.iter().flat_map(|e| [(e, false), (e, true)]) {
-                    for (&simd, dict, short) in levels
-                        .iter()
-                        .flat_map(|l| [(l, &[][..], false), (l, &[9u8; 16][..], true)])
-                    {
-                        let what = format!("{n} in {} runs, threaded {threaded}", ends.len());
+                    for (k, &(first, when)) in handoffs.iter().enumerate() {
+                        // Every handoff with each level and history, over
+                        // the runs.
+                        let simd = levels[k % levels.len()];
+                        let (dict, short) = [(&[][..], false), (&[9u8; 16][..], true)][k / 3];
+                        let what = format!(
+                            "{n} in {} runs, threaded {threaded}, sequences first {first}, \
+                             {when:?}",
+                            ends.len()
+                        );
+                        let fake = Fake {
+                            seqs: &seqs,
+                            literals: &literals,
+                            short,
+                        };
+                        let (task_took, mine_took) =
+                            (AtomicBool::new(false), AtomicBool::new(false));
                         let cell = Cell::new();
-                        cell.hand(1);
+                        cell.hand(1, first);
                         assert!(!cell.startable(1), "{what}: handed");
                         assert!(cell.take(1));
+                        let mine =
+                            |wait: &dyn Fn()| claim(&cell, &literals, true, wait, &mine_took);
+                        let step = || {
+                            if threaded {
+                                std::thread::sleep(std::time::Duration::from_micros(20));
+                            } else if when == Claim::During {
+                                drop(mine(&|| ()));
+                            }
+                        };
                         let decode = || {
-                            let step = || {
-                                if threaded {
-                                    std::thread::sleep(std::time::Duration::from_micros(50));
-                                }
-                            };
-                            let block = (&seqs[..], &literals[..], short);
-                            cell.decode(1, |slot, publish| {
-                                fake_stage2(slot, publish, block, ends, &step, Ok(()))
+                            cell.decode(1, |slot, at| {
+                                fake_stage2(slot, at, fake, ends, &step, (Ok(()), true), &task_took)
                             });
                         };
                         let mut output = Vec::new();
                         let (executed, hist) = std::thread::scope(|s| {
+                            let mut lits = None;
+                            if when == Claim::Before {
+                                lits = mine(&|| ());
+                                assert!(lits.is_some(), "{what}: claimed first");
+                            }
                             if threaded {
                                 s.spawn(decode);
-                                while !cell.startable(1) {
+                                let waited = |taken: &dyn Fn() -> bool| {
+                                    while !taken() && !cell.decoded(1) {
+                                        std::thread::yield_now();
+                                    }
+                                };
+                                match when {
+                                    Claim::Before => {}
+                                    Claim::During => {
+                                        waited(&|| {
+                                            cell.published.progress.load(Ordering::Acquire) != 0
+                                        });
+                                        let slow = || {
+                                            std::thread::sleep(std::time::Duration::from_micros(
+                                                100,
+                                            ))
+                                        };
+                                        lits = mine(&slow);
+                                    }
+                                    Claim::After => {
+                                        waited(&|| cell.lit_claim.load(Ordering::Acquire) & 1 == 1);
+                                        lits = mine(&|| ());
+                                    }
+                                }
+                                // Stage 3 waits for the task's literals
+                                // itself.
+                                while when != Claim::After && !cell.startable(1) {
                                     std::thread::yield_now();
                                 }
                             } else {
                                 decode();
+                                if when == Claim::After {
+                                    lits = mine(&|| ());
+                                }
                             }
-                            stage3(&cell, n, dict, &mut output, simd)
+                            stage3(&cell, lits, n, dict, &mut output, simd)
                         });
                         assert_eq!(executed, Ok(8 * n), "{what}");
                         assert!(output == decoded, "{what}: output");
                         assert_eq!(hist, echoes_hist(n), "{what}: offsets");
+                        let (task, mine) = (task_took.into_inner(), mine_took.into_inner());
+                        assert!(task != mine, "{what}: literals decoded once");
+                        // The executing thread decodes them when it comes
+                        // first; between publishes, it does only before a
+                        // task that does the sequences first takes them.
+                        match (when, first, threaded) {
+                            (Claim::Before, _, _) | (Claim::During, true, false) => {
+                                assert!(mine, "{what}: the executing thread's")
+                            }
+                            (Claim::After, _, _) | (Claim::During, false, false) => {
+                                assert!(task, "{what}: the task's")
+                            }
+                            (Claim::During, _, true) => {}
+                        }
                     }
                 }
             }
         }
 
-        /// A stage 2 that fails, before it publishes, after part of the
-        /// sequences, or after all of them, or that panics after part, or
-        /// that succeeds with a last sequence stage 3 rejects: stage 3
-        /// fails, or resumes the panic, and neither commits the block nor
-        /// changes the repeat offsets, whatever of it executed.
-        /// A block without sequences commits its literals once stage 2
-        /// is done, and only if it succeeded.
+        /// Stage 3 of a block, from `stage2_then_3`.
+        struct Executed {
+            result: Result<usize, DecodeError>,
+            output: Vec<u8>,
+            hist: [u32; 3],
+            /// The result of executing the block again, as a chain that
+            /// stops at it does.
+            again: Result<usize, DecodeError>,
+        }
+
+        /// Stage 2 of `fake` in a new cell, its sequences published up to
+        /// each of `ends` and ending with `result`, its literals failing
+        /// unless `literals_ok`, decoded by the executing thread before the
+        /// task starts if `mine`, the sequences first if `first`; then
+        /// stage 3 of it after `[5]`, from repeat offsets 1, 4 and 8, as
+        /// the executing thread claims the literals before it.
+        fn stage2_then_3(
+            fake: Fake<'_>,
+            ends: &[usize],
+            result: Result<(), DecodeError>,
+            (literals_ok, mine, first): (bool, bool, bool),
+        ) -> Executed {
+            let simd = Level::new();
+            let took = AtomicBool::new(false);
+            let cell = Cell::new();
+            cell.hand(1, first);
+            assert!(cell.take(1));
+            let mut lits = None;
+            if mine {
+                lits = claim(&cell, fake.literals, literals_ok, &|| (), &took);
+                assert!(lits.is_some());
+            }
+            cell.decode(1, |slot, at| {
+                fake_stage2(slot, at, fake, ends, &|| (), (result, literals_ok), &took)
+            });
+            if lits.is_none() {
+                lits = claim(&cell, fake.literals, literals_ok, &|| (), &took);
+            }
+            assert!(cell.startable(1));
+            let n = fake.seqs.len();
+            let mut output = vec![5];
+            let (result, hist) = stage3(&cell, lits, n, &[], &mut output, simd);
+            assert!(cell.literals(1, |_| panic!("decoded again")).is_none());
+            let (again, _) = stage3(&cell, None, n, &[], &mut Vec::new(), simd);
+            Executed {
+                result,
+                output,
+                hist,
+                again,
+            }
+        }
+
+        /// A stage 2 whose sequences fail, before they publish, after part
+        /// of them, or after all of them, or whose literals fail, the
+        /// task's or the executing thread's, before or after the sequences,
+        /// or that succeeds with a last sequence stage 3 rejects, or that
+        /// panics, after part of the sequences or in the literals, the
+        /// task's or the executing thread's: stage 3 fails, or resumes the
+        /// panic, and neither commits the block nor changes the repeat
+        /// offsets, whatever of it executed, and fails again for a chain
+        /// that executes it again. A block without sequences commits its
+        /// literals once stage 2 is done, and only if all of it succeeded.
         #[test]
         fn failed_stage2_keeps_its_block_out() {
             let simd = Level::new();
             let n = 2 * PUBLISH_EVERY + 1;
             let (seqs, literals, _) = echoes(n);
-            let block = (&seqs[..], &literals[..], false);
-            for ends in [vec![], vec![PUBLISH_EVERY], runs_of(n, PUBLISH_EVERY)] {
-                let cell = Cell::new();
-                cell.hand(1);
-                assert!(cell.take(1));
-                let failed = || Err("stage 2".into());
-                cell.decode(1, |slot, publish| {
-                    fake_stage2(slot, publish, block, &ends, &|| (), failed())
-                });
-                assert!(cell.startable(1));
-                let mut output = vec![5];
-                let (executed, hist) = stage3(&cell, n, &[], &mut output, simd);
-                assert!(executed.is_err(), "{ends:?}");
-                assert_eq!((output, hist), (vec![5], [1, 4, 8]), "{ends:?}");
-                // Still failed for a chain that executes it again.
-                let (again, _) = stage3(&cell, n, &[], &mut Vec::new(), simd);
-                assert!(again.is_err(), "{ends:?} again");
+            let fake = Fake {
+                seqs: &seqs,
+                literals: &literals,
+                short: false,
+            };
+            let all = runs_of(n, PUBLISH_EVERY);
+            let orders = [(false, false), (false, true), (true, false), (true, true)];
+            let kept = |what: &str, e: Executed| {
+                assert!(e.result.is_err(), "{what}");
+                assert_eq!((e.output, e.hist), (vec![5], [1, 4, 8]), "{what}");
+                assert!(e.again.is_err(), "{what} again");
+            };
+            for (mine, first) in orders {
+                for ends in [vec![], vec![PUBLISH_EVERY], all.clone()] {
+                    let what = format!("sequences failing at {ends:?}, mine {mine}, first {first}");
+                    kept(
+                        &what,
+                        stage2_then_3(fake, &ends, Err("stage 2".into()), (true, mine, first)),
+                    );
+                }
+                let what = format!("literals failing, mine {mine}, first {first}");
+                kept(
+                    &what,
+                    stage2_then_3(fake, &all, Ok(()), (false, mine, first)),
+                );
+                let mut far = seqs.clone();
+                far[n - 1].off_base = (1 << 16) + ZSTD_REP_NUM as u32;
+                let rejected = Fake { seqs: &far, ..fake };
+                let e = stage2_then_3(rejected, &all, Ok(()), (true, mine, first));
+                let what = format!("rejected, mine {mine}, first {first}");
+                assert_eq!(
+                    e.result,
+                    Err("Match offset reaches before the frame start".into()),
+                    "{what}"
+                );
+                assert_eq!((e.output, e.hist), (vec![5], [1, 4, 8]), "{what}");
             }
-            let mut far = seqs.clone();
-            far[n - 1].off_base = (1 << 16) + ZSTD_REP_NUM as u32;
-            let cell = Cell::new();
-            cell.hand(1);
-            assert!(cell.take(1));
-            let ends = runs_of(n, PUBLISH_EVERY);
-            let rejected = (&far[..], &literals[..], false);
-            cell.decode(1, |slot, publish| {
-                fake_stage2(slot, publish, rejected, &ends, &|| (), Ok(()))
-            });
-            let mut output = vec![5];
-            let (executed, hist) = stage3(&cell, n, &[], &mut output, simd);
-            assert_eq!(
-                executed,
-                Err("Match offset reaches before the frame start".into())
-            );
-            assert_eq!((output, hist), (vec![5], [1, 4, 8]), "rejected");
-            let cell = Cell::new();
-            cell.hand(1);
-            assert!(cell.take(1));
-            cell.decode(1, |slot, publish| {
-                fake_stage2(slot, publish, block, &[PUBLISH_EVERY], &|| (), Ok(()))?;
-                panic!("stage 2")
-            });
-            let mut output = vec![5];
-            let mut hist = [1, 4, 8];
-            let resumed = panic::catch_unwind(AssertUnwindSafe(|| {
-                (_, hist) = stage3(&cell, n, &[], &mut output, simd);
-            }));
-            let payload = resumed.expect_err("the decode's panic");
-            assert_eq!(payload.downcast_ref::<&str>(), Some(&"stage 2"));
-            assert_eq!((output, hist), (vec![5], [1, 4, 8]));
-            for result in [Ok(()), Err("stage 2".into())] {
-                let ok = result.is_ok();
+            let took = AtomicBool::new(false);
+            for (first, in_literals) in [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let what = format!("panic, first {first}, in the literals {in_literals}");
                 let cell = Cell::new();
-                cell.hand(1);
+                cell.hand(1, first);
                 assert!(cell.take(1));
-                let literals = (&[][..], &literals[..100], false);
-                cell.decode(1, |slot, publish| {
-                    fake_stage2(slot, publish, literals, &[], &|| (), result)
+                cell.decode(1, |slot, at| {
+                    at.stage2(
+                        || {
+                            let ends = if in_literals {
+                                &all[..]
+                            } else {
+                                &[PUBLISH_EVERY]
+                            };
+                            fake_sequences(slot, at.published(), fake, ends, &|| (), Ok(()))?;
+                            if !in_literals {
+                                panic!("stage 2");
+                            }
+                            Ok(())
+                        },
+                        |lits| {
+                            fake_literals(lits, fake.literals, true)?;
+                            if in_literals {
+                                panic!("stage 2");
+                            }
+                            Ok(())
+                        },
+                    )
                 });
-                let mut output = Vec::new();
-                let (executed, hist) = stage3(&cell, 0, &[], &mut output, simd);
-                assert_eq!(executed.is_ok(), ok);
-                let committed = if ok { literals.1 } else { &[] };
-                assert_eq!((&output[..], hist), (committed, [1, 4, 8]), "{ok}");
+                let lits = claim(&cell, fake.literals, true, &|| (), &took);
+                let mut output = vec![5];
+                let mut hist = [1, 4, 8];
+                let resumed = panic::catch_unwind(AssertUnwindSafe(|| {
+                    (_, hist) = stage3(&cell, lits, n, &[], &mut output, simd);
+                }));
+                let payload = resumed.expect_err(&what);
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"stage 2"), "{what}");
+                assert_eq!((output, hist), (vec![5], [1, 4, 8]), "{what}");
+                let (again, _) = stage3(&cell, None, n, &[], &mut Vec::new(), simd);
+                assert!(again.is_err(), "{what} again");
+            }
+            // The executing thread's literals decode panics, unwinding it,
+            // and leaves them failed.
+            let cell = Cell::new();
+            cell.hand(1, true);
+            assert!(cell.take(1));
+            let resumed = panic::catch_unwind(AssertUnwindSafe(|| {
+                drop(cell.literals(1, |_| panic!("literals")));
+            }));
+            let payload = resumed.expect_err("the literals' panic");
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"literals"));
+            let task = AtomicBool::new(false);
+            cell.decode(1, |slot, at| {
+                fake_stage2(slot, at, fake, &all, &|| (), (Ok(()), true), &task)
+            });
+            assert!(!task.into_inner(), "the literals taken");
+            let mut output = vec![5];
+            let (executed, hist) = stage3(&cell, None, n, &[], &mut output, simd);
+            assert!(executed.is_err(), "panicked literals");
+            assert_eq!((output, hist), (vec![5], [1, 4, 8]), "panicked literals");
+            let none = Fake {
+                seqs: &[],
+                literals: &literals[..100],
+                short: false,
+            };
+            for (sequences_ok, literals_ok, mine) in [
+                (true, true, false),
+                (true, true, true),
+                (false, true, false),
+                (true, false, false),
+                (true, false, true),
+            ] {
+                let ok = sequences_ok && literals_ok;
+                let result = if sequences_ok {
+                    Ok(())
+                } else {
+                    Err("stage 2".into())
+                };
+                let e = stage2_then_3(none, &[], result, (literals_ok, mine, mine));
+                let what = format!("no sequences, {sequences_ok} {literals_ok} {mine}");
+                assert_eq!((e.result.is_ok(), e.again.is_ok()), (ok, ok), "{what}");
+                let committed = [&[5][..], if ok { none.literals } else { &[] }].concat();
+                assert_eq!((e.output, e.hist), (committed, [1, 4, 8]), "{what}");
             }
         }
     }
