@@ -8,7 +8,10 @@
 
 mod common;
 
-use common::{lcg_bytes, read_all, stream_room, stream_with, STREAM_CHUNKS};
+use common::{
+    c_streaming, check_streamed, is_window_limit, lcg_bytes, read_all, stream_room, stream_with,
+    STREAM_CHUNKS,
+};
 use rust_zstd::compress::{compress_with_dict, CompressDict};
 use rust_zstd::decode::{
     decompress_with_dict, decompress_with_dict_options, DecodeDict, DecodeOptions, Decompressor,
@@ -17,6 +20,31 @@ use std::cell::RefCell;
 use zstd::zstd_safe::zstd_sys as sys;
 
 use sys::ZSTD_cParameter as P;
+
+thread_local! {
+    /// The bytes of each dictionary `ddict` parsed, by the address of its
+    /// content, which its clones share, for libzstd to decode with.
+    static DICT_BYTES: RefCell<Vec<(*const u8, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `DecodeDict::new(raw)`, which must succeed, remembered for `dict_bytes`.
+fn ddict(raw: &[u8]) -> DecodeDict {
+    let dict = DecodeDict::new(raw).unwrap();
+    DICT_BYTES.with_borrow_mut(|d| d.push((dict.content().as_ptr(), raw.to_vec())));
+    dict
+}
+
+/// The bytes `ddict` parsed `dict` from. A live dictionary's content was
+/// registered last at its address: one registered there before was freed.
+fn dict_bytes(dict: &DecodeDict) -> Vec<u8> {
+    DICT_BYTES.with_borrow(|d| {
+        d.iter()
+            .rev()
+            .find(|(at, _)| *at == dict.content().as_ptr())
+            .map(|(_, raw)| raw.clone())
+            .expect("a dictionary made by `ddict`")
+    })
+}
 
 /// Records sharing field names and a small vocabulary, like the payloads
 /// dictionaries are trained for.
@@ -296,6 +324,7 @@ fn paths() -> [(DecodeOptions, &'static str); 4] {
     let o = |min_parallel_blocks, simd| DecodeOptions {
         min_parallel_blocks,
         simd,
+        window_log_max: 0,
     };
     [
         (o(usize::MAX, true), "serial"),
@@ -345,6 +374,7 @@ thread_local! {
         Decompressor::with_options(&DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd,
+            window_log_max: 0,
         })
     }));
 }
@@ -359,14 +389,20 @@ fn outcome(r: &Result<Vec<u8>, String>) -> String {
 /// A decompressor holding `dict`, or none, gives the outcome of the
 /// one-shot `decompress_with_dict_options` (serial) on `input` at both
 /// SIMD levels, the same content or the same error: streaming at each of
-/// `STREAM_CHUNKS`, with as much output room up to 64 KiB, and through its
-/// `decompress`. So does `DecompressReader::with_dict`, in pieces of 7
-/// bytes and whole.
+/// `STREAM_CHUNKS`, with as much output room up to 64 KiB, but for the
+/// window limit's refusals that libzstd's streaming decoder shares
+/// (`check_streamed`), and through its `decompress`. So does
+/// `DecompressReader::with_dict`, in pieces of 7 bytes and whole, where it
+/// refuses by the window limit only input libzstd refuses so in pieces of
+/// a byte.
 fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
+    let raw = dict.map(dict_bytes);
+    let dict_and_bytes = dict.zip(raw.as_deref());
     for simd in [false, true] {
         let opts = DecodeOptions {
             min_parallel_blocks: usize::MAX,
             simd,
+            window_log_max: 0,
         };
         let want = decompress_with_dict_options(input, dict, &opts);
         HOLDING.with_borrow_mut(|h| {
@@ -374,12 +410,8 @@ fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
             for chunk in STREAM_CHUNKS {
                 d.set_dict(dict);
                 let got = stream_with(d, input, chunk, stream_room(chunk));
-                assert!(
-                    got == want,
-                    "{what} simd={simd} chunk {chunk}: streaming gives {} where one-shot gives {}",
-                    outcome(&got),
-                    outcome(&want)
-                );
+                let at = format!("{what} simd={simd} chunk {chunk}");
+                check_streamed(&at, input, chunk, simd, dict_and_bytes, &got, &want);
             }
             let got = d.decompress(input);
             assert!(
@@ -399,6 +431,14 @@ fn assert_streams(what: &str, input: &[u8], dict: Option<&DecodeDict>) {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}");
                 e.to_string()
             });
+            if is_window_limit(&got) {
+                assert_eq!(
+                    c_streaming(input, 1, 1, 0, raw.as_deref()),
+                    Err(sys::ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge),
+                    "{what} piece {piece}: the reader refuses a window libzstd takes"
+                );
+                continue;
+            }
             assert!(
                 got == want,
                 "{what} piece {piece}: the reader gives {} where one-shot gives {}",
@@ -451,7 +491,7 @@ const LEVELS: [i32; 10] = [-5, 1, 2, 3, 5, 7, 12, 16, 19, 22];
 #[test]
 fn formatted_dicts_parse_like_libzstd() {
     for raw in [trained_dict(), entropy_dict()] {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         // SAFETY: `raw` is read during the calls only.
         let (id, header) = unsafe {
             (
@@ -473,7 +513,7 @@ fn dict_frames_decode() {
 }
 
 fn dict_frames_decode_with(raw: &[u8], name: &str) {
-    let dict = DecodeDict::new(raw).unwrap();
+    let dict = ddict(raw);
     for (n, seed) in [(1, 1), (4, 2), (60, 3), (1500, 4)] {
         let src = records(n, seed);
         for level in LEVELS {
@@ -501,7 +541,7 @@ fn dict_small_blocks_decode() {
 }
 
 fn dict_small_blocks_decode_with(raw: &[u8], name: &str) {
-    let dict = DecodeDict::new(raw).unwrap();
+    let dict = ddict(raw);
     let src = records(400, 9);
     for level in [1, 3, 9, 19] {
         let frame = c_compress_dict(
@@ -525,7 +565,7 @@ fn dict_small_blocks_decode_with(raw: &[u8], name: &str) {
 #[test]
 fn concatenated_dict_frames_decode() {
     for (raw, name) in dicts() {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         let a = records(3, 21);
         let b = records(200, 22);
         let mut frames = c_compress_using_dict(&a, &raw, 3);
@@ -541,7 +581,7 @@ fn concatenated_dict_frames_decode() {
 #[test]
 fn frame_without_dict_id_uses_supplied_dict() {
     for (raw, name) in dicts() {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         let src = records(30, 31);
         let frame = c_compress_dict(
             &src,
@@ -578,9 +618,9 @@ fn stream(d: &mut Decompressor, src: &[u8]) -> Result<Vec<u8>, String> {
 #[test]
 fn reused_decompressor_takes_each_calls_dict() {
     let (raw_a, raw_b) = (trained_dict(), entropy_dict());
-    let a = DecodeDict::new(&raw_a).unwrap();
-    let b = DecodeDict::new(&raw_b).unwrap();
-    let content = DecodeDict::new(a.content()).unwrap();
+    let a = ddict(&raw_a);
+    let b = ddict(&raw_b);
+    let content = ddict(a.content());
     let src = records(60, 61);
     let fa = c_compress_using_dict(&src, &raw_a, 3);
     let fb = c_compress_using_dict(&src, &raw_b, 19);
@@ -623,7 +663,7 @@ fn reused_decompressor_takes_each_calls_dict() {
 fn raw_content_dict_frames_decode() {
     let content = records(150, 41);
     assert_ne!(&content[..4], &0xEC30_A437u32.to_le_bytes());
-    let dict = DecodeDict::new(&content).unwrap();
+    let dict = ddict(&content);
     assert_eq!(dict.id(), 0);
     assert_eq!(dict.content(), &content[..]);
     for (n, seed) in [(2, 42), (50, 43), (1000, 44)] {
@@ -644,7 +684,7 @@ fn raw_content_dict_frames_decode() {
 #[test]
 fn short_raw_content_dict_is_history() {
     let content = b"abcdefg";
-    let dict = DecodeDict::new(content).unwrap();
+    let dict = ddict(content);
     assert_eq!(dict.content(), content);
     // One compressed block: literal "xyz", then a match of 7 bytes at
     // offset 10 that copies the whole dictionary. LL, OF and ML in RLE
@@ -672,17 +712,17 @@ fn short_raw_content_dict_is_history() {
 #[test]
 fn wrong_or_missing_dict_is_an_error() {
     let raw = trained_dict();
-    let dict = DecodeDict::new(&raw).unwrap();
+    let dict = ddict(&raw);
     let src = records(20, 51);
     let frame = c_compress_using_dict(&src, &raw, 3);
 
     // Same tables and content, another Dictionary_ID.
     let mut other = raw.clone();
     other[4] ^= 1;
-    let other = DecodeDict::new(&other).unwrap();
+    let other = ddict(&other);
     assert_rejects("wrong id", &frame, Some(&other), "dictionary");
     // A raw-content dictionary has Dictionary_ID 0.
-    let content = DecodeDict::new(dict.content()).unwrap();
+    let content = ddict(dict.content());
     assert_rejects("raw dict", &frame, Some(&content), "dictionary");
     assert_rejects("no dict", &frame, None, "none is loaded");
 }
@@ -754,18 +794,13 @@ fn offset_before_dict_start_is_an_error() {
     let content = lcg_bytes(4096, 71);
     let src = [&lcg_bytes(100, 72)[..], &content[..2000]].concat();
     let frame = c_compress_using_dict(&src, &content, 3);
-    assert_decodes(
-        "whole dict",
-        &frame,
-        &DecodeDict::new(&content).unwrap(),
-        &src,
-    );
+    assert_decodes("whole dict", &frame, &ddict(&content), &src);
     let short = &content[1..];
     assert_eq!(c_decompress_dict(&frame, short, src.len() + 1024), None);
     assert_rejects(
         "dict one byte short",
         &frame,
-        Some(&DecodeDict::new(short).unwrap()),
+        Some(&ddict(short)),
         "before the dictionary start",
     );
 }
@@ -779,7 +814,7 @@ fn offset_before_dict_start_is_an_error() {
 #[test]
 fn dict_reach_ends_at_window_size() {
     let content = lcg_bytes(64 * 1024, 81);
-    let dict = DecodeDict::new(&content).unwrap();
+    let dict = ddict(&content);
     for (fresh, ok) in [(128 * 1024, true), (128 * 1024 + 1, false)] {
         let src = [&lcg_bytes(fresh, 82)[..], &content[..4000]].concat();
         let mut frame = c_compress_dict(
@@ -821,8 +856,8 @@ fn dict_reach_ends_at_window_size() {
 #[test]
 fn held_dict_starts_every_frame() {
     let (raw_a, raw_b) = (trained_dict(), entropy_dict());
-    let a = DecodeDict::new(&raw_a).unwrap();
-    let b = DecodeDict::new(&raw_b).unwrap();
+    let a = ddict(&raw_a);
+    let b = ddict(&raw_b);
     let src = records(60, 101);
     let fa = c_compress_using_dict(&src, &raw_a, 3);
     let fb = c_compress_using_dict(&src, &raw_b, 19);
@@ -873,7 +908,7 @@ fn held_dict_starts_every_frame() {
 #[test]
 fn our_and_cdict_frames_decode() {
     for (raw, name) in dicts() {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         for (n, seed) in [(1, 111), (40, 112), (800, 113)] {
             let src = records(n, seed);
             for level in [-5, 1, 3, 9, 19] {
@@ -901,7 +936,7 @@ fn our_and_cdict_frames_decode() {
 fn dict_frames_past_small_windows() {
     let src = records(2000, 121);
     for (raw, name) in dicts() {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         for window_log in [10, 12, 15, 17] {
             for content_size in [0, 1] {
                 let frame = c_compress_dict(
@@ -944,7 +979,7 @@ fn interleaved_dict_and_plain_frames() {
     let mut cases = dicts();
     cases.push((records(150, 131), "raw content"));
     for (raw, name) in cases {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         let (a, b, c) = (records(5, 132), records(300, 133), records(40, 134));
         let parts = [
             (zstd::bulk::compress(&b, 3).unwrap(), &b[..], "plain"),
@@ -1111,7 +1146,7 @@ fn truncated_dict_frames_verdict_matches_libzstd() {
         src,
     } in sweep_frames()
     {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         assert_eq!(decompress_with_dict(&frame, &dict), Ok(src), "{name}");
         for cut in 0..frame.len() {
             let what = format!("{name} cut {cut}");
@@ -1129,7 +1164,7 @@ fn corrupt_dict_frames_verdict_matches_libzstd() {
         name, frame, raw, ..
     } in sweep_frames()
     {
-        let dict = DecodeDict::new(&raw).unwrap();
+        let dict = ddict(&raw);
         for at in 0..frame.len() {
             for x in [0x01u8, 0x80, 0xFF, 0x55] {
                 let mut bad = frame.clone();

@@ -11,7 +11,9 @@ use std::io::{self, Read};
 /// input, keeping at most one unit of input (a block) and one window of
 /// output: a frame decodes in memory bounded by its Window_Size, by its
 /// Frame_Content_Size when that is smaller, and by what it has decoded
-/// to so far.
+/// to so far. The one exception is libzstd's: a frame whose Window_Size
+/// is above the limit `DecodeOptions::window_log_max` sets, by default
+/// `(1 << 27) + 1`, is refused unless one call gets it whole.
 ///
 /// One made `with_dict`, or given a dictionary by `set_dict`, starts every
 /// frame from it (ZSTD_DCtx_refDDict), as `decompress_with_dict` does: the
@@ -25,6 +27,9 @@ use std::io::{self, Read};
 /// the caller keeps too.
 pub struct Decompressor {
     dec: FrameDecoder,
+    /// The Window_Size above which `decompress_stream` refuses a frame
+    /// (`DecodeOptions::window_log_max`).
+    window_max: u64,
     /// The dictionary frames start from, unless a call names another.
     dict: Option<DecodeDict>,
     /// The start of a unit that came in pieces.
@@ -48,13 +53,26 @@ impl Decompressor {
         Self::with_options(&DecodeOptions::default())
     }
 
-    /// A decompressor on the paths `opts` picks. `decompress_stream`
-    /// decodes on the current thread whatever `opts.min_parallel_blocks`
-    /// says.
+    /// A decompressor on the paths `opts` picks, with the window limit it
+    /// sets. `decompress_stream` decodes on the current thread whatever
+    /// `opts.min_parallel_blocks` says.
+    ///
+    /// # Panics
+    /// If `opts.window_log_max` is neither 0 nor in
+    /// `ZSTD_WINDOWLOG_ABSOLUTEMIN..=ZSTD_WINDOWLOG_MAX`.
     #[doc(hidden)]
     pub fn with_options(opts: &DecodeOptions) -> Self {
+        let window_max = match opts.window_log_max {
+            0 => ZSTD_MAXWINDOWSIZE_DEFAULT,
+            log @ ZSTD_WINDOWLOG_ABSOLUTEMIN..=ZSTD_WINDOWLOG_MAX => 1 << log,
+            log => panic!(
+                "window_log_max {log} out of range: 0 or \
+                 {ZSTD_WINDOWLOG_ABSOLUTEMIN}..={ZSTD_WINDOWLOG_MAX}"
+            ),
+        };
         Decompressor {
             dec: FrameDecoder::new(opts),
+            window_max,
             dict: None,
             unit: Vec::new(),
             ring: Ring::default(),
@@ -169,6 +187,10 @@ impl Decompressor {
     /// many input bytes it takes to finish the current unit, or 1 when only
     /// output remains to be written.
     ///
+    /// A frame whose Window_Size is above the decompressor's limit fails at
+    /// its header, unless this call has all of it and room for its
+    /// Frame_Content_Size (`DecodeOptions::window_log_max`).
+    ///
     /// After an error the decompressor is stopped: every later call returns
     /// the same error, until `reset`.
     ///
@@ -245,7 +267,8 @@ impl Decompressor {
             }
 
             let input = &src[*src_pos..];
-            let unit = if self.unit.is_empty() && self.dec.unit_len(input) <= input.len() {
+            let whole = self.unit.is_empty() && self.dec.unit_len(input) <= input.len();
+            let unit = if whole {
                 let len = self.dec.unit_len(input);
                 *src_pos += len;
                 &input[..len]
@@ -273,14 +296,80 @@ impl Decompressor {
             };
             let event = self.dec.process(unit, &mut out, dict)?;
             self.unit.clear();
+            if event == Event::FrameStarted {
+                // A header that came whole starts the call's input: a call
+                // returns once a frame ends.
+                self.admit(if whole { input } else { &[] }, dst.len() - *dst_pos)?;
+            }
             self.frame_ended = event == Event::FrameEnded;
         }
+    }
+
+    /// ZSTD_decompressStream's window limit, on the frame just started:
+    /// refuse a Window_Size above `window_max`, unless the frame decodes in
+    /// one pass, as libzstd decodes it with ZSTD_decompress_usingDDict
+    /// then: its Frame_Content_Size fits in `room`, the output the call
+    /// has, and `input`, the call's input from the frame's start, holds the
+    /// whole frame (`holds_frame`). `input` is empty for a header that came
+    /// in pieces, where libzstd's walk starts inside the header and fails.
+    /// The verdict comes before the frame's first block, so before the ring
+    /// takes memory for it.
+    fn admit(&mut self, input: &[u8], room: usize) -> Result<(), String> {
+        let (frame, _) = self.dec.frame_start();
+        let window = frame.window as u64;
+        if window <= self.window_max
+            || frame.content_size.is_some_and(|fcs| fcs <= room as u64) && holds_frame(input)
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "Window size {} too large, the streaming limit is {}",
+            window, self.window_max
+        ))
     }
 
     /// The input bytes it takes to finish the current unit, at least 1.
     fn hint(&self) -> usize {
         (self.dec.unit_len(&self.unit) - self.unit.len()).max(1)
     }
+}
+
+/// `ZSTD_WINDOWLOG_ABSOLUTEMIN`, the least `ZSTD_d_windowLogMax`.
+const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
+/// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
+const ZSTD_WINDOWLOG_LIMIT_DEFAULT: u32 = 27;
+/// `ZSTD_MAXWINDOWSIZE_DEFAULT`, the window limit of a new ZSTD_DCtx and of
+/// `DecodeOptions::window_log_max` 0.
+const ZSTD_MAXWINDOWSIZE_DEFAULT: u64 = (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1;
+
+/// Whether `input` holds the whole frame whose header it starts with, as
+/// ZSTD_findFrameCompressedSize walks it: the header, the blocks up to the
+/// last by their headers alone, and the Content_Checksum. A reserved block
+/// type ends the walk; a Block_Size past the frame's maximum does not.
+fn holds_frame(input: &[u8]) -> bool {
+    let mut pos = frame_header_len(input);
+    if pos > input.len() {
+        return false;
+    }
+    let checksum = FrameDescriptor(input[4]).content_checksum_flag();
+    loop {
+        let Some(&[b0, b1, b2]) = input.get(pos..pos + BLOCK_HEADER_LEN) else {
+            return false;
+        };
+        let header = u32::from_le_bytes([b0, b1, b2, 0]);
+        let size = match (header >> 1) & 3 {
+            // RLE: one byte of content.
+            1 => 1,
+            // Reserved: corruption_detected.
+            3 => return false,
+            _ => header as usize >> 3,
+        };
+        pos += BLOCK_HEADER_LEN + size;
+        if header & 1 != 0 {
+            break;
+        }
+    }
+    pos + if checksum { CHECKSUM_LEN } else { 0 } <= input.len()
 }
 
 /// An `io::Read` of the content of the frames `inner` reads, decoded one

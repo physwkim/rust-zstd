@@ -20,6 +20,7 @@ fn decode_with(data: &[u8], simd: bool, min_parallel_blocks: usize) -> Result<Ve
         &DecodeOptions {
             min_parallel_blocks,
             simd,
+            window_log_max: 0,
         },
     )
 }
