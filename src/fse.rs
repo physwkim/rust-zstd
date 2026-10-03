@@ -3,6 +3,7 @@
 
 use super::bitstream::BitCStream;
 use super::huf;
+use crate::compress::entropy::Repeat;
 use crate::compress::seqstore::Seq;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -440,19 +441,6 @@ pub enum SymbolEncodingType {
     Repeat = 3,
 }
 
-/// `FSE_repeat`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FseRepeat {
-    /// `FSE_repeat_none`: the table cannot be referenced with `Repeat`.
-    #[default]
-    None,
-    /// `FSE_repeat_check`: a custom table the next block may reference
-    /// after checking that it covers its symbols.
-    Check,
-    /// `FSE_repeat_valid`: usable without checks (dictionaries only).
-    Valid,
-}
-
 /// One sequence table as the decoder holds it (`FSE_CTable` plus its
 /// `FSE_repeat` mode).
 #[derive(Clone, Debug, Default)]
@@ -471,19 +459,19 @@ impl FseTableState {
         }
     }
 
-    pub fn repeat(&self) -> FseRepeat {
+    pub fn repeat(&self) -> Repeat {
         match self {
-            FseTableState::None => FseRepeat::None,
-            FseTableState::Check(_) => FseRepeat::Check,
-            FseTableState::Valid(_) => FseRepeat::Valid,
+            FseTableState::None => Repeat::None,
+            FseTableState::Check(_) => Repeat::Check,
+            FseTableState::Valid(_) => Repeat::Valid,
         }
     }
 
-    fn from_mode(mode: FseRepeat, table: &FseCTable) -> Self {
+    fn from_mode(mode: Repeat, table: &FseCTable) -> Self {
         match mode {
-            FseRepeat::None => FseTableState::None,
-            FseRepeat::Check => FseTableState::Check(table.clone()),
-            FseRepeat::Valid => FseTableState::Valid(table.clone()),
+            Repeat::None => FseTableState::None,
+            Repeat::Check => FseTableState::Check(table.clone()),
+            Repeat::Valid => FseTableState::Valid(table.clone()),
         }
     }
 }
@@ -934,7 +922,7 @@ impl FseCTable {
 /// [`build_ctable`] reports the failure.
 #[allow(clippy::too_many_arguments)]
 fn select_encoding_type(
-    repeat_mode: &mut FseRepeat,
+    repeat_mode: &mut Repeat,
     counts: &[u32],
     max: usize,
     most_frequent: usize,
@@ -947,7 +935,7 @@ fn select_encoding_type(
     strategy: Strategy,
 ) -> SymbolEncodingType {
     if most_frequent == nb_seq {
-        *repeat_mode = FseRepeat::None;
+        *repeat_mode = Repeat::None;
         if is_default_allowed && nb_seq <= 2 {
             // Prefer set_basic over set_rle when there are 2 or fewer
             // symbols, since RLE uses 1 byte, but set_basic uses 5-6 bits
@@ -965,14 +953,14 @@ fn select_encoding_type(
             let dynamic_fse_nb_seq_min = ((1usize << default_norm_log) * mult) >> base_log;
             debug_assert!((5..=6).contains(&default_norm_log));
             debug_assert!((7..=9).contains(&mult));
-            if *repeat_mode == FseRepeat::Valid && nb_seq < static_fse_nb_seq_max {
+            if *repeat_mode == Repeat::Valid && nb_seq < static_fse_nb_seq_max {
                 return SymbolEncodingType::Repeat;
             }
             if nb_seq < dynamic_fse_nb_seq_min || most_frequent < (nb_seq >> (default_norm_log - 1))
             {
                 // The format allows default tables to be repeated, but it
                 // isn't useful: don't confuse them with dictionaries.
-                *repeat_mode = FseRepeat::None;
+                *repeat_mode = Repeat::None;
                 return SymbolEncodingType::Basic;
             }
         }
@@ -980,7 +968,7 @@ fn select_encoding_type(
         let basic_cost = is_default_allowed
             .then(|| cross_entropy_cost(default_norm, default_norm_log, counts, max));
         let repeat_cost = match (*repeat_mode, prev_ctable) {
-            (FseRepeat::None, _) | (_, None) => None,
+            (Repeat::None, _) | (_, None) => None,
             (_, Some(table)) => table.bit_cost(counts, max),
         };
         let compressed_cost = ncount_cost(counts, max, nb_seq, fse_log)
@@ -989,7 +977,7 @@ fn select_encoding_type(
         let compressed_or_max = compressed_cost.unwrap_or(u64::MAX);
         if let Some(basic) = basic_cost {
             if basic <= repeat_or_max && basic <= compressed_or_max {
-                *repeat_mode = FseRepeat::None;
+                *repeat_mode = Repeat::None;
                 return SymbolEncodingType::Basic;
             }
         }
@@ -999,7 +987,7 @@ fn select_encoding_type(
             }
         }
     }
-    *repeat_mode = FseRepeat::Check;
+    *repeat_mode = Repeat::Check;
     SymbolEncodingType::Compressed
 }
 
@@ -1108,7 +1096,7 @@ fn build_seq_table(
         matches!(
             ty,
             SymbolEncodingType::Compressed | SymbolEncodingType::Repeat
-        ) || repeat_mode == FseRepeat::None
+        ) || repeat_mode == Repeat::None
     );
     let (table, size) = build_ctable(
         out,
@@ -1740,12 +1728,12 @@ mod tests {
         let seqs = skewed_seqs(200);
         let (ll, of, ml, next) = section_types(&seqs, &FseState::default(), Strategy::Lazy2);
         assert_eq!((ll, of, ml), (2, 2, 2), "first block: custom tables");
-        assert_eq!(next.ll.repeat(), FseRepeat::Check);
-        assert_eq!(next.of.repeat(), FseRepeat::Check);
-        assert_eq!(next.ml.repeat(), FseRepeat::Check);
+        assert_eq!(next.ll.repeat(), Repeat::Check);
+        assert_eq!(next.of.repeat(), Repeat::Check);
+        assert_eq!(next.ml.repeat(), Repeat::Check);
         let (ll, of, ml, next2) = section_types(&seqs, &next, Strategy::Lazy2);
         assert_eq!((ll, of, ml), (3, 3, 3), "second block: repeat");
-        assert_eq!(next2.ll.repeat(), FseRepeat::Check);
+        assert_eq!(next2.ll.repeat(), Repeat::Check);
         assert_eq!(
             next2.ll.table().unwrap().state_table,
             next.ll.table().unwrap().state_table
@@ -1762,7 +1750,7 @@ mod tests {
         let seqs = skewed_seqs(3000);
         let (ll, _, _, next) = section_types(&seqs, &FseState::default(), Strategy::Fast);
         assert_eq!(ll, 2);
-        assert_eq!(next.ll.repeat(), FseRepeat::Check);
+        assert_eq!(next.ll.repeat(), Repeat::Check);
         let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Fast);
         assert_eq!(ll, 2);
         let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Greedy);
@@ -1812,7 +1800,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(out[1] >> 6, expected, "nb_seq {nb_seq}");
-            assert_eq!(next.ll.repeat(), FseRepeat::None);
+            assert_eq!(next.ll.repeat(), Repeat::None);
         }
     }
 

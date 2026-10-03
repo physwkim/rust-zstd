@@ -1220,7 +1220,8 @@ mod tests {
     /// tables stay `Valid`.
     #[test]
     fn end_block_demotes_a_valid_offset_table() {
-        use crate::fse::{FseCTable, FseRepeat};
+        use crate::compress::entropy::Repeat;
+        use crate::fse::FseCTable;
         let valid = || {
             let mut table = FseCTable::default();
             table.build(&[16, 16], 1, 5);
@@ -1238,7 +1239,7 @@ mod tests {
             let f = &s.prev().fse;
             (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
         };
-        let demoted = (FseRepeat::Valid, FseRepeat::Check, FseRepeat::Valid);
+        let demoted = (Repeat::Valid, Repeat::Check, Repeat::Valid);
         for next in [None, Some(dict.clone())] {
             let mut state = CommittedBlockState::new(dict.clone());
             state.end_block(next);

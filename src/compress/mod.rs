@@ -18,6 +18,7 @@ pub mod bt;
 pub mod common;
 pub mod dfast;
 pub mod dict;
+pub mod entropy;
 mod error;
 pub mod fast;
 pub mod lazy;
