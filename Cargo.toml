@@ -8,6 +8,7 @@ repository = "https://github.com/physwkim/rust-zstd"
 readme = "README.md"
 keywords = ["zstd", "zstandard", "compression", "decompression", "lz77"]
 categories = ["compression"]
+exclude = ["tests/fixtures"]
 
 [dependencies]
 fearless_simd = "0.3.0"

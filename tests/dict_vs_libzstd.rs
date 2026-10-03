@@ -15,8 +15,8 @@
 //! `ZSTD_compress_usingCDict` frames are reported beside ours. Raw
 //! prefixes are gated against `ZSTD_CCtx_refPrefix`. Streams with a
 //! dictionary or a prefix are our one-shot frames when their size is
-//! pledged, and pass the same gate against libzstd's
-//! `ZSTD_compressStream2` either way.
+//! pledged, and pass the same gate against libzstd's stream either way,
+//! without its input buffering ([`common::c_stream_unbuffered`]).
 
 mod common;
 
@@ -900,91 +900,23 @@ fn ours_stream(
     frame
 }
 
-/// libzstd's `ZSTD_compressStream2` frame of `src` on a fresh context
-/// `setup` prepares, the size pledged first if `pledged`, cut as
-/// [`stream_calls`] says.
-fn lib_stream(
-    src: &[u8],
-    pledged: bool,
-    chunk: usize,
-    flushes: &[usize],
-    setup: impl FnOnce(*mut sys::ZSTD_CCtx),
-) -> Vec<u8> {
-    use sys::ZSTD_EndDirective as E;
-    // SAFETY: the context is used only here; every buffer outlives the
-    // calls that reference it.
-    unsafe {
-        let cctx = sys::ZSTD_createCCtx();
-        setup(cctx);
-        if pledged {
-            let r = sys::ZSTD_CCtx_setPledgedSrcSize(cctx, src.len() as u64);
-            assert_eq!(sys::ZSTD_isError(r), 0);
-        }
-        let mut frame = Vec::new();
-        let mut dst = vec![0u8; sys::ZSTD_CStreamOutSize()];
-        for (range, op) in stream_calls(src.len(), chunk, flushes) {
-            let op = match op {
-                EndDirective::Continue => E::ZSTD_e_continue,
-                EndDirective::Flush => E::ZSTD_e_flush,
-                EndDirective::End => E::ZSTD_e_end,
-            };
-            let piece = &src[range];
-            let mut input = sys::ZSTD_inBuffer {
-                src: piece.as_ptr().cast(),
-                size: piece.len(),
-                pos: 0,
-            };
-            loop {
-                let mut output = sys::ZSTD_outBuffer {
-                    dst: dst.as_mut_ptr().cast(),
-                    size: dst.len(),
-                    pos: 0,
-                };
-                let left = sys::ZSTD_compressStream2(cctx, &mut output, &mut input, op);
-                assert_eq!(sys::ZSTD_isError(left), 0, "ZSTD_compressStream2");
-                frame.extend_from_slice(&dst[..output.pos]);
-                let done = match op {
-                    E::ZSTD_e_continue => input.pos == input.size,
-                    _ => left == 0,
-                };
-                if done {
-                    break;
-                }
-            }
-        }
-        sys::ZSTD_freeCCtx(cctx);
-        frame
-    }
-}
-
 impl LibCDict {
-    /// [`lib_stream`] with `ZSTD_CCtx_refCDict` and `attach`.
-    fn stream(
-        &self,
-        src: &[u8],
-        attach: Attach,
-        pledged: bool,
-        chunk: usize,
-        flushes: &[usize],
-    ) -> Vec<u8> {
+    /// [`common::c_stream_unbuffered`] with `ZSTD_CCtx_refCDict` and
+    /// `attach`.
+    fn stream(&self, src: &[u8], attach: Attach, pledged: bool, flushes: &[usize]) -> Vec<u8> {
         // SAFETY: a live context and CDict.
-        lib_stream(src, pledged, chunk, flushes, |cctx| unsafe {
+        common::c_stream_unbuffered(src, pledged, flushes, |cctx| unsafe {
             assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refCDict(cctx, self.0)), 0);
             set(cctx, P::ZSTD_c_experimentalParam4, attach as i32);
         })
     }
 }
 
-/// [`lib_stream`] at `level` with `ZSTD_CCtx_refPrefix(prefix)`.
-fn lib_stream_prefix(
-    src: &[u8],
-    prefix: &[u8],
-    level: i32,
-    pledged: bool,
-    chunk: usize,
-) -> Vec<u8> {
+/// [`common::c_stream_unbuffered`] at `level` with
+/// `ZSTD_CCtx_refPrefix(prefix)`.
+fn lib_stream_prefix(src: &[u8], prefix: &[u8], level: i32, pledged: bool) -> Vec<u8> {
     // SAFETY: a live context; `prefix` outlives the stream.
-    lib_stream(src, pledged, chunk, &[], |cctx| unsafe {
+    common::c_stream_unbuffered(src, pledged, &[], |cctx| unsafe {
         set(cctx, P::ZSTD_c_compressionLevel, level);
         let r = sys::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr().cast(), prefix.len());
         assert_eq!(sys::ZSTD_isError(r), 0);
@@ -993,14 +925,14 @@ fn lib_stream_prefix(
 
 /// `src` streamed with `cctx` at each of `chunks`: with the size pledged,
 /// `one_shot` byte for byte; without, the same frame at every chunk size,
-/// which `check` accepts (with the first chunk size) and which is returned.
+/// which `check` accepts and which is returned.
 fn check_streams(
     what: &str,
     cctx: &mut Compressor,
     src: &[u8],
     chunks: &[usize],
     one_shot: &[u8],
-    check: impl Fn(&str, usize, &[u8]),
+    check: impl Fn(&str, &[u8]),
 ) -> Vec<u8> {
     let mut unpledged: Option<Vec<u8>> = None;
     for &chunk in chunks {
@@ -1013,7 +945,7 @@ fn check_streams(
         let frame = ours_stream(cctx, src, false, chunk, &[]);
         match &unpledged {
             None => {
-                check(&what, chunk, &frame);
+                check(&what, &frame);
                 unpledged = Some(frame);
             }
             Some(first) => assert!(&frame == first, "{what}: unpledged stream differs"),
@@ -1044,7 +976,7 @@ fn dictionary_streams_are_the_one_shot_frame() {
                         );
                         let one_shot = ours_frame(src, &ours, attach);
                         let check =
-                            |what: &str, _, frame: &[u8]| assert_decodes(what, frame, &dict, src);
+                            |what: &str, frame: &[u8]| assert_decodes(what, frame, &dict, src);
                         check_streams(&what, &mut cctx, src, &STREAM_CHUNKS, &one_shot, check);
                     }
                 }
@@ -1053,12 +985,12 @@ fn dictionary_streams_are_the_one_shot_frame() {
     }
 }
 
-/// The streaming gate against libzstd's `ZSTD_compressStream2` with the
-/// same CDict and preference, cut the same way, with and without the size
-/// pledged: every frame round trips through libzstd and our decoder,
-/// carries the dictionary ID, and is at most [`common::size_limit`] of
-/// libzstd's. Prints the totals and how many frames are libzstd's byte for
-/// byte.
+/// The streaming gate against libzstd's stream with the same CDict and
+/// preference ([`common::c_stream_unbuffered`]), with and without the size
+/// pledged: every frame, however it is cut, round trips through libzstd
+/// and our decoder, carries the dictionary ID, and is at most
+/// [`common::size_limit`] of libzstd's. Prints the totals and how many
+/// frames are libzstd's byte for byte.
 #[test]
 fn dictionary_streams_pass_the_gate() {
     let mut failures = Vec::new();
@@ -1079,6 +1011,7 @@ fn dictionary_streams_pass_the_gate() {
                             } else {
                                 &[usize::MAX]
                             };
+                            let lib = lib.stream(src, attach, pledged, &[]);
                             for &chunk in chunks {
                                 let what = format!(
                                     "{} {kind} L{level} {attach:?} pledged {pledged} input {i} \
@@ -1088,7 +1021,6 @@ fn dictionary_streams_pass_the_gate() {
                                 );
                                 let frame = ours_stream(&mut cctx, src, pledged, chunk, &[]);
                                 assert_decodes(&what, &frame, &dict, src);
-                                let lib = lib.stream(src, attach, pledged, chunk, &[]);
                                 assert_eq!(
                                     zstd_safe::get_dict_id_from_frame(&frame),
                                     zstd_safe::get_dict_id_from_frame(&lib),
@@ -1136,7 +1068,7 @@ fn flushed_dictionary_streams_pass_the_gate() {
                     let mut cctx = Compressor::new(dict_opts(&ours, attach));
                     let frame = ours_stream(&mut cctx, src, pledged, 4096, &flushes);
                     assert_decodes(&what, &frame, &dict, src);
-                    let lib = lib.stream(src, attach, pledged, 4096, &flushes);
+                    let lib = lib.stream(src, attach, pledged, &flushes);
                     common::check_size(&what, frame.len(), lib.len()).unwrap();
                 }
             }
@@ -1165,13 +1097,14 @@ fn sliding_buffer_with_a_dictionary() {
             let what = format!("source 3M L{level} {attach:?}");
             let mut cctx = Compressor::new(dict_opts(&ours, attach));
             let one_shot = ours_frame(src, &ours, attach);
-            let check = |what: &str, chunk, frame: &[u8]| {
+            let lib = lib.stream(src, attach, false, &[]);
+            let check = |what: &str, frame: &[u8]| {
                 assert_decodes(what, frame, &dict, src);
-                let lib = lib.stream(src, attach, false, chunk, &[]);
                 println!(
-                    "{what} unpledged: ours {} libzstd {}",
+                    "{what} unpledged: ours {} libzstd {} identical {}",
                     frame.len(),
-                    lib.len()
+                    lib.len(),
+                    frame == lib
                 );
                 common::check_size(what, frame.len(), lib.len()).unwrap();
             };
@@ -1228,17 +1161,17 @@ fn prefix_streams() {
                             assert!(&frame == first, "{what}: unpledged stream differs")
                         }
                     }
-                    for pledged in [true, false] {
-                        let ours = if pledged {
-                            &one_shot
-                        } else {
-                            unpledged.as_ref().unwrap()
-                        };
-                        let lib = lib_stream_prefix(src, &prefix, level, pledged, chunk);
-                        let what = format!("{what} pledged {pledged}");
-                        if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
-                            failures.push(e);
-                        }
+                }
+                for pledged in [true, false] {
+                    let ours = if pledged {
+                        &one_shot
+                    } else {
+                        unpledged.as_ref().unwrap()
+                    };
+                    let lib = lib_stream_prefix(src, &prefix, level, pledged);
+                    let what = format!("{what} pledged {pledged}");
+                    if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
+                        failures.push(e);
                     }
                 }
                 // Single usage: the next frame has no prefix.

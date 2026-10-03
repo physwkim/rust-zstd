@@ -1,7 +1,8 @@
 //! Shared dataset construction for the decoder verification and benchmark
-//! tests. Datasets are cached under `target/decoder-datasets/` so that every
-//! run (before and after an optimization) works on byte-identical inputs and
-//! therefore byte-identical libzstd streams.
+//! tests. Every dataset is fixed bytes, generated or committed under
+//! `tests/fixtures/`, so every machine and every run (before and after an
+//! optimization) works on byte-identical inputs and therefore
+//! byte-identical libzstd streams.
 
 #![allow(dead_code)]
 
@@ -9,7 +10,8 @@ use rust_zstd::decode::{decompress_with_options, DecodeDict, DecodeOptions};
 use rust_zstd::{DecompressReader, Decompressor};
 use std::cell::RefCell;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::OnceLock;
 use zstd::zstd_safe::zstd_sys as sys;
 
 pub const MIB: usize = 1024 * 1024;
@@ -17,22 +19,6 @@ pub const MIB: usize = 1024 * 1024;
 pub struct Dataset {
     pub name: &'static str,
     pub data: Vec<u8>,
-}
-
-fn cache_dir() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/decoder-datasets");
-    std::fs::create_dir_all(&dir).expect("create dataset cache dir");
-    dir
-}
-
-fn cached(name: &str, build: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
-    let path = cache_dir().join(name);
-    if let Ok(bytes) = std::fs::read(&path) {
-        return bytes;
-    }
-    let bytes = build();
-    std::fs::write(&path, &bytes).expect("write dataset cache");
-    bytes
 }
 
 /// Deterministic 64-bit LCG (Knuth MMIX constants); returns the high byte.
@@ -48,91 +34,25 @@ pub fn lcg_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// Concatenation of `.rs` files (sorted by path) found under the cargo
-/// registry source cache, truncated to 8 MiB. Falls back to repeating the
-/// crate's own sources if the registry is unavailable.
-fn rust_source_8m() -> Vec<u8> {
-    let target = 8 * MIB;
-    let mut out = Vec::with_capacity(target);
-    let own = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut roots: Vec<PathBuf> = vec![own];
-    if let Some(home) = std::env::var_os("HOME") {
-        let registry = Path::new(&home).join(".cargo/registry/src");
-        if registry.is_dir() {
-            roots.push(registry);
-        }
-    }
-    let mut files = Vec::new();
-    for root in roots {
-        collect_rs(&root, &mut files);
-    }
-    files.sort();
-    for f in files {
-        if out.len() >= target {
-            break;
-        }
-        if let Ok(bytes) = std::fs::read(&f) {
-            out.extend_from_slice(&bytes);
-        }
-    }
-    if out.is_empty() {
-        panic!("no .rs sources found");
-    }
-    while out.len() < target {
-        let n = out.len();
-        out.extend_from_within(..n.min(target - n));
-    }
-    out.truncate(target);
-    out
-}
-
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            collect_rs(&p, out);
-        } else if p.extension().is_some_and(|e| e == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-/// The running test binary itself (a real ELF), capped at 8 MiB. Cached on
-/// first use so that later builds of the test binary do not change the input.
-fn elf_8m() -> Vec<u8> {
-    let exe = std::env::current_exe().expect("current_exe");
-    let mut bytes = std::fs::read(exe).expect("read current_exe");
-    bytes.truncate(8 * MIB);
-    bytes
-}
-
-/// 1 MiB of dictionary words separated by spaces, chosen with an LCG.
-fn words_1m() -> Vec<u8> {
-    let dict = std::fs::read_to_string("/usr/share/dict/words").unwrap_or_default();
-    let words: Vec<&str> = dict.lines().filter(|w| !w.is_empty()).collect();
-    let mut out = Vec::with_capacity(MIB + 64);
-    let mut state = 0x9E3779B97F4A7C15u64;
-    while out.len() < MIB {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        if words.is_empty() {
-            // Synthetic fallback: short pseudo-words.
-            let len = 2 + ((state >> 58) as usize % 8);
-            for i in 0..len {
-                out.push(b'a' + ((state >> (i * 5)) as u8 % 26));
-            }
-        } else {
-            let w = words[(state >> 33) as usize % words.len()];
-            out.extend_from_slice(w.as_bytes());
-        }
-        out.push(b' ');
-    }
-    out.truncate(MIB);
-    out
+/// The datasets committed under `tests/fixtures/` as zstd frames (see its
+/// README): Rust sources, an ELF binary and dictionary words, decoded once
+/// per test process.
+fn fixtures() -> &'static [Vec<u8>; 3] {
+    static FIXTURES: OnceLock<[Vec<u8>; 3]> = OnceLock::new();
+    FIXTURES.get_or_init(|| {
+        ["rust_src_8m", "elf_8m", "words_1m"].map(|name| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("{name}.zst"));
+            let frame = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e} (the fixtures are in the git repository, not the crate package)",
+                    path.display()
+                )
+            });
+            zstd::stream::decode_all(&frame[..]).expect("decode fixture")
+        })
+    })
 }
 
 /// All datasets named in the task, in a fixed order.
@@ -140,15 +60,15 @@ pub fn datasets() -> Vec<Dataset> {
     vec![
         Dataset {
             name: "rust_src_8m",
-            data: cached("rust_src_8m.bin", rust_source_8m),
+            data: fixtures()[0].clone(),
         },
         Dataset {
             name: "elf_8m",
-            data: cached("elf_8m.bin", elf_8m),
+            data: fixtures()[1].clone(),
         },
         Dataset {
             name: "words_1m",
-            data: cached("words_1m.bin", words_1m),
+            data: fixtures()[2].clone(),
         },
         Dataset {
             name: "text_1m",
@@ -186,6 +106,20 @@ pub fn zstd_stream(data: &[u8], level: i32) -> Vec<u8> {
 }
 
 extern "C" {
+    fn ZSTD_compressContinue(
+        cctx: *mut sys::ZSTD_CCtx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+    ) -> usize;
+    fn ZSTD_compressEnd(
+        cctx: *mut sys::ZSTD_CCtx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+    ) -> usize;
     fn ZSTD_decompressBegin(dctx: *mut sys::ZSTD_DCtx) -> usize;
     fn ZSTD_nextSrcSizeToDecompress(dctx: *mut sys::ZSTD_DCtx) -> usize;
     fn ZSTD_nextInputType(dctx: *mut sys::ZSTD_DCtx) -> i32;
@@ -196,6 +130,84 @@ extern "C" {
         src: *const u8,
         src_size: usize,
     ) -> usize;
+}
+
+/// libzstd's stream frame of `src` without its input buffering, the frame
+/// our streams are gated against: on a fresh context `setup` prepares, the
+/// size pledged if `pledged`, an empty `ZSTD_compressStream2` call starts
+/// the frame as a stream does, then each piece between `flushes` is
+/// compressed whole by `ZSTD_compressContinue`, the last by
+/// `ZSTD_compressEnd`. `ZSTD_compressStream2` itself compresses its input
+/// buffer in 128 KiB units and wraps it, so its blocks (a pre-split block
+/// never crosses a unit) and its fast finders' extDict mode depend on that
+/// buffer, and ours by design do not.
+pub fn c_stream_unbuffered(
+    src: &[u8],
+    pledged: bool,
+    flushes: &[usize],
+    setup: impl FnOnce(*mut sys::ZSTD_CCtx),
+) -> Vec<u8> {
+    // SAFETY: the context is used only here; every buffer outlives the
+    // calls that reference it, with the capacity it is given.
+    unsafe {
+        let cctx = sys::ZSTD_createCCtx();
+        setup(cctx);
+        if pledged {
+            let r = sys::ZSTD_CCtx_setPledgedSrcSize(cctx, src.len() as u64);
+            assert_eq!(sys::ZSTD_isError(r), 0);
+        }
+        let mut header = [0u8; 1];
+        let mut output = sys::ZSTD_outBuffer {
+            dst: header.as_mut_ptr().cast(),
+            size: header.len(),
+            pos: 0,
+        };
+        let mut input = sys::ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: 0,
+            pos: 0,
+        };
+        let r = sys::ZSTD_compressStream2(
+            cctx,
+            &mut output,
+            &mut input,
+            sys::ZSTD_EndDirective::ZSTD_e_continue,
+        );
+        assert_eq!(sys::ZSTD_isError(r), 0, "ZSTD_compressStream2");
+        assert_eq!(output.pos, 0, "the start writes nothing");
+        let mut frame = Vec::new();
+        let mut start = 0;
+        for (i, end) in flushes.iter().copied().chain([src.len()]).enumerate() {
+            let piece = &src[start..end];
+            // Room for the frame header, the empty last block and the
+            // checksum besides the piece's blocks.
+            let room = sys::ZSTD_compressBound(piece.len()) + 32;
+            let at = frame.len();
+            frame.resize(at + room, 0);
+            let compress = if i == flushes.len() {
+                ZSTD_compressEnd
+            } else {
+                ZSTD_compressContinue
+            };
+            let n = compress(
+                cctx,
+                frame.as_mut_ptr().add(at),
+                room,
+                piece.as_ptr(),
+                piece.len(),
+            );
+            assert_eq!(
+                sys::ZSTD_isError(n),
+                0,
+                "{}",
+                std::ffi::CStr::from_ptr(sys::ZSTD_getErrorName(n)).to_string_lossy()
+            );
+            frame.truncate(at + n);
+            start = end;
+        }
+        sys::ZSTD_freeCCtx(cctx);
+        frame
+    }
 }
 
 /// One block: type (0 RAW, 1 RLE, 2 COMPRESSED), decompressed size and
