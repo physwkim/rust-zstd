@@ -783,8 +783,15 @@ fn use_low_prob_count(nb_seq: usize) -> bool {
 }
 
 /// `ZSTD_NCountCost`: byte size of the normalized-count header for
-/// `counts`, or `None` where the C returns an error.
-fn ncount_cost(counts: &[u32], max: usize, nb_seq: usize, fse_log: u32) -> Option<usize> {
+/// `counts`, or `None` where the C returns an error. The header is written
+/// past the end of `wksp`, which is left as it was.
+fn ncount_cost(
+    wksp: &mut Vec<u8>,
+    counts: &[u32],
+    max: usize,
+    nb_seq: usize,
+    fse_log: u32,
+) -> Option<usize> {
     let table_log = optimal_table_log(fse_log, nb_seq, max);
     let mut norm = [0i16; MAX_SEQ + 1];
     let log = normalize_count(
@@ -799,8 +806,10 @@ fn ncount_cost(counts: &[u32], max: usize, nb_seq: usize, fse_log: u32) -> Optio
     if log == 0 {
         return None;
     }
-    let mut wksp = Vec::with_capacity(FSE_NCOUNTBOUND);
-    write_ncount(&mut wksp, &norm, max, table_log).ok()
+    let start = wksp.len();
+    let size = write_ncount(wksp, &norm, max, table_log);
+    wksp.truncate(start);
+    size.ok()
 }
 
 /// `ZSTD_entropyCost`: bits to encode `counts` at the entropy bound.
@@ -876,9 +885,10 @@ impl FseCTable {
 /// `ZSTD_selectEncodingType`. Costs the C reports as errors are modelled
 /// as `None`, which is never selected; when nothing is selectable
 /// (unreachable in libzstd, which asserts) the result is `Compressed` and
-/// [`build_ctable`] reports the failure.
+/// [`build_ctable`] reports the failure. `wksp` is [`ncount_cost`]'s.
 #[allow(clippy::too_many_arguments)]
 fn select_encoding_type(
+    wksp: &mut Vec<u8>,
     repeat_mode: &mut Repeat,
     counts: &[u32],
     max: usize,
@@ -928,7 +938,7 @@ fn select_encoding_type(
             (Repeat::None, _) | (_, None) => None,
             (_, Some(table)) => table.bit_cost(counts, max),
         };
-        let compressed_cost = ncount_cost(counts, max, nb_seq, fse_log)
+        let compressed_cost = ncount_cost(wksp, counts, max, nb_seq, fse_log)
             .map(|ncount| ((ncount as u64) << 3) + entropy_cost(counts, max, nb_seq));
         let repeat_or_max = repeat_cost.unwrap_or(u64::MAX);
         let compressed_or_max = compressed_cost.unwrap_or(u64::MAX);
@@ -1035,6 +1045,7 @@ fn build_seq_table<'t>(
     let is_default_allowed = max <= default_max;
     let mut repeat_mode = table.held.repeat();
     let ty = select_encoding_type(
+        out,
         &mut repeat_mode,
         &counts[..],
         max,

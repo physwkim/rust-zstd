@@ -848,7 +848,10 @@ struct HufFlags {
 /// with. `optimal_depth` probes depths from `HUF_minTableLog` up, stops
 /// once the header plus estimated payload grows by more than a byte or the
 /// tree no longer reaches the probed depth, and keeps the smallest seen.
+/// Each probe's header is written past the end of `wksp`, which is left
+/// as it was.
 fn optimal_table_log(
+    wksp: &mut Vec<u8>,
     max_table_log: u32,
     src_size: usize,
     max_symbol: usize,
@@ -864,8 +867,8 @@ fn optimal_table_log(
     let min_table_log = highbit32(cardinality) + 1;
     let mut opt_size = usize::MAX - 1;
     let mut opt_log = max_table_log;
-    let mut header = Vec::with_capacity(HUF_SYMBOLVALUE_MAX + 2);
     let mut table = HufTable::default();
+    let start = wksp.len();
     // Search until size increases
     for guess in min_table_log..=max_table_log {
         if build_ctable(&mut table, count, max_symbol, guess).is_none() {
@@ -875,8 +878,9 @@ fn optimal_table_log(
         if max_bits < guess && guess > min_table_log {
             break;
         }
-        header.clear();
-        let Some(h_size) = write_ctable(&mut header, &table, max_symbol, max_bits) else {
+        let h_size = write_ctable(wksp, &table, max_symbol, max_bits);
+        wksp.truncate(start);
+        let Some(h_size) = h_size else {
             continue;
         };
         let new_size = estimate_compressed_size(&table, count, max_symbol) + h_size;
@@ -975,6 +979,7 @@ fn compress_internal(
     }
 
     let huff_log = optimal_table_log(
+        out,
         huff_log,
         src_size,
         max_symbol_value,
@@ -1145,6 +1150,7 @@ pub fn estimate_literals_section(
     // `ZSTD_buildBlockEntropyStats` passes `HUF_flags_optimalDepth` by the
     // same strategy rule as `compress_literals`.
     let huff_log = optimal_table_log(
+        desc,
         HUF_TABLELOG_DEFAULT,
         src_size,
         max_symbol,
