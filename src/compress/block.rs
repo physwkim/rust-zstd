@@ -48,6 +48,9 @@ pub struct BlockState {
     entropy: EntropyTables,
 }
 
+// SAFETY: every field is `Zeroable`.
+unsafe impl bytemuck::Zeroable for BlockState {}
+
 impl Default for BlockState {
     /// `ZSTD_reset_compressedBlockState`: `repStartValue`, no entropy
     /// tables.

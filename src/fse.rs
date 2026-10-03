@@ -41,6 +41,9 @@ pub struct FseCTable {
     pub max_symbol: usize,
 }
 
+// SAFETY: integers only.
+unsafe impl bytemuck::Zeroable for FseCTable {}
+
 impl Default for FseCTable {
     fn default() -> Self {
         Self {

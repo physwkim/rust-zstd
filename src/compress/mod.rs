@@ -46,6 +46,7 @@ use matchstate::{needed_space, MatchState};
 use params::{CParamMode, ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use params::{CParams, ParamSwitch, Strategy};
 pub use seqstore::{Seq, SeqStore};
+use split::BlockSplitter;
 use std::ops::Range;
 #[cfg(feature = "parallel")]
 use std::sync::{
@@ -377,6 +378,10 @@ struct Context {
     ldm_state: Option<LdmState>,
 }
 
+/// Leave `field` as the zero bytes [`Context::new_boxed`] allocates, which
+/// are a valid `T`.
+fn keep_zeroed<T: bytemuck::Zeroable>(_field: *mut T) {}
+
 /// Where a job's long distance matches come from: nowhere, the frame's
 /// serial state (ZSTDMT's `rawSeqStore`), or the context's own state with
 /// these parameters, block by block (`ZSTD_buildSeqStore`), started on the
@@ -388,6 +393,46 @@ enum JobLdm<'a> {
 }
 
 impl Context {
+    /// [`Context::default`] built in its box: the block state and the
+    /// pre-splitter, 25 of its 27 KB, are left as the zero bytes it is
+    /// allocated with instead of built on the stack and copied in.
+    fn new_boxed() -> Box<Self> {
+        let mut boxed = Box::<Self>::new_zeroed();
+        let p = boxed.as_mut_ptr();
+        // SAFETY: every field is written but those `keep_zeroed` takes,
+        // whose zero bytes are valid.
+        let mut ctx = unsafe {
+            (&raw mut (*p).ms).write(None);
+            let scratch = &raw mut (*p).scratch;
+            (&raw mut (*scratch).store).write(SeqStore::default());
+            (&raw mut (*scratch).next).write(SeqStore::default());
+            (&raw mut (*scratch).cbuf).write(Vec::new());
+            (&raw mut (*scratch).codes).write(Vec::new());
+            (&raw mut (*scratch).splitter).write(BlockSplitter::default());
+            keep_zeroed(&raw mut (*scratch).presplit);
+            keep_zeroed(&raw mut (*p).state);
+            (&raw mut (*p).ldm_state).write(None);
+            boxed.assume_init()
+        };
+        // Every field is listed above; a new one fails to compile here.
+        let Context {
+            ms: _,
+            scratch:
+                BlockScratch {
+                    store: _,
+                    next: _,
+                    cbuf: _,
+                    codes: _,
+                    splitter: _,
+                    presplit: _,
+                },
+            state: _,
+            ldm_state: _,
+        } = &*ctx;
+        ctx.state.reset();
+        ctx
+    }
+
     /// `ZSTD_resetCCtx_internal` for an input of `pledged` bytes (the
     /// frame's, or a later ZSTDMT job's own) whose window starts at
     /// position `origin`, with tables for the lazy finder `method` and the
@@ -416,20 +461,17 @@ impl Context {
             JobLdm::Off | JobLdm::External(_) => None,
         };
         let needed = needed_space(&cparams, method, ldm_params, pledged as u64);
-        let (ms, resized) = match &mut self.ms {
+        let ms = match &mut self.ms {
             Some(ms) => {
-                let resized = ms.reset_needing(cparams, origin, method, needed);
-                (ms, resized)
+                if ms.reset_needing(cparams, origin, method, needed) {
+                    self.scratch = BlockScratch::default();
+                    self.ldm_state = None;
+                }
+                ms
             }
-            slot => {
-                let ms = MatchState::new_needing(cparams, origin, method, needed);
-                (slot.insert(ms), true)
-            }
+            // Never reset: the block buffers are new, no long distance tables.
+            slot => slot.insert(MatchState::new_needing(cparams, origin, method, needed)),
         };
-        if resized {
-            self.scratch = BlockScratch::default();
-            self.ldm_state = None;
-        }
         ms.set_correct_frequently(frequently);
         let ldm = match ldm {
             JobLdm::Off => BlockLdm::Off,
@@ -513,7 +555,11 @@ impl ContextPool {
 
     /// `ZSTDMT_getCCtx`: the last context given back, or a new one.
     fn take(&self) -> Box<Context> {
-        self.free.lock().unwrap().pop().unwrap_or_default()
+        self.free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(Context::new_boxed)
     }
 
     /// `ZSTDMT_releaseCCtx`: keep `ctx` unless the pool is full.
@@ -2017,6 +2063,19 @@ mod tests {
             let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;
             assert_eq!(kept, n < 129, "reset {n}");
         }
+    }
+
+    /// The zero bytes [`Context::new_boxed`] leaves for the block state are
+    /// the default block state once reset (under Miri, the field writes are
+    /// checked too).
+    #[test]
+    fn new_boxed_context_is_default() {
+        let ctx = Context::new_boxed();
+        assert!(ctx.ms.is_none() && ctx.ldm_state.is_none());
+        assert_eq!(
+            format!("{:?}", ctx.state),
+            format!("{:?}", BlockState::default())
+        );
     }
 
     /// The frame header length of `data` with `cparams`.

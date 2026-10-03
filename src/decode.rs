@@ -174,7 +174,7 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// to nothing, and bytes after the last frame are an error. A frame that
 /// names a dictionary is an error; see `decompress_with_dict`.
 ///
-/// With the `parallel` feature, frames of three or more compressed blocks,
+/// With the `parallel` feature, frames of two or more compressed blocks,
 /// of 32 KiB or more in all, are decoded on the current rayon pool when it
 /// has more than one thread; the output is the same either way.
 ///
@@ -4890,15 +4890,25 @@ mod parallel {
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    /// Batches with fewer compressed blocks decode on the calling thread:
-    /// three blocks of 34-56 KiB took 7-41% less time on the pool.
-    pub(super) const MIN_BLOCKS: usize = 3;
+    /// Batches with fewer compressed blocks decode on the calling thread,
+    /// a single block having no other to decode alongside: two blocks of
+    /// 33-57 KiB took 20-30% less time on the pool on eight cores sharing
+    /// an L3, and 9-20% less on eight over two L3s; three of 34-86 KiB,
+    /// 27-46% and 20-37% less (timed as for `MIN_BYTES`).
+    pub(super) const MIN_BLOCKS: usize = 2;
 
     /// Batches whose compressed blocks hold fewer bytes decode on the
-    /// calling thread. On eight cores sharing an L3 the pool took less time
-    /// from 10 KiB up, but on eight cores over two L3s it took up to 37%
-    /// more on frames of seven or eight 128 KiB blocks up to 29 KiB, and at
-    /// most 3% more from 30 KiB.
+    /// calling thread. Timed on 16 different frames of two or more 128 KiB
+    /// blocks decoded in turn (one frame decoded over and over lets the
+    /// branch predictor learn it): on eight cores sharing an L3, the pool
+    /// took less time from 4 KiB up for three or more blocks of 300 B or
+    /// more, and from 16 KiB for two. On eight cores over two L3s, blocks
+    /// of 1 KiB or more took up to 40% more time below 16 KiB (two of them
+    /// 64% more) and less from 20 KiB, though two blocks still took up to
+    /// 3% more at 15-23 KiB; blocks of 300 B took up to 7% more at 19-26
+    /// KiB and less from 28 KiB. Blocks of 156 B lose by a per-block cost
+    /// that no byte count pays off: at 37 KiB they took 2% more on one L3
+    /// and 4-7% more on two.
     pub(super) const MIN_BYTES: usize = 32 * 1024;
 
     /// When a batch of blocks decodes on the rayon pool
@@ -4922,7 +4932,10 @@ mod parallel {
         /// for the pool: `min_blocks` compressed blocks of `min_bytes` or
         /// more in all. Only compressed blocks have a stage 2 to hand it,
         /// and that work grows with their bytes, against the fixed cost of
-        /// starting tasks and waiting for them.
+        /// starting tasks and waiting for them. The gate stays this one
+        /// predicate, with a known edge: frames of blocks of about 156 B,
+        /// whose per-block cost no byte count pays off (`MIN_BYTES`), pass
+        /// it and take up to 7% more time on eight cores over two L3s.
         fn pools<'a>(self, blocks: impl Iterator<Item = (BlockHeader, &'a [u8], usize)>) -> bool {
             let (mut compressed, mut bytes) = (0, 0);
             for (block, content, _) in blocks {

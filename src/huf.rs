@@ -32,6 +32,9 @@ pub struct HufTable {
     pub max_symbol: u8,
 }
 
+// SAFETY: integers only.
+unsafe impl bytemuck::Zeroable for HufTable {}
+
 impl Default for HufTable {
     fn default() -> Self {
         Self {
