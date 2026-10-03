@@ -186,6 +186,20 @@ pub fn zstd_stream(data: &[u8], level: i32) -> Vec<u8> {
 }
 
 extern "C" {
+    fn ZSTD_compressContinue(
+        cctx: *mut sys::ZSTD_CCtx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+    ) -> usize;
+    fn ZSTD_compressEnd(
+        cctx: *mut sys::ZSTD_CCtx,
+        dst: *mut u8,
+        dst_capacity: usize,
+        src: *const u8,
+        src_size: usize,
+    ) -> usize;
     fn ZSTD_decompressBegin(dctx: *mut sys::ZSTD_DCtx) -> usize;
     fn ZSTD_nextSrcSizeToDecompress(dctx: *mut sys::ZSTD_DCtx) -> usize;
     fn ZSTD_nextInputType(dctx: *mut sys::ZSTD_DCtx) -> i32;
@@ -196,6 +210,84 @@ extern "C" {
         src: *const u8,
         src_size: usize,
     ) -> usize;
+}
+
+/// libzstd's stream frame of `src` without its input buffering, the frame
+/// our streams are gated against: on a fresh context `setup` prepares, the
+/// size pledged if `pledged`, an empty `ZSTD_compressStream2` call starts
+/// the frame as a stream does, then each piece between `flushes` is
+/// compressed whole by `ZSTD_compressContinue`, the last by
+/// `ZSTD_compressEnd`. `ZSTD_compressStream2` itself compresses its input
+/// buffer in 128 KiB units and wraps it, so its blocks (a pre-split block
+/// never crosses a unit) and its fast finders' extDict mode depend on that
+/// buffer, and ours by design do not.
+pub fn c_stream_unbuffered(
+    src: &[u8],
+    pledged: bool,
+    flushes: &[usize],
+    setup: impl FnOnce(*mut sys::ZSTD_CCtx),
+) -> Vec<u8> {
+    // SAFETY: the context is used only here; every buffer outlives the
+    // calls that reference it, with the capacity it is given.
+    unsafe {
+        let cctx = sys::ZSTD_createCCtx();
+        setup(cctx);
+        if pledged {
+            let r = sys::ZSTD_CCtx_setPledgedSrcSize(cctx, src.len() as u64);
+            assert_eq!(sys::ZSTD_isError(r), 0);
+        }
+        let mut header = [0u8; 1];
+        let mut output = sys::ZSTD_outBuffer {
+            dst: header.as_mut_ptr().cast(),
+            size: header.len(),
+            pos: 0,
+        };
+        let mut input = sys::ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: 0,
+            pos: 0,
+        };
+        let r = sys::ZSTD_compressStream2(
+            cctx,
+            &mut output,
+            &mut input,
+            sys::ZSTD_EndDirective::ZSTD_e_continue,
+        );
+        assert_eq!(sys::ZSTD_isError(r), 0, "ZSTD_compressStream2");
+        assert_eq!(output.pos, 0, "the start writes nothing");
+        let mut frame = Vec::new();
+        let mut start = 0;
+        for (i, end) in flushes.iter().copied().chain([src.len()]).enumerate() {
+            let piece = &src[start..end];
+            // Room for the frame header, the empty last block and the
+            // checksum besides the piece's blocks.
+            let room = sys::ZSTD_compressBound(piece.len()) + 32;
+            let at = frame.len();
+            frame.resize(at + room, 0);
+            let compress = if i == flushes.len() {
+                ZSTD_compressEnd
+            } else {
+                ZSTD_compressContinue
+            };
+            let n = compress(
+                cctx,
+                frame.as_mut_ptr().add(at),
+                room,
+                piece.as_ptr(),
+                piece.len(),
+            );
+            assert_eq!(
+                sys::ZSTD_isError(n),
+                0,
+                "{}",
+                std::ffi::CStr::from_ptr(sys::ZSTD_getErrorName(n)).to_string_lossy()
+            );
+            frame.truncate(at + n);
+            start = end;
+        }
+        sys::ZSTD_freeCCtx(cctx);
+        frame
+    }
 }
 
 /// One block: type (0 RAW, 1 RLE, 2 COMPRESSED), decompressed size and
