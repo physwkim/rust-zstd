@@ -585,20 +585,25 @@ fn load_entropy(dict: &[u8]) -> Result<(BlockState, usize), CompressError> {
     ip += len;
     let (of_norm, of_max, of_log, len) =
         read_ncount(&dict[ip..], MAX_OFF, OFF_FSE_LOG).ok_or(CORRUPTED)?;
+    let built = |norm: &[i16], max_symbol, table_log| {
+        let mut table = FseCTable::default();
+        table.build(norm, max_symbol, table_log);
+        table
+    };
     // fill all offset symbols to avoid garbage at end of table
-    let of_table = FseCTable::build(&of_norm, MAX_OFF, of_log);
+    let of_table = built(&of_norm, MAX_OFF, of_log);
     ip += len;
     let (ml_norm, ml_max, ml_log, len) =
         read_ncount(&dict[ip..], MAX_ML, ML_FSE_LOG).ok_or(CORRUPTED)?;
     let ml = repeat(
-        FseCTable::build(&ml_norm, ml_max, ml_log),
+        built(&ml_norm, ml_max, ml_log),
         ncount_covers(&ml_norm, ml_max, MAX_ML),
     );
     ip += len;
     let (ll_norm, ll_max, ll_log, len) =
         read_ncount(&dict[ip..], MAX_LL, LL_FSE_LOG).ok_or(CORRUPTED)?;
     let ll = repeat(
-        FseCTable::build(&ll_norm, ll_max, ll_log),
+        built(&ll_norm, ll_max, ll_log),
         ncount_covers(&ll_norm, ll_max, MAX_LL),
     );
     ip += len;

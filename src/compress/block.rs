@@ -1221,7 +1221,11 @@ mod tests {
     #[test]
     fn end_block_demotes_a_valid_offset_table() {
         use crate::fse::{FseCTable, FseRepeat};
-        let valid = || FseTableState::Valid(FseCTable::build(&[16, 16], 1, 5));
+        let valid = || {
+            let mut table = FseCTable::default();
+            table.build(&[16, 16], 1, 5);
+            FseTableState::Valid(table)
+        };
         let dict = BlockState {
             fse: FseState {
                 ll: valid(),

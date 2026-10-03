@@ -576,7 +576,8 @@ pub fn compress_weights(out: &mut Vec<u8>, weights: &[u8]) -> Option<usize> {
     fse::normalize_count(&mut norm, table_log, &count, wt_size, max_symbol, false).ok()?;
     let start = out.len();
     fse::write_ncount(out, &norm, max_symbol, table_log).ok()?;
-    let ct = fse::FseCTable::build(&norm, max_symbol, table_log);
+    let mut ct = fse::FseCTable::default();
+    ct.build(&norm, max_symbol, table_log);
     let c_size = fse::compress_using_ctable(out, weights, &ct);
     if c_size == 0 {
         out.truncate(start);

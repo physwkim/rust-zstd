@@ -23,35 +23,47 @@ pub struct SymbolTT {
     pub delta_nb_bits: u32,
 }
 
-/// Compiled FSE compression table.
+/// The largest table log an [`FseCTable`] holds: `LLFSELog` and
+/// `MLFSELog` (offsets use 8, Huffman weight descriptions at most 6).
+const FSE_CTABLE_MAX_LOG: u32 = 9;
+
+/// Compiled FSE compression table (`FSE_CTable`), with room for any table
+/// built here so that a table is rebuilt in place, never allocated.
 #[derive(Clone, Debug)]
 pub struct FseCTable {
     pub table_log: u32,
-    pub state_table: Vec<u16>,
-    pub symbol_tt: Vec<SymbolTT>,
+    /// `stateTable`: the first `1 << table_log` entries are the table's.
+    pub state_table: [u16; 1 << FSE_CTABLE_MAX_LOG],
+    /// `symbolTT` for every sequence code; past `max_symbol` the transform
+    /// of a zero-probability symbol.
+    pub symbol_tt: [SymbolTT; MAX_SEQ + 1],
     pub max_symbol: usize,
 }
 
+impl Default for FseCTable {
+    fn default() -> Self {
+        Self {
+            table_log: 0,
+            state_table: [0; 1 << FSE_CTABLE_MAX_LOG],
+            symbol_tt: [SymbolTT::default(); MAX_SEQ + 1],
+            max_symbol: 0,
+        }
+    }
+}
+
 impl FseCTable {
-    /// Build an FSE compression table from normalized counts.
+    /// Build an FSE compression table from normalized counts in place.
     /// Ported from FSE_buildCTable_wksp() in fse_compress.c.
-    pub fn build(norm: &[i16], max_symbol: usize, table_log: u32) -> Self {
+    pub fn build(&mut self, norm: &[i16], max_symbol: usize, table_log: u32) {
+        assert!(table_log <= FSE_CTABLE_MAX_LOG && max_symbol <= MAX_SEQ);
         let table_size = 1u32 << table_log;
         let table_mask = table_size - 1;
 
         // 1. Build cumulative counts and place low-probability symbols.
-        // `cumul` and `tableSymbol` live in the C workspace; sized for the
-        // largest alphabet and table here.
-        let mut cumul = [0u16; FSE_MAX_SYMBOL_VALUE + 2];
+        // `cumul` and `tableSymbol` live in the C workspace.
+        let mut cumul = [0u16; MAX_SEQ + 2];
         let mut high_threshold = table_size - 1;
-        let mut small_symbol_buf = [0u8; 512];
-        let mut large_symbol_buf = Vec::new();
-        let table_symbol: &mut [u8] = if table_size as usize <= small_symbol_buf.len() {
-            &mut small_symbol_buf[..table_size as usize]
-        } else {
-            large_symbol_buf.resize(table_size as usize, 0);
-            &mut large_symbol_buf
-        };
+        let mut table_symbol = [0u8; 1 << FSE_CTABLE_MAX_LOG];
 
         for s in 0..=max_symbol {
             if norm[s] == -1 {
@@ -80,11 +92,10 @@ impl FseCTable {
         debug_assert_eq!(pos, 0);
 
         // 3. Build state transition table sorted by symbol order.
-        let mut state_table = vec![0u16; table_size as usize];
         for u in 0..table_size {
             let s = table_symbol[u as usize] as usize;
             let idx = cumul[s] as usize;
-            state_table[idx] = (table_size + u) as u16;
+            self.state_table[idx] = (table_size + u) as u16;
             cumul[s] += 1;
         }
 
@@ -92,58 +103,50 @@ impl FseCTable {
         // Use the decoder's baseline/numbits calculation for compatibility.
         // For each state in the table, compute its decoder-compatible numbits,
         // then derive the CTable's delta_nb_bits and delta_find_state from that.
-        let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
         let mut total = 0u32;
-        for s in 0..=max_symbol {
-            let prob = if norm[s] == -1 {
-                1
-            } else {
-                norm[s].max(0) as u32
+        for (s, tt) in self.symbol_tt.iter_mut().enumerate() {
+            let prob = match norm[..=max_symbol].get(s) {
+                None => 0,
+                Some(-1) => 1,
+                Some(&n) => n.max(0) as u32,
             };
-            if prob == 0 {
-                symbol_tt[s].delta_nb_bits = ((table_log + 1) << 16) - table_size;
+            *tt = if prob == 0 {
+                SymbolTT {
+                    delta_find_state: 0,
+                    delta_nb_bits: ((table_log + 1) << 16) - table_size,
+                }
             } else if prob == 1 {
-                symbol_tt[s].delta_nb_bits = (table_log << 16) - table_size;
-                symbol_tt[s].delta_find_state = total as i32 - 1;
+                SymbolTT {
+                    delta_find_state: total as i32 - 1,
+                    delta_nb_bits: (table_log << 16) - table_size,
+                }
             } else {
                 // Use the same formula as C zstd FSE_buildCTable
                 let max_bits_out = table_log - highest_bit(prob - 1);
                 let min_state_plus = prob << max_bits_out;
-                symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
-                symbol_tt[s].delta_find_state = total as i32 - prob as i32;
-            }
+                SymbolTT {
+                    delta_find_state: total as i32 - prob as i32,
+                    delta_nb_bits: (max_bits_out << 16).wrapping_sub(min_state_plus),
+                }
+            };
             total += prob;
         }
-
-        Self {
-            table_log,
-            state_table,
-            symbol_tt,
-            max_symbol,
-        }
+        self.table_log = table_log;
+        self.max_symbol = max_symbol;
     }
 
-    /// `FSE_buildCTable_rle`: single symbol, 0 bits per encode.
+    /// `FSE_buildCTable_rle` in place: single symbol, 0 bits per encode.
     /// `init_state` returns 0 and every transition stays at state 0;
     /// table_log = 0, matching the decoder's RLE behavior.
-    pub fn build_rle(symbol: u8) -> Self {
+    pub fn build_rle(&mut self, symbol: u8) {
         let s = symbol as usize;
-        let max_symbol = s;
-        // Handcraft a table where everything resolves to 0 bits, state=0.
-        let state_table = vec![0u16; 1]; // state_table[0] = 0
-        let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
+        // Handcraft a table where everything resolves to 0 bits, state=0:
         // nb_bits = (state + delta_nb_bits) >> 16 = 0 for state 0, and
         // new_state = state_table[(0 >> 0) + 0] = 0
-        symbol_tt[s] = SymbolTT {
-            delta_find_state: 0,
-            delta_nb_bits: 0,
-        };
-        Self {
-            table_log: 0,
-            state_table,
-            symbol_tt,
-            max_symbol,
-        }
+        self.state_table[0] = 0;
+        self.symbol_tt.fill(SymbolTT::default());
+        self.table_log = 0;
+        self.max_symbol = s;
     }
 
     /// `FSE_initCState2`: the state that encodes `symbol` first.
@@ -161,17 +164,19 @@ impl FseCTable {
     #[inline(always)]
     fn next_state(&self, shifted: u32, delta_find_state: i32) -> u32 {
         let idx = shifted.wrapping_add_signed(delta_find_state) as usize;
-        debug_assert!(idx < self.state_table.len());
+        debug_assert!(idx < 1 << self.table_log);
         // SAFETY: `build` gives symbol `s` with normalized count `p`
         // (1 for a low-probability symbol) `deltaFindState = start_s - p`
         // and a `deltaNbBits` that makes `state >> nbBitsOut` fall in
         // `p..2p` for every state `tableSize..2*tableSize`, so `idx` lies
         // in `start_s..start_s + p`, the states `build` assigned to `s`,
-        // all below `tableSize` (a zero-count symbol gives `idx == 0`, and
-        // `build_rle` has one state at index 0). `init_state` derives
+        // all below `tableSize <= state_table.len()`. Every other code,
+        // zero-count or past `max_symbol`, gets `deltaFindState = 0` and
+        // `nbBitsOut = tableLog + 1`, so `idx == 0`; `build_rle` gives
+        // every code `idx == 0`, its one state. `init_state` derives
         // `shifted` from the same transform, so its `idx` is in the same
-        // range. Encoding a symbol above `max_symbol` panics on the
-        // `symbol_tt` index before reaching here.
+        // range. A code above `MaxSeq` panics on the `symbol_tt` index
+        // before reaching here.
         unsafe { *self.state_table.get_unchecked(idx) as u32 }
     }
 }
@@ -1019,13 +1024,16 @@ fn build_ctable(
     match ty {
         SymbolEncodingType::Rle => {
             out.push(codes[0]);
-            Some((FseCTable::build_rle(max as u8), 1))
+            let mut table = FseCTable::default();
+            table.build_rle(max as u8);
+            Some((table, 1))
         }
         SymbolEncodingType::Repeat => Some((prev_ctable?.clone(), 0)),
-        SymbolEncodingType::Basic => Some((
-            FseCTable::build(default_norm, default_max, default_norm_log),
-            0,
-        )),
+        SymbolEncodingType::Basic => {
+            let mut table = FseCTable::default();
+            table.build(default_norm, default_max, default_norm_log);
+            Some((table, 0))
+        }
         SymbolEncodingType::Compressed => {
             let mut nb_seq_1 = nb_seq;
             let table_log = optimal_table_log(fse_log, nb_seq, max);
@@ -1049,7 +1057,9 @@ fn build_ctable(
                 return None;
             }
             let ncount_size = write_ncount(out, &norm[..=max], max, table_log).ok()?;
-            Some((FseCTable::build(&norm, max, table_log), ncount_size))
+            let mut table = FseCTable::default();
+            table.build(&norm, max, table_log);
+            Some((table, ncount_size))
         }
     }
 }
@@ -1484,18 +1494,56 @@ pub fn estimate_sequences_section(
 mod tests {
     use super::*;
 
+    fn built(norm: &[i16], max_symbol: usize, table_log: u32) -> FseCTable {
+        let mut table = FseCTable::default();
+        table.build(norm, max_symbol, table_log);
+        table
+    }
+
+    /// The table's 64 states are `64..128`, each once.
+    fn assert_states_of_log_6(table: &FseCTable) {
+        assert_eq!(table.table_log, 6);
+        let mut states = table.state_table[..64].to_vec();
+        states.sort_unstable();
+        assert!(states.iter().copied().eq(64..128));
+    }
+
     #[test]
     fn build_ll_default_table() {
-        let table = FseCTable::build(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-        assert_eq!(table.table_log, 6);
-        assert_eq!(table.state_table.len(), 64);
+        assert_states_of_log_6(&built(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG));
     }
 
     #[test]
     fn build_ml_default_table() {
-        let table = FseCTable::build(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
-        assert_eq!(table.table_log, 6);
-        assert_eq!(table.state_table.len(), 64);
+        assert_states_of_log_6(&built(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG));
+    }
+
+    /// A table rebuilt in place over a larger one equals a fresh build:
+    /// nothing of the old table survives in the states or transforms the
+    /// new one uses, and every code past its `max_symbol` gets the
+    /// zero-probability transform.
+    #[test]
+    fn rebuild_in_place_matches_fresh_build() {
+        let mut table = built(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+        table.build(&[16, 16], 1, 5);
+        let fresh = built(&[16, 16], 1, 5);
+        assert_eq!(table.state_table[..32], fresh.state_table[..32]);
+        assert_eq!(table.max_symbol, 1);
+        for (s, (a, b)) in table.symbol_tt.iter().zip(&fresh.symbol_tt).enumerate() {
+            assert_eq!(
+                (a.delta_find_state, a.delta_nb_bits),
+                (b.delta_find_state, b.delta_nb_bits)
+            );
+            if s > 1 {
+                assert_eq!((a.delta_find_state, a.delta_nb_bits), (0, (6 << 16) - 32));
+            }
+        }
+        table.build_rle(7);
+        assert_eq!((table.table_log, table.max_symbol), (0, 7));
+        assert!(table
+            .symbol_tt
+            .iter()
+            .all(|tt| (tt.delta_find_state, tt.delta_nb_bits) == (0, 0)));
     }
 
     fn norm_sum(norm: &[i16]) -> u32 {
@@ -1803,7 +1851,7 @@ mod tests {
 
     #[test]
     fn init_state_in_range() {
-        let table = FseCTable::build(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+        let table = built(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
         // Encoder states are stored in the [table_size, 2 * table_size) range.
         let state = table.init_state(0);
         let table_size = 1u32 << table.table_log;
