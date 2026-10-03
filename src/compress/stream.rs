@@ -17,17 +17,27 @@
 //! start ([`Context::rebase`] keeps every index): one extra copy of the
 //! input, amortized, and the same matches as the one-shot frame.
 //!
+//! A frame with a dictionary starts from it as the one-shot frame does
+//! ([`FrameDict`]), sized for the pledged size or an unknown one: a copied
+//! or loaded dictionary's content starts the buffer, where the one-shot
+//! frame joins it before the input, and stays until the buffer first
+//! moves, which is after the input passes the window size and the content
+//! leaves the window; an attached dictionary is searched in place by every
+//! block.
+//!
 //! [`compress_blocks`]: super::block::compress_blocks
 
 use super::block::{self, InputEnd, JobBlocks};
+use super::dict::FrameDict;
 use super::{
     begin_job, block_sizing, default_search_method, multithreaded, split, write_epilogue,
-    write_frame_header, write_raw_block, CommittedBlockState, CompressError, CompressOptions,
-    Compressor, Context, JobLdm,
+    write_frame_header, write_raw_block, CommittedBlockState, CompressDict, CompressError,
+    CompressOptions, Compressor, Context, JobLdm, JobStart,
 };
 use crate::constants::ZSTD_BLOCKSIZE_MAX;
 use crate::xxhash::Xxh64;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 /// `ZSTD_EndDirective`: what a [`Compressor::compress_stream`] call does
 /// once its input is consumed.
@@ -89,16 +99,18 @@ impl Session {
     }
 }
 
-/// The size a frame of `pledged` bytes resolves its parameters for:
-/// `ZSTD_CONTENTSIZE_UNKNOWN` for an unknown one, the row of the largest
-/// inputs without a window shrink.
+/// `pledgedSrcSize` as the workspace sizing and the ZSTDMT check read it:
+/// `ZSTD_CONTENTSIZE_UNKNOWN`, larger than any input, for an unknown size.
 fn frame_size(pledged: Option<u64>) -> usize {
     pledged.map_or(usize::MAX, |p| usize::try_from(p).unwrap_or(usize::MAX))
 }
 
 /// One streaming frame: its context and job state, and the input buffer.
 struct Frame {
-    ctx: Context,
+    ctx: Box<Context>,
+    /// The dictionary the finders search in place, when attached
+    /// ([`FrameDict::dict_match_state`]).
+    attached: Option<Arc<CompressDict>>,
     /// Single-context long distance matching is on.
     ldm: bool,
     split: bool,
@@ -110,45 +122,77 @@ struct Frame {
     /// The frame header until the first block is written.
     header: Option<Vec<u8>>,
     /// Input: the window before `blocks.next_start()`, then the input not
-    /// yet compressed.
+    /// yet compressed. A copied or loaded dictionary's content comes first
+    /// until the buffer first moves.
     buf: Vec<u8>,
     /// The window size, kept before the next block when the buffer moves.
     keep: usize,
-    /// The buffer length that moves it.
+    /// The buffer length that moves it: room for a dictionary's content in
+    /// the buffer, which matches may reference whole until the input passes
+    /// the window size, and twice the window and a block.
     cap: usize,
     block_size_max: usize,
 }
 
 impl Frame {
     /// `ZSTD_CCtx_init_compressStream2` on `ctx` for `pledged` bytes, or an
-    /// unknown size: the parameters `ZSTD_compressBegin_internal` resolves
-    /// for it, which a one-shot frame of that size resolves too.
-    fn begin(opts: &CompressOptions, pledged: Option<u64>, mut ctx: Context) -> Self {
+    /// unknown size, with `prefix` if given, else `opts.dict` if set: the
+    /// parameters and dictionary use `ZSTD_compressBegin_internal` resolves
+    /// for it, which a one-shot frame of that size resolves too. A copied
+    /// or loaded dictionary's content starts the buffer, as it starts the
+    /// one-shot frame's joined input.
+    fn begin(
+        opts: &CompressOptions,
+        pledged: Option<u64>,
+        prefix: Option<&[u8]>,
+        mut ctx: Box<Context>,
+    ) -> Self {
         let size = frame_size(pledged);
+        let cdict = opts.dict.clone();
+        let dict = match (prefix, &cdict) {
+            (Some(prefix), _) => Some(FrameDict::prefix(prefix, pledged, opts)),
+            (None, Some(cdict)) => Some(FrameDict::of(cdict, pledged, opts)),
+            (None, None) => None,
+        };
+        let dict = dict.as_ref();
         debug_assert!(!multithreaded(opts, size));
-        let (cparams, ldm_params) = opts.frame_params(size);
+        let (frame_cparams, cparams, ldm_params) = match dict {
+            Some(dict) => dict.params(false),
+            None => {
+                let (cparams, ldm) = opts.frame_params(pledged);
+                (cparams, cparams, ldm)
+            }
+        };
         let mut header = Vec::new();
-        write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum, 0);
+        let id = dict.map_or(0, FrameDict::id);
+        write_frame_header(&mut header, pledged, cparams.window_log, opts.checksum, id);
         let sizing = block_sizing(opts, &cparams, false, header.len());
-        let ldm = ldm_params.map_or(JobLdm::Off, JobLdm::Internal);
         let frequently = opts.overflow_correct_frequently;
-        let method = default_search_method(&cparams);
+        let method = dict.map_or_else(|| default_search_method(&cparams), FrameDict::search_method);
+        let buf = dict.map_or_else(Vec::new, |dict| dict.content().to_vec());
+        let ldm = ldm_params.map_or(JobLdm::Off, |params| {
+            let start = dict.map_or(0..0, |dict| dict.ldm_content(false));
+            JobLdm::Internal(params, &buf, start)
+        });
         let (ms, scratch, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
-        let (blocks, state) = begin_job(ms, scratch, &[], 0..0, None, sizing, true, true);
+        let start = JobStart::First(dict);
+        let (blocks, state) = begin_job(ms, scratch, &buf, 0..buf.len(), start, sizing, true);
+        let attaches = dict.and_then(FrameDict::dict_match_state).is_some();
         let keep = 1usize << cparams.window_log;
         Self {
             ctx,
+            attached: cdict.filter(|_| attaches),
             ldm: ldm_params.is_some(),
-            split: split::block_splitter_enabled(opts.split_after_sequences, &cparams),
+            split: split::block_splitter_enabled(opts.split_after_sequences, &frame_cparams),
             blocks,
             state,
             checksum: opts.checksum.then(Xxh64::new),
             pledged,
             consumed: 0,
             header: Some(header),
-            buf: Vec::new(),
+            cap: buf.len() + 2 * (keep + sizing.block_size_max),
+            buf,
             keep,
-            cap: 2 * (keep + sizing.block_size_max),
             block_size_max: sizing.block_size_max,
         }
     }
@@ -192,7 +236,10 @@ impl Frame {
     }
 
     /// Compress the blocks of the buffered input that `input` makes ready,
-    /// the frame header before the first.
+    /// the frame header before the first. As a one-shot frame's, they go to
+    /// rayon only when the pipelined loop overlaps some of them, and then
+    /// all at once: overlapping from outside the pool, every overlap was a
+    /// thread hop, and the match state went to whichever worker took it.
     fn compress(&mut self, input: InputEnd, out: &mut Vec<u8>) {
         if !self.blocks.has_ready(input) {
             return;
@@ -201,7 +248,18 @@ impl Frame {
             out.extend_from_slice(&header);
         }
         #[cfg(feature = "parallel")]
-        let _in_job = super::InJob::enter();
+        if self.blocks.overlaps(input) {
+            rayon::scope(|_| {
+                let _in_job = super::InJob::enter();
+                self.compress_blocks(input, out, true);
+            });
+            return;
+        }
+        self.compress_blocks(input, out, false);
+    }
+
+    /// [`block::compress_blocks`] over the buffered input up to `input`.
+    fn compress_blocks(&mut self, input: InputEnd, out: &mut Vec<u8>, pipelined: bool) {
         let (ms, scratch, mut ldm) = self.ctx.resume(self.ldm);
         block::compress_blocks(
             ms,
@@ -212,8 +270,9 @@ impl Frame {
             &mut self.state,
             scratch,
             &mut ldm,
+            self.attached.as_deref().map(CompressDict::dict_match_state),
             out,
-            cfg!(feature = "parallel"),
+            pipelined,
         );
     }
 
@@ -228,7 +287,7 @@ impl Frame {
     /// `ZSTD_compressEnd`: the buffered input as the frame's last blocks,
     /// or, with none left, `ZSTD_writeEpilogue`'s empty last block; then
     /// the checksum. Returns the context.
-    fn finish(mut self, out: &mut Vec<u8>) -> Context {
+    fn finish(mut self, out: &mut Vec<u8>) -> Box<Context> {
         let end = InputEnd::JobEnd(self.buf.len());
         if self.blocks.has_ready(end) {
             self.compress(end, out);
@@ -252,6 +311,23 @@ impl Compressor {
         match self.stream.stage {
             Stage::Idle => {
                 self.stream.pledged = size;
+                Ok(())
+            }
+            _ => Err(CompressError::StageWrong),
+        }
+    }
+
+    /// `ZSTD_CCtx_refPrefix`: `prefix`, copied, is the raw-content prefix
+    /// of the next frame alone, whether [`Compressor::compress`] or
+    /// [`Compressor::compress_stream`] starts it, in place of
+    /// [`CompressOptions::dict`]; see [`Compressor::compress_with_prefix`]
+    /// for what the frame is. An empty `prefix` clears it, and
+    /// [`Compressor::reset_stream`] keeps it, as libzstd's session reset
+    /// does. Only before a frame starts, else [`CompressError::StageWrong`].
+    pub fn set_prefix(&mut self, prefix: &[u8]) -> Result<(), CompressError> {
+        match self.stream.stage {
+            Stage::Idle => {
+                self.prefix = (!prefix.is_empty()).then(|| prefix.to_vec());
                 Ok(())
             }
             _ => Err(CompressError::StageWrong),
@@ -283,15 +359,15 @@ impl Compressor {
     /// Without `Flush`, the frame is the one [`Compressor::compress`]
     /// writes for the same input when its size was pledged, however the
     /// input is cut into calls; without a pledged size, the header has no
-    /// content size and the parameters are those of an unknown size.
+    /// content size and the parameters, and how a dictionary is used, are
+    /// those of an unknown size. A frame takes the prefix
+    /// [`Compressor::set_prefix`] left, else [`CompressOptions::dict`].
     ///
     /// Errors: [`CompressError::SrcSizeWrong`] when the input passes the
     /// pledged size (the call consumes none of it) or ends short of it;
     /// [`CompressError::Unsupported`] for a `job_size` frame that is not
     /// one first `End` call or pledged at most `JOBSIZE_MIN`
-    /// (multithreaded streaming is not implemented), and for any frame of
-    /// options with a [`CompressOptions::dict`] (streaming with a
-    /// dictionary is not implemented). After an error every
+    /// (multithreaded streaming is not implemented). After an error every
     /// call returns [`CompressError::StageWrong`] until
     /// [`Compressor::reset_stream`].
     ///
@@ -329,9 +405,6 @@ impl Compressor {
             }
             match &mut self.stream.stage {
                 Stage::Failed => return Err(CompressError::StageWrong),
-                Stage::Idle if self.opts.dict.is_some() => {
-                    return Err(CompressError::Unsupported("dictionary"));
-                }
                 Stage::Ended => {
                     // ZSTD_CCtx_reset(zcs, ZSTD_reset_session_only)
                     self.stream.stage = Stage::Idle;
@@ -349,7 +422,7 @@ impl Compressor {
                         return Err(CompressError::SrcSizeWrong { pledged, consumed });
                     }
                     let mut out = std::mem::take(&mut self.stream.out);
-                    self.compress_frame(rest, None, &mut out);
+                    self.compress_next(rest, &mut out);
                     self.stream.out = out;
                     *src_pos = src.len();
                     self.stream.stage = Stage::Ended;
@@ -361,7 +434,9 @@ impl Compressor {
                     }
                     self.contexts.expand(1);
                     let ctx = self.contexts.take();
-                    let frame = Frame::begin(&self.opts, self.stream.pledged, ctx);
+                    let prefix = self.prefix.take();
+                    let frame =
+                        Frame::begin(&self.opts, self.stream.pledged, prefix.as_deref(), ctx);
                     self.stream.stage = Stage::Frame(Box::new(frame));
                 }
                 Stage::Frame(frame) => {

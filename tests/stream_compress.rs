@@ -4,8 +4,8 @@
 //! size pledged is our one-shot frame byte for byte, and without a pledged
 //! size the frame does not depend on the chunking. With flushes: round trip
 //! through our decoder and libzstd's (one-shot and streaming), and the size
-//! gate against libzstd's `ZSTD_compressStream2` flushing at the same
-//! points. The full corpus grid is ignored by default (release build):
+//! gate against libzstd's stream flushing at the same points, without its
+//! input buffering (`common::c_stream_unbuffered`). The full corpus grid is ignored by default (release build):
 //!
 //! ```text
 //! cargo nextest run --release --test stream_compress --run-ignored all
@@ -105,63 +105,16 @@ fn check_no_flush(name: &str, data: &[u8], level: i32, chunks: &[usize]) {
     }
 }
 
-/// libzstd's `ZSTD_compressStream2` frame of `data` at `level` with the
-/// size pledged or not, cut and flushed as [`stream`] does.
-fn c_stream(data: &[u8], level: i32, pledged: bool, chunk: usize, flushes: &[usize]) -> Vec<u8> {
-    // SAFETY: the context is used only here; every buffer outlives the
-    // calls that reference it.
-    unsafe {
-        let cctx = sys::ZSTD_createCCtx();
+/// libzstd's stream frame of `data` at `level` with the size pledged or
+/// not, flushed where [`stream`] flushes, without its input buffering
+/// ([`common::c_stream_unbuffered`]).
+fn c_stream(data: &[u8], level: i32, pledged: bool, flushes: &[usize]) -> Vec<u8> {
+    // SAFETY: a live context.
+    common::c_stream_unbuffered(data, pledged, flushes, |cctx| unsafe {
         let r =
             sys::ZSTD_CCtx_setParameter(cctx, sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level);
         assert_eq!(sys::ZSTD_isError(r), 0);
-        if pledged {
-            let r = sys::ZSTD_CCtx_setPledgedSrcSize(cctx, data.len() as u64);
-            assert_eq!(sys::ZSTD_isError(r), 0);
-        }
-        let mut frame = Vec::new();
-        let mut dst = vec![0u8; sys::ZSTD_CStreamOutSize()];
-        let mut call = |src: &[u8], op: sys::ZSTD_EndDirective| {
-            let mut input = sys::ZSTD_inBuffer {
-                src: src.as_ptr().cast(),
-                size: src.len(),
-                pos: 0,
-            };
-            loop {
-                let mut output = sys::ZSTD_outBuffer {
-                    dst: dst.as_mut_ptr().cast(),
-                    size: dst.len(),
-                    pos: 0,
-                };
-                let left = sys::ZSTD_compressStream2(cctx, &mut output, &mut input, op);
-                assert_eq!(sys::ZSTD_isError(left), 0, "ZSTD_compressStream2");
-                frame.extend_from_slice(&dst[..output.pos]);
-                let done = match op {
-                    sys::ZSTD_EndDirective::ZSTD_e_continue => input.pos == input.size,
-                    _ => left == 0,
-                };
-                if done {
-                    return;
-                }
-            }
-        };
-        let mut start = 0;
-        let mut cuts: Vec<usize> = (chunk..data.len()).step_by(chunk).collect();
-        cuts.extend_from_slice(flushes);
-        cuts.sort_unstable();
-        cuts.dedup();
-        for cut in cuts {
-            call(&data[start..cut], sys::ZSTD_EndDirective::ZSTD_e_continue);
-            if flushes.contains(&cut) {
-                call(&[], sys::ZSTD_EndDirective::ZSTD_e_flush);
-            }
-            start = cut;
-        }
-        call(&data[start..], sys::ZSTD_EndDirective::ZSTD_e_continue);
-        call(&[], sys::ZSTD_EndDirective::ZSTD_e_end);
-        sys::ZSTD_freeCCtx(cctx);
-        frame
-    }
+    })
 }
 
 /// The flush gate: round trip through both decoders, libzstd's streaming
@@ -181,7 +134,7 @@ fn check_flushes(name: &str, data: &[u8], level: i32, pledged: bool, flushes: &[
     );
     let decoded = zstd::stream::decode_all(&ours[..]).expect(&what);
     assert!(decoded == data, "{what}: libzstd streaming decode differs");
-    let lib = c_stream(data, level, pledged, chunk, flushes);
+    let lib = c_stream(data, level, pledged, flushes);
     assert_gate(&what, data, &ours, &lib);
 }
 

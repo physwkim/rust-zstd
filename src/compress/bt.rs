@@ -15,8 +15,11 @@
 //! (`ZSTD_btGetAllMatches`): it inserts the position and collects every
 //! repcode, 3-byte-hash and tree match that is longer than the previous one.
 
-use super::common::{byte, index_overlap_check, read32, tget, MatchCount, Src, HASH_READ_SIZE};
-use super::matchstate::{EnteredPrefix, MatchState};
+use super::common::{
+    byte, candidate_valid, count_2segments, index_overlap_check, read32, tget, MatchCount, Src,
+    HASH_READ_SIZE,
+};
+use super::matchstate::{DictMatchState, EnteredPrefix, MatchState, WINDOW_START_INDEX};
 use super::seqstore::{offset_to_offbase, repcode_to_offbase, ZSTD_REP_NUM};
 use fearless_simd::Fallback;
 
@@ -482,6 +485,358 @@ pub(crate) unsafe fn bt_get_all_matches<M: MatchCount, const MLS: u32, const EXT
         rep,
         ll0,
         length_to_beat,
+    )
+}
+
+/// An attached dictionary's tree as `ZSTD_insertBtAndGetAllMatches`
+/// (`ZSTD_dictMatchState`) reads it: the dictionary's sorted binary tree
+/// (`ZSTD_updateTree` over its content), never written.
+#[derive(Clone, Copy)]
+pub(crate) struct BtDms<'a> {
+    /// The content by the frame's indices, ending at the input's start.
+    dict: Src<'a>,
+    /// `dms->hashTable`, `dms->chainTable`.
+    hash: &'a [u32],
+    bt: &'a [u32],
+    /// `dmsHashLog`, `dmsBtMask`.
+    hash_log: u32,
+    bt_mask: usize,
+    /// `dmsBtLow`: no node at or below it has children.
+    bt_low: usize,
+    /// `dmsHighLimit`: the content's end by the dictionary's indices.
+    end: usize,
+    /// `dmsIndexDelta`: a dictionary index plus this is the frame's.
+    delta: usize,
+}
+
+impl<'a> BtDms<'a> {
+    /// The tree of `dms`, whose content ends at the frame's
+    /// `prefix_start`. Panics unless its tables are a tree's.
+    pub(crate) fn new(dms: DictMatchState<'a>, prefix_start: usize) -> Self {
+        let cp = &dms.ms.cparams;
+        let (hash, bt, _) = dms.ms.tables();
+        assert_eq!(
+            hash.len(),
+            1usize << cp.hash_log,
+            "dictionary hash_table size"
+        );
+        assert!(cp.chain_log >= 1);
+        assert_eq!(
+            bt.len(),
+            1usize << cp.chain_log,
+            "dictionary chain_table size"
+        );
+        let end = dms.src().end();
+        let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
+        let low = WINDOW_START_INDEX;
+        BtDms {
+            dict: dms.src_below(prefix_start),
+            hash,
+            bt,
+            hash_log: cp.hash_log,
+            bt_mask,
+            bt_low: if bt_mask < end - low {
+                end - bt_mask
+            } else {
+                low
+            },
+            end,
+            delta: prefix_start - end,
+        }
+    }
+}
+
+/// [`insert_bt_and_get_all_matches`] with the dictionary `d` attached
+/// (`ZSTD_dictMatchState`): a repcode below the input's start is read in
+/// the dictionary's content, and once the frame's tree is searched without
+/// reaching the end of the input, the dictionary's tree is with the
+/// compares left.
+///
+/// # Safety
+/// As [`insert_bt_and_get_all_matches`]; `ms` attached `d`, so that its
+/// window starts at the content's end.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn insert_bt_and_get_all_matches_dms<M: MatchCount, const MLS: u32>(
+    m: M,
+    matches: &mut [Match; ZSTD_OPT_SIZE],
+    ms: &mut MatchState,
+    next_to_update3: &mut usize,
+    src: Src,
+    ip: usize,
+    i_limit: usize,
+    rep: &[u32; 3],
+    ll0: u32,
+    length_to_beat: u32,
+    d: &BtDms,
+) -> u32 {
+    let cp = ms.cparams;
+    let sufficient_len = (cp.target_length as usize).min(ZSTD_OPT_NUM - 1);
+    let curr = ip;
+    let min_match: u32 = if MLS == 3 { 3 } else { 4 };
+    let bt_mask = (1usize << (cp.chain_log - 1)) - 1;
+    let dict_limit = ms.window().dict_limit();
+    let bt_low = curr.saturating_sub(bt_mask);
+    let window_low = ms.lowest_match_index(curr);
+    let match_low = window_low;
+    let hash_log3 = cp.hash_log3();
+    let dict = d.dict;
+    debug_assert!(dict.end() == dict_limit && window_low == dict_limit);
+    let (hash_table, bt, hash_table3) = ms.ws.opt_tables_mut();
+    let h = super::common::hash_ptr::<MLS>(src, ip, cp.hash_log);
+    let mut match_index = tget(hash_table, h);
+    let mut common_length_smaller = 0usize;
+    let mut common_length_larger = 0usize;
+    // farthest referenced position of any match => detects repetitive patterns
+    let mut match_end_idx = curr + 8 + 1;
+    let mut mnum = 0usize;
+    let mut nb_compares = 1u32 << cp.search_log;
+    let mut best_length = (length_to_beat - 1) as usize;
+
+    // check repCode
+    debug_assert!(ll0 <= 1);
+    {
+        let last_r = ZSTD_REP_NUM + ll0;
+        for rep_code in ll0..last_r {
+            let rep_offset = if rep_code == ZSTD_REP_NUM {
+                rep[0].wrapping_sub(1)
+            } else {
+                rep[rep_code as usize]
+            };
+            let rep_index = curr.wrapping_sub(rep_offset as usize);
+            let mut rep_len = 0usize;
+            // intentional overflow, discards 0 and -1
+            if (rep_offset.wrapping_sub(1) as usize) < curr - dict_limit {
+                // `curr > rep_index >= dict_limit == window_low`
+                if read_min_match(src, ip, min_match) == read_min_match(src, rep_index, min_match) {
+                    rep_len = m.count(
+                        src,
+                        ip + min_match as usize,
+                        rep_index + min_match as usize,
+                        i_limit,
+                    ) + min_match as usize;
+                }
+            } else if (rep_offset.wrapping_sub(1) as usize) < curr - dict.lo()
+                && index_overlap_check(dict_limit, rep_index as u32)
+                && read_min_match(src, ip, min_match) == read_min_match(dict, rep_index, min_match)
+            {
+                // `dict.lo() <= rep_index < dict_limit - 3`
+                rep_len = count_2segments(
+                    m,
+                    src,
+                    ip + min_match as usize,
+                    i_limit,
+                    dict,
+                    rep_index + min_match as usize,
+                ) + min_match as usize;
+            }
+            // save longer solution
+            if rep_len > best_length {
+                best_length = rep_len;
+                // expect value between 1 and 3
+                *matches.get_unchecked_mut(mnum) = Match {
+                    off: repcode_to_offbase(rep_code - ll0 + 1),
+                    len: rep_len as u32,
+                };
+                mnum += 1;
+                if rep_len > sufficient_len || ip + rep_len == i_limit {
+                    // best possible
+                    return mnum as u32;
+                }
+            }
+        }
+    }
+
+    // HC3 match finder
+    if MLS == 3 && best_length < MLS as usize {
+        let match_index3 =
+            insert_and_find_first_index_hash3(hash_table3, hash_log3, next_to_update3, src, ip);
+        // heuristic : longer distance likely too expensive
+        if match_index3 >= match_low && curr.wrapping_sub(match_index3) < (1 << 18) {
+            debug_assert!(match_index3 < curr);
+            let mlen = m.count(src, ip, match_index3, i_limit);
+            // save best solution
+            if mlen >= MLS as usize {
+                best_length = mlen;
+                debug_assert!(mnum == 0); // no prior solution
+                *matches.get_unchecked_mut(0) = Match {
+                    off: offset_to_offbase((curr - match_index3) as u32),
+                    len: mlen as u32,
+                };
+                mnum = 1;
+                if mlen > sufficient_len || ip + mlen == i_limit {
+                    // best possible length
+                    ms.next_to_update = curr + 1; // skip insertion
+                    return 1;
+                }
+            }
+        }
+        // no dictMatchState lookup: dicts don't have a populated HC3 table
+    }
+
+    *hash_table.get_unchecked_mut(h) = curr as u32; // Update Hash Table
+
+    let bt_ptr = bt.as_mut_ptr();
+    let mut dummy32 = 0u32;
+    let mut smaller_ptr: *mut u32 = bt_ptr.add(2 * (curr & bt_mask));
+    let mut larger_ptr: *mut u32 = smaller_ptr.add(1);
+
+    while nb_compares > 0 && match_index >= match_low {
+        let next_ptr = bt_ptr.add(2 * (match_index & bt_mask));
+        // guaranteed minimum nb of common bytes
+        let mut match_length = common_length_smaller.min(common_length_larger);
+        debug_assert!(curr > match_index);
+        match_length += m.count(src, ip + match_length, match_index + match_length, i_limit);
+
+        if match_length > best_length {
+            if match_length > match_end_idx - match_index {
+                match_end_idx = match_index + match_length;
+            }
+            best_length = match_length;
+            *matches.get_unchecked_mut(mnum) = Match {
+                off: offset_to_offbase((curr - match_index) as u32),
+                len: match_length as u32,
+            };
+            mnum += 1;
+            if match_length > ZSTD_OPT_NUM || ip + match_length == i_limit {
+                // break should also skip searching dms
+                nb_compares = 0;
+                break;
+            }
+        }
+
+        debug_assert!(ip + match_length < i_limit);
+        if byte(src, match_index + match_length) < byte(src, ip + match_length) {
+            // match smaller than current
+            *smaller_ptr = match_index as u32;
+            common_length_smaller = match_length;
+            if match_index <= bt_low {
+                // beyond tree size, stop the search
+                smaller_ptr = &mut dummy32;
+                break;
+            }
+            smaller_ptr = next_ptr.add(1);
+            match_index = *next_ptr.add(1) as usize;
+        } else {
+            *larger_ptr = match_index as u32;
+            common_length_larger = match_length;
+            if match_index <= bt_low {
+                // beyond tree size, stop the search
+                larger_ptr = &mut dummy32;
+                break;
+            }
+            larger_ptr = next_ptr;
+            match_index = *next_ptr as usize;
+        }
+        nb_compares -= 1;
+    }
+
+    *smaller_ptr = 0;
+    *larger_ptr = 0;
+
+    if nb_compares > 0 {
+        let mut dict_match_index =
+            tget(d.hash, super::common::hash_ptr::<MLS>(src, ip, d.hash_log));
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        // C tests `dictMatchIndex > dmsLowLimit` only; the dictionary's tree
+        // holds no index past its content.
+        while nb_compares > 0 && candidate_valid(dict_match_index, WINDOW_START_INDEX + 1, d.end) {
+            let next = 2 * (dict_match_index & d.bt_mask);
+            // guaranteed minimum nb of common bytes
+            let mut match_length = common_length_smaller.min(common_length_larger);
+            let local = dict_match_index + d.delta;
+            match_length += count_2segments(
+                m,
+                src,
+                ip + match_length,
+                i_limit,
+                dict,
+                local + match_length,
+            );
+
+            if match_length > best_length {
+                if match_length > match_end_idx - local {
+                    match_end_idx = local + match_length;
+                }
+                best_length = match_length;
+                *matches.get_unchecked_mut(mnum) = Match {
+                    off: offset_to_offbase((curr - local) as u32),
+                    len: match_length as u32,
+                };
+                mnum += 1;
+                if match_length > ZSTD_OPT_NUM || ip + match_length == i_limit {
+                    // drop, to guarantee consistency (miss a little bit of
+                    // compression)
+                    break;
+                }
+            }
+
+            if dict_match_index <= d.bt_low {
+                break; // beyond tree size, stop the search
+            }
+            // `ip + match_length < i_limit`, as in the frame's tree; the
+            // byte after the common part is in the content, or past its end
+            // in the input.
+            let next_byte = if local + match_length >= dict.end() {
+                byte(src, local + match_length)
+            } else {
+                byte(dict, local + match_length)
+            };
+            if next_byte < byte(src, ip + match_length) {
+                common_length_smaller = match_length;
+                dict_match_index = tget(d.bt, next + 1);
+            } else {
+                // match is larger than current
+                common_length_larger = match_length;
+                dict_match_index = tget(d.bt, next);
+            }
+            nb_compares -= 1;
+        }
+    }
+
+    debug_assert!(match_end_idx > curr + 8);
+    ms.next_to_update = match_end_idx - 8; // skip repetitive patterns
+    mnum as u32
+}
+
+/// `ZSTD_btGetAllMatches_internal(..., ZSTD_dictMatchState, mls)`: as
+/// [`bt_get_all_matches`], with the dictionary `d` attached, see
+/// [`insert_bt_and_get_all_matches_dms`].
+///
+/// # Safety
+/// As [`bt_get_all_matches`]; `ms` attached `d`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn bt_get_all_matches_dms<M: MatchCount, const MLS: u32>(
+    m: M,
+    matches: &mut [Match; ZSTD_OPT_SIZE],
+    ms: &mut MatchState,
+    next_to_update3: &mut usize,
+    src: Src,
+    ip: usize,
+    i_high_limit: usize,
+    rep: &[u32; 3],
+    ll0: u32,
+    length_to_beat: u32,
+    d: &BtDms,
+) -> u32 {
+    if ip < ms.next_to_update {
+        return 0; // skipped area
+    }
+    update_tree_internal::<M, MLS>(m, ms, src, ip, i_high_limit);
+    insert_bt_and_get_all_matches_dms::<M, MLS>(
+        m,
+        matches,
+        ms,
+        next_to_update3,
+        src,
+        ip,
+        i_high_limit,
+        rep,
+        ll0,
+        length_to_beat,
+        d,
     )
 }
 

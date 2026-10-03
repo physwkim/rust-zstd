@@ -1,17 +1,20 @@
-//! Long distance matching: port of `zstd_ldm.c` (libzstd 1.5.7) without
-//! the dictionary paths.
+//! Long distance matching: port of `zstd_ldm.c` (libzstd 1.5.7).
 //!
 //! [`LdmState::generate_sequences`] (`ZSTD_ldm_generateSequences`) cuts the
 //! input at the split points of a gear rolling hash, looks each split's
 //! `min_match_length` bytes up in a bucketed hash table of earlier splits
 //! and emits a [`RawSeq`] for every long match, extended backwards. The
 //! window is the whole input the state has seen, limited to
-//! `1 << window_log` bytes. [`block_compress`] (`ZSTD_ldm_blockCompress`)
-//! then runs the strategy's block compressor on the literals between those
-//! sequences and stores the sequences themselves verbatim.
+//! `1 << window_log` bytes, after the dictionary content it may have
+//! loaded first ([`LdmState::load_dict`], `ZSTD_ldm_fillHashTable`), which
+//! stays valid whole until the input passes the window size.
+//! [`block_compress`] (`ZSTD_ldm_blockCompress`) then runs the strategy's
+//! block compressor on the literals between those sequences and stores the
+//! sequences themselves verbatim.
 //!
 //! The hash table holds `u32` indices of the state's own [`Window`], as
-//! libzstd's `ldmState->window`: the first byte of the input is
+//! libzstd's `ldmState->window`: the first byte of the loaded content, else
+//! of the input, is
 //! [`WINDOW_START_INDEX`](super::matchstate::WINDOW_START_INDEX), and
 //! before a 1 MiB chunk would end above
 //! [`CURRENT_MAX`](super::matchstate::CURRENT_MAX) the window is corrected
@@ -19,7 +22,7 @@
 
 use super::block;
 use super::common::{count, prefetch_l1, Src, HASH_READ_SIZE};
-use super::matchstate::{Block, MatchState, Window};
+use super::matchstate::{Block, DictMatchState, MatchState, Window};
 use super::opt;
 use super::params::{CParams, Strategy};
 use super::seqstore::{offset_to_offbase, SeqStore};
@@ -373,6 +376,46 @@ impl LdmState {
         self.window.set_correct_frequently(on);
     }
 
+    /// `ZSTD_loadDictionaryContent`'s long distance matching load (and
+    /// `ZSTDMT_serialState_reset`'s): the dictionary content at `content`
+    /// of `src`, where the window starts ([`LdmState::reset`]), enters the
+    /// window as a dictionary (`loadedDictEnd`, see
+    /// [`Window::lowest_match_index`]) and its split points the hash table
+    /// (`ZSTD_ldm_fillHashTable`).
+    pub fn load_dict(&mut self, src: &[u8], content: Range<usize>) {
+        self.window.enter_dict(content.clone());
+        self.fill_hash_table(src, content);
+    }
+
+    /// `ZSTD_ldm_fillHashTable`: insert every split point of `src[range]`
+    /// whose `min_match_length` bytes lie in the range, the rolling hash
+    /// starting from `ZSTD_ldm_gear_init` at its first byte, without
+    /// searching.
+    fn fill_hash_table(&mut self, src: &[u8], range: Range<usize>) {
+        let params = self.params;
+        let min_match = params.min_match_length as usize;
+        let h_bits = params.hash_log - params.bucket_size_log;
+        let mut hash_state = GearState::init(&params);
+        let mut splits = [0usize; LDM_BATCH_SIZE];
+        let mut ip = range.start;
+        while ip < range.end {
+            let (hashed, num_splits) = hash_state.feed(&src[ip..range.end], &mut splits);
+            for &split_n in &splits[..num_splits] {
+                if ip + split_n >= range.start + min_match {
+                    let split = ip + split_n - min_match;
+                    let xxhash = xxh64(&src[split..split + min_match]);
+                    let hash = (xxhash as u32 & ((1u32 << h_bits) - 1)) as usize;
+                    let entry = LdmEntry {
+                        offset: self.window.index(split) as u32,
+                        checksum: (xxhash >> 32) as u32,
+                    };
+                    self.insert_entry(hash, entry);
+                }
+            }
+            ip += hashed;
+        }
+    }
+
     /// `window`.
     pub fn window(&self) -> &Window {
         &self.window
@@ -632,6 +675,7 @@ fn fill_fast_tables(ms: &mut MatchState, src: Src, end: usize) {
 /// run the strategy's block compressor on the literals between them, each
 /// run set up by [`MatchState::ldm_sub_block`]. Either way `seqs` moves
 /// past the block. Returns the anchor of the block's trailing literals.
+/// The block compressors are the `ZSTD_dictMatchState` ones with `dms`.
 pub fn block_compress(
     seqs: &mut RawSeqStore,
     ms: &mut MatchState,
@@ -639,12 +683,18 @@ pub fn block_compress(
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    dms: Option<DictMatchState>,
 ) -> usize {
     // If using opt parser, use LDMs only as candidates rather than always
     // accepting them
     if ms.cparams.strategy >= Strategy::BtOpt {
         let block_len = block.range().len();
-        let anchor = opt::compress_block(ms, src, block, rep, out, seqs.view());
+        let anchor = match dms {
+            None => opt::compress_block(ms, src, block, rep, out, seqs.view()),
+            Some(dms) => {
+                block::run_dms_block_compressor(ms, src, block, rep, out, seqs.view(), dms)
+            }
+        };
         seqs.skip_raw_seq_store_bytes(block_len);
         return anchor;
     }
@@ -667,7 +717,7 @@ pub fn block_compress(
         let lits = ms.ldm_sub_block(block, ip..lit_end);
         fill_fast_tables(ms, src, ip);
         // Run the block compressor
-        let anchor = block::run_block_compressor(ms, src, lits, rep, out);
+        let anchor = block::run_block_compressor(ms, src, lits, rep, out, dms);
         ip = lit_end;
         // Update the repcodes
         rep[2] = rep[1];
@@ -688,7 +738,7 @@ pub fn block_compress(
     let lits = ms.ldm_sub_block(block, ip..iend);
     fill_fast_tables(ms, src, ip);
     // Compress the last literals
-    block::run_block_compressor(ms, src, lits, rep, out)
+    block::run_block_compressor(ms, src, lits, rep, out, dms)
 }
 
 /// `ldmRollingHashState_t`: the gear hash.
@@ -698,11 +748,10 @@ struct GearState {
 }
 
 impl GearState {
-    /// `ZSTD_ldm_gear_init`, then [`GearState::reset`] on `first`, the
-    /// `min_match_length` bytes before the first byte fed: a split every
-    /// `1 << hash_rate_log` bytes on average, tested on the highest bits
-    /// that still depend only on the last `min_match_length` bytes.
-    fn new(params: &LdmParams, first: &[u8]) -> Self {
+    /// `ZSTD_ldm_gear_init`: a split every `1 << hash_rate_log` bytes on
+    /// average, tested on the highest bits that still depend only on the
+    /// last `min_match_length` bytes.
+    fn init(params: &LdmParams) -> Self {
         let max_bits_in_mask = params.min_match_length.min(64);
         let hash_rate_log = params.hash_rate_log;
         let stop_mask = if hash_rate_log > 0 && hash_rate_log <= max_bits_in_mask {
@@ -711,10 +760,16 @@ impl GearState {
             // In this degenerate case we simply honor the hash rate.
             (1u64 << hash_rate_log) - 1
         };
-        let mut state = Self {
+        Self {
             rolling: u32::MAX as u64,
             stop_mask,
-        };
+        }
+    }
+
+    /// [`GearState::init`], then [`GearState::reset`] on `first`, the
+    /// `min_match_length` bytes before the first byte fed.
+    fn new(params: &LdmParams, first: &[u8]) -> Self {
+        let mut state = Self::init(params);
         state.reset(first);
         state
     }
@@ -1238,7 +1293,7 @@ mod tests {
                 let mut out = SeqStore::new();
                 let entered = ms.enter_block(block.clone());
                 let (view, b) = ms.start_block(&src, entered);
-                let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out);
+                let anchor = block_compress(&mut seqs, &mut ms, view, b, &mut rep, &mut out, None);
                 let anchor = ms.pos(anchor);
                 let found: Vec<_> = out
                     .seqs
@@ -1449,5 +1504,61 @@ mod tests {
             inserted += 1;
         }
         assert!(inserted > 1000, "{inserted}");
+    }
+
+    /// `ZSTD_ldm_fillHashTable` on loaded content inserts split points of
+    /// the content alone, whose `min_match_length` bytes lie in it; an
+    /// input repeating the content from byte 1000 on is then one match at
+    /// that offset from the input's first byte, where without the load
+    /// (the window starting at the input) it has none. Content shorter than
+    /// `min_match_length` is a dictionary without entries.
+    #[test]
+    fn loaded_content_is_matched() {
+        let content = noise(32 << 10, 5);
+        let skip = 1000;
+        let src = [&content, &content[skip..], &noise(4096, 6)[..]].concat();
+        let start = content.len();
+        let p = params(20, 2, 4);
+        let mm = p.min_match_length as usize;
+        let stop_mask = GearState::init(&p).stop_mask;
+        let run = |load: Range<usize>| {
+            let mut state = LdmState::new(p, load.start);
+            if !load.is_empty() {
+                state.load_dict(&src, load);
+            }
+            let filled = state.hash_table.iter().filter(|e| e.offset != 0).count();
+            let mut out = RawSeqStore::default();
+            state.generate_sequences(&src, start..src.len(), usize::MAX, &mut out);
+            (state, filled, out.seqs)
+        };
+
+        let mut loaded = LdmState::new(p, 0);
+        loaded.load_dict(&src, 0..start);
+        let window = loaded.window();
+        assert_eq!(window.loaded_dict_end(), Some(window.index(start)));
+        let mut inserted = 0;
+        for entry in loaded.hash_table.iter().filter(|e| e.offset != 0) {
+            let split = window.pos(entry.offset as usize);
+            assert!(split + mm <= start, "split at {split}");
+            assert!(
+                is_split(stop_mask, &src[split..split + mm]),
+                "split at {split}"
+            );
+            inserted += 1;
+        }
+        assert!(inserted > 1000, "{inserted}");
+
+        let (_, filled, seqs) = run(0..start);
+        assert_eq!(filled, inserted);
+        assert_eq!(seqs.len(), 1);
+        let seq = seqs[0];
+        assert_eq!((seq.offset, seq.lit_length), ((start - skip) as u32, 0));
+        assert!(seq.match_length as usize >= start - skip, "{seq:?}");
+        assert!(run(start..start).2.is_empty());
+
+        let (short, filled, _) = run(start - mm + 1..start);
+        assert_eq!(filled, 0);
+        let window = short.window();
+        assert_eq!(window.loaded_dict_end(), Some(window.index(start)));
     }
 }

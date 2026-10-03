@@ -61,14 +61,14 @@ each block ≤ 128 KB decompressed). Blocks can be:
 
 ```toml
 [dependencies]
-rust-zstd = "0.2"
+rust-zstd = "0.3"
 ```
 
 Parallel compression is enabled by default. To disable it (single-threaded, no rayon dependency):
 
 ```toml
 [dependencies]
-rust-zstd = { version = "0.2", default-features = false }
+rust-zstd = { version = "0.3", default-features = false }
 ```
 
 ## API
@@ -140,7 +140,7 @@ let mut data = Vec::new();
 dec.read_to_end(&mut data)?;
 ```
 
-Under the adapters sit libzstd-style push state machines — `Compressor::compress_stream` (with `Continue`/`Flush`/`End` directives, `ZSTD_compressStream2` shape) and `Decompressor::decompress_stream` — for callers that manage their own buffers. Streaming decompression holds only the window, so arbitrarily large frames decode in bounded memory.
+Under the adapters sit libzstd-style push state machines — `Compressor::compress_stream` (with `Continue`/`Flush`/`End` directives, `ZSTD_compressStream2` shape) and `Decompressor::decompress_stream` — for callers that manage their own buffers. Streaming decompression holds the window and at most 1 MiB past it, so arbitrarily large frames decode in bounded memory.
 
 ### Dictionaries
 
@@ -157,7 +157,7 @@ let ddict = DecodeDict::new(&dict_bytes).unwrap();
 let original = decompress_with_dict(&frame, &ddict).unwrap();
 ```
 
-`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Combining a dictionary with the streaming APIs is not yet supported and returns `CompressError::Unsupported`.
+`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Streaming compression (`compress_stream`, `Encoder`) uses `CompressOptions::dict` and a prefix set with `Compressor::set_prefix`, as `ZSTD_compressStream2` uses `ZSTD_CCtx_refCDict` and `ZSTD_CCtx_refPrefix`; streaming decompression with a dictionary is not yet supported.
 
 ## Performance
 

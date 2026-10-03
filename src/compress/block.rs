@@ -12,7 +12,7 @@
 
 use super::common::Src;
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
-use super::matchstate::{Block, EnteredBlock, EnteredPrefix, MatchState};
+use super::matchstate::{Block, DictMatchState, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
 use super::presplit::{PreSplitter, SPLIT_BLOCK_SIZE};
 use super::seqstore::{Seq, SeqStore};
@@ -131,12 +131,22 @@ pub enum BlockKind {
     Compressed,
 }
 
-/// `ZSTD_isRLE`: every byte of `data` equals the first one.
+/// `ZSTD_isRLE`: every byte of `data` equals the first one. As in C, 32
+/// bytes are compared per step as words; a byte iterator's early exit
+/// keeps LLVM from vectorizing and scans an RLE block a byte per cycle.
 pub fn is_rle(data: &[u8]) -> bool {
-    match data.split_first() {
-        Some((&first, rest)) => rest.iter().all(|&b| b == first),
-        None => false,
-    }
+    let Some(&first) = data.first() else {
+        return false;
+    };
+    let splat = u64::from_ne_bytes([first; 8]);
+    let (chunks, rest) = data.as_chunks::<32>();
+    chunks.iter().all(|chunk| {
+        let words = chunk.as_chunks::<8>().0;
+        words
+            .iter()
+            .fold(0, |diff, &word| diff | (u64::from_ne_bytes(word) ^ splat))
+            == 0
+    }) && rest.iter().all(|&b| b == first)
 }
 
 /// `ZSTD_noCompressBlock`.
@@ -168,8 +178,10 @@ pub fn write_compressed_block(out: &mut Vec<u8>, compressed: &[u8], is_last: boo
 pub enum TableLoad {
     /// `ZSTD_dtlm_fast`: every third position, as a context loads content.
     Fast,
-    /// `ZSTD_dtlm_full`: also the positions between them where their slot
-    /// is empty, as a CDict loads its content once for many frames.
+    /// `ZSTD_dtlm_full` with `ZSTD_tfp_forCDict`: also the positions
+    /// between them where their slot is empty, as a CDict loads its
+    /// content once for many frames, and every fast and dfast entry tagged
+    /// (`ZSTD_CDictIndicesAreTagged`, see [`MatchState::copy_dict`]).
     Full,
 }
 
@@ -213,16 +225,22 @@ fn fill_tables(ms: &mut MatchState, data: &[u8], content: EnteredPrefix, load: T
     }
 }
 
-/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, ZSTD_noDict)`
+/// `ZSTD_selectBlockCompressor(strategy, useRowMatchFinder, dictMode)`
 /// run on `block`: store its sequences into `out` and return the anchor of
-/// the trailing literals.
+/// the trailing literals. `dms` is the attached dictionary while it is
+/// valid ([`MatchState::dict_match_state`]), which selects the
+/// `ZSTD_dictMatchState` variants.
 pub fn run_block_compressor(
     ms: &mut MatchState,
     src: Src,
     block: Block,
     rep: &mut [u32; 3],
     out: &mut SeqStore,
+    dms: Option<DictMatchState>,
 ) -> usize {
+    if let Some(dms) = dms {
+        return run_dms_block_compressor(ms, src, block, rep, out, RawSeqView::default(), dms);
+    }
     match ms.cparams.strategy {
         Strategy::Fast => fast::compress_block(ms, src, block, rep, out),
         Strategy::DFast => dfast::compress_block(ms, src, block, rep, out),
@@ -231,6 +249,32 @@ pub fn run_block_compressor(
         }
         Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
             opt::compress_block(ms, src, block, rep, out, RawSeqView::default())
+        }
+    }
+}
+
+/// The `ZSTD_dictMatchState` block compressors of
+/// [`run_block_compressor`], the optimal parser's with the long distance
+/// matches `ldm`. Out of line, so that the no-dictionary dispatch stays as
+/// it is.
+#[inline(never)]
+pub fn run_dms_block_compressor(
+    ms: &mut MatchState,
+    src: Src,
+    block: Block,
+    rep: &mut [u32; 3],
+    out: &mut SeqStore,
+    ldm: RawSeqView,
+    dms: DictMatchState,
+) -> usize {
+    match ms.cparams.strategy {
+        Strategy::Fast => fast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::DFast => dfast::compress_block_dms(ms, src, block, rep, out, dms),
+        Strategy::Greedy | Strategy::Lazy | Strategy::Lazy2 | Strategy::BtLazy2 => {
+            lazy::compress_block_dms(ms, src, block, rep, out, dms)
+        }
+        Strategy::BtOpt | Strategy::BtUltra | Strategy::BtUltra2 => {
+            opt::compress_block_dms(ms, src, block, rep, out, ldm, dms)
         }
     }
 }
@@ -262,7 +306,8 @@ pub enum BlockLdm<'a> {
 /// the strategy's block compressor on it (through `ZSTD_ldm_blockCompress`
 /// when `ldm` provides long matches) and store the trailing literals
 /// (`ZSTD_storeLastLiterals`). `rep` is the committed repeat offsets; the
-/// block's candidates are returned.
+/// block's candidates are returned. `dms` is the frame's attached
+/// dictionary, searched while it is valid.
 ///
 /// Out of line so that every caller, tests/stage_bench.rs included, runs
 /// the one instantiation the frame writer runs.
@@ -274,6 +319,7 @@ pub fn build_seq_store(
     mut rep: [u32; 3],
     store: &mut SeqStore,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
 ) -> Option<[u32; 3]> {
     let positions = block.positions();
     if !attempts_compression(positions.len()) {
@@ -282,16 +328,17 @@ pub fn build_seq_store(
     store.clear();
     let (block_len, block_end) = (positions.len(), positions.end);
     let (src, block) = ms.start_block(data, block);
+    let dms = ms.dict_match_state(dms);
     let anchor = match ldm {
         BlockLdm::External(seqs) if !seqs.is_exhausted() => {
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Internal(state) => {
             let seqs = state.generate_block_sequences(data, positions);
-            ldm::block_compress(seqs, ms, src, block, &mut rep, store)
+            ldm::block_compress(seqs, ms, src, block, &mut rep, store, dms)
         }
         BlockLdm::Off | BlockLdm::External(_) => {
-            run_block_compressor(ms, src, block, &mut rep, store)
+            run_block_compressor(ms, src, block, &mut rep, store, dms)
         }
     };
     // ZSTD_storeLastLiterals; btultra2 may have moved the window
@@ -556,6 +603,7 @@ pub fn compress_block(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     let cparams = ms.cparams;
@@ -566,7 +614,7 @@ pub fn compress_block(
         ..
     } = scratch;
     let entered = ms.enter_block(block.clone());
-    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm);
+    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm, dms);
     let parts = split.then(|| match built {
         Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
         None => &[][..],
@@ -603,6 +651,15 @@ pub struct BlockSizing {
     /// that wrote it, so job 0's `savings` owe it from its second chunk on.
     pub header_len: usize,
 }
+
+/// The least unsplit size of a block whose match finding [`compress_blocks`]'
+/// pipelined loop runs next to the previous block's entropy stage. The
+/// overlap hands that entropy stage, and the sequences it reads, to another
+/// core while the finder waits for it, so it pays only when the finder has
+/// this much to do: on one 8-core CCD, single-job rssrc and elf frames of
+/// 128 KiB and a 4-8 KiB second block lost 3-13% at L1 and L3 to the
+/// overlap, broke even at 16-28 KiB and gained 3-8% at 32 KiB.
+pub(crate) const MIN_OVERLAP: usize = 32 << 10;
 
 /// How far the input [`compress_blocks`] is handed reaches, and what
 /// follows it.
@@ -692,6 +749,22 @@ impl JobBlocks {
             InputEnd::Open(end) => end > start && end - start > self.sizing.block_size_max,
             InputEnd::Chunk(end) | InputEnd::JobEnd(end) => start < end,
         }
+    }
+
+    /// Whether [`compress_blocks`]' pipelined loop overlaps the block at
+    /// `start`, the next one written, with the one before it: the block is
+    /// ready and holds [`MIN_OVERLAP`] bytes unsplit.
+    fn overlaps_at(&self, start: usize, input: InputEnd) -> bool {
+        self.ready(start, input) && self.unsplit_size(start, input) >= MIN_OVERLAP
+    }
+
+    /// Whether `input` gives [`compress_blocks`]' pipelined loop blocks to
+    /// overlap: whether it overlaps the second ready block, the first one
+    /// taken unsplit, as no later one holds more. A job's first block is
+    /// never pre-split, so on a job's whole input this is exact.
+    pub fn overlaps(&self, input: InputEnd) -> bool {
+        let start = self.next_start();
+        self.ready(start, input) && self.overlaps_at(start + self.unsplit_size(start, input), input)
     }
 
     /// Whether `block` is the frame's last.
@@ -798,9 +871,11 @@ impl JobBlocks {
 /// `ZSTD_compress_frameChunk` over the input of a job up to `input`: the
 /// ready blocks of `src` from `blocks`' next one, sized by its
 /// [`BlockSizing`], appended to `out`, each through the post-sequence
-/// splitter when `split`, with long distance matches from `ldm`. With
+/// splitter when `split`, with long distance matches from `ldm` and the
+/// attached dictionary `dms`. With
 /// `pipelined` (parallel feature only) block N's entropy stage and
-/// emission run on rayon next to block N+1's match finding whenever every
+/// emission run on rayon next to block N+1's match finding whenever N+1
+/// holds `MIN_OVERLAP` bytes unsplit and every
 /// block N is written as is proven (`proven_rep_after`) to be COMPRESSED,
 /// so that the repeat offsets N+1 starts from are the ones the decoder
 /// will hold, and N+1's size is fixed without N's compressed size;
@@ -817,12 +892,13 @@ pub fn compress_blocks(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
     pipelined: bool,
 ) {
     #[cfg(feature = "parallel")]
     if pipelined {
-        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, out);
+        compress_blocks_pipelined(ms, src, blocks, input, split, state, scratch, ldm, dms, out);
         blocks.input_ended(input);
         return;
     }
@@ -840,6 +916,7 @@ pub fn compress_blocks(
             state,
             scratch,
             ldm,
+            dms,
             out,
         );
         blocks.wrote(&block, out.len() - written);
@@ -851,7 +928,8 @@ pub fn compress_blocks(
 #[cfg(feature = "parallel")]
 pub static PIPELINE_OVERLAPPED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Blocks with a successor whose proof failed (entropy stage ran first).
+/// Blocks with a successor of `MIN_OVERLAP` bytes whose proof failed
+/// (entropy stage ran first).
 #[cfg(feature = "parallel")]
 pub static PIPELINE_SERIALIZED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -882,6 +960,7 @@ fn compress_blocks_pipelined(
     state: &mut CommittedBlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
+    dms: Option<DictMatchState>,
     out: &mut Vec<u8>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -901,7 +980,7 @@ fn compress_blocks_pipelined(
     let mut block = blocks.next(src, input, presplit);
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
     let entered = ms.enter_block(block.clone());
-    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm);
+    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm, dms);
     loop {
         let is_first_block = blocks.is_first(&block);
         let is_last = blocks.is_last(&block, input);
@@ -912,15 +991,14 @@ fn compress_blocks_pipelined(
             None => &[][..],
         });
         let following_start = block.end;
-        // A pre-split block is at least 8 KiB, so the unsplit size decides
-        // whether the next block attempts compression.
-        let following_builds = blocks.ready(following_start, input)
-            && attempts_compression(blocks.unsplit_size(following_start, input));
+        // Pre-split, a next block that overlaps is at least 8 KiB, so it
+        // attempts compression.
+        let following_overlaps = blocks.overlaps_at(following_start, input);
         // Block N+1 may start before block N is written when N is proven
         // COMPRESSED (the offsets N+1 starts from) and N+1's size does not
         // depend on N's compressed size: it is not pre-split, or the least
         // savings a COMPRESSED N leaves already allow the split.
-        let overlap = following_builds
+        let overlap = following_overlaps
             .then(|| {
                 let rep = built?;
                 let rep_next = proven_rep_after(
@@ -948,7 +1026,7 @@ fn compress_blocks_pipelined(
             // The match state stays on this thread, whose caches hold its
             // tables; block N's entropy stage is the part a thief takes.
             let (built_following, compressed) = rayon::join(
-                || build_seq_store(ms, src, entered, rep_next, nxt, ldm),
+                || build_seq_store(ms, src, entered, rep_next, nxt, ldm, dms),
                 || {
                     emit_block(
                         src,
@@ -973,7 +1051,7 @@ fn compress_blocks_pipelined(
             built = built_following;
             block = following;
         } else {
-            if following_builds {
+            if following_overlaps {
                 PIPELINE_SERIALIZED.fetch_add(1, Relaxed);
             }
             emit_block(
@@ -994,7 +1072,7 @@ fn compress_blocks_pipelined(
             }
             block = blocks.next(src, input, presplit);
             let entered = ms.enter_block(block.clone());
-            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm);
+            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm, dms);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }
@@ -1005,6 +1083,23 @@ mod tests {
     use super::*;
     use crate::compress::common::HASH_READ_SIZE;
     use crate::compress::lazy::SearchMethod;
+
+    /// `is_rle` against its definition at every length around the 32-byte
+    /// step and its 8-byte words, with one byte changed at each position,
+    /// including the first byte, the remainder and the last byte.
+    #[test]
+    fn is_rle_matches_its_definition() {
+        for len in (0..=100).chain([ZSTD_BLOCKSIZE_MAX - 1, ZSTD_BLOCKSIZE_MAX]) {
+            let mut data = vec![0xa7u8; len];
+            assert_eq!(is_rle(&data), len > 0, "len {len}");
+            let positions = (0..len.min(100)).chain(len.saturating_sub(40)..len);
+            for at in positions {
+                data[at] ^= 1;
+                assert!(!is_rle(&data) || len == 1, "len {len} at {at}");
+                data[at] ^= 1;
+            }
+        }
+    }
 
     /// `ZSTD_loadDictionaryContent` leaves a prefix of `HASH_READ_SIZE`
     /// bytes or less unindexed, `nextToUpdate` at its start and the row
@@ -1072,20 +1167,41 @@ mod tests {
     /// `ZSTD_dtlm_full` keeps every slot `ZSTD_dtlm_fast` writes, as each
     /// third position overwrites its slot either way, and gives empty slots
     /// the positions between them: fast's table and dfast's large one gain
-    /// entries, dfast's small table is unchanged.
+    /// entries, dfast's small table is unchanged. Its entries are tagged
+    /// with the low byte of a hash 8 bits wider than the slot's.
     #[test]
     fn full_table_load_fills_only_empty_slots() {
+        use crate::compress::common::{hash_ptr, SHORT_CACHE_TAG_BITS};
         let data = crate::compress::common::testutil::synthetic_text(100_000, 5);
         for level in [1, 3] {
             let cp = CParams::for_level(level, 1 << 20);
             let load = |how| {
                 let mut ms = MatchState::new(cp, 0);
                 load_dict(&mut ms, &data, 0..data.len(), how);
+                let src = ms.view(&data);
                 let (hash, chain, _) = ms.tables();
-                (hash.to_vec(), chain.to_vec(), ms.index(0))
+                (hash.to_vec(), chain.to_vec(), ms.index(0), src)
             };
-            let (fast_hash, fast_chain, base) = load(TableLoad::Fast);
-            let (full_hash, full_chain, _) = load(TableLoad::Full);
+            let (fast_hash, fast_chain, base, _) = load(TableLoad::Fast);
+            let (tagged_hash, tagged_chain, _, src) = load(TableLoad::Full);
+            let tbits = cp.hash_log + SHORT_CACHE_TAG_BITS;
+            for &e in tagged_hash.iter().filter(|&&e| e != 0) {
+                let idx = (e >> SHORT_CACHE_TAG_BITS) as usize;
+                // SAFETY: a filled position has 8 bytes after it in `data`.
+                let hash_and_tag = unsafe {
+                    match (cp.strategy, cp.min_match) {
+                        (Strategy::DFast, _) => hash_ptr::<8>(src, idx, tbits),
+                        (_, 5) => hash_ptr::<5>(src, idx, tbits),
+                        (_, 6) => hash_ptr::<6>(src, idx, tbits),
+                        (_, 7) => hash_ptr::<7>(src, idx, tbits),
+                        _ => hash_ptr::<4>(src, idx, tbits),
+                    }
+                };
+                assert_eq!(e & 0xff, hash_and_tag as u32 & 0xff, "L{level}: tag");
+            }
+            let untag = |t: Vec<u32>| t.into_iter().map(|e| e >> SHORT_CACHE_TAG_BITS).collect();
+            let (full_hash, full_chain): (Vec<u32>, Vec<u32>) =
+                (untag(tagged_hash), untag(tagged_chain));
             for (&f, &g) in fast_hash.iter().zip(&full_hash) {
                 assert!(f == 0 || f == g, "L{level}: slot {f} became {g}");
                 assert!(
@@ -1378,6 +1494,27 @@ mod tests {
         st.rebase(100);
         assert_eq!(st.savings(899, 5), 5);
         assert_eq!(st.savings(900, 5), -5);
+    }
+
+    /// The pipelined loop has blocks to overlap once the second ready
+    /// block holds `MIN_OVERLAP` bytes unsplit: at a job or chunk end, from
+    /// `blockSizeMax + MIN_OVERLAP` bytes on; open, once the second block
+    /// is ready, past `2 * blockSizeMax`; never with `blockSizeMax` under
+    /// `MIN_OVERLAP`.
+    #[test]
+    fn overlaps_needs_a_ready_second_block_of_min_overlap() {
+        let bsm = ZSTD_BLOCKSIZE_MAX;
+        let at = 1000 + bsm + MIN_OVERLAP;
+        let mut st = job_blocks(Some(1), usize::MAX, 1000);
+        for end in [InputEnd::JobEnd, InputEnd::Chunk] {
+            assert!(!st.overlaps(end(1000 + bsm)));
+            assert!(!st.overlaps(end(at - 1)));
+            assert!(st.overlaps(end(at)));
+        }
+        assert!(!st.overlaps(InputEnd::Open(1000 + 2 * bsm)));
+        assert!(st.overlaps(InputEnd::Open(1000 + 2 * bsm + 1)));
+        st.sizing.block_size_max = MIN_OVERLAP - 1;
+        assert!(!st.overlaps(InputEnd::JobEnd(1 << 20)));
     }
 
     /// The pipelined loop fixes the next block before the current one is

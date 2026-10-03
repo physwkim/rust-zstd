@@ -3,6 +3,7 @@
 //! Port of `ZSTD_defaultCParameters` (clevels.h), `ZSTD_getCParams_internal`
 //! and `ZSTD_adjustCParams_internal` (zstd_compress.c).
 
+use super::common::SHORT_CACHE_TAG_BITS;
 use crate::constants::{ZSTD_HASHLOG_MIN, ZSTD_WINDOWLOG_MAX};
 
 /// Match-finder strategy. Numeric values follow `ZSTD_strategy`.
@@ -96,8 +97,6 @@ pub const ZSTD_CLEVEL_DEFAULT: i32 = 3;
 pub const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 const ZSTD_TARGETLENGTH_MAX: i32 = 1 << 17;
 const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
-/// `ZSTD_SHORT_CACHE_TAG_BITS`.
-const ZSTD_SHORT_CACHE_TAG_BITS: u32 = 8;
 /// `ZSTD_HASHLOG3_MAX`: the largest 3-byte hash table, see
 /// [`CParams::hash_log3`].
 pub const ZSTD_HASHLOG3_MAX: u32 = 17;
@@ -400,10 +399,8 @@ impl CParams {
         // A dictionary's fast and dfast tables tag their indices with
         // ZSTD_SHORT_CACHE_TAG_BITS (ZSTD_CDictIndicesAreTagged), so
         // (hashLog + 8) <= 32 && (chainLog + 8) <= 32.
-        if mode == CParamMode::CreateCDict
-            && matches!(self.strategy, Strategy::Fast | Strategy::DFast)
-        {
-            let max_short_cache_hash_log = 32 - ZSTD_SHORT_CACHE_TAG_BITS;
+        if mode == CParamMode::CreateCDict && self.cdict_indices_are_tagged() {
+            let max_short_cache_hash_log = 32 - SHORT_CACHE_TAG_BITS;
             self.hash_log = self.hash_log.min(max_short_cache_hash_log);
             self.chain_log = self.chain_log.min(max_short_cache_hash_log);
         }
@@ -418,6 +415,12 @@ impl CParams {
             }
         }
         self
+    }
+
+    /// `ZSTD_CDictIndicesAreTagged`: a dictionary's fast and dfast tables
+    /// hold tagged entries ([`write_tagged`](super::common::write_tagged)).
+    pub fn cdict_indices_are_tagged(&self) -> bool {
+        matches!(self.strategy, Strategy::Fast | Strategy::DFast)
     }
 
     /// `ZSTD_rowMatchFinderSupported`.

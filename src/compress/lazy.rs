@@ -27,6 +27,9 @@ use fearless_simd::{Fallback, Level};
 use std::ops::Range;
 use std::sync::OnceLock;
 
+mod dms;
+pub use dms::compress_block_dms;
+
 /// `ZSTD_ROW_HASH_TAG_BITS`: low hash bits kept in the tag table.
 const ROW_HASH_TAG_BITS: u32 = 8;
 const ROW_HASH_TAG_MASK: u32 = (1 << ROW_HASH_TAG_BITS) - 1;
@@ -271,7 +274,7 @@ impl<const MLS: u32> Search for HcSearch<MLS> {
 
 /// `ZSTD_DUBT_UNSORTED_MARK`: the second slot of a node that was inserted
 /// by [`BtSearch::update_dubt`] but not yet sorted into the tree. No real
-/// candidate is ever `1`: candidates are `> window_low >= WINDOW_START_INDEX`.
+/// candidate is ever `1`: candidates are `>= window_low >= WINDOW_START_INDEX`.
 pub(super) const DUBT_UNSORTED_MARK: usize = 1;
 
 /// `search_binaryTree`: a "delayed update binary tree" in the chain table,

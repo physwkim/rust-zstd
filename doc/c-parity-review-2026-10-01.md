@@ -170,16 +170,6 @@ C reference:
 
 Impact: It works only on a flat address space where the compiler does not exploit the UB. A source buffer near the bottom of the address space, combined with a large continued index, makes `ip - distanceFromBase` wrap. Frames and state do not differ from the port; this is a note on reference soundness. Evidence: reading.
 
-### R1-22: [libzstd] `addEvents_generic` counts fewer events than it samples
-
-Severity: Low
-
-Class: libzstd bug
-
-C reference: `zstd_preSplit.c:66` — `fp->nbEvents += limit/samplingRate;`. The loop `for (n = 0; n < limit; n += samplingRate)` makes ceil(limit/samplingRate) increments, so `nbEvents` is one short whenever the rate does not divide `limit`. For an 8 KiB chunk (limit 8191) that is every level that samples: rates 43, 11 and 5 give 190/191, 744/745 and 1638/1639. `fpDistance` and `compareFingerprints` normalise the histograms by these `nbEvents`, and `mergeEvents` accumulates the shortfall.
-
-Impact: The pre-splitter's distance and threshold are slightly biased, which can move or suppress a split point versus a correct count. Frames stay valid, since this is heuristic only. The port counts every sampled position, so its pre-split points at block splitter levels 1-3 can differ from libzstd's. Evidence: reading; `split_block_matches_libzstd` compares only levels 0 and 4, where the counts agree.
-
 ### R2-2: [libzstd] One-shot decoding never limits a block's decoded size to Block_Maximum_Size, but streaming does
 
 Severity: Low

@@ -6,10 +6,10 @@
 
 mod common;
 
-use common::{c_compress2, datasets, decompress_streaming, zstd_bulk, zstd_stream, MIB};
+use common::{c_compress2, datasets, decompress_streaming, read_all, zstd_bulk, zstd_stream, MIB};
 use rust_zstd::decode::DecodeOptions;
-use rust_zstd::{DecompressReader, Decompressor};
-use std::io::{self, Read};
+use rust_zstd::Decompressor;
+use std::io;
 use sys::ZSTD_cParameter::{
     ZSTD_c_checksumFlag, ZSTD_c_compressionLevel, ZSTD_c_contentSizeFlag, ZSTD_c_windowLog,
 };
@@ -54,7 +54,8 @@ fn check(name: &str, frame: &[u8], want: &[u8], chunks: &[usize]) {
 /// libzstd's frames of `name`, one-shot (with Frame_Content_Size) and
 /// streamed (without), at levels 1 to 22: of its first MiB at chunks of 7,
 /// 64 KiB and whole, of its first `SHORT` bytes at chunks of 1, and of all
-/// of it at a few levels.
+/// of it at a few levels, and, of 512 KiB to 2 MiB, of all of it twice
+/// over at level 1, past the 512 KiB window and the round buffer's margin.
 fn levels(name: &str) {
     let data = dataset(name);
     let mib = &data[..data.len().min(MIB)];
@@ -73,6 +74,15 @@ fn levels(name: &str) {
                     &compress(&data, level),
                     &data,
                     &[1 << 16, WHOLE],
+                );
+            }
+            if level == 1 && (MIB / 2..2 * MIB).contains(&data.len()) {
+                let twice = data.repeat(2);
+                check(
+                    &format!("{at} twice"),
+                    &compress(&twice, level),
+                    &twice,
+                    &[7, 1 << 16, WHOLE],
                 );
             }
         }
@@ -197,21 +207,23 @@ fn c_stream_flushed(data: &[u8], level: i32, pieces: &[usize]) -> Vec<u8> {
 }
 
 /// Frames of `ZSTD_compressStream2` flushed after pieces of 1 byte to
-/// 200 KB: blocks of any size end mid-frame, mid-match for the encoder.
+/// 200 KB: blocks of any size end mid-frame, mid-match for the encoder. At
+/// level 1, of 2 MiB, past the 512 KiB window and the round buffer's
+/// margin.
 #[test]
 fn compress_stream2_flushed_frames() {
     let data = dataset("rust_src_8m");
-    let mib = &data[..MIB];
     for level in [1, 3, 12, 19] {
+        let content = &data[..if level == 1 { 2 * MIB } else { MIB }];
         for pieces in [
             &[1, 2, 3, 100, 5000][..],
             &[70_000, 1, 200_000, 131_072, 131_073][..],
         ] {
-            let frame = c_stream_flushed(mib, level, pieces);
+            let frame = c_stream_flushed(content, level, pieces);
             check(
                 &format!("level {level} pieces {pieces:?}"),
                 &frame,
-                mib,
+                content,
                 &[1, 7, 1 << 16, WHOLE],
             );
         }
@@ -461,12 +473,17 @@ fn finish_needs_the_frame_written_out() {
     );
 }
 
-/// Frame of a 1 KiB window (no Frame_Content_Size) holding raw blocks of
-/// `raws` bytes, then a compressed block of `literals` raw literals (at
-/// most 31) and one sequence: the literals, then 4 bytes from `offset`
-/// back.
-fn edge_frame(raws: &[usize], literals: usize, offset: u32) -> Vec<u8> {
+/// Frame of a 1 KiB window (no Frame_Content_Size) holding `fill` RLE
+/// blocks of 1 KiB, raw blocks of `raws` bytes, then a compressed block of
+/// `literals` raw literals (at most 31) and one sequence: the literals,
+/// then 4 bytes from `offset` back.
+fn edge_frame(fill: usize, raws: &[usize], literals: usize, offset: u32) -> Vec<u8> {
     let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+    for _ in 0..fill {
+        let h = (1u32 << 1) | (1024 << 3);
+        f.extend_from_slice(&h.to_le_bytes()[..3]);
+        f.push(0);
+    }
     let mut block = |ty: u32, last: bool, body: &[u8]| {
         let h = u32::from(last) | (ty << 1) | ((body.len() as u32) << 3);
         f.extend_from_slice(&h.to_le_bytes()[..3]);
@@ -501,18 +518,19 @@ fn edge_frame(raws: &[usize], literals: usize, offset: u32) -> Vec<u8> {
 
 /// A match up to Window_Size back, right after the round buffer starts a
 /// new segment, reads the previous segment past every byte the literals
-/// before it wrote, overshoot included: after 1024 + `k` bytes for each `k`
-/// a block can end the segment at, with up to 31 literals.
+/// before it wrote, overshoot included: after 8 KiB + `k` bytes for each
+/// `k` a block can end the segment at (the window and the margin of seven
+/// blocks), with up to 31 literals.
 #[test]
 fn match_at_the_window_edge_after_a_new_segment() {
     let window = 1024u32;
     for k in 1..=48 {
         for literals in [0, 5, 15, 16, 17, 24, 31] {
             for offset in window - 48..=window {
-                let f = edge_frame(&[1024, k], literals, offset);
+                let f = edge_frame(7, &[1024, k], literals, offset);
                 let at = format!("k {k} literals {literals} offset {offset}");
                 let want = rust_zstd::decompress(&f).unwrap_or_else(|e| panic!("{at}: {e}"));
-                assert_eq!(want.len(), 1024 + k + literals + 4, "{at}");
+                assert_eq!(want.len(), 8 * 1024 + k + literals + 4, "{at}");
                 for chunk in [7, WHOLE] {
                     let got = decompress_streaming(&f, chunk, 4096, &DecodeOptions::default())
                         .unwrap_or_else(|e| panic!("{at} chunk {chunk}: {e}"));
@@ -521,51 +539,6 @@ fn match_at_the_window_edge_after_a_new_segment() {
             }
         }
     }
-}
-
-/// A reader of `data` that gives at most `piece` bytes a read, and fails
-/// with `Interrupted` before each other one.
-struct Pieces<'a> {
-    data: &'a [u8],
-    piece: usize,
-    interrupt: bool,
-}
-
-impl Read for Pieces<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.interrupt = !self.interrupt;
-        if self.interrupt {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
-        let n = self.data.len().min(self.piece).min(buf.len());
-        buf[..n].copy_from_slice(&self.data[..n]);
-        self.data = &self.data[n..];
-        Ok(n)
-    }
-}
-
-/// `DecompressReader` over a reader of `input` in pieces of `piece` bytes,
-/// read into a buffer of `room` bytes until it ends, retrying
-/// `Interrupted`; the content, or the error.
-fn read_all(input: &[u8], piece: usize, room: usize) -> io::Result<Vec<u8>> {
-    let mut r = DecompressReader::new(Pieces {
-        data: input,
-        piece,
-        interrupt: false,
-    });
-    let mut content = Vec::new();
-    let mut buf = vec![0u8; room];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => content.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    // It stays at the end.
-    assert_eq!(r.read(&mut buf).unwrap(), 0);
-    Ok(content)
 }
 
 /// The reader gives the content of a sequence of frames, whatever the
@@ -577,11 +550,11 @@ fn reader_decodes_frame_sequence() {
     let want: Vec<u8> = frames.iter().flat_map(|(_, c)| c.clone()).collect();
     for piece in [1, 7, 4096, WHOLE] {
         for room in [7, 1 << 16] {
-            let got = read_all(&input, piece, room).unwrap();
+            let got = read_all(&input, piece, room, None).unwrap();
             assert!(got == want, "piece {piece} room {room}: content differs");
         }
     }
-    assert!(read_all(&[], 1, 1).unwrap().is_empty());
+    assert!(read_all(&[], 1, 1, None).unwrap().is_empty());
 }
 
 /// The reader fails with `InvalidData` and `decompress`'s error where
@@ -601,7 +574,7 @@ fn reader_fails_where_decompress_does() {
     for input in cases {
         let want = rust_zstd::decompress(input).unwrap_err();
         for piece in [7, WHOLE] {
-            let e = read_all(input, piece, 4096).unwrap_err();
+            let e = read_all(input, piece, 4096, None).unwrap_err();
             assert_eq!(
                 e.kind(),
                 io::ErrorKind::InvalidData,

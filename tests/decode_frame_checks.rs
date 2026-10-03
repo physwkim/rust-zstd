@@ -34,7 +34,9 @@ fn check(name: &str, f: &[u8], accept: bool) {
         for min_parallel_blocks in [usize::MAX, 1] {
             let options = DecodeOptions {
                 min_parallel_blocks,
+                min_parallel_bytes: 0,
                 simd,
+                window_log_max: 0,
             };
             let ours = decompress_with_options(f, &options);
             match (&theirs, &ours) {
@@ -124,7 +126,8 @@ fn content_checksum_is_verified() {
         ("empty", vec![]),
         ("1 byte", vec![42]),
         ("text 1000", text(1000)),
-        ("text 1 MiB", text(1 << 20)),
+        // Past level 1's 512 KiB window and the round buffer's margin.
+        ("text 2 MiB", text(2 << 20)),
         ("random 300000", lcg_bytes(300_000, 5)),
     ];
     let mut raw_altered = 0;
@@ -573,7 +576,9 @@ fn skippable_frame_of_any_32_bit_size_is_skipped() {
             for min_parallel_blocks in [usize::MAX, 1] {
                 let options = DecodeOptions {
                     min_parallel_blocks,
+                    min_parallel_bytes: 0,
                     simd,
+                    window_log_max: 0,
                 };
                 let ours = decompress_with_options(&f, &options);
                 assert_eq!(

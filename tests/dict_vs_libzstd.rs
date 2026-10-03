@@ -5,26 +5,28 @@
 //! sizes across the sizes where libzstd changes how it uses a dictionary.
 //!
 //! The gate on every frame: libzstd and our decoder decode it with the
-//! dictionary, and it is at most [`common::size_limit`] of libzstd's frame with the same
-//! parameters: `ZSTD_compress2` with `ZSTD_CCtx_refCDict`, whose semantics
-//! [`CompressOptions::dict`] follows, and `ZSTD_c_forceAttachDict` =
-//! `ZSTD_dictForceCopy`, the table mode we always use (see
-//! `rust_zstd::compress::dict`). libzstd's default attaches a dictionary's
-//! tables for small inputs instead and searches them with its
-//! `ZSTD_dictMatchState` finders, whose parse differs; those frames are
-//! reported beside ours, as are `ZSTD_compress_usingDict` and
-//! `ZSTD_compress_usingCDict`. Raw prefixes are gated against
-//! `ZSTD_CCtx_refPrefix`. Streaming with a dictionary is not implemented
-//! and must say so.
+//! dictionary, and it is at most [`common::size_limit`] of libzstd's frame
+//! with the same parameters: `ZSTD_compress2` with `ZSTD_CCtx_refCDict`,
+//! whose semantics [`CompressOptions::dict`] follows, and the same
+//! `ZSTD_c_forceAttachDict`: its default, which attaches a dictionary's
+//! tables for small inputs and searches them in place, for our
+//! [`DictAttach::Auto`], and `ZSTD_dictForceCopy` for our
+//! [`DictAttach::Copy`]. `ZSTD_compress_usingDict` and
+//! `ZSTD_compress_usingCDict` frames are reported beside ours. Raw
+//! prefixes are gated against `ZSTD_CCtx_refPrefix`. Streams with a
+//! dictionary or a prefix are our one-shot frames when their size is
+//! pledged, and pass the same gate against libzstd's stream either way,
+//! without its input buffering ([`common::c_stream_unbuffered`]).
 
 mod common;
 
 use rust_zstd::compress::{
     compress_with_dict, compress_with_prefix, CompressDict, CompressError, CompressOptions,
-    Compressor, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
+    Compressor, DictAttach, Encoder, EndDirective, ParamSwitch, JOBSIZE_MIN,
 };
 use rust_zstd::decode::{decompress_with_dict, DecodeDict};
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use zstd::zstd_safe::zstd_sys::{self as sys, ZSTD_cParameter as P};
@@ -206,12 +208,36 @@ fn dictionaries(corpus: &Corpus) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// `ZSTD_dictAttachPref_e`, for `ZSTD_c_forceAttachDict`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Attach {
     /// `ZSTD_dictDefaultAttach`.
     Default = 0,
     /// `ZSTD_dictForceCopy`.
     ForceCopy = 2,
+}
+
+impl Attach {
+    /// Our preference of the same meaning.
+    fn ours(self) -> DictAttach {
+        match self {
+            Attach::Default => DictAttach::Auto,
+            Attach::ForceCopy => DictAttach::Copy,
+        }
+    }
+}
+
+/// Options with `dict` and the preference `attach` means.
+fn dict_opts(dict: &Arc<CompressDict>, attach: Attach) -> CompressOptions {
+    CompressOptions {
+        dict: Some(dict.clone()),
+        dict_attach: attach.ours(),
+        ..Default::default()
+    }
+}
+
+/// Our frame of `src` with `dict` and the preference `attach` means.
+fn ours_frame(src: &[u8], dict: &Arc<CompressDict>, attach: Attach) -> Vec<u8> {
+    Compressor::new(dict_opts(dict, attach)).compress_to_vec(src)
 }
 
 /// A frame libzstd's `f` writes into a buffer of `ZSTD_compressBound(len)`
@@ -319,6 +345,25 @@ fn lib_ref_prefix(src: &[u8], prefix: &[u8], level: i32) -> Vec<u8> {
     out
 }
 
+/// `ZSTD_compress2` at `level` with `params` after
+/// `ZSTD_CCtx_refPrefix(prefix)`.
+fn lib_prefix_with(src: &[u8], prefix: &[u8], level: i32, params: &[(P, i32)]) -> Vec<u8> {
+    lib_frame(
+        // SAFETY: a live context, `out` of its length.
+        |cctx, out| unsafe {
+            set(cctx, P::ZSTD_c_compressionLevel, level);
+            for &(param, value) in params {
+                set(cctx, param, value);
+            }
+            let (p, n) = (prefix.as_ptr().cast(), prefix.len());
+            assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refPrefix(cctx, p, n)), 0);
+            let (dst, cap) = (out.as_mut_ptr().cast(), out.len());
+            sys::ZSTD_compress2(cctx, dst, cap, src.as_ptr().cast(), src.len())
+        },
+        src.len(),
+    )
+}
+
 /// libzstd's decode of `frame` with `dict` (`ZSTD_decompress_usingDict`)
 /// and ours ([`assert_ours_decodes`]) are `src`.
 fn assert_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
@@ -343,48 +388,51 @@ fn assert_ours_decodes(what: &str, frame: &[u8], dict: &[u8], src: &[u8]) {
     assert!(out == src, "{what}: our decoder decodes another input");
 }
 
-/// One dictionary frame through the gate: our frame of `src` with `ours`
-/// round trips through libzstd and our decoder with `dict`, carries libzstd's dictionary
-/// ID, and is at most [`common::size_limit`] of libzstd's force-copy frame
-/// with `lib` (else the error is pushed to `failures`). Returns our size,
-/// libzstd's force-copy size and libzstd's default size.
+/// One dictionary frame through the gate with libzstd's default and its
+/// force-copy preference: our frame of `src` with `ours` and the same
+/// preference round trips through libzstd and our decoder with `dict`,
+/// carries libzstd's dictionary ID, and is at most [`common::size_limit`]
+/// of libzstd's frame with `lib` (else the error is pushed to `failures`).
+/// Returns our size and libzstd's with the default, then with force-copy.
 fn gate(
     what: &str,
     src: &[u8],
     dict: &[u8],
-    ours: &CompressDict,
+    ours: &Arc<CompressDict>,
     lib: &LibCDict,
     failures: &mut Vec<String>,
-) -> [usize; 3] {
-    let frame = compress_with_dict(src, ours);
-    assert_decodes(what, &frame, dict, src);
-    let copy = lib.compress(src, Attach::ForceCopy, &[]);
-    let attach = lib.compress(src, Attach::Default, &[]);
-    assert_eq!(
-        zstd_safe::get_dict_id_from_frame(&frame),
-        zstd_safe::get_dict_id_from_frame(&copy),
-        "{what}: dictionary ID"
-    );
-    if let Err(e) = common::check_size(what, frame.len(), copy.len()) {
-        failures.push(e);
-    }
-    [frame.len(), copy.len(), attach.len()]
+) -> [[usize; 2]; 2] {
+    [Attach::Default, Attach::ForceCopy].map(|attach| {
+        let what = format!("{what} {attach:?}");
+        let frame = ours_frame(src, ours, attach);
+        assert_decodes(&what, &frame, dict, src);
+        let lib = lib.compress(src, attach, &[]);
+        assert_eq!(
+            zstd_safe::get_dict_id_from_frame(&frame),
+            zstd_safe::get_dict_id_from_frame(&lib),
+            "{what}: dictionary ID"
+        );
+        if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+            failures.push(e);
+        }
+        [frame.len(), lib.len()]
+    })
 }
 
 #[test]
 fn dictionary_frames_pass_the_gate() {
     let mut failures = Vec::new();
     println!(
-        "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>9} {:>10}  worst vs copy, vs attach",
-        "corpus", "dict", "lvl", "ours", "copy", "attach", "usingDict", "usingCDict"
+        "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>8} {:>9} {:>10}  worst vs default, vs copy",
+        "corpus", "dict", "lvl", "ours", "default", "ourscopy", "copy", "usingDict", "usingCDict"
     );
     for corpus in corpora() {
         for (kind, dict) in dictionaries(&corpus) {
             for level in LEVELS {
-                let ours = CompressDict::new(&dict, level).unwrap();
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
                 let lib = LibCDict::new(&dict, level);
-                let mut sums = [0usize; 5];
-                // (largest ours - lib, its input size), vs copy and attach.
+                let mut sums = [0usize; 6];
+                // (largest ours - lib, its input size), default and copy.
                 let mut worst = [(isize::MIN, 0); 2];
                 for (i, src) in corpus.test.iter().enumerate() {
                     let what = format!(
@@ -392,21 +440,23 @@ fn dictionary_frames_pass_the_gate() {
                         corpus.name,
                         src.len()
                     );
-                    let [n, copy, attach] = gate(&what, src, &dict, &ours, &lib, &mut failures);
+                    let sizes = gate(&what, src, &dict, &ours, &lib, &mut failures);
                     let using_dict = lib_using_dict(src, &dict, level).len();
                     let using_cdict = lib.compress_using(src).len();
-                    for (sum, n) in sums
-                        .iter_mut()
-                        .zip([n, copy, attach, using_dict, using_cdict])
-                    {
+                    for (sum, n) in sums.iter_mut().zip(
+                        sizes
+                            .as_flattened()
+                            .iter()
+                            .chain(&[using_dict, using_cdict]),
+                    ) {
                         *sum += n;
                     }
-                    for (w, lib) in worst.iter_mut().zip([copy, attach]) {
+                    for (w, [n, lib]) in worst.iter_mut().zip(sizes) {
                         *w = (*w).max((n as isize - lib as isize, src.len()));
                     }
                 }
                 println!(
-                    "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>9} {:>10}  {:+} ({}), {:+} ({})",
+                    "{:<7} {:<8} {:>3} {:>8} {:>8} {:>8} {:>8} {:>9} {:>10}  {:+} ({}), {:+} ({})",
                     corpus.name,
                     kind,
                     level,
@@ -415,6 +465,7 @@ fn dictionary_frames_pass_the_gate() {
                     sums[2],
                     sums[3],
                     sums[4],
+                    sums[5],
                     worst[0].0,
                     worst[0].1,
                     worst[1].0,
@@ -426,27 +477,24 @@ fn dictionary_frames_pass_the_gate() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The held-out samples of the generated corpora at a level of every
-/// strategy are libzstd's force-copy frames byte for byte, a stricter
-/// check than the gate's size bound: the finders follow libzstd's
-/// `ZSTD_extDict` rules at the end of the dictionary content. The crate
-/// source corpus is left out: it changes with every edit, and fast,
-/// double-fast and btlazy2 may match the first byte of the content where
-/// libzstd's do not (`dictStartIndex < matchIndex`;
-/// `Window::lowest_match_index` is one inclusive bound), which some
-/// versions of it reach.
-#[test]
-fn dictionary_frames_equal_force_copy() {
+/// The held-out samples of the generated corpora at `levels` are
+/// libzstd's frames with the preference `attach` byte for byte, a stricter
+/// check than the gate's size bound. The crate source corpus is left out:
+/// it changes with every edit, and fast, double-fast and btlazy2 may match
+/// the first byte of the content where libzstd's do not
+/// (`dictStartIndex < matchIndex`; `Window::lowest_match_index` is one
+/// inclusive bound), which some versions of it reach.
+fn frames_equal(attach: Attach, levels: &[i32]) {
     let mut failures = Vec::new();
     for corpus in corpora().into_iter().filter(|c| c.name != "source") {
         for (kind, dict) in dictionaries(&corpus) {
-            for level in [-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19] {
-                let ours = CompressDict::new(&dict, level).unwrap();
+            for &level in levels {
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
                 let lib = LibCDict::new(&dict, level);
                 let differ: Vec<usize> = (0..corpus.test.len())
                     .filter(|&i| {
                         let src = &corpus.test[i];
-                        compress_with_dict(src, &ours) != lib.compress(src, Attach::ForceCopy, &[])
+                        ours_frame(src, &ours, attach) != lib.compress(src, attach, &[])
                     })
                     .collect();
                 if !differ.is_empty() {
@@ -461,11 +509,30 @@ fn dictionary_frames_equal_force_copy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// With the dictionary's tables copied, at a level of every strategy: the
+/// finders follow libzstd's `ZSTD_extDict` rules at the end of the
+/// dictionary content.
+#[test]
+fn dictionary_frames_equal_force_copy() {
+    frames_equal(
+        Attach::ForceCopy,
+        &[-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19],
+    );
+}
+
+/// With libzstd's default, which attaches the dictionary's tables for every
+/// held-out sample but the last, at a level of every strategy: the finders
+/// follow libzstd's `ZSTD_dictMatchState` rules.
+#[test]
+fn dictionary_frames_equal_default() {
+    frames_equal(Attach::Default, &[-1, 1, 3, 4, 5, 6, 9, 11, 12, 13, 16, 19]);
+}
+
 /// Levels across every strategy, and input sizes either side of each
 /// strategy's attach cutoff (8, 16 and 32 KiB), of 128 KiB and of six times
 /// a 32 KiB dictionary (the dictionary's tables or the frame's own),
 /// through the gate; also prints, per dictionary, our size minus libzstd's
-/// force-copy size and minus its default (attach) size for every cell.
+/// with its default and with force-copy for every cell.
 fn grid(levels: &[i32]) {
     let corpus = corpora().swap_remove(1);
     let text: Vec<u8> = corpus.train.concat();
@@ -491,24 +558,25 @@ fn grid(levels: &[i32]) {
     ];
     let mut failures = Vec::new();
     for (kind, dict) in [("trained 16K", &trained), ("raw 32K", &raw)] {
-        println!("{kind}: ours - copy / ours - attach (bytes) per input size");
+        println!("{kind}: ours - libzstd, default / force-copy (bytes) per input size");
         print!("{:>5}", "level");
         for size in sizes {
             print!(" {size:>11}");
         }
         println!();
         for &level in levels {
-            let ours = CompressDict::new(dict, level).unwrap();
+            let ours = Arc::new(CompressDict::new(dict, level).unwrap());
             let lib = LibCDict::new(dict, level);
             print!("{level:>5}");
             for size in sizes {
                 let src = &text[text.len() - size..];
                 let what = format!("{kind} L{level} {size} bytes");
-                let [n, copy, attach] = gate(&what, src, dict, &ours, &lib, &mut failures);
+                let [[n, default], [n_copy, copy]] =
+                    gate(&what, src, dict, &ours, &lib, &mut failures);
                 let cell = format!(
                     "{:+}/{:+}",
-                    n as isize - copy as isize,
-                    n as isize - attach as isize
+                    n as isize - default as isize,
+                    n_copy as isize - copy as isize
                 );
                 print!(" {cell:>11}");
             }
@@ -620,8 +688,10 @@ fn reused_dictionaries_are_byte_stable() {
     }
 }
 
-/// Long distance matching and a checksum with a dictionary, on an input
-/// large enough for the frame's own tables.
+/// Long distance matching and a checksum with a dictionary or a prefix,
+/// on an input of 100 KiB, for which the frame copies the dictionary's
+/// tables, and of 1 MiB, for which it loads its own, raw content into
+/// the long distance matcher too.
 #[test]
 fn dictionary_with_ldm_and_checksum() {
     let corpus = corpora().swap_remove(2);
@@ -632,92 +702,683 @@ fn dictionary_with_ldm_and_checksum() {
         }
         src.extend_from_slice(s);
     }
+    let params = [
+        (P::ZSTD_c_enableLongDistanceMatching, 1),
+        (P::ZSTD_c_checksumFlag, 1),
+    ];
+    let mut failures = Vec::new();
     for (kind, dict) in dictionaries(&corpus) {
         for level in [3, 19] {
-            let what = format!("source {kind} L{level} ldm+checksum");
-            let ours = Compressor::new(CompressOptions {
-                ldm: ParamSwitch::Enable,
-                checksum: true,
-                dict: Some(Arc::new(CompressDict::new(&dict, level).unwrap())),
-                ..Default::default()
-            })
-            .compress_to_vec(&src);
-            assert_decodes(&what, &ours, &dict, &src);
-            let params = [
-                (P::ZSTD_c_enableLongDistanceMatching, 1),
-                (P::ZSTD_c_checksumFlag, 1),
-            ];
-            let lib = LibCDict::new(&dict, level).compress(&src, Attach::ForceCopy, &params);
-            println!("{what}: ours {} libzstd {}", ours.len(), lib.len());
-            common::check_size(&what, ours.len(), lib.len()).unwrap();
+            let ours_dict = Arc::new(CompressDict::new(&dict, level).unwrap());
+            let lib_dict = LibCDict::new(&dict, level);
+            for src in [&src[..100 << 10], &src] {
+                let mut frames = Vec::new();
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let ours = Compressor::new(CompressOptions {
+                        ldm: ParamSwitch::Enable,
+                        checksum: true,
+                        ..dict_opts(&ours_dict, attach)
+                    })
+                    .compress_to_vec(src);
+                    let lib = lib_dict.compress(src, attach, &params);
+                    frames.push((format!("{kind} {attach:?}"), ours, lib));
+                }
+                if kind == "raw" {
+                    let opts = CompressOptions {
+                        level,
+                        ldm: ParamSwitch::Enable,
+                        checksum: true,
+                        ..Default::default()
+                    };
+                    let ours = compress_with_prefix(src, &dict, &opts);
+                    let lib = lib_prefix_with(src, &dict, level, &params);
+                    frames.push(("prefix".to_string(), ours, lib));
+                }
+                for (what, ours, lib) in frames {
+                    let what = format!("source {what} L{level} {} bytes ldm+checksum", src.len());
+                    assert_decodes(&what, &ours, &dict, src);
+                    println!("{what}: ours {} libzstd {}", ours.len(), lib.len());
+                    if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
+                        failures.push(e);
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `f`'s frame, which with the parallel feature must be the same on rayon
+/// pools of 1 and 4 threads.
+fn same_on_pools(what: &str, f: impl Fn() -> Vec<u8> + Sync) -> Vec<u8> {
+    let frame = f();
+    #[cfg(feature = "parallel")]
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        assert!(
+            pool.install(&f) == frame,
+            "{what}: another frame on a {threads}-thread pool"
+        );
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = what;
+    frame
+}
+
+/// Frames with a dictionary and a job size, over two jobs of 512 KiB, pass
+/// the gate against libzstd's ZSTDMT with the same CDict or prefix
+/// (`ZSTD_c_nbWorkers` 2, the same `ZSTD_c_jobSize`), with and without
+/// long distance matching. Only the first job starts from the dictionary,
+/// so a frame of several jobs is not the one-job frame.
+#[test]
+fn multithreaded_dictionary_frames_pass_the_gate() {
+    let corpus = corpora().swap_remove(1);
+    let src: Vec<u8> = corpus.train.concat();
+    assert!(src.len() > 2 * JOBSIZE_MIN);
+    let mut failures = Vec::new();
+    for (kind, dict) in dictionaries(&corpus) {
+        for level in [-5, 3, 19] {
+            let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+            let lib = LibCDict::new(&dict, level);
+            for (job_size, ldm) in [
+                (JOBSIZE_MIN, ParamSwitch::Auto),
+                (JOBSIZE_MIN, ParamSwitch::Enable),
+                (0, ParamSwitch::Auto),
+            ] {
+                let mut params = vec![
+                    (P::ZSTD_c_nbWorkers, 2),
+                    (P::ZSTD_c_jobSize, job_size as i32),
+                ];
+                if ldm == ParamSwitch::Enable {
+                    params.push((P::ZSTD_c_enableLongDistanceMatching, 1));
+                }
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let what = format!("{kind} L{level} job {job_size} ldm {ldm:?} {attach:?}");
+                    let opts = CompressOptions {
+                        job_size: Some(job_size),
+                        ldm,
+                        ..dict_opts(&ours, attach)
+                    };
+                    let frame = same_on_pools(&what, || {
+                        Compressor::new(opts.clone()).compress_to_vec(&src)
+                    });
+                    // At level 19 (btultra2) the overlap is the window,
+                    // which the job size grows to: one job.
+                    if job_size == JOBSIZE_MIN && ldm == ParamSwitch::Auto && level < 19 {
+                        let one_job = ours_frame(&src, &ours, attach);
+                        assert!(frame != one_job, "{what}: the one-job frame");
+                    }
+                    assert_decodes(&what, &frame, &dict, &src);
+                    let lib = lib.compress(&src, attach, &params);
+                    if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+                        failures.push(e);
+                    }
+                }
+                if kind != "raw" {
+                    continue;
+                }
+                let what = format!("prefix L{level} job {job_size} ldm {ldm:?}");
+                let opts = CompressOptions {
+                    level,
+                    job_size: Some(job_size),
+                    ldm,
+                    ..Default::default()
+                };
+                let frame = same_on_pools(&what, || compress_with_prefix(&src, &dict, &opts));
+                assert_decodes(&what, &frame, &dict, &src);
+                let lib = lib_prefix_with(&src, &dict, level, &params);
+                if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+                    failures.push(e);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The input chunk sizes of the streaming gate: 1, 7 and 64 KiB, and the
+/// whole input in one call.
+const STREAM_CHUNKS: [usize; 4] = [1, 7, 64 << 10, usize::MAX];
+
+/// The calls a stream of `len` bytes is cut into: `chunk`-byte `Continue`
+/// calls, `Flush` after each input position in `flushes`, then `End`.
+fn stream_calls(len: usize, chunk: usize, flushes: &[usize]) -> Vec<(Range<usize>, EndDirective)> {
+    let mut cuts: Vec<usize> = (chunk..len).step_by(chunk).collect();
+    cuts.extend_from_slice(flushes);
+    cuts.push(len);
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut calls = Vec::new();
+    let mut start = 0;
+    for cut in cuts {
+        calls.push((start..cut, EndDirective::Continue));
+        if flushes.contains(&cut) {
+            calls.push((cut..cut, EndDirective::Flush));
+        }
+        start = cut;
+    }
+    calls.push((len..len, EndDirective::End));
+    calls
+}
+
+/// Our frame of `src` through `cctx.compress_stream`, the size pledged
+/// first if `pledged`, cut as [`stream_calls`] says, into a 64 KiB output
+/// buffer drained after every call.
+fn ours_stream(
+    cctx: &mut Compressor,
+    src: &[u8],
+    pledged: bool,
+    chunk: usize,
+    flushes: &[usize],
+) -> Vec<u8> {
+    if pledged {
+        cctx.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+    }
+    let mut frame = Vec::new();
+    let mut dst = vec![0u8; 1 << 16];
+    for (range, op) in stream_calls(src.len(), chunk, flushes) {
+        let piece = &src[range];
+        let mut pos = 0;
+        loop {
+            let mut dst_pos = 0;
+            let left = cctx
+                .compress_stream(piece, &mut pos, &mut dst, &mut dst_pos, op)
+                .expect("compress_stream");
+            frame.extend_from_slice(&dst[..dst_pos]);
+            let done = match op {
+                EndDirective::Continue => pos == piece.len() && dst_pos < dst.len(),
+                EndDirective::Flush | EndDirective::End => left == 0,
+            };
+            if done {
+                break;
+            }
+        }
+    }
+    frame
+}
+
+impl LibCDict {
+    /// [`common::c_stream_unbuffered`] with `ZSTD_CCtx_refCDict` and
+    /// `attach`.
+    fn stream(&self, src: &[u8], attach: Attach, pledged: bool, flushes: &[usize]) -> Vec<u8> {
+        // SAFETY: a live context and CDict.
+        common::c_stream_unbuffered(src, pledged, flushes, |cctx| unsafe {
+            assert_eq!(sys::ZSTD_isError(sys::ZSTD_CCtx_refCDict(cctx, self.0)), 0);
+            set(cctx, P::ZSTD_c_experimentalParam4, attach as i32);
+        })
+    }
+}
+
+/// [`common::c_stream_unbuffered`] at `level` with
+/// `ZSTD_CCtx_refPrefix(prefix)`.
+fn lib_stream_prefix(src: &[u8], prefix: &[u8], level: i32, pledged: bool) -> Vec<u8> {
+    // SAFETY: a live context; `prefix` outlives the stream.
+    common::c_stream_unbuffered(src, pledged, &[], |cctx| unsafe {
+        set(cctx, P::ZSTD_c_compressionLevel, level);
+        let r = sys::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr().cast(), prefix.len());
+        assert_eq!(sys::ZSTD_isError(r), 0);
+    })
+}
+
+/// `src` streamed with `cctx` at each of `chunks`: with the size pledged,
+/// `one_shot` byte for byte; without, the same frame at every chunk size,
+/// which `check` accepts and which is returned.
+fn check_streams(
+    what: &str,
+    cctx: &mut Compressor,
+    src: &[u8],
+    chunks: &[usize],
+    one_shot: &[u8],
+    check: impl Fn(&str, &[u8]),
+) -> Vec<u8> {
+    let mut unpledged: Option<Vec<u8>> = None;
+    for &chunk in chunks {
+        let what = format!("{what} chunk {chunk}");
+        let frame = ours_stream(cctx, src, true, chunk, &[]);
+        assert!(
+            frame == one_shot,
+            "{what}: pledged stream != one-shot frame"
+        );
+        let frame = ours_stream(cctx, src, false, chunk, &[]);
+        match &unpledged {
+            None => {
+                check(&what, &frame);
+                unpledged = Some(frame);
+            }
+            Some(first) => assert!(&frame == first, "{what}: unpledged stream differs"),
+        }
+    }
+    unpledged.unwrap()
+}
+
+/// Without flushes, a dictionary stream with its size pledged is the
+/// one-shot frame byte for byte however it is cut, the dictionary attached
+/// or copied (small inputs) or loaded (the joined one over 128 KiB); one
+/// of unknown size does not depend on the cut and round trips. One
+/// `Compressor` streams them all, so each frame also starts from the
+/// contexts and dictionary the last one left.
+#[test]
+fn dictionary_streams_are_the_one_shot_frame() {
+    for corpus in corpora() {
+        for (kind, dict) in dictionaries(&corpus) {
+            for level in LEVELS {
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let mut cctx = Compressor::new(dict_opts(&ours, attach));
+                    for src in [&corpus.test[0], corpus.test.last().unwrap()] {
+                        let what = format!(
+                            "{} {kind} L{level} {attach:?} {} bytes",
+                            corpus.name,
+                            src.len()
+                        );
+                        let one_shot = ours_frame(src, &ours, attach);
+                        let check =
+                            |what: &str, frame: &[u8]| assert_decodes(what, frame, &dict, src);
+                        check_streams(&what, &mut cctx, src, &STREAM_CHUNKS, &one_shot, check);
+                    }
+                }
+            }
         }
     }
 }
 
-/// A frame with a dictionary is one job whatever the job size.
+/// The streaming gate against libzstd's stream with the same CDict and
+/// preference ([`common::c_stream_unbuffered`]), with and without the size
+/// pledged: every frame, however it is cut, round trips through libzstd
+/// and our decoder, carries the dictionary ID, and is at most
+/// [`common::size_limit`] of libzstd's. Prints the totals and how many
+/// frames are libzstd's byte for byte.
 #[test]
-fn dictionary_frames_are_one_job() {
-    let corpus = corpora().swap_remove(1);
-    let (_, trained) = dictionaries(&corpus).swap_remove(0);
-    let src: Vec<u8> = corpus.train.concat();
-    assert!(src.len() > 2 * JOBSIZE_MIN);
-    let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
-    let frame = |job_size| {
-        Compressor::new(CompressOptions {
-            job_size,
-            dict: Some(dict.clone()),
-            ..Default::default()
-        })
-        .compress_to_vec(&src)
-    };
-    let one = frame(None);
-    assert!(frame(Some(JOBSIZE_MIN)) == one);
-    assert_decodes("job size", &one, &trained, &src);
+fn dictionary_streams_pass_the_gate() {
+    let mut failures = Vec::new();
+    for corpus in corpora() {
+        for (kind, dict) in dictionaries(&corpus) {
+            for level in LEVELS {
+                let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+                let lib = LibCDict::new(&dict, level);
+                for attach in [Attach::Default, Attach::ForceCopy] {
+                    let mut cctx = Compressor::new(dict_opts(&ours, attach));
+                    for pledged in [true, false] {
+                        let (mut ours_total, mut lib_total, mut same, mut n) = (0, 0, 0, 0);
+                        for (i, src) in corpus.test.iter().enumerate() {
+                            // Every chunk size for the first and last
+                            // inputs, the whole input for the rest.
+                            let chunks: &[usize] = if i == 0 || i + 1 == corpus.test.len() {
+                                &STREAM_CHUNKS
+                            } else {
+                                &[usize::MAX]
+                            };
+                            let lib = lib.stream(src, attach, pledged, &[]);
+                            for &chunk in chunks {
+                                let what = format!(
+                                    "{} {kind} L{level} {attach:?} pledged {pledged} input {i} \
+                                     ({} bytes) chunk {chunk}",
+                                    corpus.name,
+                                    src.len()
+                                );
+                                let frame = ours_stream(&mut cctx, src, pledged, chunk, &[]);
+                                assert_decodes(&what, &frame, &dict, src);
+                                assert_eq!(
+                                    zstd_safe::get_dict_id_from_frame(&frame),
+                                    zstd_safe::get_dict_id_from_frame(&lib),
+                                    "{what}: dictionary ID"
+                                );
+                                if let Err(e) = common::check_size(&what, frame.len(), lib.len()) {
+                                    failures.push(e);
+                                }
+                                ours_total += frame.len();
+                                lib_total += lib.len();
+                                same += usize::from(frame == lib);
+                                n += 1;
+                            }
+                        }
+                        println!(
+                            "{:<7} {kind:<8} L{level:<2} {attach:<9?} pledged {pledged:<5} \
+                             ours {ours_total:>8} libzstd {lib_total:>8} identical {same}/{n}",
+                            corpus.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A streaming frame of options with a dictionary fails with
-/// `Unsupported("dictionary")` before it consumes or writes anything,
-/// whatever its first call's directive, through `compress_stream` and
-/// through `Encoder`; one-shot frames of the same `Compressor` still use
-/// the dictionary.
+/// Flushes in a dictionary stream end blocks early: the frame round trips
+/// and passes the size gate against libzstd flushing at the same points.
 #[test]
-fn streaming_with_a_dictionary_is_unsupported() {
-    let samples = log_samples(120);
-    let (content, src) = (samples[..80].concat(), samples[80..].concat());
-    let dict = Arc::new(CompressDict::new(&content, 3).unwrap());
-    let opts = CompressOptions {
-        dict: Some(dict.clone()),
-        ..Default::default()
-    };
-    let unsupported = CompressError::Unsupported("dictionary");
-    let mut dst = vec![0; 1 << 16];
-    for end_op in [
+fn flushed_dictionary_streams_pass_the_gate() {
+    let corpus = corpora().swap_remove(1);
+    let src = corpus.test.last().unwrap();
+    let flushes: Vec<usize> = [1, 17, 4000, 50_000, 100_000, 150_000]
+        .into_iter()
+        .filter(|&p| p < src.len())
+        .collect();
+    for (kind, dict) in dictionaries(&corpus) {
+        for level in [1, 3, 9] {
+            let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+            let lib = LibCDict::new(&dict, level);
+            for attach in [Attach::Default, Attach::ForceCopy] {
+                for pledged in [true, false] {
+                    let what = format!("log {kind} L{level} {attach:?} pledged {pledged} flushed");
+                    let mut cctx = Compressor::new(dict_opts(&ours, attach));
+                    let frame = ours_stream(&mut cctx, src, pledged, 4096, &flushes);
+                    assert_decodes(&what, &frame, &dict, src);
+                    let lib = lib.stream(src, attach, pledged, &flushes);
+                    common::check_size(&what, frame.len(), lib.len()).unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// A dictionary stream over inputs much larger than the window, so the
+/// buffer moves its last window down many times: with the size pledged
+/// the dictionary is loaded into the frame's tables, its content first in
+/// the buffer, and the stream is the one-shot frame; of unknown size it is
+/// attached (default) or copied with libzstd's small parameters for an
+/// unknown input with a dictionary, its content again first in the
+/// buffer, and the frame does not depend on the cut, round trips and
+/// passes the gate against libzstd's stream.
+#[test]
+fn sliding_buffer_with_a_dictionary() {
+    let corpus = corpora().swap_remove(2);
+    let (_, dict) = dictionaries(&corpus).swap_remove(0);
+    let data = common::datasets().swap_remove(0).data;
+    let src = &data[..3 << 20];
+    for level in [1, 3, 9] {
+        let ours = Arc::new(CompressDict::new(&dict, level).unwrap());
+        let lib = LibCDict::new(&dict, level);
+        for attach in [Attach::Default, Attach::ForceCopy] {
+            let what = format!("source 3M L{level} {attach:?}");
+            let mut cctx = Compressor::new(dict_opts(&ours, attach));
+            let one_shot = ours_frame(src, &ours, attach);
+            let lib = lib.stream(src, attach, false, &[]);
+            let check = |what: &str, frame: &[u8]| {
+                assert_decodes(what, frame, &dict, src);
+                println!(
+                    "{what} unpledged: ours {} libzstd {} identical {}",
+                    frame.len(),
+                    lib.len(),
+                    frame == lib
+                );
+                common::check_size(what, frame.len(), lib.len()).unwrap();
+            };
+            let chunks = [1013, 64 << 10, usize::MAX];
+            check_streams(&what, &mut cctx, src, &chunks, &one_shot, check);
+        }
+    }
+}
+
+/// A prefix set with `set_prefix` is the next frame's alone, streamed or
+/// one-shot: pledged, the stream is `compress_with_prefix`'s frame however
+/// it is cut; of unknown size, it round trips with the prefix and passes
+/// the gate against libzstd's stream after `ZSTD_CCtx_refPrefix`. The
+/// frame after it has no prefix again, and the dictionary of the options
+/// comes back.
+#[test]
+fn prefix_streams() {
+    let mut failures = Vec::new();
+    for corpus in corpora() {
+        let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+        for level in [-5, 1, 3, 9, 19] {
+            let opts = CompressOptions {
+                level,
+                ..Default::default()
+            };
+            let mut cctx = Compressor::new(opts.clone());
+            for src in [&corpus.test[0], corpus.test.last().unwrap()] {
+                let what = format!("{} prefix L{level} {} bytes", corpus.name, src.len());
+                let one_shot = compress_with_prefix(src, &prefix, &opts);
+                let mut unpledged: Option<Vec<u8>> = None;
+                for chunk in STREAM_CHUNKS {
+                    let what = format!("{what} chunk {chunk}");
+                    cctx.set_prefix(&prefix).unwrap();
+                    let frame = ours_stream(&mut cctx, src, true, chunk, &[]);
+                    assert!(
+                        frame == one_shot,
+                        "{what}: pledged stream != one-shot frame"
+                    );
+                    cctx.set_prefix(&prefix).unwrap();
+                    let frame = ours_stream(&mut cctx, src, false, chunk, &[]);
+                    match &unpledged {
+                        None => {
+                            let mut dctx = DCtx::create();
+                            dctx.ref_prefix(&prefix).unwrap();
+                            let mut out = Vec::with_capacity(src.len());
+                            dctx.decompress(&mut out, &frame).unwrap_or_else(|e| {
+                                panic!("{what}: {}", zstd_safe::get_error_name(e))
+                            });
+                            assert!(out == **src, "{what}: libzstd decodes another input");
+                            assert_ours_decodes(&what, &frame, &prefix, src);
+                            unpledged = Some(frame);
+                        }
+                        Some(first) => {
+                            assert!(&frame == first, "{what}: unpledged stream differs")
+                        }
+                    }
+                }
+                for pledged in [true, false] {
+                    let ours = if pledged {
+                        &one_shot
+                    } else {
+                        unpledged.as_ref().unwrap()
+                    };
+                    let lib = lib_stream_prefix(src, &prefix, level, pledged);
+                    let what = format!("{what} pledged {pledged}");
+                    if let Err(e) = common::check_size(&what, ours.len(), lib.len()) {
+                        failures.push(e);
+                    }
+                }
+                // Single usage: the next frame has no prefix.
+                let plain = rust_zstd::compress::compress_with(src, &opts);
+                assert!(
+                    ours_stream(&mut cctx, src, true, 4096, &[]) == plain,
+                    "{what}: the frame after the prefix's"
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // The prefix replaces the options' dictionary for one frame.
+    let corpus = corpora().swap_remove(0);
+    let (_, trained) = dictionaries(&corpus).swap_remove(0);
+    let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+    let src = &corpus.test[0];
+    let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
+    let mut cctx = Compressor::new(dict_opts(&dict, Attach::Default));
+    cctx.set_prefix(&prefix).unwrap();
+    let frame = ours_stream(&mut cctx, src, true, 7, &[]);
+    assert!(frame == compress_with_prefix(src, &prefix, &CompressOptions::default()));
+    assert!(ours_stream(&mut cctx, src, true, 7, &[]) == compress_with_dict(src, &dict));
+}
+
+/// `set_prefix` only before a frame starts; the session reset keeps a
+/// prefix not yet used, as `ZSTD_CCtx_reset(ZSTD_reset_session_only)`
+/// keeps `prefixDict`; `Compressor::compress` uses it as the next frame;
+/// `compress_with_prefix` replaces it; an empty prefix clears it.
+#[test]
+fn set_prefix_stages() {
+    let corpus = corpora().swap_remove(1);
+    let (_, prefix) = dictionaries(&corpus).pop().unwrap();
+    let src = corpus.test.last().unwrap();
+    let opts = CompressOptions::default();
+    let with_prefix = compress_with_prefix(src, &prefix, &opts);
+    let plain = rust_zstd::compress::compress_with(src, &opts);
+    let mut cctx = Compressor::new(opts.clone());
+    let mut dst = vec![0u8; 1 << 16];
+    let (mut src_pos, mut dst_pos) = (0, 0);
+    cctx.compress_stream(
+        &src[..1000],
+        &mut src_pos,
+        &mut dst,
+        &mut dst_pos,
         EndDirective::Continue,
-        EndDirective::Flush,
-        EndDirective::End,
-    ] {
-        let mut cctx = Compressor::new(opts.clone());
+    )
+    .unwrap();
+    assert_eq!(cctx.set_prefix(&prefix), Err(CompressError::StageWrong));
+    cctx.reset_stream();
+    cctx.set_prefix(&prefix).unwrap();
+    cctx.reset_stream();
+    assert!(ours_stream(&mut cctx, src, true, 64 << 10, &[]) == with_prefix);
+    cctx.set_prefix(&prefix).unwrap();
+    assert!(cctx.compress_to_vec(src) == with_prefix);
+    assert!(cctx.compress_to_vec(src) == plain);
+    cctx.set_prefix(&src[..100]).unwrap();
+    let mut out = Vec::new();
+    cctx.compress_with_prefix(src, &prefix, &mut out);
+    assert!(out == with_prefix);
+    assert!(cctx.compress_to_vec(src) == plain);
+    cctx.set_prefix(&prefix).unwrap();
+    cctx.set_prefix(&[]).unwrap();
+    assert!(cctx.compress_to_vec(src) == plain);
+    // A first End call is the one-shot frame with the prefix.
+    cctx.set_prefix(&prefix).unwrap();
+    let mut dst = vec![0u8; 1 << 18];
+    let (mut src_pos, mut dst_pos) = (0, 0);
+    let left = cctx
+        .compress_stream(src, &mut src_pos, &mut dst, &mut dst_pos, EndDirective::End)
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(dst[..dst_pos] == with_prefix[..]);
+}
+
+/// The dictionary is in the options, so it outlives the session: a frame
+/// abandoned by `reset_stream` or failed on a wrong pledged size leaves the
+/// next stream the one-shot frame; a first `End` call is the one-shot
+/// frame; `Encoder` streams with the dictionary.
+#[test]
+fn dictionary_streams_across_resets_and_encoder() {
+    let corpus = corpora().swap_remove(0);
+    let (_, trained) = dictionaries(&corpus).swap_remove(0);
+    let src = corpus.test.last().unwrap();
+    for attach in [Attach::Default, Attach::ForceCopy] {
+        let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
+        let one_shot = ours_frame(src, &dict, attach);
+        let mut cctx = Compressor::new(dict_opts(&dict, attach));
+        let mut dst = vec![0u8; 1 << 18];
         let (mut src_pos, mut dst_pos) = (0, 0);
-        let mut call = |cctx: &mut Compressor| {
-            cctx.compress_stream(&src, &mut src_pos, &mut dst, &mut dst_pos, end_op)
-        };
-        assert_eq!(call(&mut cctx), Err(unsupported.clone()), "{end_op:?}");
-        assert_eq!(
-            call(&mut cctx),
-            Err(CompressError::StageWrong),
-            "{end_op:?}"
+        cctx.compress_stream(
+            &src[..5000],
+            &mut src_pos,
+            &mut dst,
+            &mut dst_pos,
+            EndDirective::Continue,
+        )
+        .unwrap();
+        cctx.reset_stream();
+        assert!(ours_stream(&mut cctx, src, true, 999, &[]) == one_shot);
+
+        cctx.set_pledged_src_size(Some(10)).unwrap();
+        let (mut src_pos, mut dst_pos) = (0, 0);
+        let r = cctx.compress_stream(
+            src,
+            &mut src_pos,
+            &mut dst,
+            &mut dst_pos,
+            EndDirective::Continue,
+        );
+        assert!(matches!(r, Err(CompressError::SrcSizeWrong { .. })));
+        cctx.reset_stream();
+        assert!(ours_stream(&mut cctx, src, true, 999, &[]) == one_shot);
+
+        let (mut src_pos, mut dst_pos) = (0, 0);
+        let left = cctx
+            .compress_stream(src, &mut src_pos, &mut dst, &mut dst_pos, EndDirective::End)
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(dst[..dst_pos] == one_shot[..]);
+
+        let mut encoder = Encoder::new(Vec::new(), dict_opts(&dict, attach));
+        for piece in src.chunks(1000) {
+            encoder.write_all(piece).unwrap();
+        }
+        let frame = encoder.finish().unwrap();
+        let unpledged = ours_stream(&mut cctx, src, false, 1000, &[]);
+        assert!(frame == unpledged, "{attach:?}: Encoder frame");
+        assert_decodes(&format!("{attach:?} Encoder"), &frame, &trained, src);
+        let mut pledged = Compressor::new(dict_opts(&dict, attach));
+        pledged
+            .set_pledged_src_size(Some(src.len() as u64))
+            .unwrap();
+        let mut encoder = Encoder::with_compressor(Vec::new(), pledged);
+        encoder.write_all(src).unwrap();
+        assert!(
+            encoder.finish().unwrap() == one_shot,
+            "{attach:?}: pledged Encoder"
+        );
+    }
+}
+
+/// A dictionary stream with a job size and over `JOBSIZE_MIN` is
+/// multithreaded streaming, which is not implemented, unless its first call
+/// ends it, which writes the one-shot frame; long distance matching and a
+/// checksum stream with a dictionary as they compress one-shot.
+#[test]
+fn dictionary_streams_with_job_size_and_ldm() {
+    let corpus = corpora().swap_remove(2);
+    let (_, trained) = dictionaries(&corpus).swap_remove(0);
+    let mut src = Vec::new();
+    for s in corpus.test.iter().chain(&corpus.train).cycle() {
+        if src.len() > 1 << 20 {
+            break;
+        }
+        src.extend_from_slice(s);
+    }
+    let dict = Arc::new(CompressDict::new(&trained, 3).unwrap());
+    let opts = CompressOptions {
+        job_size: Some(JOBSIZE_MIN),
+        ..dict_opts(&dict, Attach::Default)
+    };
+    let one_shot = Compressor::new(opts.clone()).compress_to_vec(&src);
+    let mut cctx = Compressor::new(opts);
+    let mut dst = vec![0u8; src.len() + (1 << 16)];
+    for pledged in [true, false] {
+        if pledged {
+            cctx.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+        }
+        let (mut pos, mut dst_pos) = (0, 0);
+        let r = cctx.compress_stream(
+            &src,
+            &mut pos,
+            &mut dst,
+            &mut dst_pos,
+            EndDirective::Continue,
+        );
+        assert!(
+            matches!(r, Err(CompressError::Unsupported(_))),
+            "pledged {pledged}: {r:?}"
         );
         cctx.reset_stream();
-        assert_eq!(call(&mut cctx), Err(unsupported.clone()), "{end_op:?}");
-        assert_eq!((src_pos, dst_pos), (0, 0), "{end_op:?}");
-        assert!(cctx.compress_to_vec(&src) == compress_with_dict(&src, &dict));
+        if pledged {
+            cctx.set_pledged_src_size(Some(src.len() as u64)).unwrap();
+        }
+        let (mut pos, mut dst_pos) = (0, 0);
+        let left = cctx
+            .compress_stream(&src, &mut pos, &mut dst, &mut dst_pos, EndDirective::End)
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(
+            dst[..dst_pos] == one_shot,
+            "pledged {pledged}: first-call End"
+        );
     }
-
-    let encoder_error = |e: std::io::Error| e.get_ref()?.downcast_ref::<CompressError>().cloned();
-    let mut encoder = Encoder::new(Vec::new(), opts.clone());
-    let e = encoder.write_all(&src).unwrap_err();
-    assert_eq!(encoder_error(e), Some(unsupported.clone()));
-    assert!(encoder.get_ref().is_empty());
-    let e = Encoder::new(Vec::new(), opts).finish().unwrap_err();
-    assert_eq!(encoder_error(e), Some(unsupported));
+    let opts = CompressOptions {
+        ldm: ParamSwitch::Enable,
+        checksum: true,
+        ..dict_opts(&dict, Attach::Default)
+    };
+    let one_shot = Compressor::new(opts.clone()).compress_to_vec(&src);
+    let mut cctx = Compressor::new(opts);
+    for chunk in [7, 64 << 10] {
+        let frame = ours_stream(&mut cctx, &src, true, chunk, &[]);
+        assert!(frame == one_shot, "ldm chunk {chunk}: != one-shot frame");
+        let frame = ours_stream(&mut cctx, &src, false, chunk, &[]);
+        assert_decodes("ldm", &frame, &trained, &src);
+    }
 }

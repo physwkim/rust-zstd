@@ -26,7 +26,9 @@ fn check(name: &str, f: &[u8], want: Result<&[u8], &str>) {
         for min_parallel_blocks in [usize::MAX, 1] {
             let opts = DecodeOptions {
                 min_parallel_blocks,
+                min_parallel_bytes: 0,
                 simd,
+                window_log_max: 0,
             };
             let got = decompress_with_options(f, &opts);
             let path = format!("{name} simd={simd} min_parallel_blocks={min_parallel_blocks}");

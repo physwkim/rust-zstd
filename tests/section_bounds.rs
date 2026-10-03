@@ -109,6 +109,7 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
                 prev.rep,
                 &mut scratch.store,
                 &mut block::BlockLdm::Off,
+                None,
             );
             // None below 7 bytes (RAW)
             if let Some(rep) = built {
