@@ -33,6 +33,9 @@ struct Fingerprint {
     nb_events: u64,
 }
 
+// SAFETY: integers only.
+unsafe impl bytemuck::Zeroable for Fingerprint {}
+
 impl Default for Fingerprint {
     fn default() -> Self {
         Self {
@@ -141,6 +144,9 @@ pub struct PreSplitter {
     new: Fingerprint,
     middle: Fingerprint,
 }
+
+// SAFETY: every field is `Zeroable`.
+unsafe impl bytemuck::Zeroable for PreSplitter {}
 
 impl PreSplitter {
     /// `ZSTD_splitBlock`: the size of the block to cut from the start of

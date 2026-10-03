@@ -17,6 +17,7 @@ use crate::huf::HufTable;
 /// `HUF_repeat` / `FSE_repeat`: whether the next block may reference the
 /// table the decoder holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum Repeat {
     /// `*_repeat_none`: no table can be referenced.
     #[default]
@@ -27,6 +28,9 @@ pub enum Repeat {
     /// `*_repeat_valid`: usable without checks (dictionaries only).
     Valid,
 }
+
+// SAFETY: `None` is 0.
+unsafe impl bytemuck::Zeroable for Repeat {}
 
 /// The table the decoder holds, with its [`Repeat`] mode: there is a table
 /// exactly when one may be referenced.
@@ -94,6 +98,9 @@ pub struct Slots<T> {
     cur: usize,
     mode: Repeat,
 }
+
+// SAFETY: every field is `Zeroable`.
+unsafe impl<T: bytemuck::Zeroable> bytemuck::Zeroable for Slots<T> {}
 
 impl<T> Slots<T> {
     /// `table` held by the decoder with `mode`, which is not
@@ -181,6 +188,9 @@ pub struct FseSlots {
     pub ml: Slots<FseCTable>,
 }
 
+// SAFETY: every field is `Zeroable`.
+unsafe impl bytemuck::Zeroable for FseSlots {}
+
 /// The three sequence tables the decoder holds.
 #[derive(Clone, Copy, Debug)]
 pub struct FseHeld<'a> {
@@ -243,6 +253,9 @@ pub struct EntropyTables {
     pub huf: Slots<HufTable>,
     pub fse: FseSlots,
 }
+
+// SAFETY: every field is `Zeroable`.
+unsafe impl bytemuck::Zeroable for EntropyTables {}
 
 impl EntropyTables {
     /// No table can be referenced (`ZSTD_reset_compressedBlockState`).
