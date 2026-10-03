@@ -4887,7 +4887,7 @@ mod parallel {
     use std::any::Any;
     use std::collections::VecDeque;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Batches with fewer compressed blocks decode on the calling thread:
@@ -5106,14 +5106,125 @@ mod parallel {
         })
     }
 
-    /// One sequence before repeat-offset resolution.
+    /// One sequence as stage 2 publishes it: its offset is relative to the
+    /// repeat offsets its block starts with (`RelReps`), which only the
+    /// executing thread knows, and which it resolves (`RelBase`).
+    ///
+    /// Stage 2 resolves the repeat codes, not the executing thread: there
+    /// the branches on them had no history of the sequence's decode to
+    /// predict them by, and the executing thread alone mispredicted 2.3x
+    /// as often as the serial loop's decode and execution together.
     #[derive(Clone, Copy)]
-    struct RawSeq {
-        ll: u32,
+    struct RelSeq {
+        /// The literal length, below 2^17, and the offset's `from` in the
+        /// top two bits.
+        ll_from: u32,
         ml: u32,
-        /// libzstd OFFBASE: 1..=3 name a repeat offset, larger values are
-        /// the offset plus `ZSTD_REP_NUM`.
-        off_base: u32,
+        off: u32,
+    }
+
+    /// `RelSeq::ll_from`'s literal length.
+    const LL_MASK: u32 = (1 << 30) - 1;
+
+    impl RelSeq {
+        /// Lengths below 2^17, `o` a `RelReps` entry.
+        #[inline(always)]
+        fn new(ll: u32, ml: u32, o: u64) -> RelSeq {
+            RelSeq {
+                ll_from: ll | ((o >> 32) as u32) << 30,
+                ml,
+                off: o as u32,
+            }
+        }
+    }
+
+    /// `RelReps`' `from` of an offset the block's sequences give.
+    const REL_NONE: u64 = 3 << 32;
+
+    /// What a `RelReps` entry adds to a starting repeat offset: those only
+    /// ever decrease, by one per sequence at most, so from here they never
+    /// borrow into `from`.
+    const REL_BIAS: u32 = 1 << 31;
+
+    /// Stage 2's repeat offsets (`decode_sequence`'s), each `from << 32 |
+    /// off`: for `from` below 3 the block's starting repeat offset `from`
+    /// plus `off - REL_BIAS`, for `REL_NONE` the offset `off`.
+    #[derive(Clone, Copy)]
+    struct RelReps([u64; 3]);
+
+    impl RelReps {
+        /// The block's starting repeat offsets.
+        fn start() -> RelReps {
+            RelReps([0, 1, 2].map(|k| k << 32 | u64::from(REL_BIAS)))
+        }
+
+        /// Offset code 2 or more: the new offset `offset`, below 2^32.
+        #[inline(always)]
+        fn new_offset(&mut self, offset: u64) -> u64 {
+            let h = &mut self.0;
+            let o = REL_NONE | offset;
+            *h = [o, h[0], h[1]];
+            o
+        }
+
+        /// Offset code 0: the first repeat offset, or with `ll0` (no
+        /// literals) the second.
+        #[inline(always)]
+        fn code0(&mut self, ll0: usize) -> u64 {
+            let h = &mut self.0;
+            let o = h[ll0];
+            h[1] = h[1 - ll0];
+            h[0] = o;
+            o
+        }
+
+        /// Offset code 1: repeat offset `o` in 1..=3, 3 being the first
+        /// minus one. An offset of 0 there (corrupt input) wraps into
+        /// `from` on the next decrement, after the sequence that gave it
+        /// failed to execute.
+        #[inline(always)]
+        fn code1(&mut self, o: usize) -> u64 {
+            let h = &mut self.0;
+            let temp = if o == 3 { h[0].wrapping_sub(1) } else { h[o] };
+            if o != 1 {
+                h[2] = h[1];
+            }
+            h[1] = h[0];
+            h[0] = temp;
+            temp
+        }
+    }
+
+    /// The repeat offsets a block starts with, to resolve its sequences'
+    /// `RelReps` entries against.
+    struct RelBase([u32; 4]);
+
+    impl RelBase {
+        fn new(hist: [u32; 3]) -> RelBase {
+            let [a, b, c] = hist.map(|h| h.wrapping_sub(REL_BIAS));
+            RelBase([a, b, c, 0])
+        }
+
+        /// The offset `from` and `off` give.
+        #[inline(always)]
+        fn resolve(&self, from: u32, off: u32) -> u32 {
+            self.0[from as usize & 3].wrapping_add(off)
+        }
+
+        /// A sequence's offset, 0 (corrupt input: code 3 from a first
+        /// offset of 1) forced to one execution rejects.
+        #[inline(always)]
+        fn offset(&self, s: &RelSeq) -> usize {
+            match self.resolve(s.ll_from >> 30, s.off) {
+                0 => usize::MAX,
+                o => o as usize,
+            }
+        }
+
+        /// The repeat offsets `end` stands for.
+        fn hist(&self, end: RelReps) -> [u32; 3] {
+            end.0.map(|e| self.resolve((e >> 32) as u32, e as u32))
+        }
     }
 
     /// Where the stage 2 of one compressed block after another decodes to,
@@ -5323,14 +5434,17 @@ mod parallel {
     /// that the executing thread executes the block's sequences while the
     /// rest decode: the first `progress` of them, at `seqs`, and with the
     /// first whether the block's offsets are short
-    /// (`SHORT_OFFSET_SHARE_MIN`). The decode writes none of those again,
-    /// nor moves them, and they stay until the cell is handed another
-    /// block, which waits for the executing thread to be done with this
-    /// one.
+    /// (`SHORT_OFFSET_SHARE_MIN`), and with the last the repeat offsets
+    /// after them (`end`). The decode writes none of those again, nor
+    /// moves them, and they stay until the cell is handed another block,
+    /// which waits for the executing thread to be done with this one.
     struct Published {
         progress: AtomicUsize,
-        seqs: AtomicPtr<RawSeq>,
+        seqs: AtomicPtr<RelSeq>,
         short: AtomicBool,
+        /// `end`'s offsets, and its `from`s two bits each.
+        end: [AtomicU32; 3],
+        end_from: AtomicU32,
     }
 
     impl Published {
@@ -5339,12 +5453,14 @@ mod parallel {
                 progress: AtomicUsize::new(0),
                 seqs: AtomicPtr::new(ptr::null_mut()),
                 short: AtomicBool::new(false),
+                end: [const { AtomicU32::new(0) }; 3],
+                end_from: AtomicU32::new(0),
             }
         }
 
         /// Where the block's sequences go, and whether its offsets are
         /// short, to publish with the first.
-        fn start(&self, seqs: *mut RawSeq, short: bool) {
+        fn start(&self, seqs: *mut RelSeq, short: bool) {
             self.seqs.store(seqs, Ordering::Relaxed);
             self.short.store(short, Ordering::Relaxed);
         }
@@ -5352,6 +5468,28 @@ mod parallel {
         /// Publish the first `n` sequences, decoded, `n` above 0.
         fn decoded(&self, n: usize) {
             self.progress.store(n, Ordering::Release);
+        }
+
+        /// Publish the last of the block's `n` sequences, and `end`, the
+        /// repeat offsets after them.
+        fn decoded_all(&self, n: usize, end: RelReps) {
+            let mut from = 0;
+            for (k, (e, r)) in self.end.iter().zip(end.0).enumerate() {
+                e.store(r as u32, Ordering::Relaxed);
+                from |= ((r >> 32) as u32) << (2 * k);
+            }
+            self.end_from.store(from, Ordering::Relaxed);
+            self.decoded(n);
+        }
+
+        /// The repeat offsets after the block's sequences, once all are
+        /// published.
+        fn end(&self) -> RelReps {
+            let from = self.end_from.load(Ordering::Relaxed);
+            RelReps([0, 1, 2].map(|k| {
+                u64::from(from >> (2 * k) & 3) << 32
+                    | u64::from(self.end[k].load(Ordering::Relaxed))
+            }))
         }
     }
 
@@ -5390,7 +5528,7 @@ mod parallel {
         fse_from: [Option<u64>; 3],
         /// Room for the block's sequences, which stage 2 writes past the
         /// length and publishes (`Published`).
-        seqs: Vec<RawSeq>,
+        seqs: Vec<RelSeq>,
         result: Result<(), DecodeError>,
         /// The detached decode of the block handed to the cell, until it
         /// is taken.
@@ -6192,7 +6330,7 @@ mod parallel {
     }
 
     /// The block's three sequence tables, checked for the unchecked state
-    /// lookups of `decode_raw_sequence`, and the bitstream positioned after
+    /// lookups of `decode_rel_sequence`, and the bitstream positioned after
     /// the initial states (ZSTD_initFseState). Same checks and reads as the
     /// start of `run_sequences`.
     fn seq_stream_begin<'a>(
@@ -6235,11 +6373,12 @@ mod parallel {
         num_sequences: u32,
         bit_stream: &[u8],
         tables: [&FSETable; 3],
-        seqs: &mut Vec<RawSeq>,
+        seqs: &mut Vec<RelSeq>,
         publish: &Published,
     ) -> Result<(), DecodeError> {
         let (mut br, [ll, of, ml], [ll_dt, of_dt, ml_dt]) = seq_stream_begin(bit_stream, tables)?;
         let mut st = [ll, ml, of];
+        let mut reps = RelReps::start();
         // Zero-fill first: when the executing thread last read these lines
         // from another CCD, the fill's bulk stores take ownership of them
         // at memory bandwidth, where the loop's 12-byte stores would stall
@@ -6263,35 +6402,38 @@ mod parallel {
         while at < n - 1 {
             let end = (at + PUBLISH_EVERY).min(n - 1);
             for i in at..end {
-                let s = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, false);
+                let s =
+                    decode_rel_sequence(&mut br, &mut st, &mut reps, ll_dt, ml_dt, of_dt, false);
                 // SAFETY: `n` elements are reserved.
                 unsafe { base.add(i).write(s) };
             }
             at = end;
             publish.decoded(at);
         }
-        let last = decode_raw_sequence(&mut br, &mut st, ll_dt, ml_dt, of_dt, true);
+        let last = decode_rel_sequence(&mut br, &mut st, &mut reps, ll_dt, ml_dt, of_dt, true);
         // SAFETY: as in the loop.
         unsafe { base.add(n - 1).write(last) };
         if !br.is_finished() {
             return Err("Sequence bitstream not fully consumed".into());
         }
-        publish.decoded(n);
+        publish.decoded_all(n, reps);
         Ok(())
     }
 
-    /// `decode_sequence` with the offset left as OFFBASE; `st` is the LL,
-    /// ML, OF states. Kept separate from `decode_sequence`: sharing one
-    /// body changed the fused loop's register allocation and cost it 2-3%.
+    /// `decode_sequence` with the repeat offsets relative to those the
+    /// block starts with, `reps`; `st` is the LL, ML, OF states. Kept
+    /// separate from `decode_sequence`: sharing one body changed the fused
+    /// loop's register allocation and cost it 2-3%.
     #[inline(always)]
-    fn decode_raw_sequence(
+    fn decode_rel_sequence(
         br: &mut BitDStream<'_>,
         st: &mut [usize; 3],
+        reps: &mut RelReps,
         ll_dt: &[FSEEntry],
         ml_dt: &[FSEEntry],
         of_dt: &[FSEEntry],
         is_last: bool,
-    ) -> RawSeq {
+    ) -> RelSeq {
         // SAFETY: each state is below its table's length (see
         // `seq_stream_begin`).
         let (ll_e, ml_e, of_e) = unsafe {
@@ -6308,15 +6450,17 @@ mod parallel {
         let of_bits = u32::from(of_e.extra_bits);
         let total_bits = ll_bits + ml_bits + of_bits;
 
-        // Offset codes 0 and 1 are repeat codes (base value 0, or base
-        // value 1 plus one extra bit) and give 1..=3; larger codes carry
-        // the offset, stored plus ZSTD_REP_NUM.
-        let off_base = if of_bits > 1 {
-            of_e.base_value as usize + br.read_bits_fast(of_bits) + ZSTD_REP_NUM
-        } else if of_bits == 1 {
-            of_e.base_value as usize + br.read_bits_fast(1) + 1
+        // As in `decode_sequence`. The offset of a code above 1 is below
+        // 2^32 (code 31: base 2^31 - 3 plus 31 extra bits).
+        let off = if of_bits > 1 {
+            reps.new_offset((of_e.base_value as usize + br.read_bits_fast(of_bits)) as u64)
         } else {
-            of_e.base_value as usize + 1
+            let ll0 = usize::from(ll == 0);
+            if of_bits == 0 {
+                reps.code0(ll0)
+            } else {
+                reps.code1(1 + ll0 + br.read_bits_fast(1))
+            }
         };
         if ml_bits > 0 {
             ml += br.read_bits_fast(ml_bits);
@@ -6334,47 +6478,8 @@ mod parallel {
             st[2] = usize::from(of_e.next_state) + br.read_bits(u32::from(of_e.num_bits));
             br.reload();
         }
-        // Lengths are below 2^17 and OFFBASE at most 2^32 - 1 (offset code
-        // 31: base 2^31 - 3 plus 31 extra bits plus 3), so all fit in u32.
-        RawSeq {
-            ll: ll as u32,
-            ml: ml as u32,
-            off_base: off_base as u32,
-        }
-    }
-
-    /// The repeat-offset update of `decode_sequence`, applied to OFFBASE.
-    /// `ll` is the sequence's literal length.
-    #[inline(always)]
-    fn resolve_offset(hist: &mut [usize; 3], off_base: usize, ll: usize) -> usize {
-        if off_base > ZSTD_REP_NUM {
-            let o = off_base - ZSTD_REP_NUM;
-            hist[2] = hist[1];
-            hist[1] = hist[0];
-            hist[0] = o;
-            return o;
-        }
-        // Without literals the repeat codes shift by one: code 1 names the
-        // second offset, and code 3 means the first offset minus one.
-        let idx = off_base - 1 + usize::from(ll == 0);
-        if idx == 0 {
-            return hist[0];
-        }
-        let mut temp = if idx == 3 {
-            hist[0].wrapping_sub(1)
-        } else {
-            hist[idx]
-        };
-        if temp == 0 {
-            // Corrupt input: force an offset that execution rejects.
-            temp = usize::MAX;
-        }
-        if idx != 1 {
-            hist[2] = hist[1];
-        }
-        hist[1] = hist[0];
-        hist[0] = temp;
-        temp
+        // Lengths are below 2^17.
+        RelSeq::new(ll as u32, ml as u32, off)
     }
 
     /// The stage 2 of a compressed block for `execute_block`: the cell and
@@ -6546,7 +6651,7 @@ mod parallel {
     /// A block's sequences as stage 2 publishes them, at `seqs`, with its
     /// literals followed by `WILDCOPY_OVERLENGTH` bytes of slack.
     struct DecodedSeqs<'a> {
-        seqs: *const RawSeq,
+        seqs: *const RelSeq,
         runs: PublishedRuns<'a>,
         literals: &'a [u8],
     }
@@ -6602,7 +6707,7 @@ mod parallel {
         dst: Dst,
     ) -> Result<usize, DecodeError> {
         let out = dst.base;
-        let mut hist = offset_hist.map(|o| o as usize);
+        let base = RelBase::new(*offset_hist);
         let lit = literals.as_ptr();
         // In bounds by the contract, and `literals` ends with
         // `WILDCOPY_OVERLENGTH` bytes of slack.
@@ -6622,9 +6727,8 @@ mod parallel {
             let end = runs.ready(at)?;
             // Published, so written for good.
             for s in std::slice::from_raw_parts(seqs.add(at), end - at) {
-                let ll = s.ll as usize;
-                let offset = resolve_offset(&mut hist, s.off_base as usize, ll);
-                exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, offset)
+                let ll = (s.ll_from & LL_MASK) as usize;
+                exec_sequence::<W, EXT>(w, &mut cur, &lim, ll, s.ml as usize, base.offset(s))
                     .map_err(seq_error_message)?;
             }
             at = end;
@@ -6635,7 +6739,8 @@ mod parallel {
             return Err(seq_error_message(SeqError::BlockTooLarge));
         }
         ptr::copy_nonoverlapping(cur.lit, cur.op, rest);
-        *offset_hist = hist.map(|o| o as u32);
+        // All published, with the last.
+        *offset_hist = base.hist(runs.cell.published.end());
         Ok(cur.op as usize + rest - out as usize)
     }
 
@@ -7417,6 +7522,125 @@ mod parallel {
             });
         }
 
+        /// A faked sequence: lengths and libzstd OFFBASE (1..=3 a repeat
+        /// code, larger values the offset plus `ZSTD_REP_NUM`).
+        #[derive(Clone, Copy)]
+        struct RawSeq {
+            ll: u32,
+            ml: u32,
+            off_base: u32,
+        }
+
+        /// `s` as stage 2 publishes it, after the sequences `reps` follows.
+        fn rel(reps: &mut RelReps, s: RawSeq) -> RelSeq {
+            let ll0 = usize::from(s.ll == 0);
+            let o = match s.off_base as usize {
+                1 => reps.code0(ll0),
+                b @ 2..=3 => reps.code1(b - 1 + ll0),
+                b => reps.new_offset((b - ZSTD_REP_NUM) as u64),
+            };
+            RelSeq::new(s.ll, s.ml, o)
+        }
+
+        /// `decode_sequence`'s repeat-offset update on OFFBASE, from the
+        /// repeat offsets `hist`, 0 forced to `usize::MAX`.
+        fn absolute(hist: &mut [usize; 3], s: RawSeq) -> usize {
+            let off_base = s.off_base as usize;
+            if off_base > ZSTD_REP_NUM {
+                *hist = [off_base - ZSTD_REP_NUM, hist[0], hist[1]];
+                return hist[0];
+            }
+            let idx = off_base - 1 + usize::from(s.ll == 0);
+            if idx == 0 {
+                return hist[0];
+            }
+            let mut o = if idx == 3 {
+                hist[0].wrapping_sub(1)
+            } else {
+                hist[idx]
+            };
+            if o == 0 {
+                o = usize::MAX;
+            }
+            *hist = [o, hist[0], if idx == 1 { hist[2] } else { hist[1] }];
+            o
+        }
+
+        /// Stage 2's offsets, relative to the block's starting repeat
+        /// offsets, resolve on the executing thread to `decode_sequence`'s:
+        /// every repeat code with and without literals, from starting
+        /// offsets, from new offsets, through runs of code 3 below a
+        /// starting offset, to a code 3 from 1 (corrupt), and the repeat
+        /// offsets after the block.
+        #[test]
+        fn relative_offsets_resolve_as_decode_sequence() {
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % m
+            };
+            let seq = |ll: u32, off_base: u32| RawSeq {
+                ll,
+                ml: 3,
+                off_base,
+            };
+            let mut blocks: Vec<([u32; 3], Vec<RawSeq>)> = vec![
+                // Each code from the starting offsets, then from new ones.
+                (
+                    [1, 4, 8],
+                    [1, 2, 3]
+                        .iter()
+                        .flat_map(|&b| [seq(5, b), seq(0, b)])
+                        .collect(),
+                ),
+                (
+                    [7, 300, 9],
+                    [8, 2, 1, 3, 9, 3, 2, 1]
+                        .iter()
+                        .map(|&b| seq(b & 1, b + 1))
+                        .collect(),
+                ),
+                // Code 3 without literals down a starting offset to 1, then
+                // once more (0: corrupt).
+                ([5, 6, 7], vec![seq(0, 3); 5]),
+                // Only repeat codes: the end stays relative to the start.
+                ([10, 20, 30], vec![seq(1, 2), seq(0, 1), seq(1, 3)]),
+                // The largest offset a code gives, and a new 1.
+                ([2, 3, 4], vec![seq(1, u32::MAX), seq(1, 4), seq(0, 1)]),
+            ];
+            for _ in 0..200 {
+                let start = [0, 0, 0].map(|_| 1 + next(1 << 20) as u32);
+                let seqs = (0..64)
+                    .map(|_| {
+                        let off_base = match next(4) {
+                            0 => 4 + next(1 << 16) as u32,
+                            _ => 1 + next(3) as u32,
+                        };
+                        seq(next(2) as u32 * (1 + next(40) as u32), off_base)
+                    })
+                    .collect();
+                blocks.push((start, seqs));
+            }
+            for (start, seqs) in blocks {
+                let base = RelBase::new(start);
+                let mut reps = RelReps::start();
+                let mut hist = start.map(|h| h as usize);
+                for (i, &s) in seqs.iter().enumerate() {
+                    let r = rel(&mut reps, s);
+                    assert_eq!(r.ll_from & LL_MASK, s.ll, "{start:?} {i}");
+                    let want = absolute(&mut hist, s);
+                    assert_eq!(base.offset(&r), want, "{start:?} {i}");
+                    if want == usize::MAX {
+                        break;
+                    }
+                    let end = hist.map(|h| h as u32);
+                    assert_eq!(base.hist(reps), end, "{start:?} after {i}");
+                }
+            }
+        }
+
         /// `n` sequences of four literals and a match of them, at offset 4:
         /// the sequences, their literals, and what they decode to.
         fn echoes(n: usize) -> (Vec<RawSeq>, Vec<u8>, Vec<u8>) {
@@ -7470,17 +7694,23 @@ mod parallel {
             step: &dyn Fn(),
             result: Result<(), DecodeError>,
         ) -> Result<(), DecodeError> {
+            let mut reps = RelReps::start();
+            let seqs: Vec<RelSeq> = fake.seqs.iter().map(|&s| rel(&mut reps, s)).collect();
             slot.seqs.clear();
-            slot.seqs.reserve(fake.seqs.len());
+            slot.seqs.reserve(seqs.len());
             let base = slot.seqs.as_mut_ptr();
             publish.start(base, fake.short);
             let mut at = 0;
             for &end in ends {
-                for (i, s) in fake.seqs.iter().enumerate().take(end).skip(at) {
+                for (i, s) in seqs.iter().enumerate().take(end).skip(at) {
                     // SAFETY: reserved.
                     unsafe { base.add(i).write(*s) };
                 }
-                publish.decoded(end);
+                if end == seqs.len() {
+                    publish.decoded_all(end, reps);
+                } else {
+                    publish.decoded(end);
+                }
                 at = end;
                 step();
             }
