@@ -28,6 +28,7 @@ use super::bt::{
     ZSTD_OPT_SIZE,
 };
 use super::common::{simd_level, Src};
+use super::entropy::Held;
 use super::ldm::RawSeqView;
 use super::matchstate::{Block, DictMatchState, MatchState};
 use super::params::Strategy;
@@ -35,7 +36,6 @@ use super::seqstore::{offset_to_offbase, update_rep, SeqStore};
 use crate::constants::{ll_code, ml_code, LL_BITS, MAX_LL, MAX_ML, MAX_OFF, ML_BITS};
 use crate::constants::{ZSTD_BLOCKSIZE_MAX, ZSTD_MINMATCH};
 use crate::fse::FseCTable;
-use crate::huf::HufState;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use fearless_simd::Avx2;
 use fearless_simd::{Fallback, Level};
@@ -169,14 +169,12 @@ impl DictStats {
     /// priced here as `FSE_buildCTable_wksp` prices a zero-probability
     /// symbol it does write, `tableLog + 1` bits.
     pub fn of(dict: &BlockState) -> Option<Self> {
-        let HufState::Valid(huf) = &dict.huf else {
+        let entropy = dict.entropy();
+        let Held::Valid(huf) = entropy.huf.held() else {
             return None;
         };
-        let (ll, of, ml) = (
-            dict.fse.ll.table()?,
-            dict.fse.of.table()?,
-            dict.fse.ml.table()?,
-        );
+        let fse = entropy.fse.held();
+        let (ll, of, ml) = (fse.ll.table()?, fse.of.table()?, fse.ml.table()?);
         let freq = |scale_log: u32, bit_cost: u32| {
             debug_assert!(bit_cost <= scale_log);
             if bit_cost == 0 {

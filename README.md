@@ -52,7 +52,7 @@ each block ≤ 128 KB decompressed). Blocks can be:
 ## Features
 
 - **Pure Rust** — no C bindings, no build.rs, no `libc`. `unsafe` is confined to the performance-critical inner loops (entropy decoding, match finding); everything else is safe Rust.
-- **Full codec** — one-shot, reusable contexts, streaming with `std::io` adapters, dictionaries, and multithreaded compression (ZSTDMT-equivalent jobs via rayon, enabled by the default `parallel` feature).
+- **Full codec** — one-shot, reusable contexts, streaming with `std::io` adapters, dictionaries, and multithreading on both sides: ZSTDMT-equivalent compression jobs and parallel block decoding (which libzstd does not offer), via rayon under the default `parallel` feature.
 - **libzstd-matched encoder** — all of libzstd 1.5.7's default machinery is ported: the parameter rows for levels 1–22 (and the accelerated fast strategy for negative levels), all five match finders (fast, double-fast, lazy row hashing, binary tree, optimal parser), long-distance matching, and both block splitters. On the test corpus the emitted frames are byte-identical to libzstd 1.5.7's at every level, for single-shot and multithreaded job layouts alike.
 - **Spec-compliant decoder** — accepts and rejects frames per RFC 8878; verified against libzstd across levels, window sizes, truncation and corruption sweeps.
 - **Checksums, skippable frames, concatenated frames** — as in libzstd.
@@ -61,14 +61,14 @@ each block ≤ 128 KB decompressed). Blocks can be:
 
 ```toml
 [dependencies]
-rust-zstd = "0.3"
+rust-zstd = "0.4"
 ```
 
 Parallel compression is enabled by default. To disable it (single-threaded, no rayon dependency):
 
 ```toml
 [dependencies]
-rust-zstd = { version = "0.3", default-features = false }
+rust-zstd = { version = "0.4", default-features = false }
 ```
 
 ## API
@@ -157,7 +157,7 @@ let ddict = DecodeDict::new(&dict_bytes).unwrap();
 let original = decompress_with_dict(&frame, &ddict).unwrap();
 ```
 
-`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Streaming compression (`compress_stream`, `Encoder`) uses `CompressOptions::dict` and a prefix set with `Compressor::set_prefix`, as `ZSTD_compressStream2` uses `ZSTD_CCtx_refCDict` and `ZSTD_CCtx_refPrefix`; streaming decompression with a dictionary is not yet supported.
+`Decompressor::decompress_with_dict` reuses a context, and `compress_with_prefix` / `Compressor::compress_with_prefix` take a raw prefix (`ZSTD_c_prefix` equivalent). Streaming compression (`compress_stream`, `Encoder`) uses `CompressOptions::dict` and a prefix set with `Compressor::set_prefix`, as `ZSTD_compressStream2` uses `ZSTD_CCtx_refCDict` and `ZSTD_CCtx_refPrefix`; streaming decompression takes one through `Decompressor::with_dict`/`set_dict` or `DecompressReader::with_dict`.
 
 ## Performance
 
@@ -165,6 +165,7 @@ Measured against libzstd 1.5.7 on x86-64 (Zen 4), 8 MiB real-data corpora (ELF b
 
 - **Compressed size** — byte-identical to libzstd 1.5.7 at every level 1–22 on the test corpus, so the ratio is libzstd's exactly.
 - **Decompression** — 1.0–1.1x libzstd's speed on the AVX2 path across the corpus and levels. The portable (no-SIMD) path and non-BMI2 targets are a few percent slower.
+- **Multithreaded decompression** — libzstd decodes single-threaded; here a frame with at least two compressed blocks and 32 KiB decodes its blocks in parallel on rayon, and streaming decode pipelines entropy decoding against sequence execution, reaching 1.7–2.1x libzstd's streaming decode on the 8 MiB corpus.
 - **Compression** — within a few percent of libzstd across levels 1–22 on real data, both single-threaded and multithreaded. Degenerate constant input (all zeros) is the known exception: both codecs exceed 4 GB/s there, but libzstd's RLE fast path is several times faster still.
 - **Small inputs** — with a reused `Decompressor`, decoding 120 B–5 KB frames is at or above libzstd's reused-`DCtx` speed (dictionary frames under ~500 B remain slower).
 
@@ -202,4 +203,4 @@ The decoder began as a port of [ruzstd](https://github.com/KillingSpark/zstd-rs)
 
 ## License
 
-BSD-3-Clause AND MIT — the encoder follows zstd (BSD 3-Clause), the decoder module retains ruzstd's MIT license. See `src/LICENSE-ZSTD` and the header of `src/decode.rs`.
+BSD-3-Clause AND MIT — the encoder follows zstd (BSD 3-Clause), the decoder module retains ruzstd's MIT license. The texts are `LICENSE-BSD-3-Clause` and `LICENSE-MIT` at the repository root; see also `src/LICENSE-ZSTD` and the header of `src/decode.rs`.

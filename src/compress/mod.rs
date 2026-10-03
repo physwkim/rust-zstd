@@ -18,6 +18,7 @@ pub mod bt;
 pub mod common;
 pub mod dfast;
 pub mod dict;
+pub mod entropy;
 mod error;
 pub mod fast;
 pub mod lazy;
@@ -33,8 +34,8 @@ mod stream;
 use crate::constants::*;
 use crate::xxhash::Xxh64;
 use block::{
-    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
-    InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
+    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, InputEnd, JobBlocks,
+    ZSTD_BLOCKHEADERSIZE,
 };
 use dict::FrameDict;
 pub use dict::{CompressDict, DictAttach, DictContentType};
@@ -45,6 +46,7 @@ use matchstate::{needed_space, MatchState};
 use params::{CParamMode, ZSTD_CLEVEL_DEFAULT, ZSTD_WINDOWLOG_ABSOLUTEMIN};
 pub use params::{CParams, ParamSwitch, Strategy};
 pub use seqstore::{Seq, SeqStore};
+use split::BlockSplitter;
 use std::ops::Range;
 #[cfg(feature = "parallel")]
 use std::sync::{
@@ -363,16 +365,22 @@ pub struct Compressor {
 }
 
 /// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
-/// match state once a job has run, its block buffers, and the long distance
-/// matching state a single-threaded frame generates each block's matches
-/// from (`ldmState`). libzstd keeps all three in the context's workspace,
-/// whose bookkeeping is in the match state's [`matchstate::Workspace`].
+/// match state once a job has run, its block buffers, the job's committed
+/// block state (`blockState`), and the long distance matching state a
+/// single-threaded frame generates each block's matches from
+/// (`ldmState`). libzstd keeps them in the context's workspace, whose
+/// bookkeeping is in the match state's [`matchstate::Workspace`].
 #[derive(Default)]
 struct Context {
     ms: Option<MatchState>,
     scratch: BlockScratch,
+    state: BlockState,
     ldm_state: Option<LdmState>,
 }
+
+/// Leave `field` as the zero bytes [`Context::new_boxed`] allocates, which
+/// are a valid `T`.
+fn keep_zeroed<T: bytemuck::Zeroable>(_field: *mut T) {}
 
 /// Where a job's long distance matches come from: nowhere, the frame's
 /// serial state (ZSTDMT's `rawSeqStore`), or the context's own state with
@@ -385,6 +393,46 @@ enum JobLdm<'a> {
 }
 
 impl Context {
+    /// [`Context::default`] built in its box: the block state and the
+    /// pre-splitter, 25 of its 27 KB, are left as the zero bytes it is
+    /// allocated with instead of built on the stack and copied in.
+    fn new_boxed() -> Box<Self> {
+        let mut boxed = Box::<Self>::new_zeroed();
+        let p = boxed.as_mut_ptr();
+        // SAFETY: every field is written but those `keep_zeroed` takes,
+        // whose zero bytes are valid.
+        let mut ctx = unsafe {
+            (&raw mut (*p).ms).write(None);
+            let scratch = &raw mut (*p).scratch;
+            (&raw mut (*scratch).store).write(SeqStore::default());
+            (&raw mut (*scratch).next).write(SeqStore::default());
+            (&raw mut (*scratch).cbuf).write(Vec::new());
+            (&raw mut (*scratch).codes).write(Vec::new());
+            (&raw mut (*scratch).splitter).write(BlockSplitter::default());
+            keep_zeroed(&raw mut (*scratch).presplit);
+            keep_zeroed(&raw mut (*p).state);
+            (&raw mut (*p).ldm_state).write(None);
+            boxed.assume_init()
+        };
+        // Every field is listed above; a new one fails to compile here.
+        let Context {
+            ms: _,
+            scratch:
+                BlockScratch {
+                    store: _,
+                    next: _,
+                    cbuf: _,
+                    codes: _,
+                    splitter: _,
+                    presplit: _,
+                },
+            state: _,
+            ldm_state: _,
+        } = &*ctx;
+        ctx.state.reset();
+        ctx
+    }
+
     /// `ZSTD_resetCCtx_internal` for an input of `pledged` bytes (the
     /// frame's, or a later ZSTDMT job's own) whose window starts at
     /// position `origin`, with tables for the lazy finder `method` and the
@@ -392,8 +440,8 @@ impl Context {
     /// The match state's reset decides from what libzstd's workspace would
     /// need ([`needed_space`]) whether the workspace is resized; a resize
     /// frees the block buffers and the long distance matching tables too
-    /// (`ZSTD_cwksp_free`). Returns the match state, the block buffers and
-    /// the job's long distance matches.
+    /// (`ZSTD_cwksp_free`). Returns the match state, the block buffers, the
+    /// block state [`begin_job`] sets, and the job's long distance matches.
     fn reset<'a>(
         &'a mut self,
         cparams: CParams,
@@ -402,26 +450,28 @@ impl Context {
         ldm: JobLdm<'a>,
         pledged: usize,
         frequently: bool,
-    ) -> (&'a mut MatchState, &'a mut BlockScratch, BlockLdm<'a>) {
+    ) -> (
+        &'a mut MatchState,
+        &'a mut BlockScratch,
+        &'a mut BlockState,
+        BlockLdm<'a>,
+    ) {
         let ldm_params = match &ldm {
             JobLdm::Internal(params, ..) => Some(params),
             JobLdm::Off | JobLdm::External(_) => None,
         };
         let needed = needed_space(&cparams, method, ldm_params, pledged as u64);
-        let (ms, resized) = match &mut self.ms {
+        let ms = match &mut self.ms {
             Some(ms) => {
-                let resized = ms.reset_needing(cparams, origin, method, needed);
-                (ms, resized)
+                if ms.reset_needing(cparams, origin, method, needed) {
+                    self.scratch = BlockScratch::default();
+                    self.ldm_state = None;
+                }
+                ms
             }
-            slot => {
-                let ms = MatchState::new_needing(cparams, origin, method, needed);
-                (slot.insert(ms), true)
-            }
+            // Never reset: the block buffers are new, no long distance tables.
+            slot => slot.insert(MatchState::new_needing(cparams, origin, method, needed)),
         };
-        if resized {
-            self.scratch = BlockScratch::default();
-            self.ldm_state = None;
-        }
         ms.set_correct_frequently(frequently);
         let ldm = match ldm {
             JobLdm::Off => BlockLdm::Off,
@@ -434,19 +484,27 @@ impl Context {
                 frequently,
             )),
         };
-        (ms, &mut self.scratch, ldm)
+        (ms, &mut self.scratch, &mut self.state, ldm)
     }
 
-    /// The match state, block buffers and single-context long distance
-    /// matches (`ldm` set) of the job [`Context::reset`] last started,
-    /// for a job compressed over several calls.
-    fn resume(&mut self, ldm: bool) -> (&mut MatchState, &mut BlockScratch, BlockLdm<'_>) {
+    /// The match state, block buffers, block state and single-context long
+    /// distance matches (`ldm` set) of the job [`Context::reset`] last
+    /// started, for a job compressed over several calls.
+    fn resume(
+        &mut self,
+        ldm: bool,
+    ) -> (
+        &mut MatchState,
+        &mut BlockScratch,
+        &mut BlockState,
+        BlockLdm<'_>,
+    ) {
         let ms = self.ms.as_mut().expect("context never reset");
         let ldm = match &mut self.ldm_state {
             Some(state) if ldm => BlockLdm::Internal(state),
             _ => BlockLdm::Off,
         };
-        (ms, &mut self.scratch, ldm)
+        (ms, &mut self.scratch, &mut self.state, ldm)
     }
 
     /// The input of the job [`Context::resume`] continues moved `shift`
@@ -497,7 +555,11 @@ impl ContextPool {
 
     /// `ZSTDMT_getCCtx`: the last context given back, or a new one.
     fn take(&self) -> Box<Context> {
-        self.free.lock().unwrap().pop().unwrap_or_default()
+        self.free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(Context::new_boxed)
     }
 
     /// `ZSTDMT_releaseCCtx`: keep `ctx` unless the pool is full.
@@ -845,8 +907,9 @@ fn compress_job(
         JobStart::First(None) => (job_prefix(&job, true, overlap), data.len() - job.start),
         JobStart::Later => (job_prefix(&job, false, overlap), job.len()),
     };
-    let (ms, scratch, mut ldm) = ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
-    let (mut blocks, mut state) = begin_job(ms, scratch, data, prefix, start, sizing, last_job);
+    let (ms, scratch, state, mut ldm) =
+        ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
+    let mut blocks = begin_job(ms, scratch, state, data, prefix, start, sizing, last_job);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
         ms,
@@ -854,7 +917,7 @@ fn compress_job(
         &mut blocks,
         InputEnd::JobEnd(job.end),
         split,
-        &mut state,
+        state,
         scratch,
         &mut ldm,
         match start {
@@ -868,35 +931,35 @@ fn compress_job(
 
 /// The start of a job on a context just reset for it: a later ZSTDMT job
 /// indexes its raw-content `prefix` of `data` and starts with invalidated
-/// repeat offsets; the first job (`prefix` empty, whatever `data`) starts
-/// from `repStartValue`, or, in a frame with a dictionary, from the
-/// dictionary, whose content is `prefix` ([`FrameDict::preload`]). Returns
-/// the job's block cursor, its first block at the prefix end, and its
-/// committed block state. One-shot jobs and the streaming frame both start
-/// here.
+/// repeat offsets and no entropy tables; the first job (`prefix` empty,
+/// whatever `data`) starts from `repStartValue`, or, in a frame with a
+/// dictionary, from the dictionary, whose content is `prefix`
+/// ([`FrameDict::preload`]). Sets the job's committed block `state` and
+/// returns its block cursor, its first block at the prefix end. One-shot
+/// jobs and the streaming frame both start here.
+#[allow(clippy::too_many_arguments)]
 fn begin_job(
     ms: &mut MatchState,
     scratch: &mut BlockScratch,
+    state: &mut BlockState,
     data: &[u8],
     prefix: Range<usize>,
     start: JobStart,
     sizing: BlockSizing,
     last_job: bool,
-) -> (JobBlocks, CommittedBlockState) {
-    let initial = match start {
-        JobStart::First(Some(dict)) => dict.preload(ms, data),
-        JobStart::First(None) => BlockState::initial(),
+) -> JobBlocks {
+    match start {
+        JobStart::First(Some(dict)) => dict.preload(ms, data, state),
+        JobStart::First(None) => state.reset(),
         JobStart::Later => {
             block::load_prefix(ms, data, prefix.clone());
-            let mut initial = BlockState::initial();
-            initial.invalidate_rep_codes();
-            initial
+            state.reset();
+            state.invalidate_rep_codes();
         }
-    };
+    }
     scratch.reserve(sizing.block_size_max);
     let first_job = matches!(start, JobStart::First(_));
-    let blocks = JobBlocks::new(sizing, prefix.end, first_job, last_job);
-    (blocks, CommittedBlockState::new(initial))
+    JobBlocks::new(sizing, prefix.end, first_job, last_job)
 }
 
 /// Run `f` over every job, in job order, appending to `out`, each job on a
@@ -1991,15 +2054,28 @@ mod tests {
         let mut ctx = Context::default();
         let ldm = JobLdm::Internal(big_ldm.unwrap(), &[], 0..0);
         let method = default_search_method(&big);
-        let (_, scratch, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
+        let (_, scratch, _, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
         scratch.reserve(ZSTD_BLOCKSIZE_MAX);
         for n in 1..=129 {
             let ldm = JobLdm::Internal(small_ldm.unwrap(), &[], 0..0);
             let method = default_search_method(&small);
-            let (_, scratch, _) = ctx.reset(small, method, 0, ldm, 1024, false);
+            let (_, scratch, _, _) = ctx.reset(small, method, 0, ldm, 1024, false);
             let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;
             assert_eq!(kept, n < 129, "reset {n}");
         }
+    }
+
+    /// The zero bytes [`Context::new_boxed`] leaves for the block state are
+    /// the default block state once reset (under Miri, the field writes are
+    /// checked too).
+    #[test]
+    fn new_boxed_context_is_default() {
+        let ctx = Context::new_boxed();
+        assert!(ctx.ms.is_none() && ctx.ldm_state.is_none());
+        assert_eq!(
+            format!("{:?}", ctx.state),
+            format!("{:?}", BlockState::default())
+        );
     }
 
     /// The frame header length of `data` with `cparams`.

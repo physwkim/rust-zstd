@@ -3,6 +3,7 @@
 
 use super::bitstream::BitCStream;
 use super::huf;
+use crate::compress::entropy::{FseHeld, FseNext, FseTables, Held, Next, Repeat, TableRef};
 use crate::compress::seqstore::Seq;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -23,35 +24,50 @@ pub struct SymbolTT {
     pub delta_nb_bits: u32,
 }
 
-/// Compiled FSE compression table.
+/// The largest table log an [`FseCTable`] holds: `LLFSELog` and
+/// `MLFSELog` (offsets use 8, Huffman weight descriptions at most 6).
+const FSE_CTABLE_MAX_LOG: u32 = 9;
+
+/// Compiled FSE compression table (`FSE_CTable`), with room for any table
+/// built here so that a table is rebuilt in place, never allocated.
 #[derive(Clone, Debug)]
 pub struct FseCTable {
     pub table_log: u32,
-    pub state_table: Vec<u16>,
-    pub symbol_tt: Vec<SymbolTT>,
+    /// `stateTable`: the first `1 << table_log` entries are the table's.
+    pub state_table: [u16; 1 << FSE_CTABLE_MAX_LOG],
+    /// `symbolTT` for every sequence code; past `max_symbol` the transform
+    /// of a zero-probability symbol.
+    pub symbol_tt: [SymbolTT; MAX_SEQ + 1],
     pub max_symbol: usize,
 }
 
+// SAFETY: integers only.
+unsafe impl bytemuck::Zeroable for FseCTable {}
+
+impl Default for FseCTable {
+    fn default() -> Self {
+        Self {
+            table_log: 0,
+            state_table: [0; 1 << FSE_CTABLE_MAX_LOG],
+            symbol_tt: [SymbolTT::default(); MAX_SEQ + 1],
+            max_symbol: 0,
+        }
+    }
+}
+
 impl FseCTable {
-    /// Build an FSE compression table from normalized counts.
+    /// Build an FSE compression table from normalized counts in place.
     /// Ported from FSE_buildCTable_wksp() in fse_compress.c.
-    pub fn build(norm: &[i16], max_symbol: usize, table_log: u32) -> Self {
+    pub fn build(&mut self, norm: &[i16], max_symbol: usize, table_log: u32) {
+        assert!(table_log <= FSE_CTABLE_MAX_LOG && max_symbol <= MAX_SEQ);
         let table_size = 1u32 << table_log;
         let table_mask = table_size - 1;
 
         // 1. Build cumulative counts and place low-probability symbols.
-        // `cumul` and `tableSymbol` live in the C workspace; sized for the
-        // largest alphabet and table here.
-        let mut cumul = [0u16; FSE_MAX_SYMBOL_VALUE + 2];
+        // `cumul` and `tableSymbol` live in the C workspace.
+        let mut cumul = [0u16; MAX_SEQ + 2];
         let mut high_threshold = table_size - 1;
-        let mut small_symbol_buf = [0u8; 512];
-        let mut large_symbol_buf = Vec::new();
-        let table_symbol: &mut [u8] = if table_size as usize <= small_symbol_buf.len() {
-            &mut small_symbol_buf[..table_size as usize]
-        } else {
-            large_symbol_buf.resize(table_size as usize, 0);
-            &mut large_symbol_buf
-        };
+        let mut table_symbol = [0u8; 1 << FSE_CTABLE_MAX_LOG];
 
         for s in 0..=max_symbol {
             if norm[s] == -1 {
@@ -80,11 +96,10 @@ impl FseCTable {
         debug_assert_eq!(pos, 0);
 
         // 3. Build state transition table sorted by symbol order.
-        let mut state_table = vec![0u16; table_size as usize];
         for u in 0..table_size {
             let s = table_symbol[u as usize] as usize;
             let idx = cumul[s] as usize;
-            state_table[idx] = (table_size + u) as u16;
+            self.state_table[idx] = (table_size + u) as u16;
             cumul[s] += 1;
         }
 
@@ -92,58 +107,50 @@ impl FseCTable {
         // Use the decoder's baseline/numbits calculation for compatibility.
         // For each state in the table, compute its decoder-compatible numbits,
         // then derive the CTable's delta_nb_bits and delta_find_state from that.
-        let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
         let mut total = 0u32;
-        for s in 0..=max_symbol {
-            let prob = if norm[s] == -1 {
-                1
-            } else {
-                norm[s].max(0) as u32
+        for (s, tt) in self.symbol_tt.iter_mut().enumerate() {
+            let prob = match norm[..=max_symbol].get(s) {
+                None => 0,
+                Some(-1) => 1,
+                Some(&n) => n.max(0) as u32,
             };
-            if prob == 0 {
-                symbol_tt[s].delta_nb_bits = ((table_log + 1) << 16) - table_size;
+            *tt = if prob == 0 {
+                SymbolTT {
+                    delta_find_state: 0,
+                    delta_nb_bits: ((table_log + 1) << 16) - table_size,
+                }
             } else if prob == 1 {
-                symbol_tt[s].delta_nb_bits = (table_log << 16) - table_size;
-                symbol_tt[s].delta_find_state = total as i32 - 1;
+                SymbolTT {
+                    delta_find_state: total as i32 - 1,
+                    delta_nb_bits: (table_log << 16) - table_size,
+                }
             } else {
                 // Use the same formula as C zstd FSE_buildCTable
                 let max_bits_out = table_log - highest_bit(prob - 1);
                 let min_state_plus = prob << max_bits_out;
-                symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
-                symbol_tt[s].delta_find_state = total as i32 - prob as i32;
-            }
+                SymbolTT {
+                    delta_find_state: total as i32 - prob as i32,
+                    delta_nb_bits: (max_bits_out << 16).wrapping_sub(min_state_plus),
+                }
+            };
             total += prob;
         }
-
-        Self {
-            table_log,
-            state_table,
-            symbol_tt,
-            max_symbol,
-        }
+        self.table_log = table_log;
+        self.max_symbol = max_symbol;
     }
 
-    /// `FSE_buildCTable_rle`: single symbol, 0 bits per encode.
+    /// `FSE_buildCTable_rle` in place: single symbol, 0 bits per encode.
     /// `init_state` returns 0 and every transition stays at state 0;
     /// table_log = 0, matching the decoder's RLE behavior.
-    pub fn build_rle(symbol: u8) -> Self {
+    pub fn build_rle(&mut self, symbol: u8) {
         let s = symbol as usize;
-        let max_symbol = s;
-        // Handcraft a table where everything resolves to 0 bits, state=0.
-        let state_table = vec![0u16; 1]; // state_table[0] = 0
-        let mut symbol_tt = vec![SymbolTT::default(); max_symbol + 1];
+        // Handcraft a table where everything resolves to 0 bits, state=0:
         // nb_bits = (state + delta_nb_bits) >> 16 = 0 for state 0, and
         // new_state = state_table[(0 >> 0) + 0] = 0
-        symbol_tt[s] = SymbolTT {
-            delta_find_state: 0,
-            delta_nb_bits: 0,
-        };
-        Self {
-            table_log: 0,
-            state_table,
-            symbol_tt,
-            max_symbol,
-        }
+        self.state_table[0] = 0;
+        self.symbol_tt.fill(SymbolTT::default());
+        self.table_log = 0;
+        self.max_symbol = s;
     }
 
     /// `FSE_initCState2`: the state that encodes `symbol` first.
@@ -161,17 +168,19 @@ impl FseCTable {
     #[inline(always)]
     fn next_state(&self, shifted: u32, delta_find_state: i32) -> u32 {
         let idx = shifted.wrapping_add_signed(delta_find_state) as usize;
-        debug_assert!(idx < self.state_table.len());
+        debug_assert!(idx < 1 << self.table_log);
         // SAFETY: `build` gives symbol `s` with normalized count `p`
         // (1 for a low-probability symbol) `deltaFindState = start_s - p`
         // and a `deltaNbBits` that makes `state >> nbBitsOut` fall in
         // `p..2p` for every state `tableSize..2*tableSize`, so `idx` lies
         // in `start_s..start_s + p`, the states `build` assigned to `s`,
-        // all below `tableSize` (a zero-count symbol gives `idx == 0`, and
-        // `build_rle` has one state at index 0). `init_state` derives
+        // all below `tableSize <= state_table.len()`. Every other code,
+        // zero-count or past `max_symbol`, gets `deltaFindState = 0` and
+        // `nbBitsOut = tableLog + 1`, so `idx == 0`; `build_rle` gives
+        // every code `idx == 0`, its one state. `init_state` derives
         // `shifted` from the same transform, so its `idx` is in the same
-        // range. Encoding a symbol above `max_symbol` panics on the
-        // `symbol_tt` index before reaching here.
+        // range. A code above `MaxSeq` panics on the `symbol_tt` index
+        // before reaching here.
         unsafe { *self.state_table.get_unchecked(idx) as u32 }
     }
 }
@@ -433,62 +442,6 @@ pub enum SymbolEncodingType {
     Rle = 1,
     Compressed = 2,
     Repeat = 3,
-}
-
-/// `FSE_repeat`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FseRepeat {
-    /// `FSE_repeat_none`: the table cannot be referenced with `Repeat`.
-    #[default]
-    None,
-    /// `FSE_repeat_check`: a custom table the next block may reference
-    /// after checking that it covers its symbols.
-    Check,
-    /// `FSE_repeat_valid`: usable without checks (dictionaries only).
-    Valid,
-}
-
-/// One sequence table as the decoder holds it (`FSE_CTable` plus its
-/// `FSE_repeat` mode).
-#[derive(Clone, Debug, Default)]
-pub enum FseTableState {
-    #[default]
-    None,
-    Check(FseCTable),
-    Valid(FseCTable),
-}
-
-impl FseTableState {
-    pub fn table(&self) -> Option<&FseCTable> {
-        match self {
-            FseTableState::None => None,
-            FseTableState::Check(t) | FseTableState::Valid(t) => Some(t),
-        }
-    }
-
-    pub fn repeat(&self) -> FseRepeat {
-        match self {
-            FseTableState::None => FseRepeat::None,
-            FseTableState::Check(_) => FseRepeat::Check,
-            FseTableState::Valid(_) => FseRepeat::Valid,
-        }
-    }
-
-    fn from_mode(mode: FseRepeat, table: &FseCTable) -> Self {
-        match mode {
-            FseRepeat::None => FseTableState::None,
-            FseRepeat::Check => FseTableState::Check(table.clone()),
-            FseRepeat::Valid => FseTableState::Valid(table.clone()),
-        }
-    }
-}
-
-/// `ZSTD_fseCTables_t`: literal-length, offset and match-length tables.
-#[derive(Clone, Debug, Default)]
-pub struct FseState {
-    pub ll: FseTableState,
-    pub of: FseTableState,
-    pub ml: FseTableState,
 }
 
 /// `FSE_MIN_TABLELOG`.
@@ -833,8 +786,15 @@ fn use_low_prob_count(nb_seq: usize) -> bool {
 }
 
 /// `ZSTD_NCountCost`: byte size of the normalized-count header for
-/// `counts`, or `None` where the C returns an error.
-fn ncount_cost(counts: &[u32], max: usize, nb_seq: usize, fse_log: u32) -> Option<usize> {
+/// `counts`, or `None` where the C returns an error. The header is written
+/// past the end of `wksp`, which is left as it was.
+fn ncount_cost(
+    wksp: &mut Vec<u8>,
+    counts: &[u32],
+    max: usize,
+    nb_seq: usize,
+    fse_log: u32,
+) -> Option<usize> {
     let table_log = optimal_table_log(fse_log, nb_seq, max);
     let mut norm = [0i16; MAX_SEQ + 1];
     let log = normalize_count(
@@ -849,8 +809,10 @@ fn ncount_cost(counts: &[u32], max: usize, nb_seq: usize, fse_log: u32) -> Optio
     if log == 0 {
         return None;
     }
-    let mut wksp = Vec::with_capacity(FSE_NCOUNTBOUND);
-    write_ncount(&mut wksp, &norm, max, table_log).ok()
+    let start = wksp.len();
+    let size = write_ncount(wksp, &norm, max, table_log);
+    wksp.truncate(start);
+    size.ok()
 }
 
 /// `ZSTD_entropyCost`: bits to encode `counts` at the entropy bound.
@@ -926,10 +888,11 @@ impl FseCTable {
 /// `ZSTD_selectEncodingType`. Costs the C reports as errors are modelled
 /// as `None`, which is never selected; when nothing is selectable
 /// (unreachable in libzstd, which asserts) the result is `Compressed` and
-/// [`build_ctable`] reports the failure.
+/// [`build_ctable`] reports the failure. `wksp` is [`ncount_cost`]'s.
 #[allow(clippy::too_many_arguments)]
 fn select_encoding_type(
-    repeat_mode: &mut FseRepeat,
+    wksp: &mut Vec<u8>,
+    repeat_mode: &mut Repeat,
     counts: &[u32],
     max: usize,
     most_frequent: usize,
@@ -942,7 +905,7 @@ fn select_encoding_type(
     strategy: Strategy,
 ) -> SymbolEncodingType {
     if most_frequent == nb_seq {
-        *repeat_mode = FseRepeat::None;
+        *repeat_mode = Repeat::None;
         if is_default_allowed && nb_seq <= 2 {
             // Prefer set_basic over set_rle when there are 2 or fewer
             // symbols, since RLE uses 1 byte, but set_basic uses 5-6 bits
@@ -960,14 +923,14 @@ fn select_encoding_type(
             let dynamic_fse_nb_seq_min = ((1usize << default_norm_log) * mult) >> base_log;
             debug_assert!((5..=6).contains(&default_norm_log));
             debug_assert!((7..=9).contains(&mult));
-            if *repeat_mode == FseRepeat::Valid && nb_seq < static_fse_nb_seq_max {
+            if *repeat_mode == Repeat::Valid && nb_seq < static_fse_nb_seq_max {
                 return SymbolEncodingType::Repeat;
             }
             if nb_seq < dynamic_fse_nb_seq_min || most_frequent < (nb_seq >> (default_norm_log - 1))
             {
                 // The format allows default tables to be repeated, but it
                 // isn't useful: don't confuse them with dictionaries.
-                *repeat_mode = FseRepeat::None;
+                *repeat_mode = Repeat::None;
                 return SymbolEncodingType::Basic;
             }
         }
@@ -975,16 +938,16 @@ fn select_encoding_type(
         let basic_cost = is_default_allowed
             .then(|| cross_entropy_cost(default_norm, default_norm_log, counts, max));
         let repeat_cost = match (*repeat_mode, prev_ctable) {
-            (FseRepeat::None, _) | (_, None) => None,
+            (Repeat::None, _) | (_, None) => None,
             (_, Some(table)) => table.bit_cost(counts, max),
         };
-        let compressed_cost = ncount_cost(counts, max, nb_seq, fse_log)
+        let compressed_cost = ncount_cost(wksp, counts, max, nb_seq, fse_log)
             .map(|ncount| ((ncount as u64) << 3) + entropy_cost(counts, max, nb_seq));
         let repeat_or_max = repeat_cost.unwrap_or(u64::MAX);
         let compressed_or_max = compressed_cost.unwrap_or(u64::MAX);
         if let Some(basic) = basic_cost {
             if basic <= repeat_or_max && basic <= compressed_or_max {
-                *repeat_mode = FseRepeat::None;
+                *repeat_mode = Repeat::None;
                 return SymbolEncodingType::Basic;
             }
         }
@@ -994,16 +957,17 @@ fn select_encoding_type(
             }
         }
     }
-    *repeat_mode = FseRepeat::Check;
+    *repeat_mode = Repeat::Check;
     SymbolEncodingType::Compressed
 }
 
 /// `ZSTD_buildCTable`: write the table description for `ty` to `out` and
-/// return the table to encode with plus the number of bytes written. `None`
-/// where the C fails (normalization or NCount write errors, or `Repeat`
-/// without a previous table).
+/// return the table to encode with, the held one for `Repeat`, else built
+/// in the spare slot, plus the number of bytes written. `None` where the
+/// C fails (normalization or NCount write errors, or `Repeat` without a
+/// held table).
 #[allow(clippy::too_many_arguments)]
-fn build_ctable(
+fn build_ctable<'t>(
     out: &mut Vec<u8>,
     fse_log: u32,
     ty: SymbolEncodingType,
@@ -1014,18 +978,20 @@ fn build_ctable(
     default_norm: &[i16],
     default_norm_log: u32,
     default_max: usize,
-    prev_ctable: Option<&FseCTable>,
-) -> Option<(FseCTable, usize)> {
+    table: TableRef<'t, FseCTable>,
+) -> Option<(&'t FseCTable, usize)> {
+    let TableRef { held, spare } = table;
     match ty {
         SymbolEncodingType::Rle => {
             out.push(codes[0]);
-            Some((FseCTable::build_rle(max as u8), 1))
+            spare.build_rle(max as u8);
+            Some((spare, 1))
         }
-        SymbolEncodingType::Repeat => Some((prev_ctable?.clone(), 0)),
-        SymbolEncodingType::Basic => Some((
-            FseCTable::build(default_norm, default_max, default_norm_log),
-            0,
-        )),
+        SymbolEncodingType::Repeat => Some((held.table()?, 0)),
+        SymbolEncodingType::Basic => {
+            spare.build(default_norm, default_max, default_norm_log);
+            Some((spare, 0))
+        }
         SymbolEncodingType::Compressed => {
             let mut nb_seq_1 = nb_seq;
             let table_log = optimal_table_log(fse_log, nb_seq, max);
@@ -1049,7 +1015,8 @@ fn build_ctable(
                 return None;
             }
             let ncount_size = write_ncount(out, &norm[..=max], max, table_log).ok()?;
-            Some((FseCTable::build(&norm, max, table_log), ncount_size))
+            spare.build(&norm, max, table_log);
+            Some((spare, ncount_size))
         }
     }
 }
@@ -1058,36 +1025,37 @@ fn build_ctable(
 /// (one `ZSTD_selectEncodingType` + `ZSTD_buildCTable` step of
 /// `ZSTD_buildSequencesStatistics`). `counts`, `max` and `most_frequent`
 /// are the `HIST_countFast_wksp` result for `codes`. Returns the table to
-/// encode with, the decoder-side state for the next block, the encoding
+/// encode with, what the block does to the decoder's table, the encoding
 /// type and the description size.
 #[allow(clippy::too_many_arguments)]
-fn build_seq_table(
+fn build_seq_table<'t>(
     out: &mut Vec<u8>,
     codes: &[u8],
     counts: &mut [u32; 256],
     max: usize,
     most_frequent: usize,
     fse_log: u32,
-    prev: &FseTableState,
+    table: TableRef<'t, FseCTable>,
     default_norm: &[i16],
     default_norm_log: u32,
     default_max: usize,
     strategy: Strategy,
-) -> Option<(FseCTable, FseTableState, SymbolEncodingType, usize)> {
+) -> Option<(&'t FseCTable, Next, SymbolEncodingType, usize)> {
     let nb_seq = codes.len();
     // We can only use the basic table if max <= DefaultMaxOff, otherwise
     // the offsets are too large (a no-op for LL/ML, whose default tables
     // span every code).
     let is_default_allowed = max <= default_max;
-    let mut repeat_mode = prev.repeat();
+    let mut repeat_mode = table.held.repeat();
     let ty = select_encoding_type(
+        out,
         &mut repeat_mode,
         &counts[..],
         max,
         most_frequent,
         nb_seq,
         fse_log,
-        prev.table(),
+        table.held.table(),
         default_norm,
         default_norm_log,
         is_default_allowed,
@@ -1098,8 +1066,16 @@ fn build_seq_table(
         matches!(
             ty,
             SymbolEncodingType::Compressed | SymbolEncodingType::Repeat
-        ) || repeat_mode == FseRepeat::None
+        ) || repeat_mode == Repeat::None
     );
+    // the mode select_encoding_type left (`FSE_repeat`), applied when the
+    // block is committed
+    let next = match ty {
+        SymbolEncodingType::Repeat => Next::Keep,
+        SymbolEncodingType::Compressed => Next::New,
+        SymbolEncodingType::Basic | SymbolEncodingType::Rle => Next::None,
+    };
+    debug_assert!(next != Next::New || repeat_mode == Repeat::Check);
     let (table, size) = build_ctable(
         out,
         fse_log,
@@ -1111,17 +1087,11 @@ fn build_seq_table(
         default_norm,
         default_norm_log,
         default_max,
-        prev.table(),
+        table,
     )?;
-    let next = FseTableState::from_mode(repeat_mode, &table);
     Some((table, next, ty, size))
 }
 
-/// Write the sequences section (Sequences_Section_Header onward, as in
-/// `ZSTD_entropyCompressSeqStore_internal`) and return the FSE state the
-/// decoder holds afterwards (`nextEntropy->fse`). With `nb_seq == 0` the
-/// tables carry over unchanged (`nextEntropy->fse = prevEntropy->fse`).
-///
 /// `FSE_NCountWriteBound`: maximum size of an `FSE_writeNCount` table
 /// description for symbols `0..=max_symbol` at `table_log`.
 fn ncount_write_bound(max_symbol: usize, table_log: u32) -> usize {
@@ -1132,7 +1102,7 @@ fn ncount_write_bound(max_symbol: usize, table_log: u32) -> usize {
 }
 
 /// Upper bound on the bytes [`encode_sequences_section_with`] appends for
-/// `seqs`, whatever the previous [`FseState`] and the [`CParams`], over
+/// `seqs`, whatever the tables the decoder holds and the [`CParams`], over
 /// every encoding type `ZSTD_selectEncodingType` can pick per stream:
 /// the sequence-count header, the modes byte, per stream the larger of the
 /// RLE byte and `FSE_NCountWriteBound(max code, *FSELog)` (Basic and
@@ -1218,6 +1188,15 @@ fn seq_to_codes<'a>(
     (ll_codes, of_codes, &mut ml_codes[..nb_seq])
 }
 
+/// Write the sequences section (Sequences_Section_Header onward, as in
+/// `ZSTD_entropyCompressSeqStore_internal`) against the tables the decoder
+/// holds, building new ones in the spare slots of `tables`, and return
+/// what the section does to them (`nextEntropy->fse`). With `nb_seq == 0`
+/// the tables carry over unchanged (`nextEntropy->fse =
+/// prevEntropy->fse`). `codes` is the buffer the sequence codes are
+/// written to (`ZSTD_seqToCodes`' `llCode`, `ofCode` and `mlCode`), kept
+/// across blocks.
+///
 /// `None` means the block must be emitted uncompressed: libzstd returns 0
 /// for the 1.3.4 decoder workaround (the last table description plus the
 /// bitstream under 4 bytes) and fails the compression when a table cannot
@@ -1226,9 +1205,10 @@ fn seq_to_codes<'a>(
 pub fn encode_sequences_section_with(
     out: &mut Vec<u8>,
     sequences: &[Seq],
-    prev: &FseState,
+    codes: &mut Vec<u8>,
+    tables: FseTables<'_>,
     cparams: &CParams,
-) -> Option<FseState> {
+) -> Option<FseNext> {
     let strategy = cparams.strategy;
     let nb_seq = sequences.len();
 
@@ -1244,13 +1224,15 @@ pub fn encode_sequences_section_with(
     }
     if nb_seq == 0 {
         // Copy the old tables over as if we repeated them
-        return Some(prev.clone());
+        return Some(FseNext::KEEP);
     }
     let seq_head = out.len();
     out.push(0);
 
-    let mut codes = vec![0u8; 3 * nb_seq];
-    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut codes);
+    if codes.len() < 3 * nb_seq {
+        codes.resize(3 * nb_seq, 0);
+    }
+    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut codes[..3 * nb_seq]);
 
     // The `HIST_countFast_wksp` of each `ZSTD_buildSequencesStatistics`
     // step, taken up front so the histograms also total the raw bits the
@@ -1281,7 +1263,7 @@ pub fn encode_sequences_section_with(
         ll_max,
         ll_most as usize,
         LL_FSE_LOG,
-        &prev.ll,
+        tables.ll,
         &LL_DEFAULT_NORM,
         LL_DEFAULT_NORM_LOG,
         MAX_LL,
@@ -1297,7 +1279,7 @@ pub fn encode_sequences_section_with(
         of_max,
         of_most as usize,
         OFF_FSE_LOG,
-        &prev.of,
+        tables.of,
         &OF_DEFAULT_NORM,
         OF_DEFAULT_NORM_LOG,
         DEFAULT_MAX_OFF,
@@ -1313,7 +1295,7 @@ pub fn encode_sequences_section_with(
         ml_max,
         ml_most as usize,
         ML_FSE_LOG,
-        &prev.ml,
+        tables.ml,
         &ML_DEFAULT_NORM,
         ML_DEFAULT_NORM_LOG,
         MAX_ML,
@@ -1325,7 +1307,7 @@ pub fn encode_sequences_section_with(
     out[seq_head] = ((ll_type as u8) << 6) | ((of_type as u8) << 4) | ((ml_type as u8) << 2);
 
     let bitstream_size = encode_sequences(
-        out, &ll_table, &of_table, &ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
+        out, ll_table, of_table, ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
     );
     // zstd versions <= 1.3.4 mistakenly report corruption when
     // FSE_readNCount() receives a buffer < 4 bytes: emit an uncompressed
@@ -1335,18 +1317,20 @@ pub fn encode_sequences_section_with(
         return None;
     }
 
-    Some(FseState {
+    Some(FseNext {
         ll: ll_next,
         of: of_next,
         ml: ml_next,
     })
 }
 
-/// Reusable buffers of [`estimate_sequences_section`].
+/// Reusable buffers of [`estimate_sequences_section`], and the table a
+/// candidate is built in.
 #[derive(Default)]
 pub struct EstimateScratch {
     codes: Vec<u8>,
     descriptions: Vec<u8>,
+    table: FseCTable,
 }
 
 /// `ZSTD_buildBlockEntropyStats_sequences` followed by
@@ -1363,7 +1347,7 @@ pub struct EstimateScratch {
 /// rounded down to bytes table by table.
 pub fn estimate_sequences_section(
     sequences: &[Seq],
-    prev: &FseState,
+    prev: FseHeld<'_>,
     cparams: &CParams,
     scratch: &mut EstimateScratch,
 ) -> Option<usize> {
@@ -1382,7 +1366,7 @@ pub fn estimate_sequences_section(
     struct Stream<'a> {
         codes: &'a [u8],
         fse_log: u32,
-        prev: &'a FseTableState,
+        prev: Held<'a, FseCTable>,
         default_norm: &'a [i16],
         default_norm_log: u32,
         default_max: usize,
@@ -1395,7 +1379,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: ll_codes,
             fse_log: LL_FSE_LOG,
-            prev: &prev.ll,
+            prev: prev.ll,
             default_norm: &LL_DEFAULT_NORM,
             default_norm_log: LL_DEFAULT_NORM_LOG,
             default_max: MAX_LL,
@@ -1405,7 +1389,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: of_codes,
             fse_log: OFF_FSE_LOG,
-            prev: &prev.of,
+            prev: prev.of,
             default_norm: &OF_DEFAULT_NORM,
             default_norm_log: OF_DEFAULT_NORM_LOG,
             default_max: DEFAULT_MAX_OFF,
@@ -1415,7 +1399,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: ml_codes,
             fse_log: ML_FSE_LOG,
-            prev: &prev.ml,
+            prev: prev.ml,
             default_norm: &ML_DEFAULT_NORM,
             default_norm_log: ML_DEFAULT_NORM_LOG,
             default_max: MAX_ML,
@@ -1445,7 +1429,10 @@ pub fn estimate_sequences_section(
             max,
             most as usize,
             fse_log,
-            prev,
+            TableRef {
+                held: prev,
+                spare: &mut scratch.table,
+            },
             default_norm,
             default_norm_log,
             default_max,
@@ -1483,19 +1470,58 @@ pub fn estimate_sequences_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::entropy::FseSlots;
+
+    fn built(norm: &[i16], max_symbol: usize, table_log: u32) -> FseCTable {
+        let mut table = FseCTable::default();
+        table.build(norm, max_symbol, table_log);
+        table
+    }
+
+    /// The table's 64 states are `64..128`, each once.
+    fn assert_states_of_log_6(table: &FseCTable) {
+        assert_eq!(table.table_log, 6);
+        let mut states = table.state_table[..64].to_vec();
+        states.sort_unstable();
+        assert!(states.iter().copied().eq(64..128));
+    }
 
     #[test]
     fn build_ll_default_table() {
-        let table = FseCTable::build(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
-        assert_eq!(table.table_log, 6);
-        assert_eq!(table.state_table.len(), 64);
+        assert_states_of_log_6(&built(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG));
     }
 
     #[test]
     fn build_ml_default_table() {
-        let table = FseCTable::build(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
-        assert_eq!(table.table_log, 6);
-        assert_eq!(table.state_table.len(), 64);
+        assert_states_of_log_6(&built(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG));
+    }
+
+    /// A table rebuilt in place over a larger one equals a fresh build:
+    /// nothing of the old table survives in the states or transforms the
+    /// new one uses, and every code past its `max_symbol` gets the
+    /// zero-probability transform.
+    #[test]
+    fn rebuild_in_place_matches_fresh_build() {
+        let mut table = built(&ML_DEFAULT_NORM, MAX_ML, ML_DEFAULT_NORM_LOG);
+        table.build(&[16, 16], 1, 5);
+        let fresh = built(&[16, 16], 1, 5);
+        assert_eq!(table.state_table[..32], fresh.state_table[..32]);
+        assert_eq!(table.max_symbol, 1);
+        for (s, (a, b)) in table.symbol_tt.iter().zip(&fresh.symbol_tt).enumerate() {
+            assert_eq!(
+                (a.delta_find_state, a.delta_nb_bits),
+                (b.delta_find_state, b.delta_nb_bits)
+            );
+            if s > 1 {
+                assert_eq!((a.delta_find_state, a.delta_nb_bits), (0, (6 << 16) - 32));
+            }
+        }
+        table.build_rle(7);
+        assert_eq!((table.table_log, table.max_symbol), (0, 7));
+        assert!(table
+            .symbol_tt
+            .iter()
+            .all(|tt| (tt.delta_find_state, tt.delta_nb_bits) == (0, 0)));
     }
 
     fn norm_sum(norm: &[i16]) -> u32 {
@@ -1673,14 +1699,28 @@ mod tests {
     }
 
     /// Encoding types from the Sequences_Section_Header written by
-    /// `encode_sequences_section_with` for `seqs` (`nb_seq >= 128` and
-    /// `< LONGNBSEQ` assumed, so the count takes 2 bytes).
-    fn section_types(seqs: &[Seq], prev: &FseState, strategy: Strategy) -> (u8, u8, u8, FseState) {
+    /// `encode_sequences_section_with` for `seqs` against `tables`, which
+    /// then commit the section (`nb_seq >= 128` and `< LONGNBSEQ`
+    /// assumed, so the count takes 2 bytes).
+    fn section_types(seqs: &[Seq], tables: &mut FseSlots, strategy: Strategy) -> (u8, u8, u8) {
         let mut out = Vec::new();
-        let next = encode_sequences_section_with(&mut out, seqs, prev, &cparams(strategy)).unwrap();
+        let next = encode_sequences_section_with(
+            &mut out,
+            seqs,
+            &mut Vec::new(),
+            tables.split(),
+            &cparams(strategy),
+        )
+        .unwrap();
+        tables.commit(next);
         assert!((128..LONGNBSEQ).contains(&seqs.len()));
         let head = out[2];
-        (head >> 6, (head >> 4) & 3, (head >> 2) & 3, next)
+        (head >> 6, (head >> 4) & 3, (head >> 2) & 3)
+    }
+
+    fn repeats(tables: &FseSlots) -> (Repeat, Repeat, Repeat) {
+        let held = tables.held();
+        (held.ll.repeat(), held.of.repeat(), held.ml.repeat())
     }
 
     #[test]
@@ -1690,34 +1730,34 @@ mod tests {
         // bound, so Repeat wins (at 3000 the fresh table wins again, as in
         // libzstd).
         let seqs = skewed_seqs(200);
-        let (ll, of, ml, next) = section_types(&seqs, &FseState::default(), Strategy::Lazy2);
-        assert_eq!((ll, of, ml), (2, 2, 2), "first block: custom tables");
-        assert_eq!(next.ll.repeat(), FseRepeat::Check);
-        assert_eq!(next.of.repeat(), FseRepeat::Check);
-        assert_eq!(next.ml.repeat(), FseRepeat::Check);
-        let (ll, of, ml, next2) = section_types(&seqs, &next, Strategy::Lazy2);
-        assert_eq!((ll, of, ml), (3, 3, 3), "second block: repeat");
-        assert_eq!(next2.ll.repeat(), FseRepeat::Check);
-        assert_eq!(
-            next2.ll.table().unwrap().state_table,
-            next.ll.table().unwrap().state_table
-        );
+        let mut tables = FseSlots::default();
+        let types = section_types(&seqs, &mut tables, Strategy::Lazy2);
+        assert_eq!(types, (2, 2, 2), "first block: custom tables");
+        let check = (Repeat::Check, Repeat::Check, Repeat::Check);
+        assert_eq!(repeats(&tables), check);
+        let first_ll = tables.held().ll.table().unwrap().state_table;
+        let mut wider_tables = tables.clone();
+        let types = section_types(&seqs, &mut tables, Strategy::Lazy2);
+        assert_eq!(types, (3, 3, 3), "second block: repeat");
+        assert_eq!(repeats(&tables), check);
+        assert_eq!(tables.held().ll.table().unwrap().state_table, first_ll);
         // A symbol the previous table cannot encode rules Repeat out.
         let mut wider = seqs.clone();
         wider[10].lit_len = 70_000;
-        let (ll, _, _, _) = section_types(&wider, &next, Strategy::Lazy2);
+        let (ll, _, _) = section_types(&wider, &mut wider_tables, Strategy::Lazy2);
         assert_eq!(ll, 2);
     }
 
     #[test]
     fn heuristic_path_never_repeats_check_tables() {
         let seqs = skewed_seqs(3000);
-        let (ll, _, _, next) = section_types(&seqs, &FseState::default(), Strategy::Fast);
+        let mut tables = FseSlots::default();
+        let (ll, _, _) = section_types(&seqs, &mut tables, Strategy::Fast);
         assert_eq!(ll, 2);
-        assert_eq!(next.ll.repeat(), FseRepeat::Check);
-        let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Fast);
+        assert_eq!(tables.held().ll.repeat(), Repeat::Check);
+        let (ll, _, _) = section_types(&seqs, &mut tables.clone(), Strategy::Fast);
         assert_eq!(ll, 2);
-        let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Greedy);
+        let (ll, _, _) = section_types(&seqs, &mut tables.clone(), Strategy::Greedy);
         assert_eq!(ll, 2);
     }
 
@@ -1729,7 +1769,8 @@ mod tests {
         encode_sequences_section_with(
             &mut out,
             &seqs,
-            &FseState::default(),
+            &mut Vec::new(),
+            FseSlots::default().split(),
             &cparams(Strategy::Fast),
         )
         .unwrap();
@@ -1739,7 +1780,8 @@ mod tests {
         encode_sequences_section_with(
             &mut out,
             &seqs,
-            &FseState::default(),
+            &mut Vec::new(),
+            FseSlots::default().split(),
             &cparams(Strategy::Fast),
         )
         .unwrap();
@@ -1759,12 +1801,13 @@ mod tests {
             let next = encode_sequences_section_with(
                 &mut out,
                 &seqs,
-                &FseState::default(),
+                &mut Vec::new(),
+                FseSlots::default().split(),
                 &cparams(Strategy::Lazy),
             )
             .unwrap();
             assert_eq!(out[1] >> 6, expected, "nb_seq {nb_seq}");
-            assert_eq!(next.ll.repeat(), FseRepeat::None);
+            assert_eq!(next.ll, Next::None);
         }
     }
 
@@ -1803,7 +1846,7 @@ mod tests {
 
     #[test]
     fn init_state_in_range() {
-        let table = FseCTable::build(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
+        let table = built(&LL_DEFAULT_NORM, MAX_LL, LL_DEFAULT_NORM_LOG);
         // Encoder states are stored in the [table_size, 2 * table_size) range.
         let state = table.init_state(0);
         let table_size = 1u32 << table.table_log;
