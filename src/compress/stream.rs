@@ -31,8 +31,8 @@ use super::block::{self, InputEnd, JobBlocks};
 use super::dict::FrameDict;
 use super::{
     begin_job, block_sizing, default_search_method, multithreaded, split, write_epilogue,
-    write_frame_header, write_raw_block, CommittedBlockState, CompressDict, CompressError,
-    CompressOptions, Compressor, Context, JobLdm, JobStart,
+    write_frame_header, write_raw_block, CompressDict, CompressError, CompressOptions, Compressor,
+    Context, JobLdm, JobStart,
 };
 use crate::constants::ZSTD_BLOCKSIZE_MAX;
 use crate::xxhash::Xxh64;
@@ -115,7 +115,6 @@ struct Frame {
     ldm: bool,
     split: bool,
     blocks: JobBlocks,
-    state: CommittedBlockState,
     checksum: Option<Xxh64>,
     pledged: Option<u64>,
     consumed: u64,
@@ -174,9 +173,9 @@ impl Frame {
             let start = dict.map_or(0..0, |dict| dict.ldm_content(false));
             JobLdm::Internal(params, &buf, start)
         });
-        let (ms, scratch, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
+        let (ms, scratch, state, _) = ctx.reset(cparams, method, 0, ldm, size, frequently);
         let start = JobStart::First(dict);
-        let (blocks, state) = begin_job(ms, scratch, &buf, 0..buf.len(), start, sizing, true);
+        let blocks = begin_job(ms, scratch, state, &buf, 0..buf.len(), start, sizing, true);
         let attaches = dict.and_then(FrameDict::dict_match_state).is_some();
         let keep = 1usize << cparams.window_log;
         Self {
@@ -185,7 +184,6 @@ impl Frame {
             ldm: ldm_params.is_some(),
             split: split::block_splitter_enabled(opts.split_after_sequences, &frame_cparams),
             blocks,
-            state,
             checksum: opts.checksum.then(Xxh64::new),
             pledged,
             consumed: 0,
@@ -260,14 +258,14 @@ impl Frame {
 
     /// [`block::compress_blocks`] over the buffered input up to `input`.
     fn compress_blocks(&mut self, input: InputEnd, out: &mut Vec<u8>, pipelined: bool) {
-        let (ms, scratch, mut ldm) = self.ctx.resume(self.ldm);
+        let (ms, scratch, state, mut ldm) = self.ctx.resume(self.ldm);
         block::compress_blocks(
             ms,
             &self.buf,
             &mut self.blocks,
             input,
             self.split,
-            &mut self.state,
+            state,
             scratch,
             &mut ldm,
             self.attached.as_deref().map(CompressDict::dict_match_state),

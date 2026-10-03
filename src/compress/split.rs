@@ -11,7 +11,8 @@
 //! hold, and a repcode that means different offsets in the two is
 //! rewritten to the raw offset `c_rep` gives it.
 
-use super::block::{BlockState, ZSTD_BLOCKHEADERSIZE};
+use super::block::ZSTD_BLOCKHEADERSIZE;
+use super::entropy::EntropyTables;
 use super::params::{CParams, ParamSwitch, Strategy};
 use super::seqstore::{
     offbase_is_repcode, offbase_to_repcode, offset_to_offbase, update_rep, Seq, SeqStore,
@@ -54,12 +55,12 @@ pub struct BlockSplitter {
 
 impl BlockSplitter {
     /// `ZSTD_deriveBlockSplits`: the partitions `store`'s block of
-    /// `block_len` bytes is cut into, empty when it stays whole. `prev` is
-    /// the committed state the partitions would be coded against.
+    /// `block_len` bytes is cut into, empty when it stays whole. `prev` are
+    /// the committed tables the partitions would be coded against.
     pub fn derive(
         &mut self,
         store: &SeqStore,
-        prev: &BlockState,
+        prev: &EntropyTables,
         cparams: &CParams,
         block_len: usize,
     ) -> &[Partition] {
@@ -91,7 +92,7 @@ impl BlockSplitter {
     fn derive_helper(
         &mut self,
         store: &SeqStore,
-        prev: &BlockState,
+        prev: &EntropyTables,
         cparams: &CParams,
         chunk: Range<usize>,
         whole: Option<usize>,
@@ -122,7 +123,7 @@ impl BlockSplitter {
     fn estimate(
         &mut self,
         store: &SeqStore,
-        prev: &BlockState,
+        prev: &EntropyTables,
         cparams: &CParams,
         seqs: Range<usize>,
     ) -> Option<usize> {
@@ -132,9 +133,11 @@ impl BlockSplitter {
             self.lit_start[seqs.end] as usize
         };
         let lits = &store.lits[self.lit_start[seqs.start] as usize..lits_end];
-        let literals = huf::estimate_literals_section(lits, &prev.huf, cparams, &mut self.desc)?;
+        let literals =
+            huf::estimate_literals_section(lits, prev.huf.held(), cparams, &mut self.desc)?;
+        let seqs = &store.seqs[seqs];
         let sequences =
-            fse::estimate_sequences_section(&store.seqs[seqs], &prev.fse, cparams, &mut self.fse)?;
+            fse::estimate_sequences_section(seqs, prev.fse.held(), cparams, &mut self.fse)?;
         Some(literals + sequences + ZSTD_BLOCKHEADERSIZE)
     }
 }

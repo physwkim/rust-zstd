@@ -3,14 +3,18 @@
 //! (`ZSTD_blockState_t`) with its commit rule.
 //!
 //! State-owner invariant: the decoder's repeat offsets and entropy tables
-//! change only when a COMPRESSED block is emitted. [`CommittedBlockState`]
-//! keeps that state in a private field; the entropy stage reads it through
-//! [`CommittedBlockState::prev`] and produces a fresh [`BlockState`], and the
-//! private `end_block`, which every written block goes through, is the only
-//! path that installs it (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
+//! change only when a COMPRESSED block is emitted. [`BlockState`] keeps
+//! that state in private fields; the entropy stage reads the committed
+//! tables and builds new ones in their spare slots ([`entropy`]), returning
+//! a candidate that says what the block changes, and the private
+//! `end_block`, which every written block goes through, is the only path
+//! that applies it (`ZSTD_blockState_confirmRepcodesAndEntropyTables`).
 //! RAW and RLE blocks discard the candidate, including its repeat offsets.
+//!
+//! [`entropy`]: super::entropy
 
 use super::common::Src;
+use super::entropy::{EntropyTables, FseNext, FseTables, Next, TableRef};
 use super::ldm::{self, LdmState, RawSeqStore, RawSeqView};
 use super::matchstate::{Block, DictMatchState, EnteredBlock, EnteredPrefix, MatchState};
 use super::params::{CParams, Strategy};
@@ -19,8 +23,8 @@ use super::seqstore::{Seq, SeqStore};
 use super::split::{resolve_off_codes, BlockSplitter, Partition};
 use super::{bt, dfast, fast, lazy, opt};
 use crate::constants::*;
-use crate::fse::{self, FseState, FseTableState};
-use crate::huf::{self, HufState};
+use crate::fse;
+use crate::huf::{self, HufTable};
 use std::ops::Range;
 
 /// `ZSTD_blockHeaderSize`.
@@ -30,66 +34,96 @@ pub const MIN_CBLOCK_SIZE: usize = 2;
 /// `rleMaxLength` in `ZSTD_compressBlock_internal`.
 pub const RLE_MAX_LENGTH: usize = 25;
 
-/// `ZSTD_compressedBlockState_t`: what the decoder holds after the last
-/// COMPRESSED block. `Treeless` literals and `Repeat` sequence tables may
-/// only reference the committed instance.
-#[derive(Clone, Debug, Default)]
+/// `repStartValue`: the repeat offsets of a frame without dictionary.
+pub const REP_START_VALUE: [u32; 3] = [1, 4, 8];
+
+/// `ZSTD_blockState_t`: what the decoder holds after the last COMPRESSED
+/// block, its repeat offsets and entropy tables, with a spare slot per
+/// table for the block being coded. `Treeless` literals and `Repeat`
+/// sequence tables may only reference the committed tables. Changed only
+/// by the private `end_block` while a job runs, and set when one starts.
+#[derive(Clone, Debug)]
 pub struct BlockState {
-    pub rep: [u32; 3],
-    pub huf: HufState,
-    pub fse: FseState,
+    rep: [u32; 3],
+    entropy: EntropyTables,
+}
+
+impl Default for BlockState {
+    /// `ZSTD_reset_compressedBlockState`: `repStartValue`, no entropy
+    /// tables.
+    fn default() -> Self {
+        Self {
+            rep: REP_START_VALUE,
+            entropy: EntropyTables::default(),
+        }
+    }
+}
+
+/// What a block coded COMPRESSED commits: its repeat offsets and what its
+/// sections do to each table.
+struct Candidate {
+    rep: [u32; 3],
+    huf: Next,
+    fse: FseNext,
 }
 
 impl BlockState {
-    /// `ZSTD_reset_compressedBlockState`: `repStartValue`, no entropy tables.
-    pub fn initial() -> Self {
-        BlockState {
-            rep: [1, 4, 8],
-            huf: HufState::None,
-            fse: FseState::default(),
-        }
+    /// A dictionary's block state: its repeat offsets and tables.
+    pub(super) fn new(rep: [u32; 3], entropy: EntropyTables) -> Self {
+        Self { rep, entropy }
+    }
+
+    /// The repeat offsets the decoder holds.
+    pub fn rep(&self) -> [u32; 3] {
+        self.rep
+    }
+
+    /// The entropy tables the decoder holds (and the spare slots).
+    pub fn entropy(&self) -> &EntropyTables {
+        &self.entropy
+    }
+
+    /// `ZSTD_reset_compressedBlockState`: `repStartValue`, no entropy
+    /// tables.
+    pub(super) fn reset(&mut self) {
+        self.rep = REP_START_VALUE;
+        self.entropy.clear();
+    }
+
+    /// Start from `from`, a dictionary's block state.
+    pub(super) fn load(&mut self, from: &BlockState) {
+        self.rep = from.rep;
+        self.entropy.load(&from.entropy);
     }
 
     /// `ZSTD_invalidateRepCodes`: a job after the first one does not know
     /// the repeat offsets the decoder holds, so no repcode may be emitted
     /// until a real offset has replaced the zero.
-    pub fn invalidate_rep_codes(&mut self) {
+    pub(super) fn invalidate_rep_codes(&mut self) {
         self.rep = [0; 3];
     }
-}
 
-/// `prevCBlock`: the committed cross-block state. Replaced only by the
-/// private `end_block`, exactly when a COMPRESSED block is written.
-pub struct CommittedBlockState {
-    prev: BlockState,
-}
-
-impl CommittedBlockState {
-    pub fn new(prev: BlockState) -> Self {
-        Self { prev }
+    /// The committed tables and the spare slots, for [`entropy_code`].
+    fn coder_tables(&mut self) -> (TableRef<'_, HufTable>, FseTables<'_>) {
+        let EntropyTables { huf, fse } = &mut self.entropy;
+        (huf.split(), fse.split())
     }
 
-    /// The state the decoder holds right now.
-    pub fn prev(&self) -> &BlockState {
-        &self.prev
-    }
-
-    /// The end of every written block, with `next` its candidate state if
-    /// it was written COMPRESSED: commit it
+    /// The end of every written block, with `next` its candidate if it was
+    /// written COMPRESSED: commit it
     /// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`), then, whatever
     /// the block's type, demote a dictionary's `Valid` offset table to
     /// `Check` (`ZSTD_compressBlock_internal`'s `out:`,
     /// `ZSTD_compressSeqStore_singleBlock` for each block a split writes):
     /// the dictionary checked that it codes every offset of a first block,
     /// `dictContentSize + 128 KiB`, and a later block reaches further.
-    fn end_block(&mut self, next: Option<BlockState>) {
-        if let Some(next) = next {
-            self.prev = next;
+    fn end_block(&mut self, next: Option<Candidate>) {
+        if let Some(Candidate { rep, huf, fse }) = next {
+            self.rep = rep;
+            self.entropy.huf.commit(huf);
+            self.entropy.fse.commit(fse);
         }
-        self.prev.fse.of = match std::mem::take(&mut self.prev.fse.of) {
-            FseTableState::Valid(table) => FseTableState::Check(table),
-            of => of,
-        };
+        self.entropy.fse.of.demote_valid();
     }
 }
 
@@ -449,28 +483,29 @@ fn proven_rep_after(
 }
 
 /// `ZSTD_entropyCompressSeqStore`: code `sections` of a `block_len`-byte
-/// block into `cbuf` from the committed tables `prev`, with `codes` the
-/// sequence code buffer, returning the state the block commits if written
-/// COMPRESSED, `None` when the payload does not beat `block_len -
-/// ZSTD_minGain`.
+/// block into `cbuf` against the committed tables, building new ones in
+/// the spare slots of `tables`, with `codes` the sequence code buffer.
+/// Returns what the block commits if written COMPRESSED, `None` when the
+/// payload does not beat `block_len - ZSTD_minGain`.
 fn entropy_code(
     sections: Sections,
     block_len: usize,
-    prev: &BlockState,
+    tables: (TableRef<'_, HufTable>, FseTables<'_>),
     cparams: &CParams,
     cbuf: &mut Vec<u8>,
     codes: &mut Vec<u8>,
-) -> Option<BlockState> {
+) -> Option<Candidate> {
     let Sections { lits, seqs, rep } = sections;
+    let (huf_tables, fse_tables) = tables;
     cbuf.clear();
-    let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), &prev.huf, cparams);
-    let fse = fse::encode_sequences_section_with(cbuf, seqs, codes, &prev.fse, cparams)?;
+    let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), huf_tables, cparams);
+    let fse = fse::encode_sequences_section_with(cbuf, seqs, codes, fse_tables, cparams)?;
     let max_c_size = block_len - CParams::min_gain(block_len, cparams.strategy);
     if cbuf.len() >= max_c_size {
         return None;
     }
     debug_assert!(cbuf.len() < ZSTD_BLOCKSIZE_MAX);
-    Some(BlockState { rep, huf, fse })
+    Some(Candidate { rep, huf, fse })
 }
 
 /// The block-type decision of `ZSTD_compressBlock_internal` /
@@ -487,7 +522,7 @@ fn entropy_and_emit(
     cparams: &CParams,
     is_first_block: bool,
     is_last: bool,
-    state: &mut CommittedBlockState,
+    state: &mut BlockState,
     cbuf: &mut Vec<u8>,
     codes: &mut Vec<u8>,
     out: &mut Vec<u8>,
@@ -495,7 +530,14 @@ fn entropy_and_emit(
     debug_assert!(block.len() <= ZSTD_BLOCKSIZE_MAX);
     let block_len = block.len();
     let data = &src[block];
-    let next = entropy_code(sections, block_len, state.prev(), cparams, cbuf, codes);
+    let next = entropy_code(
+        sections,
+        block_len,
+        state.coder_tables(),
+        cparams,
+        cbuf,
+        codes,
+    );
     let c_size = if next.is_some() { cbuf.len() } else { 0 };
 
     if !is_first_block && c_size < RLE_MAX_LENGTH && is_rle(data) {
@@ -537,7 +579,7 @@ fn emit_block(
     cparams: &CParams,
     is_first_block: bool,
     is_last: bool,
-    state: &mut CommittedBlockState,
+    state: &mut BlockState,
     cbuf: &mut Vec<u8>,
     codes: &mut Vec<u8>,
     out: &mut Vec<u8>,
@@ -564,7 +606,7 @@ fn emit_block(
         }
         Some(parts) => parts,
     };
-    let mut d_rep = state.prev().rep;
+    let mut d_rep = state.rep();
     let mut c_rep = d_rep;
     let mut start = block.start;
     let mut all_compressed = true;
@@ -596,7 +638,7 @@ fn emit_block(
     }
     debug_assert_eq!(start, block.end);
     // `prevCBlock->rep = dRep`: the last COMPRESSED partition committed it.
-    debug_assert_eq!(state.prev().rep, d_rep);
+    debug_assert_eq!(state.rep(), d_rep);
     all_compressed
 }
 
@@ -612,7 +654,7 @@ pub fn compress_block(
     is_first_block: bool,
     is_last: bool,
     split: bool,
-    state: &mut CommittedBlockState,
+    state: &mut BlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
     dms: Option<DictMatchState>,
@@ -627,9 +669,9 @@ pub fn compress_block(
         ..
     } = scratch;
     let entered = ms.enter_block(block.clone());
-    let built = build_seq_store(ms, src, entered, state.prev().rep, store, ldm, dms);
+    let built = build_seq_store(ms, src, entered, state.rep(), store, ldm, dms);
     let parts = split.then(|| match built {
-        Some(_) => splitter.derive(store, state.prev(), &cparams, block.len()),
+        Some(_) => splitter.derive(store, state.entropy(), &cparams, block.len()),
         None => &[][..],
     });
     emit_block(
@@ -903,7 +945,7 @@ pub fn compress_blocks(
     blocks: &mut JobBlocks,
     input: InputEnd,
     split: bool,
-    state: &mut CommittedBlockState,
+    state: &mut BlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
     dms: Option<DictMatchState>,
@@ -971,7 +1013,7 @@ fn compress_blocks_pipelined(
     blocks: &mut JobBlocks,
     input: InputEnd,
     split: bool,
-    state: &mut CommittedBlockState,
+    state: &mut BlockState,
     scratch: &mut BlockScratch,
     ldm: &mut BlockLdm,
     dms: Option<DictMatchState>,
@@ -995,14 +1037,14 @@ fn compress_blocks_pipelined(
     let mut block = blocks.next(src, input, presplit);
     // `built`: `block`'s store is in `cur`, with the finder's offsets after it.
     let entered = ms.enter_block(block.clone());
-    let mut built = build_seq_store(ms, src, entered, state.prev().rep, cur, ldm, dms);
+    let mut built = build_seq_store(ms, src, entered, state.rep(), cur, ldm, dms);
     loop {
         let is_first_block = blocks.is_first(&block);
         let is_last = blocks.is_last(&block, input);
         // ZSTD_deriveBlockSplits runs against the state committed by the
         // previous block, before the next block's finder may start.
         let parts = split.then(|| match built {
-            Some(_) => splitter.derive(cur, state.prev(), &cparams, block.len()),
+            Some(_) => splitter.derive(cur, state.entropy(), &cparams, block.len()),
             None => &[][..],
         });
         let following_start = block.end;
@@ -1022,7 +1064,7 @@ fn compress_blocks_pipelined(
                     cur,
                     rep,
                     parts,
-                    state.prev().rep,
+                    state.rep(),
                     cparams.strategy,
                 )?;
                 let least_gained =
@@ -1061,7 +1103,7 @@ fn compress_blocks_pipelined(
             // The proof is what made block N+1 start from the decoder's
             // offsets, with the size the written block N gives it.
             assert!(compressed, "section bound proof failed");
-            assert_eq!(state.prev().rep, rep_next, "repeat offset proof failed");
+            assert_eq!(state.rep(), rep_next, "repeat offset proof failed");
             blocks.wrote(&block, out.len() - written);
             assert!(blocks.gained >= least_gained, "savings bound proof failed");
             built = built_following;
@@ -1089,7 +1131,7 @@ fn compress_blocks_pipelined(
             }
             block = blocks.next(src, input, presplit);
             let entered = ms.enter_block(block.clone());
-            built = build_seq_store(ms, src, entered, state.prev().rep, nxt, ldm, dms);
+            built = build_seq_store(ms, src, entered, state.rep(), nxt, ldm, dms);
         }
         std::mem::swap(&mut cur, &mut nxt);
     }
@@ -1099,7 +1141,9 @@ fn compress_blocks_pipelined(
 mod tests {
     use super::*;
     use crate::compress::common::HASH_READ_SIZE;
+    use crate::compress::entropy::{FseSlots, Held, Repeat, Slots};
     use crate::compress::lazy::SearchMethod;
+    use crate::fse::FseCTable;
 
     /// `is_rle` against its definition at every length around the 32-byte
     /// step and its 8-byte words, with one byte changed at each position,
@@ -1232,38 +1276,91 @@ mod tests {
         }
     }
 
+    fn fse_repeats(state: &BlockState) -> (Repeat, Repeat, Repeat) {
+        let f = state.entropy().fse.held();
+        (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
+    }
+
     /// A dictionary's `Valid` offset table is `Check` after any written
-    /// block, compressed with it as the candidate's or not; its other
-    /// tables stay `Valid`.
+    /// block, compressed keeping the tables or not; its other tables stay
+    /// `Valid`.
     #[test]
     fn end_block_demotes_a_valid_offset_table() {
-        use crate::compress::entropy::Repeat;
-        use crate::fse::FseCTable;
-        let valid = || {
-            let mut table = FseCTable::default();
-            table.build(&[16, 16], 1, 5);
-            FseTableState::Valid(table)
+        let mut table = FseCTable::default();
+        table.build(&[16, 16], 1, 5);
+        let valid = || Slots::holding(table.clone(), Repeat::Valid);
+        let fse = FseSlots {
+            ll: valid(),
+            of: valid(),
+            ml: valid(),
         };
-        let dict = BlockState {
-            fse: FseState {
-                ll: valid(),
-                of: valid(),
-                ml: valid(),
-            },
-            ..BlockState::initial()
-        };
-        let repeats = |s: &CommittedBlockState| {
-            let f = &s.prev().fse;
-            (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
+        let huf = Slots::default();
+        let dict = BlockState::new(REP_START_VALUE, EntropyTables { huf, fse });
+        let keep = || Candidate {
+            rep: REP_START_VALUE,
+            huf: Next::Keep,
+            fse: FseNext::KEEP,
         };
         let demoted = (Repeat::Valid, Repeat::Check, Repeat::Valid);
-        for next in [None, Some(dict.clone())] {
-            let mut state = CommittedBlockState::new(dict.clone());
-            state.end_block(next);
-            assert_eq!(repeats(&state), demoted);
+        for compressed in [false, true] {
+            let mut state = dict.clone();
+            state.end_block(compressed.then(keep));
+            assert_eq!(fse_repeats(&state), demoted);
             state.end_block(None);
-            assert_eq!(repeats(&state), demoted);
+            assert_eq!(fse_repeats(&state), demoted);
         }
+    }
+
+    /// A block coded with new tables in the spare slots changes nothing
+    /// when written RAW or RLE, repeat offsets included; written
+    /// COMPRESSED it installs its repeat offsets and what each section did:
+    /// a new table, no table, or the kept one.
+    #[test]
+    fn end_block_applies_only_a_committed_candidate() {
+        let coded = || {
+            let mut table = FseCTable::default();
+            table.build(&[16, 16], 1, 5);
+            let fse = FseSlots {
+                ll: Slots::holding(table.clone(), Repeat::Check),
+                of: Slots::holding(table.clone(), Repeat::Check),
+                ml: Slots::default(),
+            };
+            let huf = Slots::default();
+            let mut state = BlockState::new([2, 3, 4], EntropyTables { huf, fse });
+            let (huf, fse) = state.coder_tables();
+            let mut count = [0u32; 256];
+            count[..2].copy_from_slice(&[3, 1]);
+            huf::build_ctable(huf.spare, &count, 1, 11).unwrap();
+            fse.ml.spare.build(&[32, 32], 1, 6);
+            state
+        };
+        let mut state = coded();
+        state.end_block(None);
+        assert_eq!(state.rep(), [2, 3, 4]);
+        assert!(matches!(state.entropy().huf.held(), Held::None));
+        let check = (Repeat::Check, Repeat::Check, Repeat::None);
+        assert_eq!(fse_repeats(&state), check);
+
+        let mut state = coded();
+        state.end_block(Some(Candidate {
+            rep: [9, 10, 11],
+            huf: Next::New,
+            fse: FseNext {
+                ll: Next::None,
+                of: Next::Keep,
+                ml: Next::New,
+            },
+        }));
+        assert_eq!(state.rep(), [9, 10, 11]);
+        let Held::Check(huf) = state.entropy().huf.held() else {
+            panic!("new Huffman table not held");
+        };
+        assert_eq!((huf.max_symbol, huf.nb_bits(0), huf.nb_bits(1)), (1, 1, 1));
+        let check = (Repeat::None, Repeat::Check, Repeat::Check);
+        assert_eq!(fse_repeats(&state), check);
+        let fse = state.entropy().fse.held();
+        assert_eq!(fse.of.table().unwrap().table_log, 5);
+        assert_eq!(fse.ml.table().unwrap().table_log, 6);
     }
 
     /// Builds a block and its sequence store one partition at a time,
@@ -1324,7 +1421,7 @@ mod tests {
         let mut b = Builder {
             src: Vec::new(),
             store: SeqStore::new(),
-            c_rep: BlockState::initial().rep,
+            c_rep: REP_START_VALUE,
             parts: Vec::new(),
             part_start: (0, 0, 0),
         };
@@ -1368,7 +1465,7 @@ mod tests {
         b.end_partition();
 
         let cparams = CParams::for_level(3, b.src.len());
-        let mut state = CommittedBlockState::new(BlockState::initial());
+        let mut state = BlockState::default();
         let (mut cbuf, mut blocks) = (Vec::new(), Vec::new());
         let all_compressed = emit_block(
             &b.src,
@@ -1398,7 +1495,7 @@ mod tests {
         assert_eq!(b.store.seqs[c_first].off_base, offset_to_offbase(7));
         assert_eq!(b.store.seqs[c_first + 1].off_base, repcode_to_offbase(1));
         assert_eq!(b.store.seqs[e_first].off_base, offset_to_offbase(7));
-        assert_eq!(state.prev().rep, [7, 7, 16]);
+        assert_eq!(state.rep(), [7, 7, 16]);
 
         let mut frame = Vec::new();
         super::super::write_frame_header(

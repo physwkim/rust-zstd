@@ -34,8 +34,8 @@ mod stream;
 use crate::constants::*;
 use crate::xxhash::Xxh64;
 use block::{
-    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, CommittedBlockState,
-    InputEnd, JobBlocks, ZSTD_BLOCKHEADERSIZE,
+    write_raw_block, BlockLdm, BlockScratch, BlockSizing, BlockState, InputEnd, JobBlocks,
+    ZSTD_BLOCKHEADERSIZE,
 };
 use dict::FrameDict;
 pub use dict::{CompressDict, DictAttach, DictContentType};
@@ -364,14 +364,16 @@ pub struct Compressor {
 }
 
 /// A compression context (`ZSTD_CCtx`), which runs one job at a time: its
-/// match state once a job has run, its block buffers, and the long distance
-/// matching state a single-threaded frame generates each block's matches
-/// from (`ldmState`). libzstd keeps all three in the context's workspace,
-/// whose bookkeeping is in the match state's [`matchstate::Workspace`].
+/// match state once a job has run, its block buffers, the job's committed
+/// block state (`blockState`), and the long distance matching state a
+/// single-threaded frame generates each block's matches from
+/// (`ldmState`). libzstd keeps them in the context's workspace, whose
+/// bookkeeping is in the match state's [`matchstate::Workspace`].
 #[derive(Default)]
 struct Context {
     ms: Option<MatchState>,
     scratch: BlockScratch,
+    state: BlockState,
     ldm_state: Option<LdmState>,
 }
 
@@ -393,8 +395,8 @@ impl Context {
     /// The match state's reset decides from what libzstd's workspace would
     /// need ([`needed_space`]) whether the workspace is resized; a resize
     /// frees the block buffers and the long distance matching tables too
-    /// (`ZSTD_cwksp_free`). Returns the match state, the block buffers and
-    /// the job's long distance matches.
+    /// (`ZSTD_cwksp_free`). Returns the match state, the block buffers, the
+    /// block state [`begin_job`] sets, and the job's long distance matches.
     fn reset<'a>(
         &'a mut self,
         cparams: CParams,
@@ -403,7 +405,12 @@ impl Context {
         ldm: JobLdm<'a>,
         pledged: usize,
         frequently: bool,
-    ) -> (&'a mut MatchState, &'a mut BlockScratch, BlockLdm<'a>) {
+    ) -> (
+        &'a mut MatchState,
+        &'a mut BlockScratch,
+        &'a mut BlockState,
+        BlockLdm<'a>,
+    ) {
         let ldm_params = match &ldm {
             JobLdm::Internal(params, ..) => Some(params),
             JobLdm::Off | JobLdm::External(_) => None,
@@ -435,19 +442,27 @@ impl Context {
                 frequently,
             )),
         };
-        (ms, &mut self.scratch, ldm)
+        (ms, &mut self.scratch, &mut self.state, ldm)
     }
 
-    /// The match state, block buffers and single-context long distance
-    /// matches (`ldm` set) of the job [`Context::reset`] last started,
-    /// for a job compressed over several calls.
-    fn resume(&mut self, ldm: bool) -> (&mut MatchState, &mut BlockScratch, BlockLdm<'_>) {
+    /// The match state, block buffers, block state and single-context long
+    /// distance matches (`ldm` set) of the job [`Context::reset`] last
+    /// started, for a job compressed over several calls.
+    fn resume(
+        &mut self,
+        ldm: bool,
+    ) -> (
+        &mut MatchState,
+        &mut BlockScratch,
+        &mut BlockState,
+        BlockLdm<'_>,
+    ) {
         let ms = self.ms.as_mut().expect("context never reset");
         let ldm = match &mut self.ldm_state {
             Some(state) if ldm => BlockLdm::Internal(state),
             _ => BlockLdm::Off,
         };
-        (ms, &mut self.scratch, ldm)
+        (ms, &mut self.scratch, &mut self.state, ldm)
     }
 
     /// The input of the job [`Context::resume`] continues moved `shift`
@@ -846,8 +861,9 @@ fn compress_job(
         JobStart::First(None) => (job_prefix(&job, true, overlap), data.len() - job.start),
         JobStart::Later => (job_prefix(&job, false, overlap), job.len()),
     };
-    let (ms, scratch, mut ldm) = ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
-    let (mut blocks, mut state) = begin_job(ms, scratch, data, prefix, start, sizing, last_job);
+    let (ms, scratch, state, mut ldm) =
+        ctx.reset(cparams, method, prefix.start, ldm, pledged, frequently);
+    let mut blocks = begin_job(ms, scratch, state, data, prefix, start, sizing, last_job);
     out.reserve(job_bound(job.len(), sizing.block_size_max));
     block::compress_blocks(
         ms,
@@ -855,7 +871,7 @@ fn compress_job(
         &mut blocks,
         InputEnd::JobEnd(job.end),
         split,
-        &mut state,
+        state,
         scratch,
         &mut ldm,
         match start {
@@ -869,35 +885,35 @@ fn compress_job(
 
 /// The start of a job on a context just reset for it: a later ZSTDMT job
 /// indexes its raw-content `prefix` of `data` and starts with invalidated
-/// repeat offsets; the first job (`prefix` empty, whatever `data`) starts
-/// from `repStartValue`, or, in a frame with a dictionary, from the
-/// dictionary, whose content is `prefix` ([`FrameDict::preload`]). Returns
-/// the job's block cursor, its first block at the prefix end, and its
-/// committed block state. One-shot jobs and the streaming frame both start
-/// here.
+/// repeat offsets and no entropy tables; the first job (`prefix` empty,
+/// whatever `data`) starts from `repStartValue`, or, in a frame with a
+/// dictionary, from the dictionary, whose content is `prefix`
+/// ([`FrameDict::preload`]). Sets the job's committed block `state` and
+/// returns its block cursor, its first block at the prefix end. One-shot
+/// jobs and the streaming frame both start here.
+#[allow(clippy::too_many_arguments)]
 fn begin_job(
     ms: &mut MatchState,
     scratch: &mut BlockScratch,
+    state: &mut BlockState,
     data: &[u8],
     prefix: Range<usize>,
     start: JobStart,
     sizing: BlockSizing,
     last_job: bool,
-) -> (JobBlocks, CommittedBlockState) {
-    let initial = match start {
-        JobStart::First(Some(dict)) => dict.preload(ms, data),
-        JobStart::First(None) => BlockState::initial(),
+) -> JobBlocks {
+    match start {
+        JobStart::First(Some(dict)) => dict.preload(ms, data, state),
+        JobStart::First(None) => state.reset(),
         JobStart::Later => {
             block::load_prefix(ms, data, prefix.clone());
-            let mut initial = BlockState::initial();
-            initial.invalidate_rep_codes();
-            initial
+            state.reset();
+            state.invalidate_rep_codes();
         }
-    };
+    }
     scratch.reserve(sizing.block_size_max);
     let first_job = matches!(start, JobStart::First(_));
-    let blocks = JobBlocks::new(sizing, prefix.end, first_job, last_job);
-    (blocks, CommittedBlockState::new(initial))
+    JobBlocks::new(sizing, prefix.end, first_job, last_job)
 }
 
 /// Run `f` over every job, in job order, appending to `out`, each job on a
@@ -1992,12 +2008,12 @@ mod tests {
         let mut ctx = Context::default();
         let ldm = JobLdm::Internal(big_ldm.unwrap(), &[], 0..0);
         let method = default_search_method(&big);
-        let (_, scratch, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
+        let (_, scratch, _, _) = ctx.reset(big, method, 0, ldm, 64 << 20, false);
         scratch.reserve(ZSTD_BLOCKSIZE_MAX);
         for n in 1..=129 {
             let ldm = JobLdm::Internal(small_ldm.unwrap(), &[], 0..0);
             let method = default_search_method(&small);
-            let (_, scratch, _) = ctx.reset(small, method, 0, ldm, 1024, false);
+            let (_, scratch, _, _) = ctx.reset(small, method, 0, ldm, 1024, false);
             let kept = scratch.cbuf.capacity() >= ZSTD_BLOCKSIZE_MAX;
             assert_eq!(kept, n < 129, "reset {n}");
         }

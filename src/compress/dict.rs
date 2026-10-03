@@ -50,6 +50,7 @@
 
 use super::block::{self, BlockState, TableLoad};
 use super::common::SHORT_CACHE_TAG_BITS;
+use super::entropy::{EntropyTables, FseSlots, Repeat, Slots};
 use super::lazy::{default_search_method, SearchMethod};
 use super::ldm::LdmParams;
 use super::matchstate::{DictMatchState, MatchState, WINDOW_START_INDEX};
@@ -57,8 +58,8 @@ use super::opt::DictStats;
 use super::params::{CParamMode, CParams, ZSTD_CLEVEL_DEFAULT};
 use super::{CompressError, CompressOptions};
 use crate::constants::{LL_FSE_LOG, MAX_LL, MAX_ML, MAX_OFF, ML_FSE_LOG, OFF_FSE_LOG};
-use crate::fse::{FseCTable, FseState, FseTableState};
-use crate::huf::{HufState, HufTable, HUF_TABLELOG_DEFAULT, HUF_TABLELOG_MAX};
+use crate::fse::FseCTable;
+use crate::huf::{HufTable, HUF_TABLELOG_DEFAULT, HUF_TABLELOG_MAX};
 use std::fmt;
 use std::ops::Range;
 
@@ -195,7 +196,7 @@ impl CompressDict {
         let (header, content) = insert_dictionary(dict, content_type)?;
         let structured = header.is_some();
         let (id, entropy) = header.map_or_else(
-            || (0, BlockState::initial()),
+            || (0, BlockState::default()),
             |header| (header.id, header.entropy),
         );
         let content = content.to_vec();
@@ -491,9 +492,9 @@ impl<'a> FrameDict<'a> {
     /// Start `ms`, just reset for the frame's first job with the window at
     /// the start of `data` ([`FrameDict::content`], then the input), from
     /// the dictionary: attach it, copy its tables or load the content,
-    /// seed the optimal parser's first statistics, and return the block
-    /// state the first block starts from.
-    pub(super) fn preload(&self, ms: &mut MatchState, data: &[u8]) -> BlockState {
+    /// seed the optimal parser's first statistics, and set `state` to the
+    /// block state the first block starts from.
+    pub(super) fn preload(&self, ms: &mut MatchState, data: &[u8], state: &mut BlockState) {
         let content = self.content();
         debug_assert_eq!(&data[..content.len()], content);
         match self.tables {
@@ -506,7 +507,10 @@ impl<'a> FrameDict<'a> {
         if let (Some(stats), Some(opt)) = (self.opt_stats, ms.opt.as_mut()) {
             opt.seed_dict(stats);
         }
-        self.entropy.cloned().unwrap_or_else(BlockState::initial)
+        match self.entropy {
+            Some(entropy) => state.load(entropy),
+            None => state.reset(),
+        }
     }
 }
 
@@ -621,25 +625,15 @@ fn load_entropy(dict: &[u8]) -> Result<(BlockState, usize), CompressError> {
     if rep.iter().any(|&r| r == 0 || r as usize > content_size) {
         return Err(CORRUPTED);
     }
-    let huf = if huf_valid {
-        HufState::Valid(huf)
-    } else {
-        HufState::Check(huf)
-    };
-    let entropy = BlockState {
-        rep,
-        huf,
-        fse: FseState { ll, of, ml },
-    };
-    Ok((entropy, ip))
+    let huf = repeat(huf, huf_valid);
+    let fse = FseSlots { ll, of, ml };
+    Ok((BlockState::new(rep, EntropyTables { huf, fse }), ip))
 }
 
-fn repeat(table: FseCTable, valid: bool) -> FseTableState {
-    if valid {
-        FseTableState::Valid(table)
-    } else {
-        FseTableState::Check(table)
-    }
+/// `table` held `Valid`, or `Check`.
+fn repeat<T: Default>(table: T, valid: bool) -> Slots<T> {
+    let mode = if valid { Repeat::Valid } else { Repeat::Check };
+    Slots::holding(table, mode)
 }
 
 /// `ZSTD_dictNCountRepeat(norm, dict_max, max) == FSE_repeat_valid`: the
@@ -750,6 +744,7 @@ fn read_huf_ctable(src: &[u8]) -> Option<(HufTable, bool, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::entropy::Held;
     use crate::fse::write_ncount;
     use crate::huf::{build_ctable, write_ctable};
 
@@ -785,7 +780,8 @@ mod tests {
     /// The Huffman table `HUF_buildCTable` builds for `count` and its
     /// description.
     fn huf_of(count: &[u32; 256]) -> (Vec<u8>, HufTable) {
-        let table = build_ctable(count, 255, HUF_TABLELOG_DEFAULT).unwrap();
+        let mut table = HufTable::default();
+        build_ctable(&mut table, count, 255, HUF_TABLELOG_DEFAULT).unwrap();
         let mut out = Vec::new();
         write_ctable(&mut out, &table, 255, u32::from(table.table_log)).unwrap();
         (out, table)
@@ -854,19 +850,20 @@ mod tests {
         for ct in [Auto, FullDict] {
             let (header, content) = insert_dictionary(&structured, ct).unwrap();
             let header = header.unwrap();
-            assert_eq!((header.id, header.entropy.rep), (ID, REP));
+            assert_eq!((header.id, header.entropy.rep()), (ID, REP));
             assert_eq!(content, Parts::valid().content);
         }
     }
 
     #[test]
     fn complete_tables_are_valid() {
-        let entropy = Parts::valid().load().unwrap();
-        assert!(matches!(&entropy.huf, HufState::Valid(t) if *t == huf_of(&skewed()).1));
-        let fse = &entropy.fse;
-        assert!(matches!(fse.of, FseTableState::Valid(_)));
-        assert!(matches!(fse.ml, FseTableState::Valid(_)));
-        assert!(matches!(fse.ll, FseTableState::Valid(_)));
+        let state = Parts::valid().load().unwrap();
+        let entropy = state.entropy();
+        assert!(matches!(entropy.huf.held(), Held::Valid(t) if *t == huf_of(&skewed()).1));
+        let fse = entropy.fse.held();
+        assert_eq!(fse.of.repeat(), Repeat::Valid);
+        assert_eq!(fse.ml.repeat(), Repeat::Valid);
+        assert_eq!(fse.ll.repeat(), Repeat::Valid);
     }
 
     #[test]
@@ -878,7 +875,7 @@ mod tests {
             }
             .load()
             .unwrap();
-            assert!(matches!(entropy.huf, HufState::Check(_)));
+            assert_eq!(entropy.entropy().huf.held().repeat(), Repeat::Check);
         };
         // Two literals.
         check_huf(direct(&[1]));
@@ -887,32 +884,30 @@ mod tests {
         count[7] = 0;
         check_huf(huf_of(&count).0);
 
+        // the modes of the literal length, offset and match length tables
+        let modes = |parts: Parts| {
+            let state = parts.load().unwrap();
+            let f = state.entropy().fse.held();
+            (f.ll.repeat(), f.of.repeat(), f.ml.repeat())
+        };
         let fse = |seq| {
-            Parts {
+            modes(Parts {
                 seq,
                 ..Parts::valid()
-            }
-            .load()
-            .unwrap()
-            .fse
+            })
         };
         let mut ml_gap = flat(52, 6);
         ml_gap.insert(9, 0);
         let f = fse([(flat(18, 5), 5), (ml_gap, 6), (flat(35, 6), 6)]);
-        assert!(matches!(f.ml, FseTableState::Check(_)));
-        assert!(matches!(f.ll, FseTableState::Check(_)));
-        assert!(matches!(f.of, FseTableState::Valid(_)));
+        assert_eq!(f, (Repeat::Check, Repeat::Valid, Repeat::Check));
         // Offset codes up to 17 cover 64 bytes of content and 128 KiB.
         let f = fse([(flat(17, 5), 5), (flat(53, 6), 6), (flat(36, 6), 6)]);
-        assert!(matches!(f.of, FseTableState::Check(_)));
+        assert_eq!(f.1, Repeat::Check);
         let big = Parts {
             content: vec![0; 128 << 10],
             ..Parts::valid()
         };
-        assert!(matches!(
-            big.load().unwrap().fse.of,
-            FseTableState::Check(_)
-        ));
+        assert_eq!(modes(big).1, Repeat::Check);
     }
 
     /// Our verdict on `dict`, and whether libzstd accepts it

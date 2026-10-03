@@ -3,7 +3,7 @@
 
 use super::bitstream::BitCStream;
 use super::huf;
-use crate::compress::entropy::Repeat;
+use crate::compress::entropy::{FseHeld, FseNext, FseTables, Held, Next, Repeat, TableRef};
 use crate::compress::seqstore::Seq;
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
@@ -439,49 +439,6 @@ pub enum SymbolEncodingType {
     Rle = 1,
     Compressed = 2,
     Repeat = 3,
-}
-
-/// One sequence table as the decoder holds it (`FSE_CTable` plus its
-/// `FSE_repeat` mode).
-#[derive(Clone, Debug, Default)]
-pub enum FseTableState {
-    #[default]
-    None,
-    Check(FseCTable),
-    Valid(FseCTable),
-}
-
-impl FseTableState {
-    pub fn table(&self) -> Option<&FseCTable> {
-        match self {
-            FseTableState::None => None,
-            FseTableState::Check(t) | FseTableState::Valid(t) => Some(t),
-        }
-    }
-
-    pub fn repeat(&self) -> Repeat {
-        match self {
-            FseTableState::None => Repeat::None,
-            FseTableState::Check(_) => Repeat::Check,
-            FseTableState::Valid(_) => Repeat::Valid,
-        }
-    }
-
-    fn from_mode(mode: Repeat, table: &FseCTable) -> Self {
-        match mode {
-            Repeat::None => FseTableState::None,
-            Repeat::Check => FseTableState::Check(table.clone()),
-            Repeat::Valid => FseTableState::Valid(table.clone()),
-        }
-    }
-}
-
-/// `ZSTD_fseCTables_t`: literal-length, offset and match-length tables.
-#[derive(Clone, Debug, Default)]
-pub struct FseState {
-    pub ll: FseTableState,
-    pub of: FseTableState,
-    pub ml: FseTableState,
 }
 
 /// `FSE_MIN_TABLELOG`.
@@ -992,11 +949,12 @@ fn select_encoding_type(
 }
 
 /// `ZSTD_buildCTable`: write the table description for `ty` to `out` and
-/// return the table to encode with plus the number of bytes written. `None`
-/// where the C fails (normalization or NCount write errors, or `Repeat`
-/// without a previous table).
+/// return the table to encode with, the held one for `Repeat`, else built
+/// in the spare slot, plus the number of bytes written. `None` where the
+/// C fails (normalization or NCount write errors, or `Repeat` without a
+/// held table).
 #[allow(clippy::too_many_arguments)]
-fn build_ctable(
+fn build_ctable<'t>(
     out: &mut Vec<u8>,
     fse_log: u32,
     ty: SymbolEncodingType,
@@ -1007,20 +965,19 @@ fn build_ctable(
     default_norm: &[i16],
     default_norm_log: u32,
     default_max: usize,
-    prev_ctable: Option<&FseCTable>,
-) -> Option<(FseCTable, usize)> {
+    table: TableRef<'t, FseCTable>,
+) -> Option<(&'t FseCTable, usize)> {
+    let TableRef { held, spare } = table;
     match ty {
         SymbolEncodingType::Rle => {
             out.push(codes[0]);
-            let mut table = FseCTable::default();
-            table.build_rle(max as u8);
-            Some((table, 1))
+            spare.build_rle(max as u8);
+            Some((spare, 1))
         }
-        SymbolEncodingType::Repeat => Some((prev_ctable?.clone(), 0)),
+        SymbolEncodingType::Repeat => Some((held.table()?, 0)),
         SymbolEncodingType::Basic => {
-            let mut table = FseCTable::default();
-            table.build(default_norm, default_max, default_norm_log);
-            Some((table, 0))
+            spare.build(default_norm, default_max, default_norm_log);
+            Some((spare, 0))
         }
         SymbolEncodingType::Compressed => {
             let mut nb_seq_1 = nb_seq;
@@ -1045,9 +1002,8 @@ fn build_ctable(
                 return None;
             }
             let ncount_size = write_ncount(out, &norm[..=max], max, table_log).ok()?;
-            let mut table = FseCTable::default();
-            table.build(&norm, max, table_log);
-            Some((table, ncount_size))
+            spare.build(&norm, max, table_log);
+            Some((spare, ncount_size))
         }
     }
 }
@@ -1056,28 +1012,28 @@ fn build_ctable(
 /// (one `ZSTD_selectEncodingType` + `ZSTD_buildCTable` step of
 /// `ZSTD_buildSequencesStatistics`). `counts`, `max` and `most_frequent`
 /// are the `HIST_countFast_wksp` result for `codes`. Returns the table to
-/// encode with, the decoder-side state for the next block, the encoding
+/// encode with, what the block does to the decoder's table, the encoding
 /// type and the description size.
 #[allow(clippy::too_many_arguments)]
-fn build_seq_table(
+fn build_seq_table<'t>(
     out: &mut Vec<u8>,
     codes: &[u8],
     counts: &mut [u32; 256],
     max: usize,
     most_frequent: usize,
     fse_log: u32,
-    prev: &FseTableState,
+    table: TableRef<'t, FseCTable>,
     default_norm: &[i16],
     default_norm_log: u32,
     default_max: usize,
     strategy: Strategy,
-) -> Option<(FseCTable, FseTableState, SymbolEncodingType, usize)> {
+) -> Option<(&'t FseCTable, Next, SymbolEncodingType, usize)> {
     let nb_seq = codes.len();
     // We can only use the basic table if max <= DefaultMaxOff, otherwise
     // the offsets are too large (a no-op for LL/ML, whose default tables
     // span every code).
     let is_default_allowed = max <= default_max;
-    let mut repeat_mode = prev.repeat();
+    let mut repeat_mode = table.held.repeat();
     let ty = select_encoding_type(
         &mut repeat_mode,
         &counts[..],
@@ -1085,7 +1041,7 @@ fn build_seq_table(
         most_frequent,
         nb_seq,
         fse_log,
-        prev.table(),
+        table.held.table(),
         default_norm,
         default_norm_log,
         is_default_allowed,
@@ -1098,6 +1054,14 @@ fn build_seq_table(
             SymbolEncodingType::Compressed | SymbolEncodingType::Repeat
         ) || repeat_mode == Repeat::None
     );
+    // the mode select_encoding_type left (`FSE_repeat`), applied when the
+    // block is committed
+    let next = match ty {
+        SymbolEncodingType::Repeat => Next::Keep,
+        SymbolEncodingType::Compressed => Next::New,
+        SymbolEncodingType::Basic | SymbolEncodingType::Rle => Next::None,
+    };
+    debug_assert!(next != Next::New || repeat_mode == Repeat::Check);
     let (table, size) = build_ctable(
         out,
         fse_log,
@@ -1109,17 +1073,11 @@ fn build_seq_table(
         default_norm,
         default_norm_log,
         default_max,
-        prev.table(),
+        table,
     )?;
-    let next = FseTableState::from_mode(repeat_mode, &table);
     Some((table, next, ty, size))
 }
 
-/// Write the sequences section (Sequences_Section_Header onward, as in
-/// `ZSTD_entropyCompressSeqStore_internal`) and return the FSE state the
-/// decoder holds afterwards (`nextEntropy->fse`). With `nb_seq == 0` the
-/// tables carry over unchanged (`nextEntropy->fse = prevEntropy->fse`).
-///
 /// `FSE_NCountWriteBound`: maximum size of an `FSE_writeNCount` table
 /// description for symbols `0..=max_symbol` at `table_log`.
 fn ncount_write_bound(max_symbol: usize, table_log: u32) -> usize {
@@ -1130,7 +1088,7 @@ fn ncount_write_bound(max_symbol: usize, table_log: u32) -> usize {
 }
 
 /// Upper bound on the bytes [`encode_sequences_section_with`] appends for
-/// `seqs`, whatever the previous [`FseState`] and the [`CParams`], over
+/// `seqs`, whatever the tables the decoder holds and the [`CParams`], over
 /// every encoding type `ZSTD_selectEncodingType` can pick per stream:
 /// the sequence-count header, the modes byte, per stream the larger of the
 /// RLE byte and `FSE_NCountWriteBound(max code, *FSELog)` (Basic and
@@ -1216,9 +1174,14 @@ fn seq_to_codes<'a>(
     (ll_codes, of_codes, &mut ml_codes[..nb_seq])
 }
 
-/// `codes` is the buffer the sequence codes are written to
-/// (`ZSTD_seqToCodes`' `llCode`, `ofCode` and `mlCode`), kept across
-/// blocks.
+/// Write the sequences section (Sequences_Section_Header onward, as in
+/// `ZSTD_entropyCompressSeqStore_internal`) against the tables the decoder
+/// holds, building new ones in the spare slots of `tables`, and return
+/// what the section does to them (`nextEntropy->fse`). With `nb_seq == 0`
+/// the tables carry over unchanged (`nextEntropy->fse =
+/// prevEntropy->fse`). `codes` is the buffer the sequence codes are
+/// written to (`ZSTD_seqToCodes`' `llCode`, `ofCode` and `mlCode`), kept
+/// across blocks.
 ///
 /// `None` means the block must be emitted uncompressed: libzstd returns 0
 /// for the 1.3.4 decoder workaround (the last table description plus the
@@ -1229,9 +1192,9 @@ pub fn encode_sequences_section_with(
     out: &mut Vec<u8>,
     sequences: &[Seq],
     codes: &mut Vec<u8>,
-    prev: &FseState,
+    tables: FseTables<'_>,
     cparams: &CParams,
-) -> Option<FseState> {
+) -> Option<FseNext> {
     let strategy = cparams.strategy;
     let nb_seq = sequences.len();
 
@@ -1247,7 +1210,7 @@ pub fn encode_sequences_section_with(
     }
     if nb_seq == 0 {
         // Copy the old tables over as if we repeated them
-        return Some(prev.clone());
+        return Some(FseNext::KEEP);
     }
     let seq_head = out.len();
     out.push(0);
@@ -1286,7 +1249,7 @@ pub fn encode_sequences_section_with(
         ll_max,
         ll_most as usize,
         LL_FSE_LOG,
-        &prev.ll,
+        tables.ll,
         &LL_DEFAULT_NORM,
         LL_DEFAULT_NORM_LOG,
         MAX_LL,
@@ -1302,7 +1265,7 @@ pub fn encode_sequences_section_with(
         of_max,
         of_most as usize,
         OFF_FSE_LOG,
-        &prev.of,
+        tables.of,
         &OF_DEFAULT_NORM,
         OF_DEFAULT_NORM_LOG,
         DEFAULT_MAX_OFF,
@@ -1318,7 +1281,7 @@ pub fn encode_sequences_section_with(
         ml_max,
         ml_most as usize,
         ML_FSE_LOG,
-        &prev.ml,
+        tables.ml,
         &ML_DEFAULT_NORM,
         ML_DEFAULT_NORM_LOG,
         MAX_ML,
@@ -1330,7 +1293,7 @@ pub fn encode_sequences_section_with(
     out[seq_head] = ((ll_type as u8) << 6) | ((of_type as u8) << 4) | ((ml_type as u8) << 2);
 
     let bitstream_size = encode_sequences(
-        out, &ll_table, &of_table, &ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
+        out, ll_table, of_table, ml_table, ll_codes, of_codes, ml_codes, sequences, extra_bits,
     );
     // zstd versions <= 1.3.4 mistakenly report corruption when
     // FSE_readNCount() receives a buffer < 4 bytes: emit an uncompressed
@@ -1340,18 +1303,20 @@ pub fn encode_sequences_section_with(
         return None;
     }
 
-    Some(FseState {
+    Some(FseNext {
         ll: ll_next,
         of: of_next,
         ml: ml_next,
     })
 }
 
-/// Reusable buffers of [`estimate_sequences_section`].
+/// Reusable buffers of [`estimate_sequences_section`], and the table a
+/// candidate is built in.
 #[derive(Default)]
 pub struct EstimateScratch {
     codes: Vec<u8>,
     descriptions: Vec<u8>,
+    table: FseCTable,
 }
 
 /// `ZSTD_buildBlockEntropyStats_sequences` followed by
@@ -1368,7 +1333,7 @@ pub struct EstimateScratch {
 /// rounded down to bytes table by table.
 pub fn estimate_sequences_section(
     sequences: &[Seq],
-    prev: &FseState,
+    prev: FseHeld<'_>,
     cparams: &CParams,
     scratch: &mut EstimateScratch,
 ) -> Option<usize> {
@@ -1387,7 +1352,7 @@ pub fn estimate_sequences_section(
     struct Stream<'a> {
         codes: &'a [u8],
         fse_log: u32,
-        prev: &'a FseTableState,
+        prev: Held<'a, FseCTable>,
         default_norm: &'a [i16],
         default_norm_log: u32,
         default_max: usize,
@@ -1400,7 +1365,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: ll_codes,
             fse_log: LL_FSE_LOG,
-            prev: &prev.ll,
+            prev: prev.ll,
             default_norm: &LL_DEFAULT_NORM,
             default_norm_log: LL_DEFAULT_NORM_LOG,
             default_max: MAX_LL,
@@ -1410,7 +1375,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: of_codes,
             fse_log: OFF_FSE_LOG,
-            prev: &prev.of,
+            prev: prev.of,
             default_norm: &OF_DEFAULT_NORM,
             default_norm_log: OF_DEFAULT_NORM_LOG,
             default_max: DEFAULT_MAX_OFF,
@@ -1420,7 +1385,7 @@ pub fn estimate_sequences_section(
         Stream {
             codes: ml_codes,
             fse_log: ML_FSE_LOG,
-            prev: &prev.ml,
+            prev: prev.ml,
             default_norm: &ML_DEFAULT_NORM,
             default_norm_log: ML_DEFAULT_NORM_LOG,
             default_max: MAX_ML,
@@ -1450,7 +1415,10 @@ pub fn estimate_sequences_section(
             max,
             most as usize,
             fse_log,
-            prev,
+            TableRef {
+                held: prev,
+                spare: &mut scratch.table,
+            },
             default_norm,
             default_norm_log,
             default_max,
@@ -1488,6 +1456,7 @@ pub fn estimate_sequences_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress::entropy::FseSlots;
 
     fn built(norm: &[i16], max_symbol: usize, table_log: u32) -> FseCTable {
         let mut table = FseCTable::default();
@@ -1716,21 +1685,28 @@ mod tests {
     }
 
     /// Encoding types from the Sequences_Section_Header written by
-    /// `encode_sequences_section_with` for `seqs` (`nb_seq >= 128` and
-    /// `< LONGNBSEQ` assumed, so the count takes 2 bytes).
-    fn section_types(seqs: &[Seq], prev: &FseState, strategy: Strategy) -> (u8, u8, u8, FseState) {
+    /// `encode_sequences_section_with` for `seqs` against `tables`, which
+    /// then commit the section (`nb_seq >= 128` and `< LONGNBSEQ`
+    /// assumed, so the count takes 2 bytes).
+    fn section_types(seqs: &[Seq], tables: &mut FseSlots, strategy: Strategy) -> (u8, u8, u8) {
         let mut out = Vec::new();
         let next = encode_sequences_section_with(
             &mut out,
             seqs,
             &mut Vec::new(),
-            prev,
+            tables.split(),
             &cparams(strategy),
         )
         .unwrap();
+        tables.commit(next);
         assert!((128..LONGNBSEQ).contains(&seqs.len()));
         let head = out[2];
-        (head >> 6, (head >> 4) & 3, (head >> 2) & 3, next)
+        (head >> 6, (head >> 4) & 3, (head >> 2) & 3)
+    }
+
+    fn repeats(tables: &FseSlots) -> (Repeat, Repeat, Repeat) {
+        let held = tables.held();
+        (held.ll.repeat(), held.of.repeat(), held.ml.repeat())
     }
 
     #[test]
@@ -1740,34 +1716,34 @@ mod tests {
         // bound, so Repeat wins (at 3000 the fresh table wins again, as in
         // libzstd).
         let seqs = skewed_seqs(200);
-        let (ll, of, ml, next) = section_types(&seqs, &FseState::default(), Strategy::Lazy2);
-        assert_eq!((ll, of, ml), (2, 2, 2), "first block: custom tables");
-        assert_eq!(next.ll.repeat(), Repeat::Check);
-        assert_eq!(next.of.repeat(), Repeat::Check);
-        assert_eq!(next.ml.repeat(), Repeat::Check);
-        let (ll, of, ml, next2) = section_types(&seqs, &next, Strategy::Lazy2);
-        assert_eq!((ll, of, ml), (3, 3, 3), "second block: repeat");
-        assert_eq!(next2.ll.repeat(), Repeat::Check);
-        assert_eq!(
-            next2.ll.table().unwrap().state_table,
-            next.ll.table().unwrap().state_table
-        );
+        let mut tables = FseSlots::default();
+        let types = section_types(&seqs, &mut tables, Strategy::Lazy2);
+        assert_eq!(types, (2, 2, 2), "first block: custom tables");
+        let check = (Repeat::Check, Repeat::Check, Repeat::Check);
+        assert_eq!(repeats(&tables), check);
+        let first_ll = tables.held().ll.table().unwrap().state_table;
+        let mut wider_tables = tables.clone();
+        let types = section_types(&seqs, &mut tables, Strategy::Lazy2);
+        assert_eq!(types, (3, 3, 3), "second block: repeat");
+        assert_eq!(repeats(&tables), check);
+        assert_eq!(tables.held().ll.table().unwrap().state_table, first_ll);
         // A symbol the previous table cannot encode rules Repeat out.
         let mut wider = seqs.clone();
         wider[10].lit_len = 70_000;
-        let (ll, _, _, _) = section_types(&wider, &next, Strategy::Lazy2);
+        let (ll, _, _) = section_types(&wider, &mut wider_tables, Strategy::Lazy2);
         assert_eq!(ll, 2);
     }
 
     #[test]
     fn heuristic_path_never_repeats_check_tables() {
         let seqs = skewed_seqs(3000);
-        let (ll, _, _, next) = section_types(&seqs, &FseState::default(), Strategy::Fast);
+        let mut tables = FseSlots::default();
+        let (ll, _, _) = section_types(&seqs, &mut tables, Strategy::Fast);
         assert_eq!(ll, 2);
-        assert_eq!(next.ll.repeat(), Repeat::Check);
-        let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Fast);
+        assert_eq!(tables.held().ll.repeat(), Repeat::Check);
+        let (ll, _, _) = section_types(&seqs, &mut tables.clone(), Strategy::Fast);
         assert_eq!(ll, 2);
-        let (ll, _, _, _) = section_types(&seqs, &next, Strategy::Greedy);
+        let (ll, _, _) = section_types(&seqs, &mut tables.clone(), Strategy::Greedy);
         assert_eq!(ll, 2);
     }
 
@@ -1780,7 +1756,7 @@ mod tests {
             &mut out,
             &seqs,
             &mut Vec::new(),
-            &FseState::default(),
+            FseSlots::default().split(),
             &cparams(Strategy::Fast),
         )
         .unwrap();
@@ -1791,7 +1767,7 @@ mod tests {
             &mut out,
             &seqs,
             &mut Vec::new(),
-            &FseState::default(),
+            FseSlots::default().split(),
             &cparams(Strategy::Fast),
         )
         .unwrap();
@@ -1812,12 +1788,12 @@ mod tests {
                 &mut out,
                 &seqs,
                 &mut Vec::new(),
-                &FseState::default(),
+                FseSlots::default().split(),
                 &cparams(Strategy::Lazy),
             )
             .unwrap();
             assert_eq!(out[1] >> 6, expected, "nb_seq {nb_seq}");
-            assert_eq!(next.ll.repeat(), Repeat::None);
+            assert_eq!(next.ll, Next::None);
         }
     }
 

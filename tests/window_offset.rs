@@ -10,7 +10,7 @@
 
 mod common;
 
-use rust_zstd::compress::block::{build_seq_store, BlockLdm, BlockState};
+use rust_zstd::compress::block::{build_seq_store, BlockLdm, REP_START_VALUE};
 use rust_zstd::compress::lazy::{default_search_method, SearchMethod};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{CParams, CompressOptions, ParamSwitch, SeqStore, Strategy};
@@ -344,7 +344,7 @@ fn finders_stop_short_of_the_window() {
         };
         for method in methods {
             let mut ms = MatchState::new_for(cp, 0, method);
-            let mut rep = BlockState::initial().rep;
+            let mut rep = REP_START_VALUE;
             let mut decoder_rep = [1, 4, 8];
             let mut store = SeqStore::new();
             let mut max = 0;

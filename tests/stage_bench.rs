@@ -18,7 +18,8 @@
 //! The replica cuts 128 KiB blocks, so both compressors run with the
 //! pre-splitter off (`block_splitter_level` 1, `ZSTD_c_blockSplitterLevel` 1).
 
-use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH};
+use rust_zstd::compress::block::{self, BlockScratch, REP_START_VALUE, RLE_MAX_LENGTH};
+use rust_zstd::compress::entropy::EntropyTables;
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{
     compress_with, job_prefix, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
@@ -65,10 +66,11 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
         let prefix = job_prefix(job, first_job, overlap);
         let t = Instant::now();
         let mut ms = MatchState::new(cparams, prefix.start);
-        let mut prev = BlockState::initial();
+        let mut rep = REP_START_VALUE;
+        let mut tables = EntropyTables::default();
         if !first_job {
             block::load_prefix(&mut ms, data, prefix);
-            prev.invalidate_rep_codes();
+            rep = [0; 3];
         }
         st.block += t.elapsed();
         let mut scratch = BlockScratch::new(block_size);
@@ -86,14 +88,14 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
                 &mut ms,
                 data,
                 entered,
-                prev.rep,
+                rep,
                 &mut scratch.store,
                 &mut block::BlockLdm::Off,
                 None,
             );
             st.block += t.elapsed();
             // None below 7 bytes (RAW)
-            if let Some(rep) = built {
+            if let Some(block_rep) = built {
                 let store = &scratch.store;
                 let cbuf = &mut scratch.cbuf;
                 cbuf.clear();
@@ -102,7 +104,7 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
                     cbuf,
                     &store.lits,
                     store.seqs.len(),
-                    &prev.huf,
+                    tables.huf.split(),
                     &cparams,
                 );
                 st.lits += t.elapsed();
@@ -111,13 +113,13 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
                     cbuf,
                     &store.seqs,
                     &mut scratch.codes,
-                    &prev.fse,
+                    tables.fse.split(),
                     &cparams,
                 );
                 st.seqs += t.elapsed();
                 if let Some(fse) = fse {
                     if cbuf.len() < block_len - CParams::min_gain(block_len, cparams.strategy) {
-                        next = Some(BlockState { rep, huf, fse });
+                        next = Some((block_rep, huf, fse));
                     }
                 }
             }
@@ -129,8 +131,10 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
             };
             if !is_first && c_size < RLE_MAX_LENGTH && block::is_rle(bdata) {
                 block::write_rle_block(&mut out, bdata[0], bdata.len(), is_last);
-            } else if let Some(next) = next {
-                prev = next;
+            } else if let Some((block_rep, huf, fse)) = next {
+                rep = block_rep;
+                tables.huf.commit(huf);
+                tables.fse.commit(fse);
                 block::write_compressed_block(&mut out, &scratch.cbuf, is_last);
             } else {
                 block::write_raw_block(&mut out, bdata, is_last);

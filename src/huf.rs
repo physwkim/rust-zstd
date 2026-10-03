@@ -5,7 +5,7 @@
 //! `lib/compress/zstd_compress_literals.c` (`ZSTD_compressLiterals`).
 
 use super::fse;
-use crate::compress::entropy::Repeat;
+use crate::compress::entropy::{Held, Next, Repeat, TableRef};
 use crate::compress::{CParams, Strategy};
 use crate::constants::*;
 
@@ -32,6 +32,16 @@ pub struct HufTable {
     pub max_symbol: u8,
 }
 
+impl Default for HufTable {
+    fn default() -> Self {
+        Self {
+            elts: [0; 256],
+            table_log: 0,
+            max_symbol: 0,
+        }
+    }
+}
+
 impl HufTable {
     /// `HUF_getNbBits`.
     #[inline]
@@ -47,36 +57,6 @@ impl HufTable {
             0
         } else {
             (self.elts[symbol] >> (64 - nb)) as u32
-        }
-    }
-}
-
-/// `ZSTD_hufCTables_t`: the Huffman table the decoder currently holds and its
-/// `HUF_repeat` mode. `None` (`HUF_repeat_none`): no table. `Check`
-/// (`HUF_repeat_check`): the table may be reused if it covers every symbol.
-/// `Valid` (`HUF_repeat_valid`): known to cover the symbols (dictionaries
-/// only; never produced here).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum HufState {
-    #[default]
-    None,
-    Check(HufTable),
-    Valid(HufTable),
-}
-
-impl HufState {
-    pub fn table(&self) -> Option<&HufTable> {
-        match self {
-            HufState::None => None,
-            HufState::Check(t) | HufState::Valid(t) => Some(t),
-        }
-    }
-
-    pub fn repeat(&self) -> Repeat {
-        match self {
-            HufState::None => Repeat::None,
-            HufState::Check(_) => Repeat::Check,
-            HufState::Valid(_) => Repeat::Valid,
         }
     }
 }
@@ -446,13 +426,15 @@ fn huf_set_max_height(
     target_nb_bits
 }
 
-/// `HUF_buildCTableFromTree`.
+/// `HUF_buildCTableFromTree` into `table`; the symbols past `max_symbol`
+/// get no code.
 fn huf_build_ctable_from_tree(
+    table: &mut HufTable,
     nodes: &[NodeElt; HUFF_NODE_TABLE_SIZE],
     non_null_rank: usize,
     max_symbol: usize,
     max_nb_bits: u32,
-) -> HufTable {
+) {
     let huff_node = &nodes[1..];
     let mut nb_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
     let mut val_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
@@ -468,11 +450,12 @@ fn huf_build_ctable_from_tree(
             min >>= 1;
         }
     }
-    let mut elts = [0u64; 256];
+    let elts = &mut table.elts;
     for node in &huff_node[..alphabet_size] {
         // push nbBits per symbol, symbol order
         elts[node.byte as usize] = node.nb_bits as u64;
     }
+    elts[alphabet_size..].fill(0);
     for elt in elts.iter_mut().take(alphabet_size) {
         // assign value within rank, symbol order
         let nb_bits = (*elt & 0xFF) as usize;
@@ -483,17 +466,20 @@ fn huf_build_ctable_from_tree(
             *elt |= (value as u64) << (64 - nb_bits);
         }
     }
-    HufTable {
-        elts,
-        table_log: max_nb_bits as u8,
-        max_symbol: max_symbol as u8,
-    }
+    table.table_log = max_nb_bits as u8;
+    table.max_symbol = max_symbol as u8;
 }
 
 /// `HUF_buildCTable_wksp`: build a length-limited canonical Huffman table
-/// for `count[..=max_symbol]`. Returns `None` for the C `GENERIC` error when
-/// the depth cannot be limited to `HUF_TABLELOG_MAX`.
-pub fn build_ctable(count: &[u32], max_symbol: usize, max_nb_bits: u32) -> Option<HufTable> {
+/// for `count[..=max_symbol]` into `table`. Returns `None` for the C
+/// `GENERIC` error when the depth cannot be limited to `HUF_TABLELOG_MAX`,
+/// leaving `table` unchanged.
+pub fn build_ctable(
+    table: &mut HufTable,
+    count: &[u32],
+    max_symbol: usize,
+    max_nb_bits: u32,
+) -> Option<()> {
     let max_nb_bits = if max_nb_bits == 0 {
         HUF_TABLELOG_DEFAULT
     } else {
@@ -507,12 +493,8 @@ pub fn build_ctable(count: &[u32], max_symbol: usize, max_nb_bits: u32) -> Optio
     if max_nb_bits > HUF_TABLELOG_MAX {
         return None;
     }
-    Some(huf_build_ctable_from_tree(
-        &nodes,
-        non_null_rank,
-        max_symbol,
-        max_nb_bits,
-    ))
+    huf_build_ctable_from_tree(table, &nodes, non_null_rank, max_symbol, max_nb_bits);
+    Some(())
 }
 
 /// `HUF_estimateCompressedSize`: bytes `count[..=max_symbol]` would take
@@ -883,11 +865,12 @@ fn optimal_table_log(
     let mut opt_size = usize::MAX - 1;
     let mut opt_log = max_table_log;
     let mut header = Vec::with_capacity(HUF_SYMBOLVALUE_MAX + 2);
+    let mut table = HufTable::default();
     // Search until size increases
     for guess in min_table_log..=max_table_log {
-        let Some(table) = build_ctable(count, max_symbol, guess) else {
+        if build_ctable(&mut table, count, max_symbol, guess).is_none() {
             continue;
-        };
+        }
         let max_bits = table.table_log as u32;
         if max_bits < guess && guess > min_table_log {
             break;
@@ -912,14 +895,17 @@ fn optimal_table_log(
 /// `HUF_compress_internal` for `HUF_compress1X_repeat` /
 /// `HUF_compress4X_repeat` with `maxSymbolValue = 255` and
 /// `huffLog = LitHufLog`. Appends the tree description (if any) and the
-/// streams to `out`; `table`/`repeat` are the C `oldHufTable`/`repeat`
-/// in-out parameters. Returns `Some(0)` for "not compressible", `Some(1)`
-/// for a single-symbol input (nothing appended), `None` for a C error.
+/// streams to `out`; `old`/`repeat` are the C `oldHufTable`/`repeat`
+/// parameters, and a new table is built in `spare`: the streams use it
+/// exactly when `repeat` is set to `None`. Returns `Some(0)` for "not
+/// compressible", `Some(1)` for a single-symbol input (nothing appended),
+/// `None` for a C error.
 fn compress_internal(
     out: &mut Vec<u8>,
     src: &[u8],
     single_stream: bool,
-    table: &mut Option<HufTable>,
+    old: Option<&HufTable>,
+    spare: &mut HufTable,
     repeat: &mut Repeat,
     flags: HufFlags,
 ) -> Option<usize> {
@@ -934,7 +920,7 @@ fn compress_internal(
     let huff_log = HUF_TABLELOG_DEFAULT;
 
     if flags.prefer_repeat && *repeat == Repeat::Valid {
-        let old = table.as_ref()?;
+        let old = old?;
         return Some(compress_ctable_internal(
             out,
             ostart,
@@ -973,14 +959,12 @@ fn compress_internal(
     }
 
     if *repeat == Repeat::Check
-        && !table
-            .as_ref()
-            .is_some_and(|t| validate_ctable(t, &count, max_symbol_value))
+        && !old.is_some_and(|t| validate_ctable(t, &count, max_symbol_value))
     {
         *repeat = Repeat::None;
     }
     if flags.prefer_repeat && *repeat != Repeat::None {
-        let old = table.as_ref()?;
+        let old = old?;
         return Some(compress_ctable_internal(
             out,
             ostart,
@@ -997,14 +981,14 @@ fn compress_internal(
         &count,
         flags.optimal_depth,
     );
-    let new_table = build_ctable(&count, max_symbol_value, huff_log)?;
-    let huff_log = new_table.table_log as u32;
+    build_ctable(spare, &count, max_symbol_value, huff_log)?;
+    let huff_log = spare.table_log as u32;
 
-    let h_size = write_ctable(out, &new_table, max_symbol_value, huff_log)?;
+    let h_size = write_ctable(out, spare, max_symbol_value, huff_log)?;
     if *repeat != Repeat::None {
-        let old = table.as_ref()?;
+        let old = old?;
         let old_size = estimate_compressed_size(old, &count, max_symbol_value);
-        let new_size = estimate_compressed_size(&new_table, &count, max_symbol_value);
+        let new_size = estimate_compressed_size(spare, &count, max_symbol_value);
         if old_size <= h_size + new_size || h_size + 12 >= src_size {
             out.truncate(ostart);
             return Some(compress_ctable_internal(
@@ -1021,14 +1005,12 @@ fn compress_internal(
         return Some(0);
     }
     *repeat = Repeat::None;
-    *table = Some(new_table);
-    let new = table.as_ref().unwrap();
     Some(compress_ctable_internal(
         out,
         ostart,
         src,
         single_stream,
-        new,
+        spare,
     ))
 }
 
@@ -1090,9 +1072,9 @@ fn literals_compression_is_disabled(cparams: &CParams) -> bool {
 }
 
 /// Upper bound on the bytes [`compress_literals_with`] appends for
-/// `lit_len` literals, whatever their content, the previous [`HufState`]
-/// and the [`CParams`]: the Raw_Literals_Block, `lit_len` plus its 1, 2
-/// or 3 byte header (`ZSTD_noCompressLiterals`).
+/// `lit_len` literals, whatever their content, the Huffman table the
+/// decoder holds and the [`CParams`]: the Raw_Literals_Block, `lit_len`
+/// plus its 1, 2 or 3 byte header (`ZSTD_noCompressLiterals`).
 ///
 /// [`compress_literals_with`] has no failure return; every path ends in
 /// one of three sections, each within the bound:
@@ -1128,7 +1110,7 @@ const COMPRESS_LITERALS_SIZE_MIN: usize = 63;
 /// is costed without its header.
 pub fn estimate_literals_section(
     literals: &[u8],
-    prev: &HufState,
+    prev: Held<'_, HufTable>,
     cparams: &CParams,
     desc: &mut Vec<u8>,
 ) -> Option<usize> {
@@ -1169,7 +1151,8 @@ pub fn estimate_literals_section(
         &count,
         cparams.strategy >= HUF_OPTIMAL_DEPTH_THRESHOLD,
     );
-    let table = build_ctable(&count, max_symbol, huff_log)?;
+    let mut table = HufTable::default();
+    build_ctable(&mut table, &count, max_symbol, huff_log)?;
     let new_c_size = estimate_compressed_size(&table, &count, max_symbol);
     desc.clear();
     // The C does not check HUF_writeCTable_wksp's result: an error is
@@ -1198,19 +1181,22 @@ pub fn estimate_literals_section(
     Some(new_c_size + h_size + jump_table + header) // set_compressed
 }
 
-/// `ZSTD_compressLiterals`: write the literals section for one block and
-/// return the Huffman state the decoder holds afterwards (`nextHuf`).
-/// `nb_seq` is the block's sequence count, from which the caller-side
-/// `suspectUncompressible` flag is derived as in
+/// `ZSTD_compressLiterals`: write the literals section for one block
+/// against the Huffman table the decoder holds, `huf.held`, building a new
+/// table in `huf.spare`, and return what the section does to the table
+/// (`nextHuf`): [`Next::New`] for a section that describes the spare,
+/// else [`Next::Keep`]. `nb_seq` is the block's sequence count, from which
+/// the caller-side `suspectUncompressible` flag is derived as in
 /// `ZSTD_entropyCompressSeqStore_internal`; `cparams` supplies the
 /// strategy and the `disableLiteralCompression` decision.
 pub fn compress_literals_with(
     out: &mut Vec<u8>,
     literals: &[u8],
     nb_seq: usize,
-    prev: &HufState,
+    huf: TableRef<'_, HufTable>,
     cparams: &CParams,
-) -> HufState {
+) -> Next {
+    let TableRef { held, spare } = huf;
     let strategy = cparams.strategy;
     let src_size = literals.len();
     let lh_size = 3 + (src_size >= 1024) as usize + (src_size >= 16384) as usize;
@@ -1219,13 +1205,13 @@ pub fn compress_literals_with(
 
     if literals_compression_is_disabled(cparams) {
         encode_literals_raw(out, literals);
-        return prev.clone();
+        return Next::Keep;
     }
 
     // if too small, don't even attempt compression (speed opt)
-    if src_size < min_literals_to_compress(strategy, prev.repeat()) {
+    if src_size < min_literals_to_compress(strategy, held.repeat()) {
         encode_literals_raw(out, literals);
-        return prev.clone();
+        return Next::Keep;
     }
 
     let flags = HufFlags {
@@ -1234,18 +1220,21 @@ pub fn compress_literals_with(
         suspect_uncompressible: nb_seq == 0
             || src_size / nb_seq >= SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO,
     };
-    let (mut table, mut repeat) = match prev {
-        HufState::None => (None, Repeat::None),
-        HufState::Check(t) => (Some(t.clone()), Repeat::Check),
-        HufState::Valid(t) => (Some(t.clone()), Repeat::Valid),
-    };
+    let mut repeat = held.repeat();
     if repeat == Repeat::Valid && lh_size == 3 {
         single_stream = true;
     }
     let ostart = out.len();
     out.resize(ostart + lh_size, 0);
-    let c_lit_size =
-        compress_internal(out, literals, single_stream, &mut table, &mut repeat, flags);
+    let c_lit_size = compress_internal(
+        out,
+        literals,
+        single_stream,
+        held.table(),
+        spare,
+        &mut repeat,
+        flags,
+    );
     if repeat != Repeat::None {
         // reused the existing table
         h_type = LIT_TYPE_TREELESS;
@@ -1257,21 +1246,21 @@ pub fn compress_literals_with(
         _ => {
             out.truncate(ostart);
             encode_literals_raw(out, literals);
-            return prev.clone();
+            return Next::Keep;
         }
     };
     if c_lit_size == 1 && (src_size >= 8 || literals.iter().all(|&b| b == literals[0])) {
         out.truncate(ostart);
         encode_literals_rle(out, literals[0], src_size);
-        return prev.clone();
+        return Next::Keep;
     }
     debug_assert_eq!(out.len(), ostart + lh_size + c_lit_size);
 
     let next = if h_type == LIT_TYPE_COMPRESSED {
         // using a newly constructed table
-        HufState::Check(table.expect("a new table was written"))
+        Next::New
     } else {
-        prev.clone()
+        Next::Keep
     };
 
     // Build header
