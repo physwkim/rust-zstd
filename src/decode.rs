@@ -4891,14 +4891,21 @@ mod parallel {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Batches with fewer compressed blocks decode on the calling thread:
-    /// three blocks of 34-56 KiB took 7-41% less time on the pool.
+    /// three blocks of 34-86 KiB took 27-46% less time on the pool on eight
+    /// cores sharing an L3, and 20-37% less on eight over two L3s (timed
+    /// as for `MIN_BYTES`).
     pub(super) const MIN_BLOCKS: usize = 3;
 
     /// Batches whose compressed blocks hold fewer bytes decode on the
-    /// calling thread. On eight cores sharing an L3 the pool took less time
-    /// from 10 KiB up, but on eight cores over two L3s it took up to 37%
-    /// more on frames of seven or eight 128 KiB blocks up to 29 KiB, and at
-    /// most 3% more from 30 KiB.
+    /// calling thread. Timed on 16 different frames of three or more 128
+    /// KiB blocks decoded in turn (one frame decoded over and over lets the
+    /// branch predictor learn it), the pool took less time on eight cores
+    /// sharing an L3 from 4 KiB up, for blocks of 300 B or more. On eight
+    /// cores over two L3s, blocks of 1 KiB or more took up to 40% more time
+    /// below 16 KiB and less from 20 KiB, and blocks of 300 B up to 7% more
+    /// at 19-26 KiB and less from 28 KiB. Blocks of 156 B lose by a
+    /// per-block cost that no byte count pays off: at 37 KiB they took 2%
+    /// more on one L3 and 4-7% more on two.
     pub(super) const MIN_BYTES: usize = 32 * 1024;
 
     /// When a batch of blocks decodes on the rayon pool
