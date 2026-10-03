@@ -6,8 +6,9 @@
 
 mod common;
 
+use rust_zstd::compress::entropy::{Next, Slots};
 use rust_zstd::compress::{CParams, Strategy};
-use rust_zstd::huf::{compress_literals_with, HufState};
+use rust_zstd::huf::{compress_literals_with, HufTable};
 use std::path::Path;
 
 fn cparams(strategy: Strategy, target_length: u32) -> CParams {
@@ -81,7 +82,7 @@ fn literals_sections_match_libzstd_and_decode() {
         let mut it = line.split_whitespace();
         let chain = it.next().unwrap();
         let cp = cparams(strategy(it.next().unwrap().parse().unwrap()), 0);
-        let mut prev = HufState::None;
+        let mut huf = Slots::<HufTable>::default();
         let mut sections = Vec::new();
         let mut all_literals = Vec::new();
         for step in it {
@@ -90,7 +91,8 @@ fn literals_sections_match_libzstd_and_decode() {
             let literals = std::fs::read(dir.join(format!("{input}.in"))).unwrap();
             let expected = std::fs::read(dir.join(format!("{chain}__{input}.expected"))).unwrap();
             let mut out = Vec::new();
-            prev = compress_literals_with(&mut out, &literals, nb_seq, &prev, &cp);
+            let next = compress_literals_with(&mut out, &literals, nb_seq, huf.split(), &cp);
+            huf.commit(next);
             let what = format!("{chain}/{input} section");
             if let Err(e) = common::check_size(&what, out.len(), expected.len()) {
                 panic!("{e}");
@@ -113,11 +115,11 @@ fn negative_level_disables_literal_compression() {
         &mut out,
         &literals,
         150,
-        &HufState::None,
+        Slots::<HufTable>::default().split(),
         &cparams(Strategy::Fast, 0),
     );
     assert_eq!(out[0] & 3, 2, "compressible input compresses at level 1");
-    assert!(matches!(next, HufState::Check(_)));
+    assert_eq!(next, Next::New);
 
     // ZSTD_literalsCompressionIsDisabled: ZSTD_fast with targetLength > 0
     let mut out = Vec::new();
@@ -125,7 +127,7 @@ fn negative_level_disables_literal_compression() {
         &mut out,
         &literals,
         150,
-        &HufState::None,
+        Slots::<HufTable>::default().split(),
         &cparams(Strategy::Fast, 1),
     );
     assert_eq!(out[0] & 3, 0, "raw block");
@@ -134,6 +136,6 @@ fn negative_level_disables_literal_compression() {
         2 + literals.len(),
         "2-byte raw header + literals"
     );
-    assert_eq!(next, HufState::None);
+    assert_eq!(next, Next::Keep);
     decodes_to(&[out], &literals, "target_length 1");
 }

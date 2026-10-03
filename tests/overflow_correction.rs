@@ -30,7 +30,7 @@
 
 mod common;
 
-use rust_zstd::compress::block::{build_seq_store, BlockLdm, BlockState};
+use rust_zstd::compress::block::{build_seq_store, BlockLdm, REP_START_VALUE};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::{CParams, CompressOptions, Compressor, ParamSwitch, SeqStore};
 use std::collections::BTreeMap;
@@ -351,7 +351,7 @@ fn window_low_follows_libzstd_low_limit() {
                 let want = (b[2], b[3], b[4]);
                 assert_eq!(got, want, "L{level} frame {frame}: block {row}");
                 if start == 0 {
-                    let rep = BlockState::initial().rep;
+                    let rep = REP_START_VALUE;
                     build_seq_store(
                         &mut ms,
                         &data,

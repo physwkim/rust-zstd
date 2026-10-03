@@ -15,14 +15,15 @@
 //!
 //! `ZSTD_CORPUS_DIR` overrides the corpus directory.
 
-use rust_zstd::compress::block::{self, BlockScratch, BlockState, RLE_MAX_LENGTH};
+use rust_zstd::compress::block::{self, BlockScratch, REP_START_VALUE, RLE_MAX_LENGTH};
+use rust_zstd::compress::entropy::{EntropyTables, FseNext, FseSlots, Next};
 use rust_zstd::compress::matchstate::MatchState;
 use rust_zstd::compress::seqstore::Seq;
 use rust_zstd::compress::{
     compress_with, job_prefix, job_ranges, job_size_for, overlap_size, CParams, CompressOptions,
 };
 use rust_zstd::constants::ZSTD_BLOCKSIZE_MAX;
-use rust_zstd::fse::{self, sequences_section_bound, FseState};
+use rust_zstd::fse::{self, sequences_section_bound};
 use rust_zstd::huf::{self, literals_section_bound};
 use std::path::{Path, PathBuf};
 
@@ -35,27 +36,30 @@ struct Tally {
     proven: usize,
 }
 
-/// Run both stages on one block's store against `prev`, check the bounds
-/// and return `(section bytes, BlockState)` when the block compresses.
+/// Run both stages on one block's store against `tables`, check the bounds
+/// and return the section bytes and what the block does to the tables
+/// when it compresses.
 fn stages(
     store_lits: &[u8],
     seqs: &[Seq],
-    prev: &BlockState,
-    rep: [u32; 3],
+    tables: &mut EntropyTables,
     cparams: &CParams,
     block_len: usize,
     what: &str,
-) -> Option<(Vec<u8>, BlockState)> {
+) -> Option<(Vec<u8>, Next, FseNext)> {
     let lit_bound = literals_section_bound(store_lits.len());
     let seq_bound = sequences_section_bound(seqs);
     let mut cbuf = Vec::new();
-    let huf = huf::compress_literals_with(&mut cbuf, store_lits, seqs.len(), &prev.huf, cparams);
+    let huf_tables = tables.huf.split();
+    let huf = huf::compress_literals_with(&mut cbuf, store_lits, seqs.len(), huf_tables, cparams);
     let lit_size = cbuf.len();
     assert!(
         lit_size <= lit_bound,
         "{what}: literals {lit_size} > bound {lit_bound}"
     );
-    let fse = fse::encode_sequences_section_with(&mut cbuf, seqs, &prev.fse, cparams);
+    let fse_tables = tables.fse.split();
+    let fse =
+        fse::encode_sequences_section_with(&mut cbuf, seqs, &mut Vec::new(), fse_tables, cparams);
     let seq_size = cbuf.len() - lit_size;
     assert!(
         seq_size <= seq_bound,
@@ -70,7 +74,7 @@ fn stages(
         "{what}: bounds {lit_bound}+{seq_bound} < {limit} but the block is not compressed"
     );
     let fse = fse?;
-    compressed.then_some((cbuf, BlockState { rep, huf, fse }))
+    compressed.then_some((cbuf, huf, fse))
 }
 
 /// `compress_with`'s job and block loop around [`stages`]. Returns the
@@ -80,17 +84,17 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
     let block_size = ZSTD_BLOCKSIZE_MAX.min(1usize << cparams.window_log);
     let overlap = overlap_size(&cparams, 0, false);
     let jobs = job_ranges(data.len(), job_size_for(None, &cparams, false, overlap));
-    let fresh = BlockState::initial();
     let mut out = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
         let first_job = k == 0;
         let last_job = k + 1 == jobs.len();
         let prefix = job_prefix(job, first_job, overlap);
         let mut ms = MatchState::new(cparams, prefix.start);
-        let mut prev = BlockState::initial();
+        let mut rep = REP_START_VALUE;
+        let mut tables = EntropyTables::default();
         if !first_job {
             block::load_prefix(&mut ms, data, prefix);
-            prev.invalidate_rep_codes();
+            rep = [0; 3];
         }
         let mut scratch = BlockScratch::new(block_size);
         let mut start = job.start;
@@ -106,13 +110,13 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
                 &mut ms,
                 data,
                 entered,
-                prev.rep,
+                rep,
                 &mut scratch.store,
                 &mut block::BlockLdm::Off,
                 None,
             );
             // None below 7 bytes (RAW)
-            if let Some(rep) = built {
+            if let Some(block_rep) = built {
                 tally.blocks += 1;
                 let store = &scratch.store;
                 let proven = literals_section_bound(store.lits.len())
@@ -123,8 +127,7 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
                 stages(
                     &store.lits,
                     &store.seqs,
-                    &fresh,
-                    rep,
+                    &mut EntropyTables::default(),
                     &cparams,
                     block_len,
                     &format!("{what} (fresh state)"),
@@ -132,20 +135,22 @@ fn sweep(data: &[u8], level: i32, name: &str, tally: &mut Tally) -> Vec<u8> {
                 next = stages(
                     &store.lits,
                     &store.seqs,
-                    &prev,
-                    rep,
+                    &mut tables,
                     &cparams,
                     block_len,
                     &what,
-                );
+                )
+                .map(|(cbuf, huf, fse)| (cbuf, block_rep, huf, fse));
             }
             let bdata = &data[start..end];
-            let c_size = next.as_ref().map_or(0, |(c, _)| c.len());
+            let c_size = next.as_ref().map_or(0, |(c, ..)| c.len());
             if !is_first && c_size < RLE_MAX_LENGTH && block::is_rle(bdata) {
                 block::write_rle_block(&mut out, bdata[0], bdata.len(), is_last);
-            } else if let Some((cbuf, state)) = next {
+            } else if let Some((cbuf, block_rep, huf, fse)) = next {
                 tally.compressed += 1;
-                prev = state;
+                rep = block_rep;
+                tables.huf.commit(huf);
+                tables.fse.commit(fse);
                 block::write_compressed_block(&mut out, &cbuf, is_last);
             } else {
                 block::write_raw_block(&mut out, bdata, is_last);
@@ -323,7 +328,8 @@ fn sequences_bound_guards_the_decoder_workaround() {
     let st = fse::encode_sequences_section_with(
         &mut out,
         &[],
-        &FseState::default(),
+        &mut Vec::new(),
+        FseSlots::default().split(),
         &CParams::for_level(1, 1 << 20),
     );
     assert!(st.is_some() && out.len() == 1);
