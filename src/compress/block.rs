@@ -101,6 +101,8 @@ pub struct BlockScratch {
     /// sized on first use.
     pub next: SeqStore,
     pub cbuf: Vec<u8>,
+    /// The sequence codes of [`fse::encode_sequences_section_with`].
+    pub codes: Vec<u8>,
     /// The post-sequence splitter's partitions and estimator buffers.
     pub splitter: BlockSplitter,
     /// The pre-splitter's fingerprints.
@@ -120,6 +122,10 @@ impl BlockScratch {
         self.store.reserve(block_size);
         self.cbuf
             .reserve_exact(block_size.saturating_sub(self.cbuf.len()));
+        // three codes per sequence of the store's reservation
+        let codes = 3 * (block_size / 4 + 1);
+        self.codes
+            .reserve_exact(codes.saturating_sub(self.codes.len()));
     }
 }
 
@@ -443,20 +449,22 @@ fn proven_rep_after(
 }
 
 /// `ZSTD_entropyCompressSeqStore`: code `sections` of a `block_len`-byte
-/// block into `cbuf` from the committed tables `prev`, returning the state
-/// the block commits if written COMPRESSED, `None` when the payload does not
-/// beat `block_len - ZSTD_minGain`.
+/// block into `cbuf` from the committed tables `prev`, with `codes` the
+/// sequence code buffer, returning the state the block commits if written
+/// COMPRESSED, `None` when the payload does not beat `block_len -
+/// ZSTD_minGain`.
 fn entropy_code(
     sections: Sections,
     block_len: usize,
     prev: &BlockState,
     cparams: &CParams,
     cbuf: &mut Vec<u8>,
+    codes: &mut Vec<u8>,
 ) -> Option<BlockState> {
     let Sections { lits, seqs, rep } = sections;
     cbuf.clear();
     let huf = huf::compress_literals_with(cbuf, lits, seqs.len(), &prev.huf, cparams);
-    let fse = fse::encode_sequences_section_with(cbuf, seqs, &prev.fse, cparams)?;
+    let fse = fse::encode_sequences_section_with(cbuf, seqs, codes, &prev.fse, cparams)?;
     let max_c_size = block_len - CParams::min_gain(block_len, cparams.strategy);
     if cbuf.len() >= max_c_size {
         return None;
@@ -481,12 +489,13 @@ fn entropy_and_emit(
     is_last: bool,
     state: &mut CommittedBlockState,
     cbuf: &mut Vec<u8>,
+    codes: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> BlockKind {
     debug_assert!(block.len() <= ZSTD_BLOCKSIZE_MAX);
     let block_len = block.len();
     let data = &src[block];
-    let next = entropy_code(sections, block_len, state.prev(), cparams, cbuf);
+    let next = entropy_code(sections, block_len, state.prev(), cparams, cbuf, codes);
     let c_size = if next.is_some() { cbuf.len() } else { 0 };
 
     if !is_first_block && c_size < RLE_MAX_LENGTH && is_rle(data) {
@@ -530,6 +539,7 @@ fn emit_block(
     is_last: bool,
     state: &mut CommittedBlockState,
     cbuf: &mut Vec<u8>,
+    codes: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> bool {
     let Some((store, rep)) = built else {
@@ -548,6 +558,7 @@ fn emit_block(
                 is_last,
                 state,
                 cbuf,
+                codes,
                 out,
             ) == BlockKind::Compressed;
         }
@@ -573,6 +584,7 @@ fn emit_block(
             is_last && i + 1 == parts.len(),
             state,
             cbuf,
+            codes,
             out,
         );
         if kind != BlockKind::Compressed {
@@ -610,6 +622,7 @@ pub fn compress_block(
     let BlockScratch {
         store,
         cbuf,
+        codes,
         splitter,
         ..
     } = scratch;
@@ -629,6 +642,7 @@ pub fn compress_block(
         is_last,
         state,
         cbuf,
+        codes,
         out,
     );
 }
@@ -973,6 +987,7 @@ fn compress_blocks_pipelined(
         store,
         next,
         cbuf,
+        codes,
         splitter,
         presplit,
     } = scratch;
@@ -1038,6 +1053,7 @@ fn compress_blocks_pipelined(
                         is_last,
                         state,
                         cbuf,
+                        codes,
                         out,
                     )
                 },
@@ -1064,6 +1080,7 @@ fn compress_blocks_pipelined(
                 is_last,
                 state,
                 cbuf,
+                codes,
                 out,
             );
             blocks.wrote(&block, out.len() - written);
@@ -1363,6 +1380,7 @@ mod tests {
             true,
             &mut state,
             &mut cbuf,
+            &mut Vec::new(),
             &mut blocks,
         );
         assert!(!all_compressed);

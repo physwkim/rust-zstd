@@ -55,7 +55,8 @@ fn stages(
         lit_size <= lit_bound,
         "{what}: literals {lit_size} > bound {lit_bound}"
     );
-    let fse = fse::encode_sequences_section_with(&mut cbuf, seqs, &prev.fse, cparams);
+    let fse =
+        fse::encode_sequences_section_with(&mut cbuf, seqs, &mut Vec::new(), &prev.fse, cparams);
     let seq_size = cbuf.len() - lit_size;
     assert!(
         seq_size <= seq_bound,
@@ -323,6 +324,7 @@ fn sequences_bound_guards_the_decoder_workaround() {
     let st = fse::encode_sequences_section_with(
         &mut out,
         &[],
+        &mut Vec::new(),
         &FseState::default(),
         &CParams::for_level(1, 1 << 20),
     );

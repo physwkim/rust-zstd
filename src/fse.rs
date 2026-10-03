@@ -1216,6 +1216,10 @@ fn seq_to_codes<'a>(
     (ll_codes, of_codes, &mut ml_codes[..nb_seq])
 }
 
+/// `codes` is the buffer the sequence codes are written to
+/// (`ZSTD_seqToCodes`' `llCode`, `ofCode` and `mlCode`), kept across
+/// blocks.
+///
 /// `None` means the block must be emitted uncompressed: libzstd returns 0
 /// for the 1.3.4 decoder workaround (the last table description plus the
 /// bitstream under 4 bytes) and fails the compression when a table cannot
@@ -1224,6 +1228,7 @@ fn seq_to_codes<'a>(
 pub fn encode_sequences_section_with(
     out: &mut Vec<u8>,
     sequences: &[Seq],
+    codes: &mut Vec<u8>,
     prev: &FseState,
     cparams: &CParams,
 ) -> Option<FseState> {
@@ -1247,8 +1252,10 @@ pub fn encode_sequences_section_with(
     let seq_head = out.len();
     out.push(0);
 
-    let mut codes = vec![0u8; 3 * nb_seq];
-    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut codes);
+    if codes.len() < 3 * nb_seq {
+        codes.resize(3 * nb_seq, 0);
+    }
+    let (ll_codes, of_codes, ml_codes) = seq_to_codes(sequences, &mut codes[..3 * nb_seq]);
 
     // The `HIST_countFast_wksp` of each `ZSTD_buildSequencesStatistics`
     // step, taken up front so the histograms also total the raw bits the
@@ -1713,7 +1720,14 @@ mod tests {
     /// `< LONGNBSEQ` assumed, so the count takes 2 bytes).
     fn section_types(seqs: &[Seq], prev: &FseState, strategy: Strategy) -> (u8, u8, u8, FseState) {
         let mut out = Vec::new();
-        let next = encode_sequences_section_with(&mut out, seqs, prev, &cparams(strategy)).unwrap();
+        let next = encode_sequences_section_with(
+            &mut out,
+            seqs,
+            &mut Vec::new(),
+            prev,
+            &cparams(strategy),
+        )
+        .unwrap();
         assert!((128..LONGNBSEQ).contains(&seqs.len()));
         let head = out[2];
         (head >> 6, (head >> 4) & 3, (head >> 2) & 3, next)
@@ -1765,6 +1779,7 @@ mod tests {
         encode_sequences_section_with(
             &mut out,
             &seqs,
+            &mut Vec::new(),
             &FseState::default(),
             &cparams(Strategy::Fast),
         )
@@ -1775,6 +1790,7 @@ mod tests {
         encode_sequences_section_with(
             &mut out,
             &seqs,
+            &mut Vec::new(),
             &FseState::default(),
             &cparams(Strategy::Fast),
         )
@@ -1795,6 +1811,7 @@ mod tests {
             let next = encode_sequences_section_with(
                 &mut out,
                 &seqs,
+                &mut Vec::new(),
                 &FseState::default(),
                 &cparams(Strategy::Lazy),
             )

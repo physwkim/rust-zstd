@@ -107,8 +107,13 @@ fn stage_pass(data: &[u8], cparams: CParams, st: &mut Stages, layout: &mut Layou
                 );
                 st.lits += t.elapsed();
                 let t = Instant::now();
-                let fse =
-                    fse::encode_sequences_section_with(cbuf, &store.seqs, &prev.fse, &cparams);
+                let fse = fse::encode_sequences_section_with(
+                    cbuf,
+                    &store.seqs,
+                    &mut scratch.codes,
+                    &prev.fse,
+                    &cparams,
+                );
                 st.seqs += t.elapsed();
                 if let Some(fse) = fse {
                     if cbuf.len() < block_len - CParams::min_gain(block_len, cparams.strategy) {
