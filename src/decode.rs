@@ -4892,8 +4892,8 @@ mod parallel {
 
     /// Batches with fewer compressed blocks decode on the calling thread,
     /// a single block having no other to decode alongside: two blocks of
-    /// 33-57 KiB took 20-30% less time on the pool on eight cores sharing
-    /// an L3, and 9-20% less on eight over two L3s; three of 34-86 KiB,
+    /// 32-57 KiB took 11-30% less time on the pool on eight cores sharing
+    /// an L3, and 2-20% less on eight over two L3s; three of 34-86 KiB,
     /// 27-46% and 20-37% less (timed as for `MIN_BYTES`).
     pub(super) const MIN_BLOCKS: usize = 2;
 
@@ -4905,10 +4905,10 @@ mod parallel {
     /// more, and from 16 KiB for two. On eight cores over two L3s, blocks
     /// of 1 KiB or more took up to 40% more time below 16 KiB (two of them
     /// 64% more) and less from 20 KiB, though two blocks still took up to
-    /// 3% more at 15-23 KiB; blocks of 300 B took up to 7% more at 19-26
-    /// KiB and less from 28 KiB. Blocks of 156 B lose by a per-block cost
-    /// that no byte count pays off: at 37 KiB they took 2% more on one L3
-    /// and 4-7% more on two.
+    /// 3% more at 15-29 KiB and less from 31 KiB; blocks of 300 B took up
+    /// to 7% more at 19-26 KiB and less from 28 KiB. Blocks of 156 B lose
+    /// by a per-block cost that no byte count pays off: at 37 KiB they took
+    /// 2% more on one L3 and 4-7% more on two.
     pub(super) const MIN_BYTES: usize = 32 * 1024;
 
     /// When a batch of blocks decodes on the rayon pool
