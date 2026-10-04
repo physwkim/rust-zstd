@@ -175,8 +175,9 @@ pub fn parse_fse_header(source: &[u8], max_log: u8) -> Result<(u8, Vec<i32>, usi
 /// names a dictionary is an error; see `decompress_with_dict`.
 ///
 /// With the `parallel` feature, frames of two or more compressed blocks,
-/// of 32 KiB or more in all, are decoded on the current rayon pool when it
-/// has more than one thread; the output is the same either way.
+/// of 32 KiB or more in all and 163 B or more each on average, are decoded
+/// on the current rayon pool when it has more than one thread; the output
+/// is the same either way.
 ///
 /// Which frames decode follows RFC 8878, not libzstd: every block, raw,
 /// RLE or compressed, holds and decodes to at most Block_Maximum_Size
@@ -212,7 +213,8 @@ pub fn decompress_with_dict(data: &[u8], dict: &DecodeDict) -> Result<Vec<u8>, S
 pub struct DecodeOptions {
     /// The whole blocks of a frame in the input decode on the current rayon
     /// pool, whatever its size, when at least this many of them are
-    /// compressed, of `min_parallel_bytes` or more in all; `usize::MAX`
+    /// compressed, of `min_parallel_bytes` or more in all and
+    /// `min_parallel_bytes / 200` or more each on average; `usize::MAX`
     /// never do.
     pub min_parallel_blocks: usize,
     /// See `min_parallel_blocks`.
@@ -4892,8 +4894,8 @@ mod parallel {
 
     /// Batches with fewer compressed blocks decode on the calling thread,
     /// a single block having no other to decode alongside: two blocks of
-    /// 33-57 KiB took 20-30% less time on the pool on eight cores sharing
-    /// an L3, and 9-20% less on eight over two L3s; three of 34-86 KiB,
+    /// 32-57 KiB took 11-30% less time on the pool on eight cores sharing
+    /// an L3, and 2-20% less on eight over two L3s; three of 34-86 KiB,
     /// 27-46% and 20-37% less (timed as for `MIN_BYTES`).
     pub(super) const MIN_BLOCKS: usize = 2;
 
@@ -4905,11 +4907,23 @@ mod parallel {
     /// more, and from 16 KiB for two. On eight cores over two L3s, blocks
     /// of 1 KiB or more took up to 40% more time below 16 KiB (two of them
     /// 64% more) and less from 20 KiB, though two blocks still took up to
-    /// 3% more at 15-23 KiB; blocks of 300 B took up to 7% more at 19-26
-    /// KiB and less from 28 KiB. Blocks of 156 B lose by a per-block cost
-    /// that no byte count pays off: at 37 KiB they took 2% more on one L3
-    /// and 4-7% more on two.
+    /// 3% more at 15-29 KiB and less from 31 KiB; blocks of 300 B took up
+    /// to 7% more at 19-26 KiB and less from 28 KiB.
     pub(super) const MIN_BYTES: usize = 32 * 1024;
+
+    /// Batches whose compressed blocks hold fewer bytes each, on average,
+    /// decode on the calling thread: 163 B, the per-block floor of a gate
+    /// of `MIN_BYTES`. Timed as for `MIN_BYTES` on frames of 200-240
+    /// blocks of 32-41 KiB: blocks of 147-159 B took 2-3% more time on the
+    /// pool on eight cores sharing an L3 and 8% more on eight over two
+    /// L3s; blocks of 167-178 B, 5-7% less on one L3 and 2-4% more on two.
+    /// Blocks of 186-411 B in frames of 32-50 KiB took 8-19% less on one
+    /// L3 and from 5% more to 2% less on two.
+    pub(super) const MIN_BLOCK_BYTES: usize = MIN_BYTES / BLOCK_SHARE;
+
+    /// A gate's per-block floor is its `min_bytes` over this, so that the
+    /// floor scales with the gate.
+    const BLOCK_SHARE: usize = 200;
 
     /// When a batch of blocks decodes on the rayon pool
     /// (`DecodeOptions::min_parallel_blocks` and `min_parallel_bytes`).
@@ -4917,25 +4931,29 @@ mod parallel {
     pub(super) struct Gate {
         min_blocks: usize,
         min_bytes: usize,
+        min_block_bytes: usize,
     }
 
     impl Gate {
-        /// The gate of `opts`; `None` if it takes no batch.
+        /// The gate of `opts`; `None` if it takes no batch. Its per-block
+        /// floor scales with `min_parallel_bytes`, so that `0` still takes
+        /// every batch of `min_parallel_blocks`.
         pub(super) fn new(opts: &DecodeOptions) -> Option<Gate> {
             (opts.min_parallel_blocks != usize::MAX).then_some(Gate {
                 min_blocks: opts.min_parallel_blocks,
                 min_bytes: opts.min_parallel_bytes,
+                min_block_bytes: opts.min_parallel_bytes / BLOCK_SHARE,
             })
         }
 
         /// Whether the blocks `located` gives carry enough compressed work
         /// for the pool: `min_blocks` compressed blocks of `min_bytes` or
-        /// more in all. Only compressed blocks have a stage 2 to hand it,
-        /// and that work grows with their bytes, against the fixed cost of
-        /// starting tasks and waiting for them. The gate stays this one
-        /// predicate, with a known edge: frames of blocks of about 156 B,
-        /// whose per-block cost no byte count pays off (`MIN_BYTES`), pass
-        /// it and take up to 7% more time on eight cores over two L3s.
+        /// more in all and `min_block_bytes` or more each on average. Only
+        /// compressed blocks have a stage 2 to hand it, and that work grows
+        /// with their bytes, against the fixed cost of starting tasks and
+        /// waiting for them and a cost per block handed: stage 3 executes
+        /// every block on one thread either way, so blocks of few bytes
+        /// leave the pool that cost with little to share (`MIN_BLOCK_BYTES`).
         fn pools<'a>(self, blocks: impl Iterator<Item = (BlockHeader, &'a [u8], usize)>) -> bool {
             let (mut compressed, mut bytes) = (0, 0);
             for (block, content, _) in blocks {
@@ -4944,7 +4962,9 @@ mod parallel {
                     bytes += content.len();
                 }
             }
-            compressed >= self.min_blocks && bytes >= self.min_bytes
+            compressed >= self.min_blocks
+                && bytes >= self.min_bytes
+                && bytes >= compressed.saturating_mul(self.min_block_bytes)
         }
     }
 
@@ -7159,11 +7179,27 @@ mod parallel {
             let span = located(&data, BLOCK_SIZE_MAX, usize::MAX);
             assert_eq!(span.count(), kinds.len(), "{kinds}");
             let span = located(&data, BLOCK_SIZE_MAX, usize::MAX);
-            Gate {
-                min_blocks,
-                min_bytes,
-            }
-            .pools(span)
+            let opts = DecodeOptions {
+                min_parallel_blocks: min_blocks,
+                min_parallel_bytes: min_bytes,
+                ..DecodeOptions::default()
+            };
+            Gate::new(&opts).unwrap().pools(span)
+        }
+
+        /// `Gate::pools` on either side of its per-block floor: under a gate
+        /// of `MIN_BYTES`, 240 compressed blocks of `MIN_BLOCK_BYTES` pool
+        /// and of one byte fewer do not, though over `MIN_BYTES` in all; RLE
+        /// blocks among them leave the average alone; a gate of no bytes
+        /// takes blocks of one byte.
+        #[test]
+        fn gate_pools_at_its_block_floor() {
+            let c = "c".repeat(240);
+            const { assert!(240 * (MIN_BLOCK_BYTES - 1) > MIN_BYTES) };
+            assert!(pools(&c, MIN_BLOCK_BYTES, 2, MIN_BYTES));
+            assert!(!pools(&c, MIN_BLOCK_BYTES - 1, 2, MIN_BYTES));
+            assert!(pools(&"cz".repeat(240), MIN_BLOCK_BYTES, 2, MIN_BYTES));
+            assert!(pools(&c, 1, 2, 0));
         }
 
         /// `Gate::pools` on either side of its two thresholds: blocks of no
