@@ -6805,14 +6805,14 @@ mod parallel {
         /// Inline down to the stage and frame it never takes, which cost
         /// the serial driver a branch on every unit.
         #[inline]
-        pub(super) fn decode_blocks_parallel<O: FrameOut + Send>(
+        pub(super) fn decode_blocks_parallel<O: FrameOut>(
             &mut self,
             data: &[u8],
             dict: Option<&DecodeDict>,
             out: &mut O,
             room: usize,
             read: &mut usize,
-            next: impl FnMut(&mut O) -> bool + Send,
+            next: impl FnMut(&mut O) -> bool,
         ) -> Result<Option<Event>, DecodeError> {
             match &self.stage {
                 Stage::Block {
@@ -6828,14 +6828,14 @@ mod parallel {
         /// `decode_blocks_parallel` at a block header of a frame it may
         /// take.
         #[inline(never)]
-        fn decode_block_batch<O: FrameOut + Send>(
+        fn decode_block_batch<O: FrameOut>(
             &mut self,
             data: &[u8],
             dict: Option<&DecodeDict>,
             out: &mut O,
             room: usize,
             read: &mut usize,
-            next: impl FnMut(&mut O) -> bool + Send,
+            next: impl FnMut(&mut O) -> bool,
         ) -> Result<Option<Event>, DecodeError> {
             let (Stage::Block { frame, .. }, Some(gate)) = (&self.stage, self.parallel) else {
                 return Ok(None);
@@ -6888,14 +6888,14 @@ mod parallel {
 
         /// `decode_block_batch` on blocks `room` takes all of: stages 2 and
         /// 3 in one rayon scope.
-        fn decode_scoped<O: FrameOut + Send>(
+        fn decode_scoped<O: FrameOut>(
             &mut self,
             data: &[u8],
             dict: Option<&DecodeDict>,
             out: &mut O,
             room: usize,
             read: &mut usize,
-            mut next: impl FnMut(&mut O) -> bool + Send,
+            mut next: impl FnMut(&mut O) -> bool,
         ) -> Result<Option<Event>, DecodeError> {
             let (Stage::Block { frame, .. }, Some(scratch)) = (&mut self.stage, &mut self.scratch)
             else {
@@ -7018,13 +7018,13 @@ mod parallel {
     /// fails or before which `next` returns false; the repeat offsets after
     /// them, and the frame's size check on them, which ends them where it
     /// fails.
-    fn run_batch<O: FrameOut + Send>(
+    fn run_batch<O: FrameOut>(
         batch: &Batch<'_>,
         frame: &mut Frame,
         start: FrameStart<'_>,
         out: &mut O,
         simd: Level,
-        next: &mut (impl FnMut(&mut O) -> bool + Send),
+        next: &mut impl FnMut(&mut O) -> bool,
         ring: &[Arc<Cell>],
     ) -> (usize, [u32; 3], Result<(), DecodeError>) {
         // Block `i` is decoded into `ring[i % ring.len()]` by a rayon task
@@ -7033,6 +7033,11 @@ mod parallel {
         // that thread needs block `i`, or waits for block `i - 1`. It
         // decodes no block further ahead, so a block it needs is never left
         // waiting behind the decode of a later one.
+        //
+        // The executing thread is the caller's, not a worker's, so output
+        // it faults in is freed on the CPU that faulted it: a fresh buffer
+        // faulted on a worker and freed by the caller took half again as
+        // much kernel time per fault.
         let block_size_max = frame.block_size_max;
         let (plans, base) = (&batch.plans[..], batch.base);
         let def = |d| batch.def(d);
@@ -7047,7 +7052,7 @@ mod parallel {
         };
         let mut hist = start.init.offset_hist;
         let (mut done, mut stopped) = (0, false);
-        let accounted = rayon::scope_fifo(|s| {
+        let accounted = rayon::in_place_scope_fifo(|s| {
             let spawn_decode = |i: usize| {
                 let Some(Plan::Compressed(_)) = plans.get(i) else {
                     return;
