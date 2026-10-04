@@ -137,16 +137,35 @@ pub fn split_level(block_splitter_level: u8, strategy: Strategy) -> Option<u8> {
 }
 
 /// `FPStats` plus `fromBorders`' middle segment: the workspace of
-/// [`PreSplitter::split_block`], kept across blocks.
+/// [`PreSplitter::split_block`], kept across blocks. It is 12 KB and only
+/// blocks of a full 128 KiB use it, so it is allocated by the first one
+/// that does: a context that compresses small inputs never pays for it.
 #[derive(Clone, Default)]
-pub struct PreSplitter {
+pub struct PreSplitter(Option<Box<Stats>>);
+
+// SAFETY: `None` is the null pointer (`Option<Box<_>>` niche).
+unsafe impl bytemuck::Zeroable for PreSplitter {}
+
+/// The fingerprints of a [`PreSplitter`]. Each is cleared by the `record`
+/// that starts its use, so the zero bytes it is allocated with carry no
+/// meaning.
+#[derive(Clone, Default)]
+struct Stats {
     past: Fingerprint,
     new: Fingerprint,
     middle: Fingerprint,
 }
 
 // SAFETY: every field is `Zeroable`.
-unsafe impl bytemuck::Zeroable for PreSplitter {}
+unsafe impl bytemuck::Zeroable for Stats {}
+
+impl Stats {
+    /// A `Stats` built in its box, not on the stack and copied.
+    fn new_boxed() -> Box<Self> {
+        // SAFETY: the zero bytes are a valid `Stats`.
+        unsafe { Box::<Self>::new_zeroed().assume_init() }
+    }
+}
 
 impl PreSplitter {
     /// `ZSTD_splitBlock`: the size of the block to cut from the start of
@@ -155,16 +174,19 @@ impl PreSplitter {
     /// 43, 11, 5 and 1 positions.
     pub fn split_block(&mut self, block: &[u8], level: u8) -> usize {
         assert_eq!(block.len(), SPLIT_BLOCK_SIZE);
+        let stats = self.0.get_or_insert_with(Stats::new_boxed);
         match level {
-            0 => self.by_borders(block),
-            1 => self.by_chunks::<43, 8>(block),
-            2 => self.by_chunks::<11, 9>(block),
-            3 => self.by_chunks::<5, 10>(block),
-            4 => self.by_chunks::<1, 10>(block),
+            0 => stats.by_borders(block),
+            1 => stats.by_chunks::<43, 8>(block),
+            2 => stats.by_chunks::<11, 9>(block),
+            3 => stats.by_chunks::<5, 10>(block),
+            4 => stats.by_chunks::<1, 10>(block),
             _ => panic!("ZSTD_splitBlock level {level} out of range 0..=4"),
         }
     }
+}
 
+impl Stats {
     /// `ZSTD_splitBlock_byChunks`: end the block at the first 8 KiB chunk
     /// too different from everything before it.
     fn by_chunks<const RATE: usize, const HASH_LOG: u32>(&mut self, block: &[u8]) -> usize {

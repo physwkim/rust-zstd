@@ -125,8 +125,9 @@ impl Decompressor {
     /// `decompress_with_dict` does with this decompressor's dictionary if it
     /// has one, with the tables and buffers it keeps from call to call
     /// (ZSTD_decompressDCtx). With the `parallel` feature, frames of two
-    /// or more compressed blocks, of 32 KiB or more in all, decode on the
-    /// current rayon pool if the pool `new` found had more than one thread.
+    /// or more compressed blocks, of 32 KiB or more in all and 163 B or
+    /// more each on average, decode on the current rayon pool if the pool
+    /// `new` found had more than one thread.
     ///
     /// It resets the streaming state, as `reset` does, before decoding and
     /// again after, whatever the result: input and output that
@@ -222,7 +223,8 @@ impl Decompressor {
     /// two on a pool of more than one thread) and `dst` has room for the
     /// most they decode to, they decode on the current rayon pool if that
     /// many of them are compressed, of `min_parallel_bytes` or more in all
-    /// (32 KiB from `new`). The pool decodes up to twice its threads' worth
+    /// and `min_parallel_bytes / 200` or more each on average (32 KiB and
+    /// 163 B from `new`). The pool decodes up to twice its threads' worth
     /// of blocks more, which the next call takes where its input starts
     /// with the same bytes. Every call reads, writes and returns what it
     /// would decoding the blocks one after another.
