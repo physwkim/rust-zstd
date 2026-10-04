@@ -165,7 +165,7 @@ Measured against libzstd 1.5.7 on x86-64 (Zen 4), 8 MiB real-data corpora (ELF b
 
 - **Compressed size** — byte-identical to libzstd 1.5.7 at every level 1–22 on the test corpus, so the ratio is libzstd's exactly.
 - **Decompression** — 1.0–1.1x libzstd's speed on the AVX2 path across the corpus and levels. The portable (no-SIMD) path and non-BMI2 targets are a few percent slower.
-- **Multithreaded decompression** — libzstd decodes single-threaded; here a frame with at least two compressed blocks and 32 KiB decodes its blocks in parallel on rayon, and streaming decode pipelines entropy decoding against sequence execution, reaching 1.7–2.1x libzstd's streaming decode on the 8 MiB corpus.
+- **Multithreaded decompression** — libzstd decodes single-threaded; here a frame with at least two compressed blocks, 32 KiB in all and 163 B per block on average, decodes its blocks in parallel on rayon, and streaming decode pipelines entropy decoding against sequence execution, reaching 1.7–2.1x libzstd's streaming decode on the 8 MiB corpus.
 - **Compression** — within a few percent of libzstd across levels 1–22 on real data, both single-threaded and multithreaded. Degenerate constant input (all zeros) is the known exception: both codecs exceed 4 GB/s there, but libzstd's RLE fast path is several times faster still.
 - **Small inputs** — with a reused `Decompressor`, decoding 120 B–5 KB frames is at or above libzstd's reused-`DCtx` speed (dictionary frames under ~500 B remain slower).
 
