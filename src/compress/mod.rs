@@ -396,6 +396,13 @@ impl Context {
     /// [`Context::default`] built in its box: the block state and the
     /// pre-splitter, 25 of its 27 KB, are left as the zero bytes it is
     /// allocated with instead of built on the stack and copied in.
+    ///
+    /// The allocation is still zeroed, so calloc's memset covers the
+    /// ~13 KB of entropy tables in the block state too: the tables are
+    /// always built over before they are read (`Repeat` guards that), but
+    /// uninitialized storage for them needs `MaybeUninit`-shaped public
+    /// `Slots`, `TableRef::spare` and `FseCTable::build`, a semver break.
+    /// Measured bound: ~410 cycles per one-off 4 KiB dict frame.
     fn new_boxed() -> Box<Self> {
         let mut boxed = Box::<Self>::new_zeroed();
         let p = boxed.as_mut_ptr();
